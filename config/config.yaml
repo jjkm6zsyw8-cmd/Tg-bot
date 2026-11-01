@@ -1,0 +1,136 @@
+# Пороги, пресеты и шаблоны ссылок Pump.fun Dev Scanner.
+# Файл перечитывается на лету (раз в 10 с), пересборка не нужна.
+# Пользовательские значения из /settings хранятся в БД и перекрывают раздел defaults.
+
+defaults:
+  # --- разд. 2: ключевые определения ---
+  funding_window_min: 30          # окно финансирования кошельков кластера до запуска
+  big_sell_single_tx_pct: 30      # крупная продажа: >=30% токенов кластера одной tx
+  big_sell_window_pct: 50         # ... или >=50% за окно
+  big_sell_window_s: 60
+  reaction_s: 5                   # время реакции пользователя
+  target_k: 0.8                   # цель = 80% типичного MC дампа
+  min_net_profit: 0.30            # порог алерта по чистому профиту (30%)
+  copy_delay_s: 5                 # задержка копирования сделок трейдера
+
+  # --- разд. 3: девы ---
+  min_repeatability: 0.5          # минимальная повторяемость для алерта
+  mc_tolerance: 0.30              # допуск похожести по MC (±30%)
+  time_tolerance: 0.50            # допуск по времени (±50%)
+  recent_days: 30                 # свежие запуски весят вдвое больше
+  recent_weight: 2.0
+  min_launches: 3                 # минимум запусков для профиля
+  strong_potential_mult: 1.5      # Сильный: потенциал от 1.5 порога
+  strong_repeatability: 0.70      # ... и повторяемость от 70%
+  dump_zone_silence: 0.70         # молчать, если MC уже >70% типичного дампа
+  max_cluster_share: 0.35         # молчать, если кластер держит больше
+  instant_rug_s: 15               # дамп быстрее — «мгновенный раг»
+  max_entry_mc_sol: 0             # 0 = без ограничения
+  watch_level_enabled: false      # уровень «Наблюдение» выключен по умолчанию
+  wait_full_data: false           # ждать данных о холдерах или слать с пометкой
+  full_data_wait_s: 3
+  follow_minutes: 60              # сопровождение монеты после алерта
+
+  # --- разд. 4: смарт-мани ---
+  smart_filtered: true            # фильтрованный (true) / полный (false) режим
+  smart_full_feed: false          # дополнительно лента полного режима в отдельном топике
+  smart_min_buy_sol: 0.5
+  smart_mc_min_sol: 20
+  smart_mc_max_sol: 600
+  smart_max_growth_1m: 1.0        # монета выросла за минуту не больше 100%
+  consensus_window_min: 10
+  trader_min_trades_30d: 30
+  trader_min_hold_s: 120
+  trader_max_snipe_share: 0.20
+  trader_active_days: 7
+
+  # --- разд. 5: разбор дня ---
+  daily_report_time: "21:00"
+  timezone: "Europe/Moscow"
+  position_sol: 0.5               # размер позиции для расчёта проскальзывания
+
+  # --- разд. 7: фильтры ---
+  filter_preset: normal
+
+  # --- разд. 9: показ ---
+  burst_per_minute: 8             # больше — второстепенные собираются в сводку
+  compact: false
+  quiet_hours: ""                 # например "01:00-08:00"
+  modes:
+    dev: true
+    smart: true
+    daily: true
+
+# Издержки сделки. Комиссия кривой уточняется по реальным сделкам (fee в TradeEvent),
+# здесь только стартовые значения до накопления замеров.
+costs:
+  curve_fee_bps: 125              # протокол + создатель, стартовое значение
+  priority_fee_sol: 0.0005        # приоритет + чаевые на одну транзакцию
+  extra_slippage_bps: 100         # запас на гонку с другими покупателями
+
+presets:
+  cautious:
+    cluster_share_smart: 0.08
+    bundles: 0.15
+    snipers: 0.10
+    insiders: 0.08
+    top10: 0.25
+    fresh_wallets: 0.30
+    growth_1m: 0.7
+    wash_volume: 0.20
+  normal:
+    cluster_share_smart: 0.10
+    bundles: 0.20
+    snipers: 0.15
+    insiders: 0.10
+    top10: 0.30
+    fresh_wallets: 0.40
+    growth_1m: 1.0
+    wash_volume: 0.30
+  aggressive:
+    cluster_share_smart: 0.15
+    bundles: 0.30
+    snipers: 0.25
+    insiders: 0.15
+    top10: 0.40
+    fresh_wallets: 0.60
+    growth_1m: 2.0
+    wash_volume: 0.45
+
+# Шаблоны ссылок. {mint} — адрес токена, {wallet} — адрес кошелька.
+# Форматы URL терминалов меняются — правьте здесь, без изменения кода.
+links:
+  pump_redirect: "{redirect_base}/p/{mint}"   # своя HTTPS-страница → pump://coin/<mint>
+  pump_web: "https://pump.fun/coin/{mint}"
+  pump_app: "pump://coin/{mint}"
+  axiom: "https://axiom.trade/meme/{mint}"
+  gmgn: "https://gmgn.ai/sol/token/{mint}"
+  chart: "https://dexscreener.com/solana/{mint}"
+  solscan_token: "https://solscan.io/token/{mint}"
+  solscan_wallet: "https://solscan.io/account/{wallet}"
+  # true — кнопка ведёт прямо на pump_web (если проверено, что ссылка сама открывает приложение)
+  use_direct_pump_link: false
+
+# Известные адреса бирж: цепочка вывода SOL на них обрывается.
+# Дополнительно работает эвристика: кошелёк с очень большим числом транзакций считается сервисом.
+exchanges: []
+
+# Топики супергруппы. Если message_thread_id не задан, бот создаёт топики сам при /start.
+topics:
+  strong: "Сильные алерты"
+  dev: "Девы"
+  smart: "Смарт-мани"
+  full: "Полный режим"
+  follow: "Сопровождение монет"
+  daily: "Разбор дня"
+  system: "Система"
+
+reliability:
+  silence_failover_s: 30
+  coverage_target: 0.995
+  parse_error_alert_per_min: 20
+  raw_trades_days: 30
+  pumpportal_trade_window_min: 60   # сколько минут держать подписку на сделки новой монеты
+  withdrawal_poll_s: 15
+  withdrawal_hops: 3
+  exchange_tx_heuristic: 1000       # столько подписей за <1 ч — считаем биржей/сервисом

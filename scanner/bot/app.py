@@ -1,0 +1,44 @@
+"""Сервис бота: команды + доставка очереди outbox."""
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import BotCommand
+
+from ..config import Env, Settings
+from ..db.pool import Database
+from . import handlers
+from .sender import Sender
+
+log = logging.getLogger(__name__)
+
+COMMANDS = [
+    ("start", "Главное меню"), ("mode", "Режимы"), ("settings", "Настройки"), ("token", "Разбор монеты"),
+    ("dev", "Профиль дева"), ("trader", "Профиль трейдера"), ("watch", "Сопровождение монеты"),
+    ("watchlist", "Отслеживаемое"), ("addwallet", "Добавить кошелёк"), ("removewallet", "Убрать кошелёк"),
+    ("blacklist", "Чёрный список"), ("today", "Разбор дня"), ("backtest", "Бэктест"), ("stats", "Итог серии"),
+    ("mute", "Пауза алертов"), ("health", "Состояние"),
+]
+
+
+async def run_bot(env: Env, settings: Settings, db: Database) -> None:
+    if not env.bot_token:
+        raise SystemExit("BOT_TOKEN не задан")
+    if not env.allowed_ids:
+        raise SystemExit("ALLOWED_USER_IDS не задан — бот не будет никому отвечать")
+    bot = Bot(env.bot_token)
+    dp = Dispatcher()
+    router = Router()
+    sender = Sender(bot, env, settings, db)
+    handlers.setup(router, env, settings, db, sender)
+    dp.include_router(router)
+    settings.overrides = await db.get_overrides()
+    log.info(await sender.setup_topics())
+    try:
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("set_my_commands: %s", exc)
+    asyncio.create_task(sender.run())
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])

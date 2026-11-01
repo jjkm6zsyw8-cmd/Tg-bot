@@ -1,0 +1,923 @@
+"""Аналитика реального времени: кластеры → профили → скоринг → алерты (разд. 3, 4, 8, 9, 12 ТЗ).
+
+Читает новые строки tokens/trades из PostgreSQL по курсору (NOTIFY 'events' от приёмника),
+держит в памяти состояние монет моложе окна сопровождения, кладёт сообщения в outbox.
+"""
+from __future__ import annotations
+
+import asyncio
+import heapq
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from ..alerts import format as fmt
+from ..config import Env, Settings
+from ..db.pool import Database
+from ..ingest.rpc import RpcError, SolanaRpc
+from . import clusters as cl
+from .copytrade import TIER_NAMES, refresh_traders
+from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_profit
+from .features import launch_summary
+from .filters import check as check_filters
+from .loader import attach_cluster, cluster_profile, load_state, save_profile, state_from_token
+from .price import SolPrice, measured_fee_bps
+from .profiles import Profile, similar_to_reference
+from .scoring import LEVELS, Snapshot, bump, evaluate_dev
+from .state import TokenState, TradeRow
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class TokenInfo:
+    resolution: cl.Resolution | None = None
+    profile: Profile | None = None
+    cluster_row: Any = None
+    last_reason: str = ""
+    last_decision: dict[str, Any] = field(default_factory=dict)
+    resolving: bool = False
+
+
+@dataclass
+class AlertEntry:
+    """Объединённый алерт по монете: одна монета — одно сообщение."""
+    mint: str
+    created_mono: float
+    created_wall: datetime
+    modes: dict[str, str] = field(default_factory=dict)      # режим → уровень
+    alert_ids: dict[str, int] = field(default_factory=dict)  # режим → alerts.id
+    data: dict[str, Any] = field(default_factory=dict)
+    level: str = "normal"
+    topic: str = "dev"
+    has_message: bool = False
+    last_edit: float = 0.0
+    last_text: str = ""
+    follow_until: float = 0.0
+    flags: set[str] = field(default_factory=set)
+    trigger_traders: dict[str, float] = field(default_factory=dict)  # трейдер → позиция токенов
+    trader_sold: dict[str, float] = field(default_factory=dict)
+    manual: bool = False  # /watch без алерта
+    alert_ts: float = 0.0  # unix-время алерта
+
+    def combined_level(self) -> str:
+        lvl = max(self.modes.values(), key=lambda x: LEVELS[x]) if self.modes else "normal"
+        real_modes = [m for m in self.modes if m != "new_dev_wallet"]
+        if len(set(real_modes)) >= 2:
+            lvl = bump(lvl)
+        return lvl
+
+
+class Engine:
+    def __init__(self, env: Env, settings: Settings, db: Database):
+        self.env = env
+        self.settings = settings
+        self.db = db
+        self.rpc = SolanaRpc(env.rpc_url)
+        rel = settings.reliability()
+        self.linker = cl.Linker(db, self.rpc, settings.exchanges(), int(rel.get("exchange_tx_heuristic", 1000)))
+        self.price = SolPrice(db)
+        self.fee_bps: float | None = None
+        self.states: dict[str, TokenState] = {}
+        self.info: dict[str, TokenInfo] = {}
+        self.alerts: dict[str, AlertEntry] = {}
+        self.traders: dict[str, Any] = {}
+        self.smart_buys: dict[str, list[tuple[float, str, float]]] = {}
+        self.references: list[dict[str, Any]] = []
+        self.cur_token = 0
+        self.cur_trade = 0
+        self.wake = asyncio.Event()
+        self.slots_dirty = asyncio.Event()
+        self.timers: list[tuple[float, int, str, str]] = []
+        self._tseq = 0
+        self.sent_times: list[float] = []
+        self.summary: dict[str, list[str]] = {}
+        self.latencies: list[float] = []
+        self.watch_tokens: set[str] = set()
+
+    # ------------------------------------------------------------------ утилиты
+    @property
+    def cfg(self) -> dict[str, Any]:
+        return self.settings.effective()
+
+    def costs(self) -> Costs:
+        return Costs.from_config(self.settings.costs(), self.fee_bps)
+
+    def schedule(self, delay_s: float, mint: str, what: str) -> None:
+        self._tseq += 1
+        heapq.heappush(self.timers, (time.monotonic() + delay_s, self._tseq, mint, what))
+
+    async def reload_settings(self) -> None:
+        self.settings.overrides = await self.db.get_overrides()
+
+    # ------------------------------------------------------------------ запуск
+    async def start(self) -> None:
+        await self.reload_settings()
+        cfg = self.cfg
+        window = int(cfg.get("follow_minutes", 60))
+        self.cur_token = await self.db.fetchval("SELECT COALESCE(max(id), 0) FROM tokens")
+        self.cur_trade = await self.db.fetchval("SELECT COALESCE(max(id), 0) FROM trades")
+        rows = await self.db.fetch(
+            "SELECT * FROM tokens WHERE created_at > now() - make_interval(mins => $1) AND id <= $2 ORDER BY id",
+            window + 5, self.cur_token)
+        for r in rows:
+            st = await load_state(self.db, r["mint"], cfg)
+            if st:
+                self.states[st.mint] = st
+                self.info[st.mint] = TokenInfo()
+                if r["cluster_id"]:
+                    await self._load_profile(st.mint, r["cluster_id"])
+        # незавершённые сопровождения после рестарта
+        for a in await self.db.fetch(
+                "SELECT * FROM alerts WHERE follow_until > now() AND closed_at IS NULL ORDER BY id"):
+            e = self.alerts.get(a["mint"])
+            if e is None:
+                e = AlertEntry(a["mint"], time.monotonic(), a["created_at"], alert_ts=a["created_at"].timestamp())
+                e.follow_until = time.monotonic() + (a["follow_until"] - datetime.now(timezone.utc)).total_seconds()
+                e.data = dict(a["payload"] or {})
+                e.has_message = True
+                self.alerts[a["mint"]] = e
+            e.modes[a["mode"]] = a["level"]
+            e.alert_ids[a["mode"]] = a["id"]
+            e.level = e.combined_level()
+            if a["trader"]:
+                e.trigger_traders.setdefault(a["trader"], 0.0)
+            if a["mint"] not in self.states:
+                st = await load_state(self.db, a["mint"], cfg)
+                if st:
+                    self.states[a["mint"]] = st
+                    self.info[a["mint"]] = TokenInfo()
+        await self._load_traders()
+        await self._load_references()
+        log.info("engine: %d монет в памяти, %d сопровождений", len(self.states), len(self.alerts))
+
+    async def _listen(self) -> None:
+        conn = await self.db.p.acquire()
+        try:
+            await conn.add_listener("events", lambda *_: self.wake.set())
+            await conn.add_listener("slots", lambda *_: self.slots_dirty.set())
+            await conn.add_listener("meta", lambda _c, _p, _ch, payload: asyncio.create_task(self._on_meta(payload)))
+            await conn.add_listener("settings", lambda *_: asyncio.create_task(self.reload_settings()))
+            await conn.add_listener("jobs", lambda *_: self.wake.set())
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            await self.db.p.release(conn)
+
+    async def run(self) -> None:
+        await self.start()
+        tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
+                 self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
+                 self._daily_loop(), self._withdrawal_loop()]
+        await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
+
+    # ------------------------------------------------------------------ поток событий
+    async def _consume_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self.wake.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            self.wake.clear()
+            try:
+                await self._consume()
+            except Exception:  # noqa: BLE001
+                log.exception("consume")
+                await asyncio.sleep(1)
+
+    async def _consume(self) -> None:
+        cfg = self.cfg
+        toks = await self.db.fetch("SELECT * FROM tokens WHERE id > $1 ORDER BY id LIMIT 5000", self.cur_token)
+        for r in toks:
+            self.cur_token = max(self.cur_token, r["id"])
+            if r["mint"] in self.states:
+                continue
+            st = state_from_token(r, cfg)
+            self.states[st.mint] = st
+            self.info[st.mint] = TokenInfo()
+            asyncio.create_task(self._on_new_token(st, r))
+        trades = await self.db.fetch("SELECT * FROM trades WHERE id > $1 ORDER BY id LIMIT 20000", self.cur_trade)
+        for r in trades:
+            self.cur_trade = max(self.cur_trade, r["id"])
+            await self._on_trade(r)
+        if len(trades) == 20000 or len(toks) == 5000:
+            self.wake.set()
+
+    async def _on_new_token(self, st: TokenState, rec: Any) -> None:
+        cfg = self.cfg
+        info = self.info[st.mint]
+        info.resolving = True
+        try:
+            if not cfg.get("modes", {}).get("dev", True):
+                return
+            # 1) быстрый путь: деплоер уже в базе — алерт в первые секунды
+            known = await cl.cluster_of(self.db, st.deployer)
+            if known:
+                info.resolution = cl.Resolution(known[0], known[1], known[2])
+                await self._bind_cluster(st, known[0])
+                await self.evaluate_dev(st.mint, "create")
+            # 2) свежий кошелёк: финансирование, тайминг, метаданные
+            try:
+                res, funded = await self.linker.resolve_deployer(
+                    st.deployer, rec["created_at"], float(cfg.get("funding_window_min", 30)), st.meta.get("image"))
+            except RpcError as exc:
+                log.debug("resolve %s: %s", st.mint, exc)
+                res, funded = None, []
+            if res:
+                for w, why in funded:
+                    st.add_cluster_wallet(w, why, "high")
+                    if res.cluster_id:
+                        await cl.add_link(self.db, res.cluster_id, w, why, "high")
+                if not known or known[0] != res.cluster_id:
+                    info.resolution = res
+                    await self._bind_cluster(st, res.cluster_id)
+                if res.known_dev_wallet:
+                    await self._new_dev_wallet_alert(st, res)
+                await self.evaluate_dev(st.mint, "resolved")
+        finally:
+            info.resolving = False
+            for d in (3, 10, 30, 60, 120):
+                self.schedule(d, st.mint, "eval")
+
+    async def _bind_cluster(self, st: TokenState, cluster_id: int | None) -> None:
+        if not cluster_id:
+            return
+        await attach_cluster(self.db, st, cluster_id)
+        await self.db.execute("UPDATE tokens SET cluster_id=$2 WHERE mint=$1", st.mint, cluster_id)
+        await self._load_profile(st.mint, cluster_id)
+
+    async def _load_profile(self, mint: str, cluster_id: int) -> None:
+        row = await self.db.fetchrow("SELECT * FROM clusters WHERE id=$1", cluster_id)
+        info = self.info.setdefault(mint, TokenInfo())
+        info.cluster_row = row
+        prof = Profile.from_json(row["profile"]) if row else None
+        if row and prof is None:
+            prof, _ = await cluster_profile(self.db, cluster_id, self.cfg)
+        info.profile = prof
+
+    async def _on_meta(self, mint: str) -> None:
+        st = self.states.get(mint)
+        if not st:
+            return
+        row = await self.db.fetchrow("SELECT image, description, twitter, telegram, website FROM tokens WHERE mint=$1",
+                                     mint)
+        if not row:
+            return
+        st.meta = {k: v for k, v in dict(row).items() if v}
+        info = self.info.get(mint)
+        if st.cluster_id and info and info.resolution:
+            for cid, reason in await self.linker.link_by_metadata(st.cluster_id, mint, st.meta):
+                # повтор метаданных: предлагаем связь с известным кластером (средняя уверенность)
+                if not await self.db.fetchval("SELECT qualified_at IS NOT NULL OR priority FROM clusters WHERE id=$1",
+                                              cid):
+                    continue
+                exists = await self.db.fetchval(
+                    "SELECT status FROM cluster_links WHERE cluster_id=$1 AND wallet=$2", cid, st.deployer)
+                if exists:
+                    continue
+                lid = await cl.add_link(self.db, cid, st.deployer, reason, "medium", status="proposed")
+                await self.db.enqueue("text", {
+                    "topic": "dev",
+                    "text": (f"🔗 <b>Возможная связь с кластером #{cid}</b>\nДеплоер <code>{st.deployer}</code> "
+                             f"(${fmt.esc(st.symbol)})\nПричина: {fmt.esc(reason)}\nУверенность: средняя"),
+                    "keyboard": [[{"text": "Подтвердить", "callback": f"lk:{lid}:y", "style": "success"},
+                                  {"text": "Отклонить", "callback": f"lk:{lid}:n", "style": "danger"}]],
+                }, priority=6)
+
+    async def _on_trade(self, r: Any) -> None:
+        mint = r["mint"]
+        st = self.states.get(mint)
+        trader = r["trader"]
+        tracked = trader in self.traders
+        if st is None and (tracked or mint in self.alerts or mint in self.watch_tokens):
+            st = await load_state(self.db, mint, self.cfg)
+            if st is None:
+                return
+            self.states[mint] = st
+            self.info.setdefault(mint, TokenInfo())
+            if st.cluster_id:
+                await self._load_profile(mint, st.cluster_id)
+            if any(t.signature == r["signature"] for t in st.trades):
+                eff = None
+            else:
+                eff = st.add_trade(TradeRow.from_record(r))
+        elif st is None:
+            return
+        else:
+            eff = st.add_trade(TradeRow.from_record(r))
+        if r["pool"] == "pump-amm" and not st.migrated:
+            st.migrated = True
+        if tracked:
+            await self._on_smart_trade(st, r)
+        entry = self.alerts.get(mint)
+        if entry and eff is not None and time.monotonic() < entry.follow_until:
+            await self._follow(st, entry, eff, r)
+        # до алерта: продажа кластера меняет решение
+        if eff is not None and (eff.cluster_sell or eff.big_sell) and mint not in self.alerts:
+            self.info.get(mint, TokenInfo()).last_reason = "dev_sold"
+
+    # ------------------------------------------------------------------ режим 1: девы
+    def _snapshot(self, st: TokenState, info: TokenInfo) -> Snapshot:
+        now = time.time()
+        res = info.resolution
+        row = info.cluster_row
+        deployer_sold = any(not t.is_buy and t.trader == st.deployer for t in st.trades)
+        return Snapshot(
+            mc=st.mc, age_s=max(0.0, now - st.created_ts),
+            cluster_sold=deployer_sold or st.big_sell_ts is not None,
+            cluster_share=st.share(st.cluster_wallets()),
+            link_confidence=res.confidence if res else "low", link_reason=res.reason if res else "",
+            blacklisted=bool(row and row["blacklisted"]),
+            observed_growth_rate=st.growth_rate_per_s(now),
+            threshold_override=row["threshold_override"] if row and row["threshold_override"] is not None else None,
+        )
+
+    async def evaluate_dev(self, mint: str, why: str) -> None:
+        cfg = self.cfg
+        if not cfg.get("modes", {}).get("dev", True):
+            return
+        st, info = self.states.get(mint), self.info.get(mint)
+        if not st or not info:
+            return
+        snap = self._snapshot(st, info)
+        dec = evaluate_dev(info.profile, snap, cfg, self.costs())
+        info.last_reason = dec.reason if not dec.alert else "alerted"
+        info.last_decision = {"reason": dec.reason, "net": dec.net, "potential": dec.potential, "at_age": snap.age_s}
+        if not dec.alert:
+            if cfg.get("watch_level_enabled") and snap.age_s >= 25 and mint not in self.alerts:
+                await self._maybe_watch(st, info)
+            return
+        incomplete = not st.slots_known() or not st.meta
+        if incomplete and cfg.get("wait_full_data") and snap.age_s < float(cfg.get("full_data_wait_s", 3)):
+            return  # подождём следующую переоценку
+        metrics = st.metrics()
+        filt = check_filters(metrics, self.settings.filters(), "dev")
+        prof = info.profile
+        data = {
+            "symbol": st.symbol, "mc": st.mc, "age_s": snap.age_s, "potential": dec.potential, "net": dec.net,
+            "entry_mc": dec.entry_mc, "entry_max_mc": dec.entry_max_mc, "target_mc": dec.target_mc,
+            "dump_mc": dec.dump_mc, "profile": prof.to_json() if prof else None,
+            "link_confidence": snap.link_confidence, "link_reason": snap.link_reason,
+            "metrics": metrics, "violations": filt.violations, "incomplete": incomplete,
+            "cluster_id": st.cluster_id, "stage": self._stage(st),
+            "exit_rule": "Выход сразу при продаже кластера",
+        }
+        await self.compose("dev", mint, dec.level or "normal", data)
+
+    async def _maybe_watch(self, st: TokenState, info: TokenInfo) -> None:
+        if not self.references:
+            return
+        cur = launch_summary(st, self.cfg, self.costs())
+        for ref in self.references:
+            ok, reasons = similar_to_reference(cur, ref, self.cfg)
+            if ok:
+                metrics = st.metrics()
+                await self.compose("dev", st.mint, "watch", {
+                    "symbol": st.symbol, "mc": st.mc, "age_s": time.time() - st.created_ts,
+                    "entry_max_mc": st.mc * 1.1, "target_mc": ref.get("dump_mc") and 0.8 * ref["dump_mc"],
+                    "metrics": metrics, "violations": [], "link_confidence": "low",
+                    "extra_reasons": [f"Похоже на эталон {ref['mint'][:6]}…: " + ", ".join(reasons)],
+                    "cluster_id": st.cluster_id, "stage": self._stage(st),
+                })
+                return
+
+    async def _new_dev_wallet_alert(self, st: TokenState, res: cl.Resolution) -> None:
+        await self.compose("new_dev_wallet", st.mint, "normal", {
+            "symbol": st.symbol, "mc": st.mc, "age_s": time.time() - st.created_ts,
+            "entry_max_mc": st.mc * 1.2, "target_mc": None, "link_confidence": "high",
+            "link_reason": res.reason, "cluster_id": res.cluster_id,
+            "extra_reasons": [f"Новый кошелёк известного дева (кластер #{res.cluster_id})"],
+            "metrics": st.metrics(), "violations": [], "stage": self._stage(st),
+        })
+
+    @staticmethod
+    def _stage(st: TokenState) -> str:
+        if st.migrated:
+            return "мигрировала"
+        p = st.progress()
+        return "скоро миграция" if p is not None and p >= 0.7 else "новая"
+
+    # ------------------------------------------------------------------ режим 2: смарт-мани
+    async def _load_traders(self) -> None:
+        rows = await self.db.fetch("SELECT * FROM traders WHERE active")
+        self.traders = {r["address"]: r for r in rows}
+        for r in await self.db.fetch("SELECT address, label FROM watchlist WHERE kind='trader'"):
+            self.traders.setdefault(r["address"], {"address": r["address"], "label": r["label"], "tier": None,
+                                                   "copy_30d": None, "win_rate": None})
+        self.watch_tokens = {r["address"] for r in await self.db.fetch(
+            "SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())")}
+
+    async def _load_references(self) -> None:
+        rows = await self.db.fetch(
+            "SELECT * FROM launches WHERE is_reference ORDER BY created_at DESC LIMIT 200")
+        self.references = [dict(r) for r in rows]
+
+    async def _on_smart_trade(self, st: TokenState, r: Any) -> None:
+        cfg = self.cfg
+        if not cfg.get("modes", {}).get("smart", True):
+            return
+        trader = self.traders[r["trader"]]
+        line = {"is_buy": r["is_buy"], "label": trader["label"], "trader": r["trader"], "sol": r["sol_amount"],
+                "symbol": st.symbol, "mc": st.mc, "mint": st.mint}
+        if not cfg.get("smart_filtered", True) or cfg.get("smart_full_feed"):
+            await self.db.enqueue("full", {"text": fmt.render_full_line(line, self.price.value)}, priority=7)
+        entry = self.alerts.get(st.mint)
+        if not r["is_buy"]:
+            if entry and r["trader"] in entry.trigger_traders:
+                entry.trader_sold[r["trader"]] = entry.trader_sold.get(r["trader"], 0.0) + r["token_amount"]
+                pos = entry.trigger_traders[r["trader"]] or 0.0
+                if pos and entry.trader_sold[r["trader"]] > 0.5 * pos and f"tsell:{r['trader']}" not in entry.flags:
+                    entry.flags.add(f"tsell:{r['trader']}")
+                    await self._follow_msg(entry, "trader_sell", st, emergency=True,
+                                           extra=f"Трейдер «{fmt.esc(trader['label'] or r['trader'][:6])}»")
+            return
+        if not cfg.get("smart_filtered", True):
+            return
+        now = time.time()
+        buys = [b for b in self.smart_buys.get(st.mint, [])
+                if now - b[0] <= 60 * float(cfg.get("consensus_window_min", 10))]
+        buys.append((now, r["trader"], r["sol_amount"]))
+        self.smart_buys[st.mint] = buys
+        if r["sol_amount"] < float(cfg.get("smart_min_buy_sol", 0.5)):
+            return
+        if not (float(cfg.get("smart_mc_min_sol", 0)) <= st.mc <= float(cfg.get("smart_mc_max_sol", 1e9))):
+            return
+        if st.growth(now) > float(cfg.get("smart_max_growth_1m", 1.0)):
+            return
+        fresh = await self._fresh_share(st)
+        metrics = st.metrics(fresh)
+        blacklisted = bool(self.info.get(st.mint) and self.info[st.mint].cluster_row
+                           and self.info[st.mint].cluster_row["blacklisted"])
+        filt = check_filters(metrics, self.settings.filters(), "smart", blacklisted)
+        if not filt.passed:
+            return
+        distinct = {b[1] for b in buys}
+        signal, level = "single", "normal"
+        if len(distinct) >= 2:
+            signal, level = "consensus", "strong"
+        if entry and "dev" in entry.modes:
+            signal, level = "dev_match", "strong"
+        costs = self.costs()
+        pos = float(cfg.get("position_sol", 0.5))
+        thr = float(cfg.get("min_net_profit", 0.3))
+        entry_mc = st.mc * (1 + max(0.0, st.growth_rate_per_s(now)) * float(cfg.get("reaction_s", 5)))
+        f_in = entry_cost_fraction(entry_mc, pos, costs)
+        target = entry_mc * (1 + thr) / max(0.05, (1 - f_in) * (1 - exit_cost_fraction(entry_mc * 1.3, pos, costs)))
+        traders = []
+        for addr in distinct:
+            t = self.traders.get(addr) or {}
+            traders.append({"address": addr, "label": t.get("label"), "tier_name": TIER_NAMES.get(t.get("tier"), ""),
+                            "copy_30d": t.get("copy_30d"), "win_rate": t.get("win_rate"),
+                            "buy_sol": sum(b[2] for b in buys if b[1] == addr)})
+        data = {
+            "symbol": st.symbol, "mc": st.mc, "age_s": now - st.created_ts, "signal": signal,
+            "entry_max_mc": st.mc * 1.15, "target_mc": target, "entry_mc": entry_mc,
+            "metrics": metrics, "violations": filt.violations, "traders": traders,
+            "smart_in_coin": sum(1 for a in self.traders if st.balances.get(a, 0) > 0),
+            "exit_rule": "Выход при продаже трейдера или кластера", "trader": r["trader"],
+            "cluster_id": st.cluster_id, "stage": self._stage(st),
+        }
+        await self.compose("smart", st.mint, level, data, signal=signal, trader=r["trader"])
+        e = self.alerts.get(st.mint)
+        if e:
+            e.trigger_traders[r["trader"]] = e.trigger_traders.get(r["trader"], 0.0) + r["token_amount"]
+
+    async def _fresh_share(self, st: TokenState, top: int = 15) -> float | None:
+        """Доля холдеров (из топа), созданных за последние 24 часа."""
+        holders = sorted(st.holders().items(), key=lambda x: -x[1])[:top]
+        if not holders:
+            return None
+        addrs = [a for a, _ in holders]
+        known = {r["address"]: r["created_est"] for r in await self.db.fetch(
+            "SELECT address, created_est FROM wallets WHERE address = ANY($1) AND created_est IS NOT NULL", addrs)}
+        missing = [a for a in addrs if a not in known]
+
+        async def one(a: str) -> None:
+            try:
+                sigs = await self.rpc.signatures_for(a, limit=1000)
+            except RpcError:
+                return
+            if not sigs:
+                return
+            if len(sigs) >= 1000:
+                est = datetime(2000, 1, 1, tzinfo=timezone.utc)  # старый активный кошелёк
+            else:
+                bt = sigs[-1].get("blockTime")
+                if not bt:
+                    return
+                est = datetime.fromtimestamp(bt, tz=timezone.utc)
+            known[a] = est
+            await self.db.execute(
+                "INSERT INTO wallets(address, created_est) VALUES ($1, $2) "
+                "ON CONFLICT (address) DO UPDATE SET created_est = EXCLUDED.created_est", a, est)
+
+        try:
+            await asyncio.wait_for(asyncio.gather(*(one(a) for a in missing)), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        if not known:
+            return None
+        cut = datetime.now(timezone.utc) - timedelta(hours=24)
+        vals = [known[a] for a in addrs if a in known]
+        return sum(1 for v in vals if v > cut) / len(vals)
+
+    # ------------------------------------------------------------------ сборка алерта
+    def _topic_for(self, level: str, modes: dict[str, str]) -> str:
+        if level == "strong":
+            return "strong"
+        if level == "watch":
+            return "full"
+        if "dev" in modes or "new_dev_wallet" in modes:
+            return "dev"
+        return "smart"
+
+    async def compose(self, mode: str, mint: str, level: str, data: dict[str, Any],
+                      signal: str | None = None, trader: str | None = None) -> None:
+        cfg = self.cfg
+        st = self.states.get(mint)
+        e = self.alerts.get(mint)
+        if e is None:
+            e = AlertEntry(mint, time.monotonic(), datetime.now(timezone.utc), alert_ts=time.time())
+            e.follow_until = time.monotonic() + 60 * float(cfg.get("follow_minutes", 60))
+            self.alerts[mint] = e
+        prev_mode_level = e.modes.get(mode)
+        if prev_mode_level is not None and LEVELS[level] <= LEVELS[prev_mode_level]:
+            # ключ алерта — токен + режим: повтор только при повышении уровня
+            e.data.update({k: v for k, v in data.items() if k in ("mc", "age_s", "metrics", "traders",
+                                                                    "smart_in_coin", "incomplete", "violations")})
+            return
+        prev_level = e.level if e.modes else None
+        e.modes[mode] = level
+        # данные режима «дев» приоритетнее для целей и входа
+        if mode == "dev" or "dev" not in e.modes or not e.data:
+            merged = {**e.data, **data}
+        else:
+            merged = {**data, **{k: v for k, v in e.data.items() if v is not None}}
+            merged["traders"] = data.get("traders")
+        if e.data.get("extra_reasons") and data.get("extra_reasons"):
+            merged["extra_reasons"] = list(dict.fromkeys(e.data["extra_reasons"] + data["extra_reasons"]))
+        e.data = merged
+        e.level = e.combined_level()
+        e.data["mint"] = mint
+        e.data["level"] = e.level
+        e.data["modes"] = list(e.modes)
+        e.data["reaction_s"] = cfg.get("reaction_s", 5)
+        latency = time.time() - st.created_ts if st and mode == "dev" else None
+        if latency is not None and prev_mode_level is None:
+            e.data["latency_s"] = latency
+            self.latencies.append(latency)
+            self.latencies = self.latencies[-500:]
+        aid = await self.db.fetchval(
+            """INSERT INTO alerts(mint, mode, level, signal, trader, cluster_id, mc_alert, entry_mc, target_mc,
+                   dump_mc, potential, net_profit, reasons, payload, incomplete, latency_ms, follow_until)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16, now() + make_interval(mins => $17))
+               ON CONFLICT (mint, mode) DO UPDATE SET level=EXCLUDED.level, payload=EXCLUDED.payload,
+                   signal=COALESCE(EXCLUDED.signal, alerts.signal)
+               RETURNING id""",
+            mint, mode, level, signal, trader, data.get("cluster_id"), data.get("mc"), data.get("entry_mc"),
+            data.get("target_mc"), data.get("dump_mc"), data.get("potential"), data.get("net"),
+            data.get("extra_reasons") or [], _jsonable(e.data), bool(data.get("incomplete")),
+            int(latency * 1000) if latency is not None else None, int(cfg.get("follow_minutes", 60)))
+        e.alert_ids[mode] = aid
+        text = fmt.render_alert(e.data, self.price.value, bool(cfg.get("compact")))
+        profile_kind, profile_ref = ("d", str(e.data.get("cluster_id"))) if e.data.get("cluster_id") else \
+            ("t", trader or e.data.get("trader") or "")
+        kb = fmt.alert_keyboard(mint, self.settings.links(), self.env.redirect_base, profile_kind, profile_ref)
+        topic = self._topic_for(e.level, e.modes)
+        upgraded = prev_level is not None and LEVELS[e.level] > LEVELS[prev_level]
+        if e.has_message and not upgraded:
+            await self._edit(e, text, kb, force=True)
+            return
+        # всплеск: второстепенные — в сводку
+        now = time.monotonic()
+        self.sent_times = [t for t in self.sent_times if now - t < 60]
+        if e.level != "strong" and len(self.sent_times) >= int(cfg.get("burst_per_minute", 8)) and not e.has_message:
+            self.summary.setdefault(topic, []).append(
+                f"{fmt.ICONS[e.level]} ${fmt.esc(e.data.get('symbol') or '?')} · "
+                f"MC {fmt.mc_usd(e.data.get('mc'), self.price.value)} · {'+'.join(e.modes)} · "
+                f"<code>{mint}</code>")
+            return
+        self.sent_times.append(now)
+        e.has_message = True
+        e.topic = topic
+        e.last_text = text
+        e.last_edit = now
+        prio = 1 if e.level == "strong" else 2 if e.level == "normal" else 4
+        if signal == "dev_match":
+            prio = 0
+        await self.db.enqueue("alert", {
+            "mint": mint, "topic": topic, "text": text, "keyboard": kb, "level": e.level,
+            "silent": e.level == "watch", "upgrade": upgraded, "alert_ids": e.alert_ids,
+        }, priority=prio)
+
+    async def _edit(self, e: AlertEntry, text: str | None = None, kb: Any = None, force: bool = False) -> None:
+        now = time.monotonic()
+        if not e.has_message or (not force and now - e.last_edit < 5):
+            return
+        if text is None:
+            text = fmt.render_alert(e.data, self.price.value, bool(self.cfg.get("compact")))
+        if text == e.last_text:
+            return
+        e.last_edit = now
+        e.last_text = text
+        await self.db.enqueue("edit", {"mint": e.mint, "text": text, "keyboard": kb}, priority=6)
+
+    # ------------------------------------------------------------------ сопровождение
+    async def _follow(self, st: TokenState, e: AlertEntry, eff: Any, r: Any) -> None:
+        cfg = self.cfg
+        e.data["mc"] = st.mc
+        e.data["age_s"] = time.time() - st.created_ts
+        prof = (e.data.get("profile") or {}).get("medians") or {}
+        if eff.cluster_sell and "emergency" not in e.flags and (eff.big_sell or eff.sold_fraction >= 0.05):
+            e.flags.add("emergency")
+            extra = f"Продано {eff.sold_fraction:.0%} позиции кластера одной транзакцией"
+            ttd = prof.get("time_to_dump_s")
+            age_s = r["ts"].timestamp() - st.created_ts
+            if ttd and age_s < 0.5 * ttd:
+                extra += f"\n⚠️ Раньше обычного: через {fmt.age(age_s)} вместо ~{fmt.age(ttd)}"
+            await self._follow_msg(e, "emergency", st, emergency=True, extra=extra)
+        elif eff.cluster_buy_more and "dev_buys" not in e.flags:
+            e.flags.add("dev_buys")
+            await self._follow_msg(e, "dev_buys", st)
+        if "emergency" not in e.flags:
+            tgt = e.data.get("target_mc")
+            if tgt and st.mc >= tgt and "target" not in e.flags:
+                e.flags.add("target")
+                await self._follow_msg(e, "target", st)
+            dump = e.data.get("dump_mc")
+            if dump and st.mc >= float(cfg.get("dump_zone_silence", 0.7)) * dump and "zone70" not in e.flags:
+                e.flags.add("zone70")
+                await self._follow_msg(e, "zone70", st)
+        p = st.progress()
+        if p is not None and p >= 0.9 and "pre_migration" not in e.flags and not st.migrated:
+            e.flags.add("pre_migration")
+            await self._follow_msg(e, "pre_migration", st)
+        if st.migrated and "migrated" not in e.flags:
+            e.flags.add("migrated")
+            await self._follow_msg(e, "migrated", st)
+        await self._edit(e)
+
+    async def _follow_msg(self, e: AlertEntry, kind: str, st: TokenState, emergency: bool = False,
+                          extra: str = "") -> None:
+        text = fmt.render_follow(kind, {"mint": e.mint, "symbol": st.symbol, "mc": st.mc}, self.price.value, extra)
+        kb = fmt.exit_keyboard(e.mint, self.settings.links(), self.env.redirect_base) if emergency else None
+        await self.db.enqueue("follow", {"mint": e.mint, "text": text, "keyboard": kb, "emergency": emergency,
+                                         "kind": kind}, priority=0 if emergency else 5)
+
+    async def _finalize_alert(self, e: AlertEntry) -> None:
+        st = self.states.get(e.mint) or await load_state(self.db, e.mint, self.cfg)
+        if st is None:
+            return
+        cfg = self.cfg
+        costs = self.costs()
+        reaction = float(cfg.get("reaction_s", 5))
+        pos = float(cfg.get("position_sol", 0.5))
+        t_alert = e.alert_ts or (e.created_wall.timestamp())
+        t_entry = t_alert + reaction
+        entry_mc = st.mc_at(t_entry)
+        exit_reason, t_exit = "timeout", t_alert + 60 * float(cfg.get("follow_minutes", 60))
+        tgt = e.data.get("target_mc")
+        for t in st.trades:
+            if t.ts < t_entry:
+                continue
+            if st.big_sell_ts and t.ts >= st.big_sell_ts:
+                exit_reason, t_exit = "emergency", st.big_sell_ts + reaction
+                break
+            if tgt and t.mc >= tgt:
+                exit_reason, t_exit = "target", t.ts + reaction
+                break
+        exit_mc = st.mc_at(t_exit)
+        net = trade_net_profit(entry_mc, exit_mc, pos, costs)
+        end = (st.big_sell_ts - reaction) if st.big_sell_ts and st.big_sell_ts > t_entry else t_exit
+        max_mc = st.max_mc_between(t_entry, max(end, t_entry))
+        best = trade_net_profit(entry_mc, max_mc, pos, costs)
+        thr = float(cfg.get("min_net_profit", 0.3))
+        rug = st.big_sell_ts is not None and st.big_sell_ts - t_alert < 30 and st.mc_at(st.big_sell_ts + 5) < 0.5 * entry_mc
+        auto = "scam" if rug else "great" if best >= max(1.0, 2 * thr) else "good" if best >= thr else "fail"
+        outcome = {"max_mc": max_mc, "exit_mc": exit_mc, "exit_reason": exit_reason, "net_result": net,
+                   "achievable_profit": best, "auto_mark": auto}
+        for aid in e.alert_ids.values():
+            await self.db.execute(
+                """INSERT INTO alert_outcomes(alert_id, max_mc, exit_mc, exit_reason, net_result, achievable_profit,
+                       auto_mark) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                   ON CONFLICT (alert_id) DO UPDATE SET max_mc=EXCLUDED.max_mc, exit_mc=EXCLUDED.exit_mc,
+                       exit_reason=EXCLUDED.exit_reason, net_result=EXCLUDED.net_result,
+                       achievable_profit=EXCLUDED.achievable_profit, auto_mark=EXCLUDED.auto_mark,
+                       computed_at=now()""",
+                aid, max_mc, exit_mc, exit_reason, net, best, auto)
+            await self.db.execute("UPDATE alerts SET closed_at=now() WHERE id=$1", aid)
+        if e.manual:
+            text = fmt.render_final({**e.data, "mint": e.mint, "symbol": st.symbol}, outcome, self.price.value)
+            await self.db.enqueue("follow", {"mint": e.mint, "text": text, "keyboard": None, "emergency": False,
+                                             "kind": "final"}, priority=5)
+            return
+        main_id = e.alert_ids.get("dev") or next(iter(e.alert_ids.values()), None)
+        text = fmt.render_final({**e.data, "symbol": st.symbol}, outcome, self.price.value)
+        await self.db.enqueue("final", {"mint": e.mint, "text": text,
+                                        "keyboard": fmt.marks_keyboard(main_id) if main_id else None}, priority=5)
+
+    # ------------------------------------------------------------------ таймеры и обслуживание
+    async def _timer_loop(self) -> None:
+        while True:
+            await asyncio.sleep(0.2)
+            now = time.monotonic()
+            while self.timers and self.timers[0][0] <= now:
+                _, _, mint, what = heapq.heappop(self.timers)
+                try:
+                    e = self.alerts.get(mint)
+                    if what == "eval" and (e is None or e.modes.get("dev") != "strong"):
+                        await self.evaluate_dev(mint, "timer")
+                except Exception:  # noqa: BLE001
+                    log.exception("timer %s", mint)
+            for mint, e in list(self.alerts.items()):
+                if now >= e.follow_until:
+                    self.alerts.pop(mint, None)
+                    try:
+                        await self._finalize_alert(e)
+                    except Exception:  # noqa: BLE001
+                        log.exception("finalize alert %s", mint)
+
+    async def _slots_loop(self) -> None:
+        while True:
+            await self.slots_dirty.wait()
+            self.slots_dirty.clear()
+            await asyncio.sleep(0.2)
+            young = [m for m, s in self.states.items() if time.time() - s.created_ts < 180 and not s.slots_known()]
+            if not young:
+                continue
+            rows = await self.db.fetch(
+                "SELECT mint, signature, slot FROM trades WHERE mint = ANY($1) AND slot IS NOT NULL", young)
+            toks = {r["mint"]: r["created_slot"] for r in await self.db.fetch(
+                "SELECT mint, created_slot FROM tokens WHERE mint = ANY($1)", young)}
+            by_mint: dict[str, dict[str, int]] = {}
+            for r in rows:
+                by_mint.setdefault(r["mint"], {})[r["signature"]] = r["slot"]
+            for m in young:
+                st = self.states.get(m)
+                if st:
+                    st.apply_slots(by_mint.get(m, {}), toks.get(m))
+
+    async def _housekeeping_loop(self) -> None:
+        """Завершение запусков старше окна → launches + профиль кластера."""
+        while True:
+            await asyncio.sleep(20)
+            try:
+                self.fee_bps = await measured_fee_bps(self.db) or self.fee_bps
+                await self._load_traders()
+                window = 60 * float(self.cfg.get("follow_minutes", 60))
+                old = [m for m, s in self.states.items()
+                       if time.time() - s.created_ts > window and m not in self.alerts]
+                for m in old:
+                    st = self.states.pop(m)
+                    info = self.info.pop(m, None)
+                    await self.finalize_launch(st, info)
+                await self.db.kv_set("health:analytics", {
+                    "at": datetime.now(timezone.utc).isoformat(), "tokens_in_memory": len(self.states),
+                    "following": len(self.alerts), "tracked_traders": len(self.traders),
+                    "sol_usd": self.price.value, "fee_bps": self.fee_bps,
+                    "latency_median_s": _median(self.latencies), "latency_p95_s": _pct(self.latencies, 0.95),
+                })
+            except Exception:  # noqa: BLE001
+                log.exception("housekeeping")
+
+    async def finalize_launch(self, st: TokenState, info: TokenInfo | None) -> None:
+        s = launch_summary(st, self.cfg, self.costs(), _median(self.latencies) or 1.5)
+        s["features"]["decision_reason"] = info.last_reason if info else ""
+        s["features"]["decision"] = info.last_decision if info else {}
+        good_mark = await self.db.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM user_marks m JOIN alerts a ON a.id=m.alert_id
+                             WHERE a.mint=$1 AND m.mark IN ('great','good'))""", st.mint)
+        await self.db.execute(
+            """INSERT INTO launches(mint, cluster_id, deployer, created_at, initial_mc, peak_mc, dump_mc,
+                   time_to_dump_s, sold_share, cluster_share_start, early_buyers, achievable_profit, entry_mc,
+                   mc_30s, mc_60s, mc_120s, dev_buy_sol, bundle_wallets, bundle_share, migrated, features,
+                   is_reference)
+               VALUES ($1,$2,$3,to_timestamp($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+               ON CONFLICT (mint) DO UPDATE SET peak_mc=EXCLUDED.peak_mc, dump_mc=EXCLUDED.dump_mc,
+                   time_to_dump_s=EXCLUDED.time_to_dump_s, achievable_profit=EXCLUDED.achievable_profit,
+                   features=EXCLUDED.features, finalized_at=now()""",
+            st.mint, st.cluster_id, st.deployer, st.created_ts, s["initial_mc"], s["peak_mc"], s["dump_mc"],
+            s["time_to_dump_s"], s["sold_share"], s["cluster_share_start"], s["early_buyers"],
+            s["achievable_profit"], s["entry_mc"], s["mc_30s"], s["mc_60s"], s["mc_120s"], s["dev_buy_sol"],
+            s["bundle_wallets"], s["bundle_share"], s["migrated"], _jsonable(s["features"]), good_mark)
+        if st.cluster_id is None:
+            return
+        await self.linker.promote_slot_buyers(st.cluster_id, s["features"].get("first_slot_buyers") or [])
+        prof, _ = await cluster_profile(self.db, st.cluster_id, self.cfg)
+        await save_profile(self.db, st.cluster_id, prof, self.cfg)
+
+    async def _summary_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            pending, self.summary = self.summary, {}
+            for topic, lines in pending.items():
+                await self.db.enqueue("summary", {
+                    "topic": topic,
+                    "text": f"📦 <b>Сводка: {len(lines)} второстепенных алертов за минуту</b>\n" + "\n".join(lines[:40]),
+                }, priority=6)
+
+    async def _jobs_loop(self) -> None:
+        from .feedback import Feedback
+        fb = Feedback(self)
+        while True:
+            await asyncio.sleep(1)
+            rows = await self.db.fetch("SELECT * FROM jobs WHERE done_at IS NULL ORDER BY id LIMIT 20")
+            for j in rows:
+                err = None
+                try:
+                    await fb.handle(j["kind"], j["payload"] or {})
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("job %s", j["kind"])
+                    err = str(exc)[:500]
+                await self.db.execute("UPDATE jobs SET done_at=now(), error=$2 WHERE id=$1", j["id"], err)
+
+    async def _withdrawal_loop(self) -> None:
+        from .feedback import WithdrawalWatcher
+        await WithdrawalWatcher(self).run()
+
+    async def _daily_loop(self) -> None:
+        """Разбор дня в заданное время + ночной пересчёт трейдеров и профилей."""
+        from ..reports.daily import send_daily
+        last_daily = last_nightly = None
+        while True:
+            await asyncio.sleep(30)
+            cfg = self.cfg
+            tz = ZoneInfo(cfg.get("timezone", "UTC"))
+            now = datetime.now(tz)
+            hh, mm = (int(x) for x in str(cfg.get("daily_report_time", "21:00")).split(":"))
+            if cfg.get("modes", {}).get("daily", True) and (now.hour, now.minute) >= (hh, mm) \
+                    and last_daily != now.date():
+                last_daily = now.date()
+                try:
+                    await send_daily(self.db, self.settings, now.date())
+                except Exception:  # noqa: BLE001
+                    log.exception("daily")
+            utc = datetime.now(timezone.utc)
+            if utc.hour == 3 and last_nightly != utc.date():
+                last_nightly = utc.date()
+                try:
+                    res = await refresh_traders(self.db, cfg, self.costs())
+                    await self.recompute_profiles()
+                    await self.db.system(f"Ночной пересчёт: трейдеров-кандидатов {res['candidates']}, "
+                                         f"прошли фильтр {res['qualified']}.")
+                except Exception:  # noqa: BLE001
+                    log.exception("nightly")
+
+    async def recompute_profiles(self) -> None:
+        rows = await self.db.fetch(
+            "SELECT DISTINCT cluster_id FROM launches WHERE created_at > now() - interval '90 days'")
+        for r in rows:
+            prof, _ = await cluster_profile(self.db, r["cluster_id"], self.cfg)
+            await save_profile(self.db, r["cluster_id"], prof, self.cfg)
+        await self._load_references()
+
+    async def watch_token(self, mint: str) -> None:
+        """/watch: сопровождение монеты без алерта."""
+        st = self.states.get(mint) or await load_state(self.db, mint, self.cfg)
+        if not st:
+            return
+        self.states[mint] = st
+        self.info.setdefault(mint, TokenInfo())
+        if mint in self.alerts:
+            return
+        e = AlertEntry(mint, time.monotonic(), datetime.now(timezone.utc), manual=True, alert_ts=time.time())
+        e.follow_until = time.monotonic() + 60 * float(self.cfg.get("follow_minutes", 60))
+        e.data = {"mint": mint, "symbol": st.symbol, "mc": st.mc, "modes": ["watch"], "level": "normal"}
+        if st.cluster_id:
+            await self._load_profile(mint, st.cluster_id)
+            prof = self.info[mint].profile
+            if prof and prof.dump_mc:
+                e.data["dump_mc"] = prof.dump_mc
+                e.data["target_mc"] = float(self.cfg.get("target_k", 0.8)) * prof.dump_mc
+                e.data["profile"] = prof.to_json()
+        self.alerts[mint] = e
+        self.watch_tokens.add(mint)
+
+
+def _median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    return s[len(s) // 2]
+
+
+def _pct(xs: list[float], q: float) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    return s[min(len(s) - 1, int(q * len(s)))]
+
+
+def _jsonable(v: Any) -> Any:
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+        return None
+    return v

@@ -1,0 +1,67 @@
+# Приёмник, аналитика, бот, страница перехода и база — отдельные сервисы с автоперезапуском.
+x-app: &app
+  build: .
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://scanner:${POSTGRES_PASSWORD:-scanner}@db:5432/scanner
+    LOG_DIR: /app/logs
+  volumes:
+    - ./config:/app/config:ro          # пороги и шаблоны ссылок меняются без пересборки
+    - ./logs:/app/logs
+  depends_on:
+    db:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: scanner
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scanner}
+      POSTGRES_DB: scanner
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scanner"]
+      interval: 5s
+      retries: 20
+    command: ["postgres", "-c", "shared_buffers=1GB", "-c", "max_connections=200", "-c", "synchronous_commit=off"]
+
+  ingest:
+    <<: *app
+    command: ["ingest"]
+
+  analytics:
+    <<: *app
+    command: ["analytics"]
+
+  bot:
+    <<: *app
+    command: ["bot"]
+
+  web:
+    <<: *app
+    command: ["web"]
+    ports:
+      - "127.0.0.1:8080:8080"          # за reverse-proxy с HTTPS (Caddy/nginx), см. README
+
+  backup:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-scanner}
+    volumes:
+      - ./backups:/backups
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/backup_loop.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
