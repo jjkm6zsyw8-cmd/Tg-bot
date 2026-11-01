@@ -40,5 +40,8 @@ async def run_bot(env: Env, settings: Settings, db: Database) -> None:
         await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS])
     except Exception as exc:  # noqa: BLE001
         log.warning("set_my_commands: %s", exc)
-    asyncio.create_task(sender.run())
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    sender_task = asyncio.create_task(sender.run())
+    try:
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    finally:
+        sender_task.cancel()  # иначе при остановке отправщик пишет ошибки «pool is closing»
