@@ -35,7 +35,8 @@ echo "=== 3/5 Настройки (вставьте значения и нажм�
 if [ -f .env ]; then
   echo "Файл .env уже есть — оставляю как есть. Чтобы ввести заново: rm $DIR/.env и запустите установку снова."
 else
-  ask BOT_TOKEN "Токен бота от @BotFather"
+  ask BOT_TOKEN "Токен бота от @BotFather (нажмите на токен в сообщении BotFather — скопируется только он)"
+  BOT_TOKEN="${BOT_TOKEN%% *}"   # отрезаем приклеившееся время сообщения
   ask ALLOWED "Ваш Telegram user_id (от @userinfobot)"
   ask CHAT "Id группы (начинается с -100)"
   case "$CHAT" in -*) ;; *) CHAT="-$CHAT" ;; esac   # минус часто теряется при копировании
@@ -66,7 +67,8 @@ sed -i 's/use_direct_pump_link: false/use_direct_pump_link: true/' config/config
 mkdir -p logs backups && chown -R 10001:10001 logs   # контейнеры бота работают под uid 10001
 
 echo "=== 5/5 Запускаю (первая сборка 2–5 минут) ==="
-docker compose up -d --build db ingest analytics bot backup
+docker compose up -d --build db backup
+docker compose up -d --build --force-recreate ingest analytics bot
 
 echo
 docker compose ps
