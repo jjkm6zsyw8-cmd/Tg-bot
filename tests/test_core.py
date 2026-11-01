@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import time
+
 import pytest
 
 from scanner.alerts import format as fmt
@@ -344,3 +346,16 @@ def test_logs_ws_url_derived_from_rpc():
     from scanner.config import Env
     assert Env(rpc_url="https://mainnet.helius-rpc.com/?api-key=k").logs_ws_url == "wss://mainnet.helius-rpc.com/?api-key=k"
     assert Env(rpc_url="https://api.mainnet-beta.solana.com").logs_ws_url == ""
+
+
+def test_trend_score():
+    from scanner.analytics.trends import PairInfo, score
+    pair = {"baseToken": {"address": addr("tr"), "symbol": "TR", "name": "T"}, "pairAddress": "p", "dexId": "pumpswap",
+            "priceUsd": "0.0001", "marketCap": 80_000, "liquidity": {"usd": 25_000, "base": 1e8},
+            "volume": {"m5": 6_000, "h1": 40_000}, "txns": {"m5": {"buys": 40, "sells": 15}},
+            "priceChange": {"m5": 12, "h1": 80}, "pairCreatedAt": (time.time() - 3600) * 1000}
+    pi = PairInfo.from_pair(pair)
+    assert score(pi, CFG) == (True, "")
+    assert score(PairInfo.from_pair({**pair, "priceChange": {"m5": 120, "h1": 80}}), CFG)[1] == "price_m5"
+    assert score(PairInfo.from_pair({**pair, "txns": {"m5": {"buys": 20, "sells": 30}}}), CFG)[1] == "pressure"
+    assert score(PairInfo.from_pair({**pair, "liquidity": {"usd": 1000}}), CFG)[1] == "liquidity"

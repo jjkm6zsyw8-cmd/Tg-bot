@@ -14,9 +14,10 @@ from ..solana import short
 
 ICONS = {"strong": "🟢", "normal": "🟡", "watch": "⚪", "exit": "🔴", "info": "🔵"}
 LEVEL_NAMES = {"strong": "СИЛЬНЫЙ", "normal": "ОБЫЧНЫЙ", "watch": "НАБЛЮДЕНИЕ"}
-MODE_NAMES = {"dev": "ДЕВ", "smart": "СМАРТ-МАНИ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ МОНЕТА"}
+MODE_NAMES = {"dev": "ДЕВ", "smart": "СМАРТ-МАНИ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ МОНЕТА", "trend": "ТРЕНД"}
 CONF_NAMES = {"high": "высокая", "medium": "средняя", "low": "низкая"}
-SIGNAL_NAMES = {"single": "покупка трейдера", "consensus": "консенсус", "dev_match": "совпадение с девом"}
+SIGNAL_NAMES = {"single": "покупка трейдера", "consensus": "консенсус", "dev_match": "совпадение с девом",
+                "impulse": "импульс"}
 
 
 def esc(s: Any) -> str:
@@ -71,7 +72,8 @@ def alert_keyboard(mint: str, links: dict[str, Any], redirect_base: str, profile
         [{"text": "Скопировать адрес", "copy": mint},
          {"text": "График", "url": link(links["chart"], mint=mint)}],
         [{"text": "Профиль дева" if profile_kind == "d" else "Профиль трейдера",
-          "callback": f"prof:{profile_kind}:{profile_ref}"},
+          "callback": f"prof:{profile_kind}:{profile_ref}"} if profile_ref and profile_ref != "None" else
+         {"text": "GMGN", "url": link(links["gmgn"], mint=mint)},
          {"text": "Отслеживать", "callback": f"trk:{mint}"}],
     ]
     if marks_alert_id is not None:
@@ -168,6 +170,7 @@ def render_follow(kind: str, a: dict[str, Any], sol_usd: float, extra: str = "")
         "level_up": f"⬆️ <b>Уровень повышен</b> · {sym} · MC {mc}",
         "pre_migration": f"🚀 <b>Скоро миграция</b> · {sym} · MC {mc}",
         "migrated": f"🔁 <b>Мигрировала в PumpSwap</b> · {sym} · MC {mc}. Отслеживание продолжается.",
+        "trend_exit": f"🔴 <b>ВЫХОД: тренд развернулся</b> · {sym} · MC {mc}",
     }
     out = texts.get(kind, f"{kind} · {sym} · MC {mc}")
     if extra:

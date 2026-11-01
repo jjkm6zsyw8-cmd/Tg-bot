@@ -194,6 +194,10 @@ async def health_view(db: Database) -> str:
     if ana.get("fee_bps"):
         lines.append(f"Комиссия кривой по реальным сделкам: {ana['fee_bps']:.0f} bps")
     lines.append(f"Курс SOL: ${ana.get('sol_usd', 0):.2f}")
+    tr = await db.kv_get("health:trends", {}) or {}
+    if tr:
+        lines.append(f"Тренды: кандидатов {tr.get('candidates', 0)}, проверено {tr.get('checked', 0)}, "
+                     f"алертов {tr.get('alerts', 0)}, на сопровождении {tr.get('tracked', 0)}, ошибок API {tr.get('errors', 0)}")
     if cov.get("parts"):
         lines.append("Покрытие за час: " + "; ".join(cov["parts"]))
     lines.append(f"Очередь сообщений: {backlog}")

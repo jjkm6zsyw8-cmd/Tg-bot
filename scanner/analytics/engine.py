@@ -24,6 +24,7 @@ from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_pro
 from .features import launch_summary
 from .filters import check as check_filters
 from .newcoins import evaluate_new
+from .trends import Trends
 from .loader import attach_cluster, cluster_profile, load_state, save_profile, state_from_token
 from .price import SolPrice, measured_fee_bps
 from .profiles import Profile, similar_to_reference
@@ -102,6 +103,7 @@ class Engine:
         self.latencies: list[float] = []
         self.watch_tokens: set[str] = set()
         self.new_eval_at: dict[str, float] = {}
+        self.trends = Trends(self)
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -176,7 +178,7 @@ class Engine:
         await self.start()
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
-                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop()]
+                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run()]
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий
@@ -619,7 +621,9 @@ class Engine:
             return "dev"
         if "smart" in modes:
             return "smart"
-        return "new"
+        if "new" in modes:
+            return "new"
+        return "trend"
 
     async def compose(self, mode: str, mint: str, level: str, data: dict[str, Any],
                       signal: str | None = None, trader: str | None = None) -> None:
@@ -755,6 +759,9 @@ class Engine:
                                          "kind": kind}, priority=0 if emergency else 5)
 
     async def _finalize_alert(self, e: AlertEntry) -> None:
+        if "trend" in e.modes and e.mint in self.trends.tracked:
+            await self.trends.finalize(e)   # итог по ценам DexScreener (монета могла мигрировать)
+            return
         st = self.states.get(e.mint) or await load_state(self.db, e.mint, self.cfg)
         if st is None:
             return

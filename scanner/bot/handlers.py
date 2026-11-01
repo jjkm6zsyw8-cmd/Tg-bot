@@ -87,6 +87,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
              {"text": f"{on(m.get('smart', True))} Смарт-мани", "callback": "mode:smart"},
              {"text": f"{on(m.get('daily', True))} Разбор дня", "callback": "mode:daily"}],
             [{"text": f"{on(m.get('new', True))} Новые монеты (проверка каждой монеты)", "callback": "mode:new"}],
+            [{"text": f"{on(m.get('trend', True))} Тренды (DexScreener, GeckoTerminal)", "callback": "mode:trend"}],
             [{"text": "Смарт: " + ("фильтрованный → полный" if cfg.get("smart_filtered", True) else "полный → фильтрованный"),
               "callback": "tog:smart_filtered"}],
             [{"text": f"{on(cfg.get('smart_full_feed'))} Лента полного режима вместе с фильтрованным",

@@ -146,7 +146,7 @@ class Settings:
         return self.yaml.section("reliability")
 
     def topics(self) -> dict[str, str]:
-        return {"new": "Новые монеты", **self.yaml.section("topics")}
+        return {"new": "Новые монеты", "trend": "Тренды", **self.yaml.section("topics")}
 
     def exchanges(self) -> set[str]:
         return set(self.yaml.data.get("exchanges") or [])
