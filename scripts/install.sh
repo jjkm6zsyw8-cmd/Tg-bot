@@ -36,7 +36,17 @@ if [ -f .env ]; then
   echo "Файл .env уже есть — оставляю как есть. Чтобы ввести заново: rm $DIR/.env и запустите установку снова."
 else
   ask BOT_TOKEN "Токен бота от @BotFather (нажмите на токен в сообщении BotFather — скопируется только он)"
-  BOT_TOKEN="${BOT_TOKEN%% *}"   # отрезаем приклеившееся время сообщения
+  # токен = цифры:35 символов; всё, что приклеилось после (время сообщения и т.п.), отрезаем
+  while ! [[ "$BOT_TOKEN" =~ ^[[:space:]]*([0-9]{6,12}:[A-Za-z0-9_-]{35}) ]]; do
+    echo "Это не похоже на токен (нужно вида 123456789:AA... — 35 символов после двоеточия)."
+    ask BOT_TOKEN "Токен бота ещё раз"
+  done
+  BOT_TOKEN="${BASH_REMATCH[1]}"
+  if curl -fsS "https://api.telegram.org/bot$BOT_TOKEN/getMe" >/dev/null 2>&1; then
+    echo "✅ Telegram принял токен"
+  else
+    echo "⚠️ Telegram не принял токен — проверьте его в @BotFather. Продолжаю установку."
+  fi
   ask ALLOWED "Ваш Telegram user_id (от @userinfobot)"
   ask CHAT "Id группы (начинается с -100)"
   case "$CHAT" in -*) ;; *) CHAT="-$CHAT" ;; esac   # минус часто теряется при копировании
