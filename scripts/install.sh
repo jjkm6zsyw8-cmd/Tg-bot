@@ -2,6 +2,7 @@
 # Установка Pump.fun Dev Scanner одной командой на чистую Ubuntu (запуск от root):
 #   curl -fsSL https://raw.githubusercontent.com/jjkm6zsyw8-cmd/Tg-bot/claude/telegram-bot-spec-fbcq7j/scripts/install.sh | bash
 set -euo pipefail
+trap 'echo; echo "❌ Ошибка в строке $LINENO. Пришлите этот текст в чат (без токенов)."' ERR
 
 REPO="https://github.com/jjkm6zsyw8-cmd/Tg-bot.git"
 BRANCH="claude/telegram-bot-spec-fbcq7j"
@@ -37,10 +38,11 @@ else
   ask BOT_TOKEN "Токен бота от @BotFather"
   ask ALLOWED "Ваш Telegram user_id (от @userinfobot)"
   ask CHAT "Id группы (начинается с -100)"
+  case "$CHAT" in -*) ;; *) CHAT="-$CHAT" ;; esac   # минус часто теряется при копировании
   ask RPC "RPC URL из Helius (https://mainnet.helius-rpc.com/?api-key=...)"
-  HELIUS_KEY="${RPC##*api-key=}"
-  [ "$HELIUS_KEY" = "$RPC" ] && HELIUS_KEY=""
-  PG_PASS="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+  HELIUS_KEY=""
+  case "$RPC" in *api-key=*) HELIUS_KEY="${RPC##*api-key=}" ;; esac
+  PG_PASS="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
   cat > .env <<EOF
 BOT_TOKEN=$BOT_TOKEN
 ALLOWED_USER_IDS=$ALLOWED
