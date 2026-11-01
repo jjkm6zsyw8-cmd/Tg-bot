@@ -56,8 +56,14 @@ async def main(cmd: str) -> None:
         raise SystemExit(f"неизвестная команда {cmd}")
     try:
         await asyncio.gather(*tasks)
+    except BaseException as exc:
+        if not isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+            logging.getLogger("scanner").critical("СЕРВИС %s ОСТАНОВЛЕН: %s: %s", cmd, type(exc).__name__, exc)
+        raise
     finally:
-        await db.close()
+        # terminate, а не close: close ждёт соединения LISTEN и может зависнуть навсегда
+        if db.pool is not None:
+            db.pool.terminate()
 
 
 if __name__ == "__main__":
