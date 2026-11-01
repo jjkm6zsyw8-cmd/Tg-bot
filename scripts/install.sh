@@ -77,7 +77,11 @@ sed -i 's/use_direct_pump_link: false/use_direct_pump_link: true/' config/config
 mkdir -p logs backups && chown -R 10001:10001 logs   # контейнеры бота работают под uid 10001
 
 echo "=== 5/5 Запускаю (первая сборка 2–5 минут) ==="
-docker compose up -d --build db backup
+docker compose up -d --wait db
+# база могла остаться от прошлой установки со старым паролем — выравниваем по .env
+PG_PASS_ENV="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2-)"
+docker compose exec -T db psql -q -U scanner -d scanner -c "ALTER USER scanner PASSWORD '${PG_PASS_ENV//\'/\'\'}'" >/dev/null
+docker compose up -d --build backup
 docker compose up -d --build --force-recreate ingest analytics bot
 
 echo
