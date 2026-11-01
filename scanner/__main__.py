@@ -20,11 +20,14 @@ def setup_logging(level: str, name: str) -> None:
     root.addHandler(h)
     log_dir = os.environ.get("LOG_DIR")
     if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(os.path.join(log_dir, f"{name}.log"), maxBytes=20_000_000,
-                                                  backupCount=5, encoding="utf-8")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(os.path.join(log_dir, f"{name}.log"), maxBytes=20_000_000,
+                                                      backupCount=5, encoding="utf-8")
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except OSError as exc:  # нет прав на папку логов — пишем только в stdout, но не падаем
+            root.warning("файловый лог отключён: %s", exc)
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 

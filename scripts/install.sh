@@ -63,6 +63,8 @@ sed -i 's/shared_buffers=1GB/shared_buffers=256MB/' docker-compose.yml
 sed -i 's/raw_trades_days: 30/raw_trades_days: 7/' config/config.yaml
 sed -i 's/use_direct_pump_link: false/use_direct_pump_link: true/' config/config.yaml
 
+mkdir -p logs backups && chown -R 10001:10001 logs   # контейнеры бота работают под uid 10001
+
 echo "=== 5/5 Запускаю (первая сборка 2–5 минут) ==="
 docker compose up -d --build db ingest analytics bot backup
 
