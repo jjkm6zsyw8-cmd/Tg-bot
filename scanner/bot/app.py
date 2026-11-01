@@ -29,6 +29,13 @@ async def run_bot(env: Env, settings: Settings, db: Database) -> None:
     if not env.allowed_ids:
         raise SystemExit("ALLOWED_USER_IDS не задан — бот не будет никому отвечать")
     bot = Bot(env.bot_token)
+    try:
+        me = await bot.get_me()
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            f"Telegram не принимает BOT_TOKEN ({type(exc).__name__}: {exc}). Проверьте токен в .env: "
+            "формат 123456789:AAxxxxxxxx… без пробелов; после /revoke нужен новый токен.") from exc
+    log.info("бот @%s подключён к Telegram", me.username)
     dp = Dispatcher()
     router = Router()
     sender = Sender(bot, env, settings, db)

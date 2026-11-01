@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +40,16 @@ class Env(BaseSettings):
 
     config_path: str = "config/config.yaml"
     log_level: str = "INFO"
+
+    @field_validator("bot_token", mode="before")
+    @classmethod
+    def _clean_token(cls, v: Any) -> Any:
+        """Пробелы, кавычки и префикс «bot» при вставке токена — частая ошибка."""
+        if isinstance(v, str):
+            v = v.strip().strip("'\"").strip()
+            if v.lower().startswith("bot") and ":" in v:
+                v = v[3:]
+        return v
 
     @property
     def allowed_ids(self) -> set[int]:
