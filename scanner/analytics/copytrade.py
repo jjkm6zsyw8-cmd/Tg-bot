@@ -240,3 +240,17 @@ async def refresh_traders(db: Database, cfg: dict[str, Any], costs: Costs, limit
         except Exception:  # noqa: BLE001
             log.exception("trader %s", addr)
     return {"candidates": len(candidates), "qualified": qualified}
+
+
+async def refresh_traders_adaptive(db: Database, cfg: dict[str, Any], costs: Costs, limit: int = 500) -> dict[str, Any]:
+    """Пока в базе меньше 7 дней сделок, порог числа сделок снижается пропорционально истории."""
+    first = await db.fetchval("SELECT min(ts) FROM trades")
+    days = (datetime.now(timezone.utc) - first).total_seconds() / 86400 if first else 0.0
+    eff = dict(cfg)
+    bootstrap = days < 7
+    if bootstrap:
+        full = int(cfg.get("trader_min_trades_30d", 30))
+        eff["trader_min_trades_30d"] = max(int(cfg.get("trader_min_trades_bootstrap", 5)),
+                                           int(full * max(days, 0.0) / 30))
+    res = await refresh_traders(db, eff, costs, limit=limit)
+    return {**res, "bootstrap": bootstrap, "min_trades": eff.get("trader_min_trades_30d")}

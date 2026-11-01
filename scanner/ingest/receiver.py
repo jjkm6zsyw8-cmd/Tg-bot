@@ -25,7 +25,7 @@ from ..models import Event, Migration, SolTransfer, TokenCreated, Trade
 from ..solana import PUMP_PROGRAM
 from .pump_parser import ParseStats, parse_transaction
 from .rpc import RpcError, SolanaRpc
-from .sources import HeliusSource, PumpPortalSource, Source
+from .sources import HeliusSource, LogsSource, PumpPortalSource, Source
 
 log = logging.getLogger(__name__)
 
@@ -62,13 +62,20 @@ class Receiver:
         self.settings = settings
         self.db = db
         rel = settings.reliability()
-        self.rpc = SolanaRpc(env.rpc_url)
+        self.rpc = SolanaRpc(env.rpc_url, rps=env.rpc_rps)
         self.pool_to_mint: dict[str, str] = {}
         self.sources: list[Source] = [
             PumpPortalSource(env.pumpportal_ws, env.pumpportal_api_key, rel.get("pumpportal_trade_window_min", 60))
         ]
+        if env.logs_ws_url:
+            self.sources.append(LogsSource(env.logs_ws_url, self.pool_to_mint))
         if env.helius_ws_url:
             self.sources.append(HeliusSource(env.helius_ws_url, self.pool_to_mint))
+        # какие сделки хранить: монеты моложе trade_store_hours + отслеживаемые кошельки и монеты
+        self.store_hours = float(rel.get("trade_store_hours", 24))
+        self.known_mints: dict[str, float] = {}   # mint → unix-время создания
+        self.tracked_wallets: set[str] = set()
+        self.tracked_mints: set[str] = set()
         self.seen = LruSet()
         self.buf_tokens: list[TokenCreated] = []
         self.buf_trades: list[Trade] = []
@@ -100,7 +107,7 @@ class Receiver:
             if isinstance(ev, (TokenCreated, Trade)) and ev.slot is not None:
                 if isinstance(ev, TokenCreated):
                     self.buf_tokens.append(ev)
-                else:
+                elif self.should_store(ev):
                     self.buf_trades.append(ev)
             return
         if getattr(ev, "signature", None):
@@ -108,7 +115,8 @@ class Receiver:
         if isinstance(ev, TokenCreated):
             self.buf_tokens.append(ev)
             self.created_mono[ev.mint] = time.monotonic()
-            if ev.slot is None:
+            self.known_mints[ev.mint] = time.time()
+            if ev.slot is None and not self.logs_alive():
                 self.slot_queue[ev.signature] = time.monotonic()
             if ev.uri:
                 try:
@@ -119,9 +127,11 @@ class Receiver:
                 if isinstance(s, PumpPortalSource):
                     await s.subscribe_tokens([ev.mint])
         elif isinstance(ev, Trade):
+            if not self.should_store(ev):
+                return
             self.buf_trades.append(ev)
             born = self.created_mono.get(ev.mint)
-            if ev.slot is None and born and time.monotonic() - born < 15:
+            if ev.slot is None and born and time.monotonic() - born < 15 and not self.logs_alive():
                 self.slot_queue[ev.signature] = time.monotonic()
         elif isinstance(ev, Migration):
             self.buf_migr.append(ev)
@@ -129,6 +139,30 @@ class Receiver:
                 self.pool_to_mint[ev.pool] = ev.mint
         elif isinstance(ev, SolTransfer):
             self.buf_transfers.append(ev)
+
+    def logs_alive(self) -> bool:
+        """Поток logsSubscribe жив — слоты придут с ним, RPC для слотов не тратим."""
+        return any(isinstance(s, LogsSource) and s.silence_s() < 10 for s in self.sources)
+
+    def should_store(self, t: Trade) -> bool:
+        """Храним сделки свежих монет и отслеживаемых кошельков/монет — иначе диск забьётся
+        (по программе Pump.fun идёт ~100 сделок в секунду)."""
+        born = self.known_mints.get(t.mint)
+        if born is not None and time.time() - born < self.store_hours * 3600:
+            return True
+        return t.trader in self.tracked_wallets or t.mint in self.tracked_mints
+
+    async def load_known_mints(self) -> None:
+        rows = await self.db.fetch(
+            "SELECT mint, extract(epoch FROM created_at) ts FROM tokens "
+            "WHERE created_at > now() - make_interval(hours => $1)", int(self.store_hours))
+        for r in rows:
+            self.known_mints[r["mint"]] = float(r["ts"])
+
+    def prune_known(self) -> None:
+        cut = time.time() - self.store_hours * 3600
+        for m in [m for m, t in self.known_mints.items() if t < cut]:
+            self.known_mints.pop(m, None)
 
     def _count(self, source: str, creates: int = 0, trades: int = 0) -> None:
         hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -270,8 +304,12 @@ class Receiver:
                 if quiet and not was:
                     self.silent[s.name] = True
                     others = [o.name for o in self.sources if o is not s and o.silence_s() <= silence_s]
-                    alt = f"работаем на {', '.join(others)}" if others else "второго живого источника нет, досбор через RPC"
-                    await self.db.system(f"⚠️ Нет событий от {s.name} {int(silence_s)} с — {alt}.")
+                    if others:
+                        # второй источник жив — пропусков нет, в Telegram не шумим
+                        log.warning("нет событий от %s %d с, работаем на %s", s.name, silence_s, ", ".join(others))
+                    else:
+                        await self.db.system(f"⚠️ Нет событий ни от одного источника {int(silence_s)} с "
+                                             f"({s.name}) — досбор через RPC после восстановления.")
                     self.gap_ids[s.name] = await self.db.fetchval(
                         "INSERT INTO ingest_gaps(source, started_at) VALUES ($1, now() - make_interval(secs => $2)) "
                         "RETURNING id", s.name, float(silence_s))
@@ -280,8 +318,12 @@ class Receiver:
                     gid = self.gap_ids.pop(s.name, None)
                     if gid:
                         await self.db.execute("UPDATE ingest_gaps SET ended_at=now() WHERE id=$1", gid)
-                    await self.db.system(f"✅ {s.name}: поток восстановлен, досбор пропущенного.")
-                    asyncio.create_task(self.backfill())
+                    others_alive = any(o is not s and o.silence_s() <= silence_s for o in self.sources)
+                    if others_alive:
+                        log.info("%s: поток восстановлен", s.name)
+                    else:
+                        await self.db.system(f"✅ {s.name}: поток восстановлен, досбор пропущенного через RPC.")
+                        asyncio.create_task(self.backfill())
             # всплеск ошибок парсинга → «Система»
             threshold = self.settings.reliability().get("parse_error_alert_per_min", 20)
             errs = sum(s.stats.errors_last_minute() for s in self.sources) + self.backfill_stats.errors_last_minute()
@@ -292,21 +334,24 @@ class Receiver:
                     f"🛠 Всплеск ошибок парсинга Pump.fun: {errs}/мин. Возможно обновление программы. "
                     f"Последняя: {last}")
 
-    async def backfill(self, max_tx: int = 3000) -> None:
+    async def backfill(self, max_tx: int | None = None) -> None:
         """Досбор пропущенных транзакций программы Pump.fun после разрыва."""
         until = await self.db.kv_get("last_signature")
         if not until:
             return
+        # каждая транзакция досбора — отдельный запрос к RPC; на бесплатных тарифах держим лимит низким
+        max_tx = max_tx or int(self.settings.reliability().get("backfill_max_tx", 300))
         before = None
         sigs: list[dict[str, Any]] = []
         try:
             while len(sigs) < max_tx:
-                page = await self.rpc.signatures_for(PUMP_PROGRAM, limit=1000, before=before, until=until)
+                page = await self.rpc.signatures_for(PUMP_PROGRAM, limit=min(1000, max_tx), before=before,
+                                                     until=until)
                 if not page:
                     break
                 sigs.extend(page)
                 before = page[-1]["signature"]
-                if len(page) < 1000:
+                if len(page) < min(1000, max_tx):
                     break
         except RpcError as exc:
             await self.db.system(f"Досбор после разрыва не удался: {exc}")
@@ -361,6 +406,11 @@ class Receiver:
                 rows = await self.db.fetch(
                     "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist WHERE kind='trader'")
                 wallets = {r["address"] for r in rows}
+                self.tracked_wallets = wallets
+                self.tracked_mints = {r["mint"] for r in await self.db.fetch(
+                    "SELECT mint FROM alerts WHERE created_at > now() - interval '1 day' "
+                    "UNION SELECT address FROM watchlist WHERE kind='token'")}
+                self.prune_known()
                 for s in self.sources:
                     if isinstance(s, PumpPortalSource):
                         await s.set_accounts(wallets)
@@ -378,7 +428,7 @@ class Receiver:
             if self.last_signature:
                 await self.db.kv_set("last_signature", self.last_signature)
             for s in self.sources:
-                if isinstance(s, HeliusSource) and s.last_slot:
+                if isinstance(s, (HeliusSource, LogsSource)) and s.last_slot:
                     await self.db.kv_set("last_slot", s.last_slot)
             now_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
             for (src, hour), (c, t) in list(self.hour_counts.items()):
@@ -409,6 +459,7 @@ class Receiver:
             await self.db.execute("DELETE FROM outbox WHERE sent_at < now() - interval '7 days'")
 
     async def run(self) -> None:
+        await self.load_known_mints()
         tasks = [asyncio.create_task(s.run(self.sink), name=s.name) for s in self.sources]
         tasks += [asyncio.create_task(c()) for c in (
             self.flush_loop, self.slot_loop, self.watchdog_loop, self.coverage_loop,

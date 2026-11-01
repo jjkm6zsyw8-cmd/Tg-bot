@@ -19,10 +19,11 @@ from ..config import Env, Settings
 from ..db.pool import Database
 from ..ingest.rpc import RpcError, SolanaRpc
 from . import clusters as cl
-from .copytrade import TIER_NAMES, refresh_traders
+from .copytrade import TIER_NAMES, refresh_traders_adaptive
 from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_profit
 from .features import launch_summary
 from .filters import check as check_filters
+from .newcoins import evaluate_new
 from .loader import attach_cluster, cluster_profile, load_state, save_profile, state_from_token
 from .price import SolPrice, measured_fee_bps
 from .profiles import Profile, similar_to_reference
@@ -40,6 +41,9 @@ class TokenInfo:
     last_reason: str = ""
     last_decision: dict[str, Any] = field(default_factory=dict)
     resolving: bool = False
+    needs_rpc: bool = False        # свежий деплоер: проверка финансирования через RPC ещё не сделана
+    rpc_started: bool = False
+    created_at: Any = None
 
 
 @dataclass
@@ -76,7 +80,7 @@ class Engine:
         self.env = env
         self.settings = settings
         self.db = db
-        self.rpc = SolanaRpc(env.rpc_url)
+        self.rpc = SolanaRpc(env.rpc_url, rps=env.rpc_rps)
         rel = settings.reliability()
         self.linker = cl.Linker(db, self.rpc, settings.exchanges(), int(rel.get("exchange_tx_heuristic", 1000)))
         self.price = SolPrice(db)
@@ -97,6 +101,7 @@ class Engine:
         self.summary: dict[str, list[str]] = {}
         self.latencies: list[float] = []
         self.watch_tokens: set[str] = set()
+        self.new_eval_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -171,7 +176,7 @@ class Engine:
         await self.start()
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
-                 self._daily_loop(), self._withdrawal_loop()]
+                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop()]
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий
@@ -210,37 +215,67 @@ class Engine:
         cfg = self.cfg
         info = self.info[st.mint]
         info.resolving = True
+        info.created_at = rec["created_at"]
         try:
             if not cfg.get("modes", {}).get("dev", True):
                 return
-            # 1) быстрый путь: деплоер уже в базе — алерт в первые секунды
+            # 1) только БД: известный дев, кошелёк из цепочки вывода SOL или новый кластер
             known = await cl.cluster_of(self.db, st.deployer)
-            if known:
+            watch = await self.db.fetchrow(
+                "SELECT cluster_id, hop FROM withdrawal_watch WHERE wallet=$1 AND stopped IS NULL", st.deployer)
+            if watch and not known:
+                cid = watch["cluster_id"]
+                await cl.add_link(self.db, cid, st.deployer,
+                                  f"получил SOL от кластера после дампа ({watch['hop']} переход)", "high")
+                info.resolution = cl.Resolution(cid, "high", "SOL после дампа пришли на этот кошелёк",
+                                                known_dev_wallet=True)
+                await self._bind_cluster(st, cid)
+                await self._new_dev_wallet_alert(st, info.resolution)
+            elif known:
                 info.resolution = cl.Resolution(known[0], known[1], known[2])
                 await self._bind_cluster(st, known[0])
-                await self.evaluate_dev(st.mint, "create")
-            # 2) свежий кошелёк: финансирование, тайминг, метаданные
-            try:
-                res, funded = await self.linker.resolve_deployer(
-                    st.deployer, rec["created_at"], float(cfg.get("funding_window_min", 30)), st.meta.get("image"))
-            except RpcError as exc:
-                log.debug("resolve %s: %s", st.mint, exc)
-                res, funded = None, []
-            if res:
-                for w, why in funded:
-                    st.add_cluster_wallet(w, why, "high")
-                    if res.cluster_id:
-                        await cl.add_link(self.db, res.cluster_id, w, why, "high")
-                if not known or known[0] != res.cluster_id:
-                    info.resolution = res
-                    await self._bind_cluster(st, res.cluster_id)
-                if res.known_dev_wallet:
-                    await self._new_dev_wallet_alert(st, res)
-                await self.evaluate_dev(st.mint, "resolved")
+            else:
+                cid = await cl.new_cluster(self.db, st.deployer)
+                info.resolution = cl.Resolution(cid, "high", "новый кластер", new_cluster=True)
+                await self._bind_cluster(st, cid)
+                info.needs_rpc = True
+            await self.evaluate_dev(st.mint, "create")
+            # 2) свежий кошелёк: связь через финансирование (RPC). В экономном режиме — только когда
+            #    у монеты появились покупатели, иначе бесплатного лимита RPC не хватит.
+            if info.needs_rpc and not cfg.get("rpc_economy", True):
+                await self._resolve_rpc(st)
         finally:
             info.resolving = False
             for d in (3, 10, 30, 60, 120):
                 self.schedule(d, st.mint, "eval")
+
+    async def _resolve_rpc(self, st: TokenState) -> None:
+        info = self.info.get(st.mint)
+        if info is None or info.rpc_started:
+            return
+        info.rpc_started = True
+        cfg = self.cfg
+        fresh = info.resolution.cluster_id if info.resolution and info.resolution.new_cluster else None
+        created = info.created_at or datetime.fromtimestamp(st.created_ts, tz=timezone.utc)
+        try:
+            res, funded = await self.linker.resolve_deployer(
+                st.deployer, created, float(cfg.get("funding_window_min", 30)), st.meta.get("image"),
+                fresh_cluster=fresh, economy=bool(cfg.get("rpc_economy", True)))
+        except RpcError as exc:
+            log.debug("resolve %s: %s", st.mint, exc)
+            return
+        target = res.cluster_id if res and not res.new_cluster else (fresh or st.cluster_id)
+        for w, why in funded:
+            st.add_cluster_wallet(w, why, "high")
+            if target:
+                await cl.add_link(self.db, target, w, why, "high")
+        if res and not res.new_cluster and res.cluster_id != st.cluster_id:
+            info.resolution = res
+            await self._bind_cluster(st, res.cluster_id)
+            if res.known_dev_wallet:
+                await self._new_dev_wallet_alert(st, res)
+        info.needs_rpc = False
+        await self.evaluate_dev(st.mint, "resolved")
 
     async def _bind_cluster(self, st: TokenState, cluster_id: int | None) -> None:
         if not cluster_id:
@@ -312,6 +347,12 @@ class Engine:
             st.migrated = True
         if tracked:
             await self._on_smart_trade(st, r)
+        info = self.info.get(mint)
+        if info is not None and info.needs_rpc and not info.rpc_started and r["is_buy"]:
+            n = len({t.trader for t in st.trades if t.is_buy and t.trader != st.deployer})
+            if n >= int(self.cfg.get("resolve_min_buyers", 8)):
+                asyncio.create_task(self._resolve_rpc(st))
+        await self._maybe_new_coin(st)
         entry = self.alerts.get(mint)
         if entry and eff is not None and time.monotonic() < entry.follow_until:
             await self._follow(st, entry, eff, r)
@@ -399,6 +440,50 @@ class Engine:
             return "мигрировала"
         p = st.progress()
         return "скоро миграция" if p is not None and p >= 0.7 else "новая"
+
+    # ------------------------------------------------------------------ режим «Новые монеты»
+    async def _maybe_new_coin(self, st: TokenState) -> None:
+        """Проверка свежей монеты при каждой сделке (не чаще раза в секунду на монету)."""
+        cfg = self.cfg
+        if not cfg.get("modes", {}).get("new", True):
+            return
+        e = self.alerts.get(st.mint)
+        if e and "new" in e.modes:
+            return
+        now = time.time()
+        if now - self.new_eval_at.get(st.mint, 0) < 1.0:
+            return
+        self.new_eval_at[st.mint] = now
+        info = self.info.get(st.mint)
+        blacklisted = bool(info and info.cluster_row and info.cluster_row["blacklisted"])
+        chk = evaluate_new(st, now, cfg, self.settings.filters(), blacklisted)
+        if info is not None and not chk.ok:
+            info.last_decision.setdefault("new_reason", chk.reason)
+        if not chk.ok:
+            return
+        costs = self.costs()
+        pos = float(cfg.get("position_sol", 0.5))
+        thr = float(cfg.get("min_net_profit", 0.3))
+        entry_mc = st.mc * (1 + max(0.0, st.growth_rate_per_s(now)) * float(cfg.get("reaction_s", 5)))
+        f_in = entry_cost_fraction(entry_mc, pos, costs)
+        target = entry_mc * (1 + thr) / max(0.05, (1 - f_in) * (1 - exit_cost_fraction(entry_mc * 1.3, pos, costs)))
+        prof = info.profile if info else None
+        dump = prof.dump_mc if prof and prof.launches >= int(cfg.get("min_launches", 3)) else None
+        if dump and 0.8 * dump > target:
+            target = 0.8 * dump
+        data = {
+            "symbol": st.symbol, "mc": st.mc, "age_s": now - st.created_ts, "entry_mc": entry_mc,
+            "entry_max_mc": st.mc * 1.1, "target_mc": target, "dump_mc": dump,
+            "metrics": chk.metrics, "violations": chk.violations, "cluster_id": st.cluster_id,
+            "stage": self._stage(st), "exit_rule": "Выход сразу при продаже дева",
+            "extra_reasons": [f"Покупателей {chk.buyers} · объём {chk.volume:.1f} SOL · "
+                              f"покупки {chk.buy_share:.0%} объёма за минуту"],
+        }
+        if prof and prof.launches:
+            data["profile"] = prof.to_json()
+            data["link_confidence"] = info.resolution.confidence if info and info.resolution else "low"
+            data["link_reason"] = info.resolution.reason if info and info.resolution else ""
+        await self.compose("new", st.mint, "normal", data)
 
     # ------------------------------------------------------------------ режим 2: смарт-мани
     async def _load_traders(self) -> None:
@@ -532,7 +617,9 @@ class Engine:
             return "full"
         if "dev" in modes or "new_dev_wallet" in modes:
             return "dev"
-        return "smart"
+        if "smart" in modes:
+            return "smart"
+        return "new"
 
     async def compose(self, mode: str, mint: str, level: str, data: dict[str, Any],
                       signal: str | None = None, trader: str | None = None) -> None:
@@ -771,6 +858,7 @@ class Engine:
                 old = [m for m, s in self.states.items()
                        if time.time() - s.created_ts > window and m not in self.alerts]
                 for m in old:
+                    self.new_eval_at.pop(m, None)
                     st = self.states.pop(m)
                     info = self.info.pop(m, None)
                     await self.finalize_launch(st, info)
@@ -859,12 +947,29 @@ class Engine:
             if utc.hour == 3 and last_nightly != utc.date():
                 last_nightly = utc.date()
                 try:
-                    res = await refresh_traders(self.db, cfg, self.costs())
+                    res = await refresh_traders_adaptive(self.db, cfg, self.costs(), limit=2000)
                     await self.recompute_profiles()
                     await self.db.system(f"Ночной пересчёт: трейдеров-кандидатов {res['candidates']}, "
                                          f"прошли фильтр {res['qualified']}.")
                 except Exception:  # noqa: BLE001
                     log.exception("nightly")
+
+    async def _traders_loop(self) -> None:
+        """Пересчёт списка смарт-мани каждый час (пока данных мало — облегчённые пороги)."""
+        await asyncio.sleep(120)
+        last_count = None
+        while True:
+            try:
+                res = await refresh_traders_adaptive(self.db, self.cfg, self.costs(), limit=500)
+                await self._load_traders()
+                if res["qualified"] != last_count:
+                    last_count = res["qualified"]
+                    note = " (облегчённые пороги: истории меньше 7 дней)" if res.get("bootstrap") else ""
+                    await self.db.system(f"Смарт-мани: в списке {res['qualified']} трейдеров из "
+                                         f"{res['candidates']} кандидатов{note}.")
+            except Exception:  # noqa: BLE001
+                log.exception("traders refresh")
+            await asyncio.sleep(60 * float(self.cfg.get("trader_refresh_min", 60)))
 
     async def recompute_profiles(self) -> None:
         rows = await self.db.fetch(

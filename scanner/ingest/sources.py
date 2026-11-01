@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import random
+import struct
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -17,7 +19,7 @@ import websockets
 
 from ..models import Event, Migration, TokenCreated, Trade
 from ..solana import PUMP_AMM_PROGRAM, PUMP_PROGRAM, TOTAL_SUPPLY
-from .pump_parser import ParseStats, parse_transaction
+from .pump_parser import KNOWN, ParseStats, TxContext, decode_event, parse_transaction
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +76,7 @@ class PumpPortalSource(Source):
     def __init__(self, url: str, api_key: str = "", trade_window_min: int = 60):
         super().__init__()
         self.url = url + (f"?api-key={api_key}" if api_key else "")
+        self.has_key = bool(api_key)
         self.trade_window_s = trade_window_min * 60
         self.token_subs: dict[str, float] = {}     # mint → monotonic подписки
         self.account_subs: set[str] = set()
@@ -82,6 +85,8 @@ class PumpPortalSource(Source):
         self._lock = asyncio.Lock()
 
     async def subscribe_tokens(self, mints: list[str]) -> None:
+        if not self.has_key:
+            return  # без ключа с балансом ≥0.02 SOL PumpPortal не отдаёт сделки
         now = time.monotonic()
         new = [m for m in mints if m not in self.token_subs]
         for m in mints:
@@ -90,6 +95,8 @@ class PumpPortalSource(Source):
             await self._send({"method": "subscribeTokenTrade", "keys": new})
 
     async def set_accounts(self, wallets: set[str]) -> None:
+        if not self.has_key:
+            return
         add = sorted(wallets - self.account_subs)
         rem = sorted(self.account_subs - wallets)
         self.account_subs = set(wallets)
@@ -256,3 +263,69 @@ class HeliusSource(Source):
                     await sink(ev)
                 self.last_slot = slot or self.last_slot
                 self.last_signature = sig
+
+
+class LogsSource(Source):
+    """Все создания, сделки и миграции Pump.fun через logsSubscribe стандартного websocket RPC.
+
+    События Anchor приходят в логах строками «Program data: <base64>» — транзакцию целиком
+    скачивать не нужно. Работает на бесплатном тарифе Helius. Неудачные транзакции пропускаются.
+    """
+
+    name = "logs"
+
+    def __init__(self, url: str, pool_to_mint: dict[str, str]):
+        super().__init__()
+        self.url = url
+        self.pool_to_mint = pool_to_mint
+        self.last_slot: int | None = None
+        self.last_signature: str | None = None
+
+    async def _session(self, sink: Sink) -> None:
+        async with websockets.connect(self.url, ping_interval=30, max_size=2**24, open_timeout=20) as ws:
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                                      "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "processed"}]}))
+            self.connected = True
+            log.info("logs: подключено")
+            async for raw in ws:
+                for ev in self.parse_notification(raw, self.stats, self.pool_to_mint):
+                    self.mark_event()
+                    await sink(ev)
+                    self.last_signature = getattr(ev, "signature", self.last_signature)
+                    self.last_slot = getattr(ev, "slot", None) or self.last_slot
+
+    @staticmethod
+    def parse_notification(raw: str | bytes, stats: ParseStats,
+                           pool_to_mint: dict[str, str] | None = None) -> list[Event]:
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return []
+        result = (msg.get("params") or {}).get("result") if isinstance(msg, dict) else None
+        if not result:
+            return []
+        value = result.get("value") or {}
+        if value.get("err") is not None or not value.get("signature"):
+            return []
+        ctx = TxContext(value["signature"], (result.get("context") or {}).get("slot"), None, None, "logs")
+        out: list[Event] = []
+        seen: set[bytes] = set()
+        for line in value.get("logs") or []:
+            if not line.startswith("Program data: "):
+                continue
+            try:
+                data = base64.b64decode(line[14:])
+            except ValueError:
+                continue
+            if data[:8] not in KNOWN or data in seen:
+                continue
+            seen.add(data)
+            try:
+                ev = decode_event(data, ctx, pool_to_mint)
+            except (ValueError, struct.error) as exc:
+                stats.error(f"{ctx.signature[:12]}: {exc}")
+                continue
+            if ev is not None:
+                stats.ok += 1
+                out.append(ev)
+        return out

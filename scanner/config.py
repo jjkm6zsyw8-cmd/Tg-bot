@@ -31,7 +31,9 @@ class Env(BaseSettings):
     pumpportal_ws: str = "wss://pumpportal.fun/api/data"
     pumpportal_api_key: str = ""
     helius_api_key: str = ""
-    helius_ws: str = ""  # по умолчанию wss://atlas-mainnet.helius-rpc.com/?api-key=...
+    helius_ws: str = ""  # Enhanced WebSockets (платный Helius), напр. wss://atlas-mainnet.helius-rpc.com/?api-key=...
+    logs_ws: str = ""    # websocket для logsSubscribe; по умолчанию выводится из RPC_URL (https → wss)
+    rpc_rps: float = 5   # лимит запросов к RPC в секунду (бесплатный Helius — 10)
     rpc_url: str = "https://api.mainnet-beta.solana.com"
 
     redirect_base: str = "https://example.com"
@@ -61,10 +63,16 @@ class Env(BaseSettings):
 
     @property
     def helius_ws_url(self) -> str:
-        if self.helius_ws:
-            return self.helius_ws
-        if self.helius_api_key:
-            return f"wss://atlas-mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+        """Helius Enhanced WebSockets (transactionSubscribe) — только платные тарифы, включается явно."""
+        return self.helius_ws
+
+    @property
+    def logs_ws_url(self) -> str:
+        """Стандартный websocket RPC (logsSubscribe) — работает и на бесплатном Helius."""
+        if self.logs_ws:
+            return self.logs_ws
+        if self.rpc_url.startswith("https://") and "api.mainnet-beta.solana.com" not in self.rpc_url:
+            return "wss://" + self.rpc_url[len("https://"):]
         return ""
 
 
@@ -138,7 +146,7 @@ class Settings:
         return self.yaml.section("reliability")
 
     def topics(self) -> dict[str, str]:
-        return self.yaml.section("topics")
+        return {"new": "Новые монеты", **self.yaml.section("topics")}
 
     def exchanges(self) -> set[str]:
         return set(self.yaml.data.get("exchanges") or [])
@@ -153,6 +161,9 @@ EDITABLE: dict[str, tuple[str, float, float, float, str]] = {
     "position_sol": ("Позиция, SOL", 0.1, 0.05, 50, "num"),
     "smart_min_buy_sol": ("Мин. покупка трейдера, SOL", 0.1, 0.05, 50, "num"),
     "max_cluster_share": ("Макс. доля кластера", 0.05, 0.05, 1.0, "pct"),
+    "new_min_buyers": ("Новые: мин. покупателей", 5, 5, 200, "num"),
+    "new_min_volume_sol": ("Новые: мин. объём, SOL", 2, 1, 500, "num"),
+    "new_mc_min_sol": ("Новые: мин. MC, SOL", 5, 28, 1000, "num"),
 }
 
 PRESETS = ("cautious", "normal", "aggressive")

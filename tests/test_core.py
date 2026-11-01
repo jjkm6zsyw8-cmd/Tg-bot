@@ -299,3 +299,48 @@ def test_backtest_args():
 def test_series_metric():
     s = series([0.5, 0.3, -0.2, -1.0])
     assert s["win_rate"] == 0.5 and s["series"] == pytest.approx(0.5 * 0.4 - 0.5 * 0.6)
+
+
+# ------------------------------------------------------------------ новые монеты
+def test_new_coin_filter():
+    from scanner.analytics.newcoins import evaluate_new
+    dev = addr("devN")
+    st = TokenState(mint=addr("mintN"), deployer=dev, created_ts=1000.0, created_slot=100, initial_mc=27.96)
+    c = Curve()
+    st.add_trade(TradeRow(1000.1, 100, dev, True, 0.5, c.buy(0.5), c.mc, "c"))
+    lim = Settings(YamlConfig("config/config.yaml")).filters()
+    assert evaluate_new(st, 1005, CFG, lim).reason == "age"
+    for i in range(22):
+        tok = c.buy(0.4)
+        st.add_trade(TradeRow(1001 + i * 3, 110 + i, addr(f"nb{i}"), True, 0.4, tok, c.mc, f"n{i}"))
+    ok = evaluate_new(st, 1066, CFG, lim)
+    assert ok.ok, (ok.reason, ok.violations)
+    assert ok.buyers == 22 and ok.volume > 8
+    st.add_trade(TradeRow(1063, 300, dev, False, 0.3, 1e6, c.mc, "ds"))
+    assert evaluate_new(st, 1064, CFG, lim).reason == "dev_sold"
+    assert evaluate_new(st, 1000 + 16 * 60, CFG, lim).reason == "old"
+
+
+def test_logs_source_parses_program_data():
+    import base64 as b64
+    import json as js
+
+    from scanner.ingest.sources import LogsSource
+    mint, dev = addr("lmint"), addr("ldev")
+    logs = ["Program 6EF8 invoke [1]",
+            "Program data: " + b64.b64encode(create_event(mint, dev)).decode(),
+            "Program data: " + b64.b64encode(trade_event(mint, dev, 1.0, 3e7, True, 31, 1.04e9)).decode()]
+    msg = js.dumps({"params": {"result": {"context": {"slot": 777},
+                                          "value": {"signature": "sigL", "err": None, "logs": logs}}}})
+    evs = LogsSource.parse_notification(msg, ParseStats())
+    assert [type(e).__name__ for e in evs] == ["TokenCreated", "Trade"]
+    assert all(e.slot == 777 and e.source == "logs" for e in evs)
+    failed = js.dumps({"params": {"result": {"context": {"slot": 1},
+                                             "value": {"signature": "s", "err": {"x": 1}, "logs": logs}}}})
+    assert LogsSource.parse_notification(failed, ParseStats()) == []
+
+
+def test_logs_ws_url_derived_from_rpc():
+    from scanner.config import Env
+    assert Env(rpc_url="https://mainnet.helius-rpc.com/?api-key=k").logs_ws_url == "wss://mainnet.helius-rpc.com/?api-key=k"
+    assert Env(rpc_url="https://api.mainnet-beta.solana.com").logs_ws_url == ""

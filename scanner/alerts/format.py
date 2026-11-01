@@ -14,7 +14,7 @@ from ..solana import short
 
 ICONS = {"strong": "🟢", "normal": "🟡", "watch": "⚪", "exit": "🔴", "info": "🔵"}
 LEVEL_NAMES = {"strong": "СИЛЬНЫЙ", "normal": "ОБЫЧНЫЙ", "watch": "НАБЛЮДЕНИЕ"}
-MODE_NAMES = {"dev": "ДЕВ", "smart": "СМАРТ-МАНИ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА"}
+MODE_NAMES = {"dev": "ДЕВ", "smart": "СМАРТ-МАНИ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ МОНЕТА"}
 CONF_NAMES = {"high": "высокая", "medium": "средняя", "low": "низкая"}
 SIGNAL_NAMES = {"single": "покупка трейдера", "consensus": "консенсус", "dev_match": "совпадение с девом"}
 

@@ -116,21 +116,27 @@ class Linker:
         return out
 
     async def resolve_deployer(self, deployer: str, created_at: datetime, funding_window_min: float,
-                               image: str | None = None) -> tuple[Resolution, list[tuple[str, str]]]:
+                               image: str | None = None, fresh_cluster: int | None = None,
+                               economy: bool = False) -> tuple[Resolution, list[tuple[str, str]]]:
         """Кластер деплоера + кошельки, профинансированные им перед запуском.
 
         Возвращает (резолюция, [(кошелёк, причина)]) для добавления в кластер запуска."""
         funded: list[tuple[str, str]] = []
         known = await cluster_of(self.db, deployer)
+        if known and fresh_cluster is not None and known[0] == fresh_cluster:
+            known = None  # только что созданный кластер-заглушка — ищем настоящую связь
         watch = await self.db.fetchrow(
             "SELECT cluster_id, hop, parent FROM withdrawal_watch WHERE wallet=$1 AND stopped IS NULL", deployer)
 
         win_start = created_at - timedelta(minutes=funding_window_min)
-        transfers = await self.transfers_around(deployer, created_at - timedelta(hours=24), created_at)
+        transfers = await self.transfers_around(deployer, created_at - timedelta(hours=24), created_at,
+                                                limit=20 if economy else 40, max_tx=5 if economy else 12)
         inbound = [t for t in transfers if t.dst == deployer and t.src != deployer]
-        outbound = [t for t in transfers if t.src == deployer and t.dst != deployer and t.ts >= win_start]
-        for t in outbound:
-            if not await self.is_exchange(t.dst):
+        outbound = [t for t in transfers if t.src == deployer and t.dst != deployer and t.ts >= win_start
+                    and t.sol >= 0.05]
+        for t in outbound[:5]:
+            # в экономном режиме не проверяем получателей на биржу (это ещё по запросу на каждого)
+            if economy or not await self.is_exchange(t.dst):
                 funded.append((t.dst, f"профинансирован деплоером до запуска ({t.sol:.2f} SOL)"))
         funder = max(inbound, key=lambda t: t.sol, default=None)
         if funder:
@@ -170,6 +176,8 @@ class Linker:
                 await add_link(self.db, row["cluster_id"], deployer, "повтор картинки из прошлых запусков", "medium")
                 return Resolution(row["cluster_id"], "medium", "повтор картинки из прошлых запусков"), funded
 
+        if fresh_cluster is not None:
+            return Resolution(fresh_cluster, "high", "новый кластер", new_cluster=True), funded
         cid = await new_cluster(self.db, deployer)
         return Resolution(cid, "high", "новый кластер", new_cluster=True), funded
 

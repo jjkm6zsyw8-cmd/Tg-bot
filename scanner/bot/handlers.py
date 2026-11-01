@@ -11,6 +11,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObject
 
 from ..alerts.format import esc, pct
+from ..analytics.newcoins import DEFAULTS as NEW_DEFAULTS
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -85,6 +86,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             [{"text": f"{on(m.get('dev', True))} Девы", "callback": "mode:dev"},
              {"text": f"{on(m.get('smart', True))} Смарт-мани", "callback": "mode:smart"},
              {"text": f"{on(m.get('daily', True))} Разбор дня", "callback": "mode:daily"}],
+            [{"text": f"{on(m.get('new', True))} Новые монеты (проверка каждой монеты)", "callback": "mode:new"}],
             [{"text": "Смарт: " + ("фильтрованный → полный" if cfg.get("smart_filtered", True) else "полный → фильтрованный"),
               "callback": "tog:smart_filtered"}],
             [{"text": f"{on(cfg.get('smart_full_feed'))} Лента полного режима вместе с фильтрованным",
@@ -97,7 +99,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         lines = ["<b>Настройки</b>"]
         kb = []
         for key, (label, _step, _lo, _hi, kind) in EDITABLE.items():
-            v = cfg.get(key)
+            v = cfg.get(key, NEW_DEFAULTS.get(key))
             shown = pct(v, False) if kind == "pct" else f"{v:g}" if isinstance(v, (int, float)) else str(v)
             lines.append(f"{label}: <b>{shown}</b>")
             kb.append([{"text": f"− {label[:24]}", "callback": f"set:{key}:-"},
@@ -355,7 +357,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         elif kind == "set":
             key, _, sign = rest.partition(":")
             label, step, lo, hi, _k = EDITABLE[key]
-            v = float(cfg.get(key) or 0) + (step if sign == "+" else -step)
+            v = float(cfg.get(key, NEW_DEFAULTS.get(key)) or 0) + (step if sign == "+" else -step)
             await db.set_override(key, round(min(hi, max(lo, v)), 4))
             view = settings_view
         else:
