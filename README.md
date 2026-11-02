@@ -32,6 +32,29 @@ web: https://<домен>/p/<mint> → pump://coin/<mint> (или pump.fun на 
 | `db` | `scanner/db/schema.sql` | PostgreSQL 16: tokens, trades, wallets, clusters, cluster_links, launches, traders, alerts, alert_outcomes, user_marks, settings и служебные таблицы |
 | `backup` | `scripts/backup_loop.sh` | Ежедневный `pg_dump`, 14 копий |
 
+## Источники данных
+
+Основа — собственные ончейн-данные; внешние сервисы только дополняют их (подробно — `docs/TZ.md`, раздел 16).
+
+| Источник | Роль | Ключ | Где получить |
+|---|---|---|---|
+| Helius (websocket `logsSubscribe` + RPC) | **Основной поток**: все создания и сделки Pump.fun; слоты, переводы SOL, холдеры | `RPC_URL` с api-key | dashboard.helius.dev (бесплатный тариф подходит) |
+| PumpPortal | Второй источник созданий монет; сделки — только с ключом с балансом от 0,02 SOL | `PUMPPORTAL_API_KEY` (необязателен) | pumpportal.fun |
+| DexScreener | Цена, ликвидность, объём, бусты; режим «Тренды»; сопровождение после миграции | не нужен | — |
+| GeckoTerminal | Новые и трендовые пулы (режим «Тренды») | не нужен | — |
+| RugCheck | Mint/freeze authority, риски, топ-холдеры | не нужен | — |
+| GMGN OpenAPI | Метки smart_degen и KOL, безопасность токена, метки и PnL кошелька | `GMGN_API_KEY` | gmgn.ai/ai |
+| Jupiter Price v3 | Резервный курс SOL, цены токенов | `JUPITER_API_KEY` (необязателен) | portal.jup.ag |
+| Birdeye | Цена; PnL кошелька (с платного тарифа Starter) | `BIRDEYE_API_KEY` | bds.birdeye.so |
+| Solscan Pro | Метки бирж (тариф Level 2) | `SOLSCAN_API_KEY` | pro-api.solscan.io |
+
+Нет ключа — источник выключен, бот работает дальше. Включение, лимиты и фильтры — `config/external.yaml`.
+Внешние запросы идут только для кандидатов на алерт и по командам `/token`, `/dev`, `/trader`, с тайм-аутом 1 с.
+Состояние каждого источника видно в `/health`.
+
+**Добавить ключ на сервере:** `cd /opt/tg-bot && nano .env` → вписать, например, `GMGN_API_KEY=...` →
+сохранить → `docker compose up -d --force-recreate analytics bot`.
+
 Ключевые формулы (`scanner/analytics/curve.py`, `scoring.py`):
 
 ```

@@ -24,7 +24,8 @@ from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_pro
 from .features import launch_summary
 from .filters import check as check_filters
 from .newcoins import evaluate_new
-from .trends import Trends
+from .trends import Trends, Tracked
+from ..external import ExternalHub
 from .loader import attach_cluster, cluster_profile, load_state, save_profile, state_from_token
 from .price import SolPrice, measured_fee_bps
 from .profiles import Profile, similar_to_reference
@@ -83,8 +84,12 @@ class Engine:
         self.db = db
         self.rpc = SolanaRpc(env.rpc_url, rps=env.rpc_rps)
         rel = settings.reliability()
-        self.linker = cl.Linker(db, self.rpc, settings.exchanges(), int(rel.get("exchange_tx_heuristic", 1000)))
-        self.price = SolPrice(db)
+        self.ext = ExternalHub(env, db)
+        self.linker = cl.Linker(db, self.rpc, settings.exchanges(), int(rel.get("exchange_tx_heuristic", 1000)),
+                                ext=self.ext)
+        self.price = SolPrice(db, ext=self.ext)
+        self.ext_pending: dict[str, list[tuple[Any, ...]]] = {}
+        self.ext_blocked: dict[str, float] = {}
         self.fee_bps: float | None = None
         self.states: dict[str, TokenState] = {}
         self.info: dict[str, TokenInfo] = {}
@@ -558,6 +563,7 @@ class Engine:
             t = self.traders.get(addr) or {}
             traders.append({"address": addr, "label": t.get("label"), "tier_name": TIER_NAMES.get(t.get("tier"), ""),
                             "copy_30d": t.get("copy_30d"), "win_rate": t.get("win_rate"),
+                            "tags": (t.get("tags") if hasattr(t, "get") else None) or None,
                             "buy_sol": sum(b[2] for b in buys if b[1] == addr)})
         data = {
             "symbol": st.symbol, "mc": st.mc, "age_s": now - st.created_ts, "signal": signal,
@@ -627,6 +633,53 @@ class Engine:
 
     async def compose(self, mode: str, mint: str, level: str, data: dict[str, Any],
                       signal: str | None = None, trader: str | None = None) -> None:
+        """Первый алерт по монете проходит проверку внешних источников (≤1 с, в фоне, не тормозя поток)."""
+        args = (mode, mint, level, data, signal, trader)
+        if mint in self.alerts or not self.ext.any_token_source():
+            await self._compose_inner(*args)
+            return
+        if time.time() - self.ext_blocked.get(mint, 0) < 600:
+            return
+        if mint in self.ext_pending:
+            self.ext_pending[mint].append(args)
+            return
+        self.ext_pending[mint] = [args]
+        asyncio.create_task(self._compose_checked(mint))
+
+    async def _compose_checked(self, mint: str) -> None:
+        st = self.states.get(mint)
+        onchain = {"top10": st.top10_share()} if st is not None and st.trades else {}
+        wallets = [a[5] for a in self.ext_pending.get(mint, []) if a[5]]
+        try:
+            chk = await self.ext.token_checks(mint, onchain=onchain, wallets=wallets)
+        except Exception:  # noqa: BLE001
+            log.exception("external checks %s", mint)
+            chk = None
+        queue = self.ext_pending.pop(mint, [])
+        if chk is not None and chk.block:
+            self.ext_blocked[mint] = time.time()
+            info = self.info.get(mint)
+            if info is not None:
+                info.last_reason = "external_filters"
+                info.last_decision["external_block"] = chk.block
+            log.info("алерт %s отсечён внешними фильтрами: %s", mint, "; ".join(chk.block))
+            return
+        for mode, m, level, data, signal, trader in queue:
+            if chk is not None:
+                data = {**data, "extra_reasons": list(data.get("extra_reasons") or []) + chk.lines,
+                        "ext_missing": chk.missing}
+                if chk.smart is not None:
+                    data["smart_in_coin_ext"] = chk.smart
+                if chk.wallets and data.get("traders"):
+                    for t in data["traders"]:
+                        info = chk.wallets.get(t.get("address"))
+                        if info:
+                            t["tags"] = info.get("tags")
+                            t["twitter"] = info.get("twitter")
+            await self._compose_inner(mode, m, level, data, signal, trader)
+
+    async def _compose_inner(self, mode: str, mint: str, level: str, data: dict[str, Any],
+                             signal: str | None = None, trader: str | None = None) -> None:
         cfg = self.cfg
         st = self.states.get(mint)
         e = self.alerts.get(mint)
@@ -759,8 +812,8 @@ class Engine:
                                          "kind": kind}, priority=0 if emergency else 5)
 
     async def _finalize_alert(self, e: AlertEntry) -> None:
-        if "trend" in e.modes and e.mint in self.trends.tracked:
-            await self.trends.finalize(e)   # итог по ценам DexScreener (монета могла мигрировать)
+        if e.mint in self.trends.tracked:
+            await self.trends.finalize(e)   # итог по ценам DexScreener (тренд или монета после миграции)
             return
         st = self.states.get(e.mint) or await load_state(self.db, e.mint, self.cfg)
         if st is None:
@@ -869,6 +922,11 @@ class Engine:
                     st = self.states.pop(m)
                     info = self.info.pop(m, None)
                     await self.finalize_launch(st, info)
+                await self.ext.publish_health("analytics")
+                await self._follow_migrated()
+                cut = time.time() - 600
+                for m in [m for m, t in self.ext_blocked.items() if t < cut]:
+                    self.ext_blocked.pop(m, None)
                 await self.db.kv_set("health:analytics", {
                     "at": datetime.now(timezone.utc).isoformat(), "tokens_in_memory": len(self.states),
                     "following": len(self.alerts), "tracked_traders": len(self.traders),
@@ -877,6 +935,35 @@ class Engine:
                 })
             except Exception:  # noqa: BLE001
                 log.exception("housekeeping")
+
+    async def _follow_migrated(self) -> None:
+        """После миграции сделки идут в PumpSwap — сопровождение продолжаем по данным DexScreener."""
+        mints = [m for m in self.alerts if m not in self.trends.tracked]
+        if not mints:
+            return
+        rows = await self.db.fetch(
+            "SELECT mint FROM tokens WHERE mint = ANY($1) AND migrated_at IS NOT NULL", mints)
+        for r in rows:
+            e = self.alerts.get(r["mint"])
+            st = self.states.get(r["mint"])
+            if st is not None:
+                st.migrated = True
+            pair = await self.ext.dex_pair(r["mint"], timeout=3.0)
+            if not e or not pair or not pair.get("price_usd") or not pair.get("market_cap_usd"):
+                continue
+            price, mc_usd = pair["price_usd"], pair["market_cap_usd"]
+            sol = self.price.value or 150
+            tgt_mc = e.data.get("target_mc")
+            target_price = price * (tgt_mc * sol / mc_usd) if tgt_mc else price * 1.5
+            alert_mc = e.data.get("entry_mc") or e.data.get("mc")
+            alert_price = price * (alert_mc * sol / mc_usd) if alert_mc else price
+            self.trends.tracked[r["mint"]] = Tracked(r["mint"], alert_price, e.alert_ts or time.time(),
+                                                      target_price, max_price=price,
+                                                      flags={"target"} if "target" in e.flags else set())
+            await self._follow_msg(e, "migrated", st or TokenState(mint=r["mint"], deployer="", created_ts=0,
+                                                                 symbol=e.data.get("symbol") or ""),
+                                   extra="Сопровождение продолжается по данным DexScreener.")
+            e.flags.add("migrated")
 
     async def finalize_launch(self, st: TokenState, info: TokenInfo | None) -> None:
         s = launch_summary(st, self.cfg, self.costs(), _median(self.latencies) or 1.5)
@@ -954,7 +1041,7 @@ class Engine:
             if utc.hour == 3 and last_nightly != utc.date():
                 last_nightly = utc.date()
                 try:
-                    res = await refresh_traders_adaptive(self.db, cfg, self.costs(), limit=2000)
+                    res = await refresh_traders_adaptive(self.db, cfg, self.costs(), limit=2000, ext=self.ext)
                     await self.recompute_profiles()
                     await self.db.system(f"Ночной пересчёт: трейдеров-кандидатов {res['candidates']}, "
                                          f"прошли фильтр {res['qualified']}.")
@@ -967,7 +1054,7 @@ class Engine:
         last_count = None
         while True:
             try:
-                res = await refresh_traders_adaptive(self.db, self.cfg, self.costs(), limit=500)
+                res = await refresh_traders_adaptive(self.db, self.cfg, self.costs(), limit=500, ext=self.ext)
                 await self._load_traders()
                 if res["qualified"] != last_count:
                     last_count = res["qualified"]

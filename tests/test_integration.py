@@ -106,6 +106,7 @@ async def test_end_to_end(monkeypatch):
         now = datetime.now(timezone.utc)
         cid = await cl.new_cluster(db, dev)
         engine = Engine(env, settings, db)
+        engine.ext.disable_all("тест")   # внешние источники проверяются отдельными тестами
 
         async def no_transfers(*a, **k):
             return []

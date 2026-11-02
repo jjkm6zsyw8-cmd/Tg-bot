@@ -58,6 +58,8 @@ HELP = """<b>Pump.fun Dev Scanner</b>
 
 
 def setup(router: Router, env: Env, settings: Settings, db: Database, sender: Any) -> None:
+    from ..external import ExternalHub
+    ext = ExternalHub(env, db)   # внешние источники только по командам /token, /dev, /trader
     router.message.outer_middleware(Whitelist(env.allowed_ids))
     router.callback_query.outer_middleware(Whitelist(env.allowed_ids))
 
@@ -66,6 +68,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         return settings.effective()
 
     async def reply(m: Message, text: str, kb: Any = None) -> None:
+        try:
+            await ext.publish_health("bot")
+        except Exception:  # noqa: BLE001
+            pass
         for i in range(0, len(text), 4000):
             await m.answer(text[i:i + 4000], parse_mode="HTML", reply_markup=build(kb) if i == 0 else None,
                            link_preview_options=NO_PREVIEW)
@@ -143,7 +149,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         a = arg_addr(command)
         if not a:
             return await reply(m, "Формат: /token &lt;адрес токена&gt;")
-        await reply(m, await views.token_view(db, settings, a),
+        await reply(m, await views.token_view(db, settings, a, ext),
                     [[{"text": "Отслеживать", "callback": f"trk:{a}"}, {"text": "Скопировать адрес", "copy": a}]])
 
     @router.message(Command("dev"))
@@ -151,14 +157,14 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         ref = (command.args or "").strip().lstrip("#")
         if not ref:
             return await reply(m, "Формат: /dev &lt;адрес деплоера, монеты или номер кластера&gt;")
-        await reply(m, await views.dev_view(db, settings, ref))
+        await reply(m, await views.dev_view(db, settings, ref, ext))
 
     @router.message(Command("trader"))
     async def cmd_trader(m: Message, command: CommandObject) -> None:
         a = arg_addr(command)
         if not a:
             return await reply(m, "Формат: /trader &lt;адрес&gt;")
-        await reply(m, await views.trader_view(db, settings, a))
+        await reply(m, await views.trader_view(db, settings, a, ext))
 
     @router.message(Command("watch"))
     async def cmd_watch(m: Message, command: CommandObject) -> None:
@@ -198,7 +204,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('dev', $1, $2) "
                              "ON CONFLICT (kind, address) DO UPDATE SET label=EXCLUDED.label", addr, label)
             await db.job("recompute_cluster", {"cluster_id": cid})
-            await reply(m, f"✅ Дев добавлен в кластер #{cid}.\n\n" + await views.dev_view(db, settings, str(cid)))
+            await reply(m, f"✅ Дев добавлен в кластер #{cid}.\n\n" + await views.dev_view(db, settings, str(cid), ext))
             return
         cfg = await reload()
         s7, s30, _ = await compute_trader(db, addr, cfg, views.costs_of(settings))
@@ -208,7 +214,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await db.execute("UPDATE traders SET active=true WHERE address=$1", addr)
         await db.job("reload")
         note = "" if ok else "\n⚠️ Не проходит автофильтр (" + "; ".join(fails) + "), но оставлен в списке по вашему выбору."
-        await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr),
+        await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr, ext),
                     [[{"text": "Убрать из списка", "callback": f"wl:t:{addr}"}]])
 
     @router.message(Command("removewallet"))
@@ -375,7 +381,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def cb_profile(c: CallbackQuery) -> None:
         _, kind, ref = c.data.split(":", 2)
         await c.answer()
-        text = await (views.dev_view(db, settings, ref) if kind == "d" else views.trader_view(db, settings, ref))
+        text = await (views.dev_view(db, settings, ref, ext) if kind == "d" else views.trader_view(db, settings, ref, ext))
         await c.message.answer(text[:4000], parse_mode="HTML")
 
     @router.callback_query(F.data.startswith("trk:"))

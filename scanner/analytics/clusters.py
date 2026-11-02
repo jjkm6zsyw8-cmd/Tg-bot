@@ -63,17 +63,25 @@ async def new_cluster(db: Database, deployer: str) -> int:
 class Linker:
     """Связь свежего кошелька с известными кластерами в реальном времени."""
 
-    def __init__(self, db: Database, rpc: SolanaRpc, exchanges: set[str], exchange_tx_heuristic: int = 1000):
+    def __init__(self, db: Database, rpc: SolanaRpc, exchanges: set[str], exchange_tx_heuristic: int = 1000,
+                 ext: Any = None):
         self.db = db
         self.rpc = rpc
         self.exchanges = exchanges
         self.heuristic = exchange_tx_heuristic
+        self.ext = ext   # ExternalHub: метки бирж (Solscan, GMGN) исключают кошелёк из кластеризации
         self.stats = ParseStats()
 
     async def is_exchange(self, wallet: str) -> bool:
         if wallet in self.exchanges:
             return True
-        row = await self.db.fetchrow("SELECT is_exchange, checked_at FROM wallets WHERE address=$1", wallet)
+        row = await self.db.fetchrow("SELECT is_exchange, checked_at, labels_at FROM wallets WHERE address=$1", wallet)
+        if row and row["is_exchange"]:
+            return True
+        if self.ext is not None and not (row and row["labels_at"]):
+            labeled = await self.ext.is_exchange(wallet)
+            if labeled:
+                return True
         if row and row["checked_at"]:
             return row["is_exchange"]
         try:

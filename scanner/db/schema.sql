@@ -298,3 +298,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_pending_idx ON jobs (id) WHERE done_at IS NULL;
 
 ALTER TABLE traders ADD COLUMN IF NOT EXISTS priority boolean NOT NULL DEFAULT false;
+
+-- Внешние источники: каждое значение с указанием источника (ончейн имеет приоритет)
+CREATE TABLE IF NOT EXISTS external_facts (
+    entity     text NOT NULL,            -- token:<mint> | wallet:<address>
+    key        text NOT NULL,
+    source     text NOT NULL,            -- rugcheck | gmgn | dexscreener | birdeye | jupiter | solscan
+    value      jsonb,
+    fetched_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (entity, key, source)
+);
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS label_source text;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS tags jsonb;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS tags_source text;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS labels_at timestamptz;
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS tags jsonb;
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS tags_source text;

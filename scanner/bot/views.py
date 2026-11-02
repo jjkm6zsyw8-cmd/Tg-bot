@@ -24,7 +24,7 @@ def costs_of(settings: Settings) -> Costs:
     return Costs.from_config(settings.costs())
 
 
-async def token_view(db: Database, settings: Settings, mint: str) -> str:
+async def token_view(db: Database, settings: Settings, mint: str, ext: Any = None) -> str:
     cfg = settings.effective()
     st = await load_state(db, mint, cfg)
     if not st:
@@ -67,8 +67,50 @@ async def token_view(db: Database, settings: Settings, mint: str) -> str:
     if st.big_sell_ts:
         lines.append(f"⚠️ Крупная продажа кластера через {age(st.big_sell_ts - st.created_ts)}, MC дампа "
                      f"{mc_usd(st.dump_mc, price)}")
+    lines += await external_token_block(ext, mint, metrics.get("top10"))
     lines.append(f"\n<code>{mint}</code>")
     return "\n".join(lines)
+
+
+async def external_token_block(ext: Any, mint: str, onchain_top10: float | None) -> list[str]:
+    """Данные внешних источников с указанием источника каждого значения."""
+    if ext is None:
+        return []
+    import asyncio
+    chk, pair = await asyncio.gather(
+        ext.token_checks(mint, onchain={"top10": onchain_top10}, timeout=ext.command_timeout),
+        ext.dex_pair(mint, timeout=ext.command_timeout))
+    out = ["", "<b>Внешние источники</b>"]
+    rc = chk.facts.get("rugcheck")
+    if rc:
+        auth = "отозваны" if not rc.get("mint_authority") and not rc.get("freeze_authority") else "⚠️ НЕ отозваны"
+        out.append(f"RugCheck: mint/freeze {auth}, риск {rc.get('score_normalised') or 0:.0f}, "
+                   f"топ-10 {pct(rc.get('top10_pct'), False)}, инсайдеров в топе {rc.get('insiders_in_top', 0)}"
+                   + (f", опасно: {esc(', '.join(rc['danger_risks'][:3]))}" if rc.get("danger_risks") else ""))
+    gm, gh = chk.facts.get("gmgn"), chk.facts.get("gmgn_holders")
+    if gm:
+        out.append(f"GMGN: rug {pct(gm.get('rug_ratio'), False)}, топ-10 {pct(gm.get('top10_rate'), False)}, "
+                   f"снайперов {gm.get('sniper_count') or 0}")
+    if gh:
+        out.append(f"GMGN: смарт-мани среди холдеров {gh.get('smart', 0)}, KOL {gh.get('kol', 0)}")
+    if pair:
+        out.append(f"DexScreener: {esc(pair.get('dex'))}, цена ${pair.get('price_usd') or 0:.8f}, "
+                   f"MC {mc_usd_plain(pair.get('market_cap_usd'))}, ликвидность {mc_usd_plain(pair.get('liquidity_usd'))}, "
+                   f"5 мин: покупок {pair.get('buys_m5')} / продаж {pair.get('sells_m5')}")
+    if "discrepancy" in chk.facts:
+        d = chk.facts["discrepancy"].get("top10") or {}
+        out.append(f"Расхождение топ-10: ончейн {pct(d.get('onchain'), False)} vs внешнее "
+                   f"{pct(d.get('external'), False)} — используется ончейн")
+    if chk.block:
+        out.append("⛔ Внешние фильтры: " + esc("; ".join(chk.block)))
+    if chk.missing:
+        out.append("⏳ нет данных: " + ", ".join(chk.missing))
+    return out if len(out) > 2 else []
+
+
+def mc_usd_plain(v: float | None) -> str:
+    from ..alerts.format import usd
+    return usd(v)
 
 
 async def resolve_cluster(db: Database, ref: str) -> int | None:
@@ -83,7 +125,7 @@ async def resolve_cluster(db: Database, ref: str) -> int | None:
     return row["cluster_id"] if row and row["cluster_id"] else None
 
 
-async def dev_view(db: Database, settings: Settings, ref: str) -> str:
+async def dev_view(db: Database, settings: Settings, ref: str, ext: Any = None) -> str:
     cfg = settings.effective()
     cid = await resolve_cluster(db, ref)
     if not cid:
@@ -120,10 +162,26 @@ async def dev_view(db: Database, settings: Settings, ref: str) -> str:
                          f" · дамп {mc_usd(h['dump_mc'], price)}"
                          + (f" через {age(h['time_to_dump_s'])}" if h["time_to_dump_s"] else "")
                          + f" · профит {pct(h['achievable_profit'])}")
+    if ext is not None and ext.gmgn.enabled:
+        deployer = await db.fetchval(
+            "SELECT wallet FROM cluster_links WHERE cluster_id=$1 AND reason='исходный деплоер' LIMIT 1", cid)
+        if deployer:
+            import asyncio
+            info, created = await asyncio.gather(
+                ext.wallet_info(deployer, timeout=ext.command_timeout),
+                ext._call(ext.gmgn, ext.gmgn.created_tokens(deployer), ext.command_timeout))
+            data = created[1]
+            items = (data or {}).get("tokens") or (data or {}).get("list") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                lines.append(f"GMGN: дев создал токенов {len(items)} (по данным GMGN, вкл. до запуска бота)")
+            if info and (info.get("tags") or info.get("twitter")):
+                lines.append("Метки деплоера: " + esc(", ".join(info.get("tags") or [])
+                                                      + (f" @{info['twitter']}" if info.get("twitter") else ""))
+                             + f" ({', '.join(sorted(set(info['sources'].values())))})")
     return "\n".join(lines)
 
 
-async def trader_view(db: Database, settings: Settings, address: str) -> str:
+async def trader_view(db: Database, settings: Settings, address: str, ext: Any = None) -> str:
     cfg = settings.effective()
     s7, s30, _ = await compute_trader(db, address, cfg, costs_of(settings))
     linked = await linked_to_dev(db, address)
@@ -145,6 +203,23 @@ async def trader_view(db: Database, settings: Settings, address: str) -> str:
     ]
     if alerts and alerts["n"]:
         lines.append(f"Алертов по нему: {alerts['n']}, удачных {alerts['wins']}, средний итог {pct(alerts['avg'])}")
+    if ext is not None:
+        import asyncio
+        info, (_ok, be) = await asyncio.gather(
+            ext.wallet_info(address, timeout=ext.command_timeout),
+            ext._call(ext.birdeye, ext.birdeye.wallet_pnl(address), ext.command_timeout))
+        if info:
+            srcs = ", ".join(sorted(set(info["sources"].values())))
+            if info.get("tags") or info.get("label"):
+                lines.append(f"Метки ({srcs}): " + esc(", ".join([*(info.get("tags") or []), info.get("label") or ""]).strip(", ")))
+            if info.get("twitter"):
+                lines.append(f"Twitter: @{esc(info['twitter'])}")
+            if info.get("pnl_30d") is not None:
+                lines.append(f"GMGN 30 д: прибыль ${info['pnl_30d']:,.0f}, винрейт {pct(info.get('winrate_30d'), False)}")
+            if info.get("is_exchange"):
+                lines.append("⚠️ Помечен как биржа — в кластеризацию не входит")
+        if be and be.get("total_usd") is not None:
+            lines.append(f"Birdeye PnL: ${be['total_usd']:,.0f}")
     return "\n".join(lines)
 
 
@@ -201,6 +276,21 @@ async def health_view(db: Database) -> str:
     if cov.get("parts"):
         lines.append("Покрытие за час: " + "; ".join(cov["parts"]))
     lines.append(f"Очередь сообщений: {backlog}")
+    ext_a = await db.kv_get("health:external:analytics", {}) or {}
+    ext_b = await db.kv_get("health:external:bot", {}) or {}
+    for k, v in ext_b.items():   # запросы команд бота считаются вместе с запросами аналитики
+        if k in ext_a:
+            for f in ("requests", "cache_hits", "errors_hour", "rate_limited"):
+                ext_a[k][f] = (ext_a[k].get(f) or 0) + (v.get(f) or 0)
+    if ext_a:
+        names = {"dexscreener": "DexScreener", "rugcheck": "RugCheck", "gmgn": "GMGN", "birdeye": "Birdeye",
+                 "jupiter": "Jupiter", "solscan": "Solscan"}
+        lines.append("\n<b>Внешние источники</b> (статус · остаток лимита · ошибок за час · запросов/из кеша)")
+        for k, v in ext_a.items():
+            icon = "🟢" if v.get("status") == "ok" else "⚪" if not v.get("enabled") else "🟡"
+            lines.append(f"  {icon} {names.get(k, k)}: {esc(v.get('status'))} · {v.get('remaining')} · "
+                         f"{v.get('errors_hour', 0)} · {v.get('requests', 0)}/{v.get('cache_hits', 0)}"
+                         + (f" · 429: {v['rate_limited']}" if v.get("rate_limited") else ""))
     return "\n".join(lines)
 
 

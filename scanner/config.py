@@ -34,6 +34,13 @@ class Env(BaseSettings):
     helius_ws: str = ""  # Enhanced WebSockets (платный Helius), напр. wss://atlas-mainnet.helius-rpc.com/?api-key=...
     logs_ws: str = ""    # websocket для logsSubscribe; по умолчанию выводится из RPC_URL (https → wss)
     rpc_rps: float = 5   # лимит запросов к RPC в секунду (бесплатный Helius — 10)
+
+    # внешние источники (необязательно; без ключа источник выключен)
+    gmgn_api_key: str = ""
+    birdeye_api_key: str = ""
+    solscan_api_key: str = ""
+    jupiter_api_key: str = ""
+    external_config_path: str = "config/external.yaml"
     rpc_url: str = "https://api.mainnet-beta.solana.com"
 
     redirect_base: str = "https://example.com"

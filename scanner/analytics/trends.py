@@ -138,6 +138,15 @@ class Trends:
         self.stats = {"candidates": 0, "checked": 0, "alerts": 0, "errors": 0}
 
     async def _get(self, http: aiohttp.ClientSession, url: str) -> Any:
+        if url.startswith(DEX):
+            # DexScreener — через адаптер: общий лимит, пауза после 429, статистика в /health
+            from ..external.base import Unavailable
+            path_key = "tokens" if "/tokens/" in url else "profiles"
+            try:
+                return await self.e.ext.dex.get_json(url, path_key)
+            except Unavailable:
+                self.stats["errors"] += 1
+                return None
         try:
             async with http.get(url, headers={"Accept": "application/json"}) as r:
                 if r.status != 200:

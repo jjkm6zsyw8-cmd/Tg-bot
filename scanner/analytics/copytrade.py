@@ -242,7 +242,40 @@ async def refresh_traders(db: Database, cfg: dict[str, Any], costs: Costs, limit
     return {"candidates": len(candidates), "qualified": qualified}
 
 
-async def refresh_traders_adaptive(db: Database, cfg: dict[str, Any], costs: Costs, limit: int = 500) -> dict[str, Any]:
+async def apply_external_labels(db: Database, ext: Any, cfg: dict[str, Any], limit: int = 30) -> int:
+    """Метки GMGN (smart_degen, KOL) для лучших кандидатов в смарт-мани.
+
+    Ончейн-критерии в приоритете: в список попадает только кошелёк с положительной копируемостью,
+    удержанием не меньше порога и без связи с девами. Метка лишь снимает требование к числу сделок.
+    """
+    if ext is None or not ext.gmgn.enabled:
+        return 0
+    rows = await db.fetch(
+        """SELECT address FROM traders WHERE copy_30d > 0 AND copy_7d > 0 AND NOT linked_to_dev
+               AND median_hold_s >= $1 AND snipe_share < $2 AND last_active > now() - interval '7 days'
+               AND (tags_source IS NULL OR updated_at > now() - interval '1 day')
+           ORDER BY qualified, copy_30d DESC LIMIT $3""",
+        float(cfg.get("trader_min_hold_s", 120)), float(cfg.get("trader_max_snipe_share", 0.2)), limit)
+    added = 0
+    for r in rows:
+        info = await ext.wallet_info(r["address"], timeout=ext.command_timeout)
+        if not info:
+            continue
+        smart_or_kol = bool(info.get("is_smart") or info.get("is_kol"))
+        await db.execute(
+            """UPDATE traders SET tags=$2, tags_source='gmgn', is_kol = is_kol OR $3,
+                   qualified = qualified OR $4, active = active OR $4,
+                   qualified_at = CASE WHEN $4 AND NOT qualified THEN now() ELSE qualified_at END,
+                   label = COALESCE(label, $5)
+               WHERE address=$1""",
+            r["address"], info.get("tags") or [], bool(info.get("is_kol")), smart_or_kol,
+            ("@" + info["twitter"]) if info.get("twitter") else None)
+        added += smart_or_kol
+    return added
+
+
+async def refresh_traders_adaptive(db: Database, cfg: dict[str, Any], costs: Costs, limit: int = 500,
+                                   ext: Any = None) -> dict[str, Any]:
     """Пока в базе меньше 7 дней сделок, порог числа сделок снижается пропорционально истории."""
     first = await db.fetchval("SELECT min(ts) FROM trades")
     days = (datetime.now(timezone.utc) - first).total_seconds() / 86400 if first else 0.0
@@ -253,4 +286,6 @@ async def refresh_traders_adaptive(db: Database, cfg: dict[str, Any], costs: Cos
         eff["trader_min_trades_30d"] = max(int(cfg.get("trader_min_trades_bootstrap", 5)),
                                            int(full * max(days, 0.0) / 30))
     res = await refresh_traders(db, eff, costs, limit=limit)
-    return {**res, "bootstrap": bootstrap, "min_trades": eff.get("trader_min_trades_30d")}
+    labeled = await apply_external_labels(db, ext, eff)
+    return {**res, "qualified": res["qualified"] + labeled, "labeled": labeled, "bootstrap": bootstrap,
+            "min_trades": eff.get("trader_min_trades_30d")}

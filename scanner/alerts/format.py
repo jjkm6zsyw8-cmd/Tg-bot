@@ -141,7 +141,9 @@ def render_alert(a: dict[str, Any], sol_usd: float, compact: bool = False) -> st
             lines.append(
                 f"Трейдер «{esc(t.get('label') or short(t['address']))}» ({esc(t.get('tier_name', ''))}): "
                 f"копируемость {pct(t.get('copy_30d'))}/сделку, {pct(t.get('win_rate'), False)} удачных, "
-                f"купил {t.get('buy_sol', 0):.2f} SOL")
+                f"купил {t.get('buy_sol', 0):.2f} SOL"
+                + (f" · {esc(', '.join(map(str, t['tags'][:3])))}" if t.get("tags") else "")
+                + (f" · @{esc(t['twitter'])}" if t.get("twitter") else ""))
         if a.get("smart_in_coin"):
             lines.append(f"Смарт-мани в монете: {a['smart_in_coin']}")
         for r in a.get("extra_reasons") or []:

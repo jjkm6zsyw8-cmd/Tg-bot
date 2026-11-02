@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from statistics import median
+from typing import Any
 
 import aiohttp
 
@@ -20,8 +21,9 @@ SOURCES = {
 
 
 class SolPrice:
-    def __init__(self, db: Database, fallback: float = 150.0):
+    def __init__(self, db: Database, fallback: float = 150.0, ext: Any = None):
         self.db = db
+        self.ext = ext   # ExternalHub: Jupiter Price API — ещё один независимый источник курса
         self.value = fallback
         self.sources_ok: list[str] = []
 
@@ -36,6 +38,11 @@ class SolPrice:
                     ok.append(name)
             except Exception:  # noqa: BLE001
                 continue
+        if self.ext is not None:
+            jup = await self.ext.sol_usd()
+            if jup:
+                vals.append(jup)
+                ok.append("jupiter")
         if vals:
             self.value = median(vals)
             self.sources_ok = ok

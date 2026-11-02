@@ -1,0 +1,24 @@
+# Внешние источники данных — дополнение к ончейн-потоку. Отдельный файл, чтобы не конфликтовать
+# с локальными правками config.yaml на сервере. Ключи — только в .env (GMGN_API_KEY, BIRDEYE_API_KEY,
+# SOLSCAN_API_KEY, JUPITER_API_KEY). Нет ключа — источник выключен, бот работает дальше.
+
+timeout_s: 1.0           # для алертов: не ответил за 1 с — алерт уходит без его данных
+command_timeout_s: 4.0   # для /token, /dev, /trader
+
+sources:
+  dexscreener: {enabled: true}   # без ключа; 300 запросов/мин на пары
+  rugcheck: {enabled: true}      # без ключа; лимит не опубликован — 1 запрос/с
+  gmgn: {enabled: true}          # нужен GMGN_API_KEY (gmgn.ai/ai); Free: 5 «единиц»/с
+  birdeye: {enabled: true}       # нужен BIRDEYE_API_KEY; Standard: 1 запрос/с
+  jupiter: {enabled: true}       # ключ необязателен: без ключа 0.5 запроса/с, с ключом 1
+  solscan: {enabled: true}       # нужен SOLSCAN_API_KEY; метки — тариф Level 2
+  # можно переопределить лимит: например  gmgn: {enabled: true, rate_per_s: 20, capacity: 20}
+
+# Фильтры безопасности (раздел 7 ТЗ) по внешним данным. Ончейн-значения имеют приоритет.
+filters:
+  require_mint_renounced: true
+  require_freeze_renounced: true
+  block_rugged: true
+  max_rug_ratio: 0.3             # GMGN rug_ratio
+  block_rugcheck_danger: false   # false — опасные риски RugCheck выделяются в алерте, true — отсекают
+  max_top10_external: 0.45       # только если своего ончейн-топ-10 нет (например, после миграции)
