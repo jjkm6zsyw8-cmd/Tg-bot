@@ -446,7 +446,9 @@ class Engine:
             "link_confidence": snap.link_confidence, "link_reason": snap.link_reason,
             "metrics": metrics, "violations": filt.violations, "incomplete": incomplete,
             "cluster_id": st.cluster_id, "stage": self._stage(st),
-            "exit_rule": "Выход сразу при продаже кластера",
+            "exit_rule": "Выход сразу при первой продаже кластера",
+            "buy_within_s": buy_window_s(prof, snap.age_s),
+            "smart_in_coin": sum(1 for a in self.traders if st.balances.get(a, 0) > 0),
         }
         await self.compose("dev", mint, dec.level or "normal", data)
 
@@ -517,7 +519,8 @@ class Engine:
             "symbol": st.symbol, "mc": st.mc, "age_s": now - st.created_ts, "entry_mc": entry_mc,
             "entry_max_mc": st.mc * 1.1, "target_mc": target, "dump_mc": dump,
             "metrics": chk.metrics, "violations": chk.violations, "cluster_id": st.cluster_id,
-            "stage": self._stage(st), "exit_rule": "Выход сразу при продаже дева",
+            "stage": self._stage(st), "exit_rule": "Выход сразу при первой продаже дева",
+            "buy_within_s": 20.0, "smart_in_coin": sum(1 for a in self.traders if st.balances.get(a, 0) > 0),
             "extra_reasons": [f"Покупателей {chk.buyers} · объём {chk.volume:.1f} SOL · "
                               f"покупки {chk.buy_share:.0%} объёма за минуту"],
         }
@@ -812,9 +815,10 @@ class Engine:
         e.data["mc"] = st.mc
         e.data["age_s"] = time.time() - st.created_ts
         prof = (e.data.get("profile") or {}).get("medians") or {}
-        if eff.cluster_sell and "emergency" not in e.flags and (eff.big_sell or eff.sold_fraction >= 0.05):
+        if eff.cluster_sell and "emergency" not in e.flags:
+            # экстренный сигнал — при ПЕРВОЙ продаже кластера дева, любого размера
             e.flags.add("emergency")
-            extra = f"Продано {eff.sold_fraction:.0%} позиции кластера одной транзакцией"
+            extra = f"Первая продажа кластера: {eff.sold_fraction:.0%} его позиции"
             ttd = prof.get("time_to_dump_s")
             age_s = r["ts"].timestamp() - st.created_ts
             if ttd and age_s < 0.5 * ttd:
@@ -1162,6 +1166,18 @@ class Engine:
                 e.data["profile"] = prof.to_json()
         self.alerts[mint] = e
         self.watch_tokens.add(mint)
+
+
+def buy_window_s(prof: Profile | None, age_s: float) -> float:
+    """Сколько секунд ещё имеет смысл покупать: до конца окна входа по истории, иначе до трети
+    типичного времени до дампа; минимум 5 с."""
+    if prof is not None:
+        ew = (prof.extra or {}).get("entry_window")
+        if ew:
+            return max(5.0, float(ew["t_to"]) - age_s)
+        if prof.time_to_dump:
+            return max(5.0, 0.3 * float(prof.time_to_dump) - age_s)
+    return 30.0
 
 
 def _median(xs: list[float]) -> float | None:

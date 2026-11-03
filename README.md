@@ -84,7 +84,11 @@ web: https://<домен>/p/<mint> → pump://coin/<mint> (или pump.fun на 
    docker compose up -d --build
    docker compose logs -f ingest analytics bot
    ```
-5. **HTTPS для страницы перехода.** Сервис `web` слушает `127.0.0.1:8080`. Пример Caddy:
+5. **Страница перехода в приложение Pump.fun бесплатно (GitHub Pages).** GitHub → репозиторий → Settings →
+   Pages → Source: «Deploy from a branch», ветка `claude/telegram-bot-spec-fbcq7j`, папка `/docs` → Save.
+   Через минуту в `.env`: `REDIRECT_BASE=https://<ваш-логин>.github.io/Tg-bot` и перезапуск
+   `docker compose up -d --force-recreate analytics bot`. Либо свой домен:
+6. **HTTPS для страницы перехода (свой домен).** Сервис `web` слушает `127.0.0.1:8080`. Пример Caddy:
    ```
    scanner.example.com {
        reverse_proxy 127.0.0.1:8080

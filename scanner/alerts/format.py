@@ -58,8 +58,14 @@ def link(template: str, mint: str = "", wallet: str = "", redirect_base: str = "
     return template.format(mint=mint, wallet=wallet, redirect_base=redirect_base.rstrip("/"))
 
 
+def has_redirect(redirect_base: str) -> bool:
+    return bool(redirect_base) and "example.com" not in redirect_base and redirect_base.startswith("https://")
+
+
 def pump_url(links: dict[str, Any], mint: str, redirect_base: str) -> str:
-    if links.get("use_direct_pump_link"):
+    """Своя HTTPS-страница → pump://coin/<адрес>, запасной вариант https://pump.fun/coin/<адрес>.
+    Без своей страницы (REDIRECT_BASE не задан) — сразу pump.fun."""
+    if not has_redirect(redirect_base):
         return link(links["pump_web"], mint=mint)
     return link(links.get("pump_redirect", "{redirect_base}/p/{mint}"), mint=mint, redirect_base=redirect_base)
 
@@ -111,9 +117,22 @@ def dev_block(profile: dict[str, Any] | None, link_conf: str, link_reason: str, 
         f"{profile.get('launches', 0)}, связь {CONF_NAMES.get(link_conf, link_conf)}"
         + (f" ({esc(link_reason)})" if link_reason else ""),
     ]
-    if med.get("dump_mc"):
-        lines.append(f"Типичный дамп: MC {mc_usd(med['dump_mc'], sol_usd)}"
-                     + (f" через ~{age(ttd)}" if ttd else ""))
+    extra = profile.get("extra") or {}
+    ds = extra.get("dump_spread") or {}
+    if ds:
+        lines.append(f"Средний MC дампа: {mc_usd(ds.get('median'), sol_usd)} (25–75%: "
+                     f"{mc_usd(ds.get('p25'), sol_usd)}–{mc_usd(ds.get('p75'), sol_usd)})"
+                     + (f", через ~{age(ttd)}" if ttd else ""))
+    elif med.get("dump_mc"):
+        lines.append(f"Средний MC дампа: {mc_usd(med['dump_mc'], sol_usd)}" + (f" через ~{age(ttd)}" if ttd else ""))
+    ew = extra.get("entry_window")
+    if ew:
+        lines.append(f"Окно входа по истории: {ew['t_from']}–{ew['t_to']} с от запуска, MC "
+                     f"{mc_usd(ew['mc_from'], sol_usd)}–{mc_usd(ew['mc_to'], sol_usd)}")
+    seq = extra.get("sell_sequence") or {}
+    if seq.get("first"):
+        lines.append(f"Дев обычно начинает продавать через ~{age(seq['first']['t'])} при MC "
+                     f"{mc_usd(seq['first']['mc'], sol_usd)}")
     if profile.get("migrated"):
         lines.append(f"Мигрировало: {profile['migrated']}")
     return lines
@@ -133,8 +152,10 @@ def render_alert(a: dict[str, Any], sol_usd: float, compact: bool = False) -> st
         head += f" · {SIGNAL_NAMES.get(a['signal'], a['signal'])}"
     l2 = f"<b>${esc(a.get('symbol') or '?')}</b> · MC {mc_usd(a['mc'], sol_usd)} · {age(a['age_s'])} от запуска"
     exit_rule = a.get("exit_rule") or "Выход сразу при продаже кластера"
-    l3 = (f"Вход до MC {mc_usd(a.get('entry_max_mc'), sol_usd)} · Цель MC {mc_usd(a.get('target_mc'), sol_usd)}"
-          f" · {exit_rule}")
+    within = a.get("buy_within_s")
+    l3 = (f"Покупать до MC {mc_usd(a.get('entry_max_mc'), sol_usd)}"
+          + (f" в течение {age(within)}" if within else "")
+          + f" · Цель MC {mc_usd(a.get('target_mc'), sol_usd)} · {exit_rule}")
     lines = [head, l2, l3]
     if a.get("incomplete"):
         lines.append("<i>⏳ данные неполные (холдеры/связи ещё досчитываются)</i>")
@@ -148,8 +169,10 @@ def render_alert(a: dict[str, Any], sol_usd: float, compact: bool = False) -> st
                 f"купил {t.get('buy_sol', 0):.2f} SOL"
                 + (f" · {esc(', '.join(map(str, t['tags'][:3])))}" if t.get("tags") else "")
                 + (f" · @{esc(t['twitter'])}" if t.get("twitter") else ""))
-        if a.get("smart_in_coin"):
-            lines.append(f"Смарт-мани в монете: {a['smart_in_coin']}")
+        smart_line = f"Смарт-мани в монете: {a.get('smart_in_coin') or 0}"
+        if a.get("smart_in_coin_ext") is not None:
+            smart_line += f" (GMGN: {a['smart_in_coin_ext']})"
+        lines.append(smart_line)
         for r in a.get("extra_reasons") or []:
             lines.append(esc(r))
         metrics = a.get("metrics") or {}

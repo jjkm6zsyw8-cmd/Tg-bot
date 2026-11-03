@@ -255,14 +255,15 @@ def test_alert_render_first_three_lines_and_keyboard():
     a = {"mint": addr("fmt"), "symbol": "TICKER", "level": "strong", "modes": ["dev"], "mc": 21.3, "age_s": 14,
          "potential": 1.9, "net": 0.6, "entry_max_mc": 24, "target_mc": 48, "dump_mc": 60,
          "profile": {"launches": 8, "similar_launches": 6, "medians": {"dump_mc": 60, "time_to_dump_s": 240}},
-         "link_confidence": "high", "link_reason": "общий источник финансирования",
+         "link_confidence": "high", "link_reason": "общий источник финансирования", "buy_within_s": 40,
          "metrics": {"cluster": 0.18, "bundles": 0.09, "snipers": 0.04, "top10": 0.22}, "latency_s": 1.2}
     text = fmt.render_alert(a, 150)
     lines = text.split("\n")
     assert "СИЛЬНЫЙ · ДЕВ" in lines[0] and "x1.9" in lines[0] and "+60%" in lines[0]
     assert "$TICKER" in lines[1] and "MC $3.2k" in lines[1] and "14 с" in lines[1]
-    assert lines[2].startswith("Вход до MC $3.6k") and "Цель MC $7.2k" in lines[2]
+    assert lines[2].startswith("Покупать до MC $3.6k") and "Цель MC $7.2k" in lines[2]
     assert "похожих 6/8" in text and "Задержка бота: 1.2 с" in text and f"<code>{a['mint']}</code>" in text
+    assert "в течение 40 с" in lines[2] and "Смарт-мани в монете: 0" in text and "Средний MC дампа" in text
     kb = fmt.alert_keyboard(a["mint"], YamlConfig("config/config.yaml").section("links"), "https://bot.example",
                             "t", addr("trader"), marks_alert_id=123456789)
     assert kb[0][0]["url"] == f"https://bot.example/p/{a['mint']}"
@@ -370,3 +371,10 @@ def test_trend_score():
     assert score(PairInfo.from_pair({**pair, "priceChange": {"m5": 120, "h1": 80}}), CFG)[1] == "price_m5"
     assert score(PairInfo.from_pair({**pair, "txns": {"m5": {"buys": 20, "sells": 30}}}), CFG)[1] == "pressure"
     assert score(PairInfo.from_pair({**pair, "liquidity": {"usd": 1000}}), CFG)[1] == "liquidity"
+
+
+def test_pump_link_without_and_with_redirect_page():
+    links = YamlConfig("config/config.yaml").section("links")
+    m = addr("pl")
+    assert fmt.pump_url(links, m, "https://example.com") == f"https://pump.fun/coin/{m}"     # своей страницы нет
+    assert fmt.pump_url(links, m, "https://u.github.io/Tg-bot") == f"https://u.github.io/Tg-bot/p/{m}"
