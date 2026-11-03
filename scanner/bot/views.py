@@ -257,10 +257,22 @@ async def health_view(db: Database) -> str:
 
     lines = ["🩺 <b>Состояние</b>", f"Приёмник: обновлено {ago(ing.get('at'))}"]
     for s in ing.get("sources", []):
-        state = "🟢" if s["connected"] and s["silence_s"] < 30 else "🔴"
-        lines.append(f"  {state} {s['name']}: тишина {s['silence_s']:.0f} с, событий {s['events']}, "
-                     f"переподключений {s['reconnects']}, ошибок парсинга {s['parse_errors']}")
-    lines.append(f"  очередь слотов {ing.get('slot_queue', 0)}, метаданных {ing.get('meta_queue', 0)}")
+        if s.get("active") is False:
+            state = "⚪ резерв"
+        else:
+            state = "🟢" if s["connected"] else "🔴"
+        lines.append(f"  {state} {s['name']}: {'подключено' if s['connected'] else 'нет соединения'}"
+                     f", событий {s['events']}, {s.get('mb_in', 0)} МБ, переподключений {s['reconnects']}, "
+                     f"ошибок парсинга {s['parse_errors']}")
+    if ing:
+        if not ing.get("pumpportal_key"):
+            lines.append("  ⚠️ нет PUMPPORTAL_API_KEY — сделки не собираются (нужен ключ с 0.02 SOL)")
+        lines.append(f"  подписок на сделки {ing.get('pumpportal_subs', 0)}, продлено {ing.get('extended', 0)}, "
+                     f"Helius: {ing.get('helius_mode', 'off')}")
+        lines.append(f"  очередь событий {ing.get('queue', 0)} (потеряно {ing.get('dropped', 0)}), досбора "
+                     f"{ing.get('backfill_queue', 0)}, слотов {ing.get('slot_queue', 0)}, метаданных "
+                     f"{ing.get('meta_queue', 0)}; RPC {ing.get('rpc_calls', 0)} запросов, 429: {ing.get('rpc_429', 0)}")
+    lines += await data_health(db)
     lines.append(f"Аналитика: обновлено {ago(ana.get('at'))}, монет в памяти {ana.get('tokens_in_memory', 0)}, "
                  f"сопровождений {ana.get('following', 0)}, трейдеров {ana.get('tracked_traders', 0)}")
     med, p95 = ana.get("latency_median_s"), ana.get("latency_p95_s")
@@ -315,3 +327,41 @@ async def watchlist_view(db: Database) -> tuple[str, list[list[dict[str, Any]]]]
         for t in traders:
             lines.append(f"  · {esc(t['label'] or short(t['address']))} ({TIER_NAMES.get(t['tier'], 'ручной')})")
     return "\n".join(lines), kb[:30]
+
+
+async def data_health(db: Database) -> list[str]:
+    """Токены и сделки за час/сутки, профили, воронка отсева, расход по источникам."""
+    out = ["", "<b>Данные</b>"]
+    t1, t24, tt24 = await db.fetchval("SELECT count(*) FROM tokens WHERE created_at > now() - interval '1 hour'"), \
+        await db.fetchval("SELECT count(*) FROM tokens WHERE created_at > now() - interval '1 day'"), \
+        await db.fetchval("SELECT count(*) FROM tokens WHERE created_at > now() - interval '1 day' "
+                          "AND peak_mc_sol IS NOT NULL")
+    tr1 = await db.fetchval("SELECT count(*) FROM trades WHERE ts > now() - interval '1 hour'")
+    tr24 = await db.fetchval("SELECT count(*) FROM trades WHERE ts > now() - interval '1 day'")
+    out.append(f"Токены: час {t1}, сутки {t24} (со сделками {tt24}, {tt24 / t24:.0%})" if t24 else "Токены: нет")
+    out.append(f"Сделки: час {tr1}, сутки {tr24}")
+    prof = await db.fetchval("SELECT count(*) FROM clusters WHERE (profile->>'launches')::int >= 3 AND NOT suspicious")
+    susp = await db.fetchval("SELECT count(*) FROM clusters WHERE suspicious")
+    out.append(f"Профилей с 3+ запусками со сделками: {prof}; подозрительных кластеров: {susp}")
+    rows = await db.fetch(
+        """SELECT COALESCE(NULLIF(features->>'decision_reason', ''), 'не оценивалась') r, count(*) n FROM launches
+           WHERE created_at > now() - interval '1 day' GROUP BY 1 ORDER BY 2 DESC""")
+    if rows:
+        out.append("Воронка «Девы» за сутки: " + ", ".join(f"{REASONS.get(r['r'], r['r'])} {r['n']}" for r in rows))
+    rows = await db.fetch(
+        """SELECT features->'decision'->>'new_reason' r, count(*) n FROM launches
+           WHERE created_at > now() - interval '1 day' AND features->'decision'->>'new_reason' IS NOT NULL
+           GROUP BY 1 ORDER BY 2 DESC""")
+    if rows:
+        from ..analytics.newcoins import REASONS as NR
+        out.append("Воронка «Новые монеты»: " + ", ".join(f"{NR.get(r['r'], r['r'])} {r['n']}" for r in rows))
+    al = await db.fetch("SELECT mode, count(*) n FROM alerts WHERE created_at > now() - interval '1 day' GROUP BY 1")
+    out.append("Алертов за сутки: " + (", ".join(f"{r['mode']} {r['n']}" for r in al) if al else "0"))
+    use = await db.kv_get("usage:ingest", {}) or {}
+    ua = await db.kv_get("usage:analytics", {}) or {}
+    if use:
+        out.append(f"Расход за {use.get('day')}: PumpPortal {use.get('pp_pump_msgs', 0):.0f} сообщ. (кривая, бесплатно) "
+                   f"+ {use.get('pp_amm_msgs', 0):.0f} PumpSwap (~{use.get('pp_amm_msgs', 0) / 10000 * 0.01:.4f} SOL); "
+                   f"Helius стриминг ~{use.get('helius_stream_credits', 0):,} кредитов; RPC "
+                   f"{use.get('rpc_calls', 0) + (ua.get('rpc_calls') or 0):,.0f} запросов")
+    return out

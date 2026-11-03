@@ -82,7 +82,7 @@ class Engine:
         self.env = env
         self.settings = settings
         self.db = db
-        self.rpc = SolanaRpc(env.rpc_url, rps=env.rpc_rps)
+        self.rpc = SolanaRpc(env.rpc_endpoint, rps=env.rpc_rps)
         rel = settings.reliability()
         self.ext = ExternalHub(env, db)
         self.linker = cl.Linker(db, self.rpc, settings.exchanges(), int(rel.get("exchange_tx_heuristic", 1000)),
@@ -109,6 +109,9 @@ class Engine:
         self.watch_tokens: set[str] = set()
         self.new_eval_at: dict[str, float] = {}
         self.trends = Trends(self)
+        self._ls_cache: set[str] = set()
+        self._ls_loaded = 0.0
+        self._cl_day: dict[int, tuple[Any, int]] = {}
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -226,13 +229,19 @@ class Engine:
         try:
             if not cfg.get("modes", {}).get("dev", True):
                 return
+            # 0) личность: если монету создал сервис запуска за другого создателя — кластер по создателю
+            ident = st.deployer
+            if st.creator and st.creator != st.deployer and st.deployer in await self._launch_services():
+                ident = st.creator
+                st.add_cluster_wallet(st.creator, "создатель (запуск через сервис)", "high")
+            await self.db.execute("UPDATE tokens SET identity=$2 WHERE mint=$1", st.mint, ident)
             # 1) только БД: известный дев, кошелёк из цепочки вывода SOL или новый кластер
-            known = await cl.cluster_of(self.db, st.deployer)
+            known = await cl.cluster_of(self.db, ident)
             watch = await self.db.fetchrow(
-                "SELECT cluster_id, hop FROM withdrawal_watch WHERE wallet=$1 AND stopped IS NULL", st.deployer)
+                "SELECT cluster_id, hop FROM withdrawal_watch WHERE wallet=$1 AND stopped IS NULL", ident)
             if watch and not known:
                 cid = watch["cluster_id"]
-                await cl.add_link(self.db, cid, st.deployer,
+                await cl.add_link(self.db, cid, ident,
                                   f"получил SOL от кластера после дампа ({watch['hop']} переход)", "high")
                 info.resolution = cl.Resolution(cid, "high", "SOL после дампа пришли на этот кошелёк",
                                                 known_dev_wallet=True)
@@ -242,10 +251,11 @@ class Engine:
                 info.resolution = cl.Resolution(known[0], known[1], known[2])
                 await self._bind_cluster(st, known[0])
             else:
-                cid = await cl.new_cluster(self.db, st.deployer)
+                cid = await cl.new_cluster(self.db, ident)
                 info.resolution = cl.Resolution(cid, "high", "новый кластер", new_cluster=True)
                 await self._bind_cluster(st, cid)
                 info.needs_rpc = True
+            await self._count_cluster_launch(info.resolution.cluster_id if info.resolution else None)
             await self.evaluate_dev(st.mint, "create")
             # 2) свежий кошелёк: связь через финансирование (RPC). В экономном режиме — только когда
             #    у монеты появились покупатели, иначе бесплатного лимита RPC не хватит.
@@ -255,6 +265,29 @@ class Engine:
             info.resolving = False
             for d in (3, 10, 30, 60, 120):
                 self.schedule(d, st.mint, "eval")
+
+    async def _launch_services(self) -> set[str]:
+        now = time.time()
+        if now - self._ls_loaded > 300:
+            from .services import launch_services
+            self._ls_cache = await launch_services(self.db)
+            self._ls_loaded = now
+        return self._ls_cache
+
+    async def _count_cluster_launch(self, cluster_id: int | None) -> None:
+        """50+ запусков кластера в сутки — подозрительный кластер (склейка или массовый запуск)."""
+        if cluster_id is None:
+            return
+        day = datetime.now(timezone.utc).date()
+        d, n = self._cl_day.get(cluster_id, (day, 0))
+        n = n + 1 if d == day else 1
+        self._cl_day[cluster_id] = (day, n)
+        if n == 50:
+            await self.db.execute(
+                "UPDATE clusters SET suspicious=true, suspicious_reason=$2 WHERE id=$1 AND NOT suspicious",
+                cluster_id, "50+ запусков за сутки")
+        if len(self._cl_day) > 200_000:
+            self._cl_day = {k: v for k, v in self._cl_day.items() if v[0] == day}
 
     async def _resolve_rpc(self, st: TokenState) -> None:
         info = self.info.get(st.mint)
@@ -379,6 +412,7 @@ class Engine:
             cluster_share=st.share(st.cluster_wallets()),
             link_confidence=res.confidence if res else "low", link_reason=res.reason if res else "",
             blacklisted=bool(row and row["blacklisted"]),
+            suspicious=bool(row and row.get("suspicious")),
             observed_growth_rate=st.growth_rate_per_s(now),
             threshold_override=row["threshold_override"] if row and row["threshold_override"] is not None else None,
         )
@@ -393,7 +427,8 @@ class Engine:
         snap = self._snapshot(st, info)
         dec = evaluate_dev(info.profile, snap, cfg, self.costs())
         info.last_reason = dec.reason if not dec.alert else "alerted"
-        info.last_decision = {"reason": dec.reason, "net": dec.net, "potential": dec.potential, "at_age": snap.age_s}
+        info.last_decision.update({"reason": dec.reason, "net": dec.net, "potential": dec.potential,
+                                   "at_age": snap.age_s})
         if not dec.alert:
             if cfg.get("watch_level_enabled") and snap.age_s >= 25 and mint not in self.alerts:
                 await self._maybe_watch(st, info)
@@ -465,7 +500,7 @@ class Engine:
         blacklisted = bool(info and info.cluster_row and info.cluster_row["blacklisted"])
         chk = evaluate_new(st, now, cfg, self.settings.filters(), blacklisted)
         if info is not None and not chk.ok:
-            info.last_decision.setdefault("new_reason", chk.reason)
+            info.last_decision["new_reason"] = chk.reason
         if not chk.ok:
             return
         costs = self.costs()
@@ -923,6 +958,7 @@ class Engine:
                     info = self.info.pop(m, None)
                     await self.finalize_launch(st, info)
                 await self.ext.publish_health("analytics")
+                await self.db.kv_set("usage:analytics", {"rpc_calls": self.rpc.calls, "rpc_429": self.rpc.rate_limited})
                 await self._follow_migrated()
                 cut = time.time() - 600
                 for m in [m for m, t in self.ext_blocked.items() if t < cut]:
@@ -976,15 +1012,16 @@ class Engine:
             """INSERT INTO launches(mint, cluster_id, deployer, created_at, initial_mc, peak_mc, dump_mc,
                    time_to_dump_s, sold_share, cluster_share_start, early_buyers, achievable_profit, entry_mc,
                    mc_30s, mc_60s, mc_120s, dev_buy_sol, bundle_wallets, bundle_share, migrated, features,
-                   is_reference)
-               VALUES ($1,$2,$3,to_timestamp($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+                   is_reference, trades_count)
+               VALUES ($1,$2,$3,to_timestamp($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
                ON CONFLICT (mint) DO UPDATE SET peak_mc=EXCLUDED.peak_mc, dump_mc=EXCLUDED.dump_mc,
                    time_to_dump_s=EXCLUDED.time_to_dump_s, achievable_profit=EXCLUDED.achievable_profit,
-                   features=EXCLUDED.features, finalized_at=now()""",
+                   features=EXCLUDED.features, trades_count=EXCLUDED.trades_count, finalized_at=now()""",
             st.mint, st.cluster_id, st.deployer, st.created_ts, s["initial_mc"], s["peak_mc"], s["dump_mc"],
             s["time_to_dump_s"], s["sold_share"], s["cluster_share_start"], s["early_buyers"],
             s["achievable_profit"], s["entry_mc"], s["mc_30s"], s["mc_60s"], s["mc_120s"], s["dev_buy_sol"],
-            s["bundle_wallets"], s["bundle_share"], s["migrated"], _jsonable(s["features"]), good_mark)
+            s["bundle_wallets"], s["bundle_share"], s["migrated"], _jsonable(s["features"]), good_mark,
+            s["trades_count"])
         if st.cluster_id is None:
             return
         await self.linker.promote_slot_buyers(st.cluster_id, s["features"].get("first_slot_buyers") or [])

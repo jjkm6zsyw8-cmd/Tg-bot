@@ -10,7 +10,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from ..solana import TOTAL_SUPPLY
+from ..solana import INITIAL_V_SOL, INITIAL_V_TOKENS, TOTAL_SUPPLY
+
+INITIAL_MC = INITIAL_V_SOL / INITIAL_V_TOKENS * TOTAL_SUPPLY   # ≈ 27.96 SOL
 from .curve import curve_progress
 
 
@@ -85,6 +87,8 @@ class TokenState:
     _sigs: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
+        if not self.initial_mc or self.initial_mc <= 0:
+            self.initial_mc = INITIAL_MC
         if self.deployer and self.deployer not in self.cluster:
             self.cluster[self.deployer] = Link("исходный деплоер", "high")
         self.mc = self.mc or self.initial_mc
@@ -114,6 +118,9 @@ class TokenState:
             return TradeEffects()
         if t.signature:
             self._sigs.add(key)
+        if t.ts < self.created_ts:
+            # время создания пришло с задержкой (время приёма, а не блока): сделка не может быть раньше
+            self.created_ts = t.ts
         # сделки приходят почти по порядку; редкие опоздания вставляем на место и пересчитываем
         if self.trades and t.ts < self.trades[-1].ts - 0.5:
             idx = bisect.bisect_right([x.ts for x in self.trades], t.ts)
@@ -222,13 +229,13 @@ class TokenState:
         return self.mc / base - 1 if base > 0 else 0.0
 
     def creation_mc(self) -> float:
-        """MC сразу после транзакции создания (включая покупку дева в ней)."""
+        """MC сразу после транзакции создания (включая покупку дева в ней). Нулевой MC — битые данные."""
         for t in self.trades:
             if t.ts - self.created_ts > 1.5:
                 break
-            if t.trader == self.deployer and t.is_buy:
+            if t.trader == self.deployer and t.is_buy and t.mc > 0:
                 return t.mc
-        return self.initial_mc
+        return self.initial_mc if self.initial_mc > 0 else INITIAL_MC
 
     def growth_rate_per_s(self, now: float, window_s: float = 10.0, min_span_s: float = 3.0) -> float:
         """Наблюдаемый относительный рост MC в секунду за последние window_s.
@@ -245,6 +252,10 @@ class TokenState:
         return (cur / base) ** (1 / span) - 1
 
     # ------------------------------------------------------------- метрики безопасности
+    def trades_count(self) -> int:
+        """Сделки после транзакции создания (покупка дева в ней не считается)."""
+        return sum(1 for t in self.trades if not (t.trader == self.deployer and t.ts - self.created_ts <= 1.5))
+
     def holders(self) -> dict[str, float]:
         return {w: b for w, b in self.balances.items() if b > 1e-6}
 

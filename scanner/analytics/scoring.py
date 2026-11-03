@@ -23,6 +23,8 @@ REASONS = {
     "low_profit": "мало чистого профита",
     "low_confidence": "связь низкой уверенности",
     "no_profile": "нет кластера",
+    "suspicious": "подозрительный кластер (50+ запусков в сутки)",
+    "external_filters": "внешние фильтры безопасности",
 }
 
 
@@ -35,6 +37,7 @@ class Snapshot:
     link_confidence: str = "high"
     link_reason: str = ""
     blacklisted: bool = False
+    suspicious: bool = False
     observed_growth_rate: float = 0.0
     threshold_override: float | None = None
 
@@ -61,6 +64,9 @@ def evaluate_dev(profile: Profile | None, snap: Snapshot, cfg: dict[str, Any], c
     d = Decision(alert=False, threshold=thr)
     if snap.blacklisted:
         d.reason = "blacklist"
+        return d
+    if snap.suspicious:
+        d.reason = "suspicious"
         return d
     if profile is None:
         d.reason = "no_profile"

@@ -27,16 +27,28 @@ Sink = Callable[[Event], Awaitable[None]]
 
 
 class Source:
+    """Базовый поток. Живость — по ping/pong websocket (ping_interval/ping_timeout), а не по «тишине»:
+    если сервер не ответил на ping, websockets закрывает соединение и мы переподключаемся
+    с нарастающей паузой от 5 с до 5 минут."""
+
     name = "source"
+    min_backoff = 5.0
+    max_backoff = 300.0
 
     def __init__(self) -> None:
         self.connected = False
+        self.connected_since = 0.0
+        self.disconnected_since = time.monotonic()
         self.last_event_at = 0.0      # monotonic
         self.last_event_wall: datetime | None = None
         self.reconnects = 0
         self.events = 0
+        self.bytes_in = 0             # для оценки расхода (Helius считает трафик по МБ)
         self.stats = ParseStats()
         self._stop = asyncio.Event()
+        self.gate = asyncio.Event()   # резервный поток подключается только при открытом «шлагбауме»
+        self.gate.set()
+        self._ws: Any = None
 
     def mark_event(self) -> None:
         self.events += 1
@@ -46,20 +58,45 @@ class Source:
     def silence_s(self) -> float:
         return time.monotonic() - self.last_event_at if self.last_event_at else float("inf")
 
+    def down_s(self) -> float:
+        """Сколько секунд нет соединения (0 — подключено)."""
+        return 0.0 if self.connected else time.monotonic() - self.disconnected_since
+
+    def _set_connected(self, value: bool) -> None:
+        if value and not self.connected:
+            self.connected_since = time.monotonic()
+        if not value and self.connected:
+            self.disconnected_since = time.monotonic()
+        self.connected = value
+
     async def run(self, sink: Sink) -> None:
-        backoff = 1.0
+        backoff = self.min_backoff
         while not self._stop.is_set():
+            await self.gate.wait()
+            started = time.monotonic()
             try:
                 await self._session(sink)
-                backoff = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — любой сбой сети → переподключение
                 log.warning("%s: соединение потеряно: %s", self.name, exc)
-            self.connected = False
+            self._set_connected(False)
+            self._ws = None
+            if not self.gate.is_set():
+                continue  # резерв закрыли намеренно — ждём следующего открытия
             self.reconnects += 1
+            if time.monotonic() - started > 120:
+                backoff = self.min_backoff   # соединение жило долго — начинаем паузы сначала
             await asyncio.sleep(backoff + random.random())
-            backoff = min(backoff * 2, 60)
+            backoff = min(backoff * 2, self.max_backoff)
+
+    async def close_now(self) -> None:
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def stop(self) -> None:
         self._stop.set()
@@ -69,30 +106,38 @@ class Source:
 
 
 class PumpPortalSource(Source):
-    """wss://pumpportal.fun/api/data — subscribeNewToken / TokenTrade / AccountTrade / Migration."""
+    """wss://pumpportal.fun/api/data — одно соединение на все подписки.
+
+    subscribeNewToken / Migration — бесплатно; subscribeTokenTrade / AccountTrade — только с ключом,
+    на кошельке которого ≥0.02 SOL (сделки на bonding curve бесплатны, PumpSwap — 0.01 SOL за 10 тыс.).
+    Сделки каждой новой монеты слушаем window_min минут; дольше — если keep(mint) == True
+    (алерт, бумажная позиция, наблюдение, растущий MC).
+    """
 
     name = "pumpportal"
 
-    def __init__(self, url: str, api_key: str = "", trade_window_min: int = 60):
+    def __init__(self, url: str, api_key: str = "", window_min: float = 30,
+                 keep: Callable[[str], bool] | None = None):
         super().__init__()
         self.url = url + (f"?api-key={api_key}" if api_key else "")
         self.has_key = bool(api_key)
-        self.trade_window_s = trade_window_min * 60
+        self.window_s = window_min * 60
+        self.keep = keep or (lambda _m: False)
         self.token_subs: dict[str, float] = {}     # mint → monotonic подписки
         self.account_subs: set[str] = set()
-        self._ws: Any = None
-        self._pending_tokens: list[str] = []
+        self._pending_sub: set[str] = set()
+        self._pending_unsub: set[str] = set()
         self._lock = asyncio.Lock()
+        self.messages_by_pool: dict[str, int] = {"pump": 0, "pump-amm": 0}
 
     async def subscribe_tokens(self, mints: list[str]) -> None:
         if not self.has_key:
             return  # без ключа с балансом ≥0.02 SOL PumpPortal не отдаёт сделки
         now = time.monotonic()
-        new = [m for m in mints if m not in self.token_subs]
         for m in mints:
+            if m not in self.token_subs:
+                self._pending_sub.add(m)
             self.token_subs[m] = now
-        if new:
-            await self._send({"method": "subscribeTokenTrade", "keys": new})
 
     async def set_accounts(self, wallets: set[str]) -> None:
         if not self.has_key:
@@ -100,54 +145,80 @@ class PumpPortalSource(Source):
         add = sorted(wallets - self.account_subs)
         rem = sorted(self.account_subs - wallets)
         self.account_subs = set(wallets)
-        if add:
-            await self._send({"method": "subscribeAccountTrade", "keys": add})
-        if rem:
-            await self._send({"method": "unsubscribeAccountTrade", "keys": rem})
+        for i in range(0, len(add), 100):
+            await self._send({"method": "subscribeAccountTrade", "keys": add[i:i + 100]})
+        for i in range(0, len(rem), 100):
+            await self._send({"method": "unsubscribeAccountTrade", "keys": rem[i:i + 100]})
 
-    async def _send(self, msg: dict[str, Any]) -> None:
+    async def _send(self, msg: dict[str, Any]) -> bool:
         ws = self._ws
         if ws is None:
-            return
+            return False
         try:
             async with self._lock:
                 await ws.send(json.dumps(msg))
+            return True
         except Exception as exc:  # noqa: BLE001
             log.debug("pumpportal send failed: %s", exc)
+            return False
 
-    async def _expire_loop(self) -> None:
+    async def _subs_loop(self) -> None:
+        """Подписки пачками раз в 0.5 с; отписка по окончании окна, если монету не нужно держать."""
+        last_expire = 0.0
         while True:
-            await asyncio.sleep(30)
-            cutoff = time.monotonic() - self.trade_window_s
-            old = [m for m, t in self.token_subs.items() if t < cutoff]
-            for m in old:
-                self.token_subs.pop(m, None)
-            for i in range(0, len(old), 200):
-                await self._send({"method": "unsubscribeTokenTrade", "keys": old[i : i + 200]})
+            await asyncio.sleep(0.5)
+            if self._pending_sub:
+                batch, self._pending_sub = sorted(self._pending_sub), set()
+                for i in range(0, len(batch), 100):
+                    if not await self._send({"method": "subscribeTokenTrade", "keys": batch[i:i + 100]}):
+                        self._pending_sub.update(batch[i:])
+                        break
+            if time.monotonic() - last_expire > 30:
+                last_expire = time.monotonic()
+                cutoff = time.monotonic() - self.window_s
+                old = [m for m, t in self.token_subs.items() if t < cutoff]
+                for m in old:
+                    if self.keep(m):
+                        self.token_subs[m] = time.monotonic() - self.window_s + 600   # продлить на 10 минут
+                    else:
+                        self.token_subs.pop(m, None)
+                        self._pending_unsub.add(m)
+                if self._pending_unsub:
+                    batch, self._pending_unsub = sorted(self._pending_unsub), set()
+                    for i in range(0, len(batch), 100):
+                        await self._send({"method": "unsubscribeTokenTrade", "keys": batch[i:i + 100]})
 
     async def _session(self, sink: Sink) -> None:
-        async with websockets.connect(self.url, ping_interval=20, max_size=2**22) as ws:
+        async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2**22,
+                                      open_timeout=20) as ws:
             self._ws = ws
-            self.connected = True
-            log.info("pumpportal: подключено")
+            self._set_connected(True)
+            log.info("pumpportal: подключено (ключ: %s)", "да" if self.has_key else "нет — только создания")
             await ws.send(json.dumps({"method": "subscribeNewToken"}))
             await ws.send(json.dumps({"method": "subscribeMigration"}))
             keys = list(self.token_subs)
-            for i in range(0, len(keys), 200):
-                await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": keys[i : i + 200]}))
+            for i in range(0, len(keys), 100):
+                await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": keys[i:i + 100]}))
             if self.account_subs:
-                await ws.send(json.dumps({"method": "subscribeAccountTrade", "keys": sorted(self.account_subs)}))
-            expire = asyncio.create_task(self._expire_loop())
+                acc = sorted(self.account_subs)
+                for i in range(0, len(acc), 100):
+                    await ws.send(json.dumps({"method": "subscribeAccountTrade", "keys": acc[i:i + 100]}))
+            subs = asyncio.create_task(self._subs_loop())
             try:
                 async for raw in ws:
+                    self.bytes_in += len(raw)
                     try:
                         msg = json.loads(raw)
                     except ValueError:
                         continue
                     ev = self.normalize(msg)
                     if ev is None:
+                        if isinstance(msg, dict) and msg.get("message") and "only available" in str(msg["message"]):
+                            log.warning("pumpportal: %s", msg["message"])
                         continue
                     self.mark_event()
+                    if isinstance(ev, Trade):
+                        self.messages_by_pool[ev.pool] = self.messages_by_pool.get(ev.pool, 0) + 1
                     if isinstance(ev, TokenCreated):
                         await self.subscribe_tokens([ev.mint])
                         await sink(ev)
@@ -162,8 +233,7 @@ class PumpPortalSource(Source):
                         continue
                     await sink(ev)
             finally:
-                expire.cancel()
-                self._ws = None
+                subs.cancel()
 
     @staticmethod
     def normalize(msg: dict[str, Any]) -> Event | None:
@@ -215,7 +285,10 @@ def _f(v: Any) -> float | None:
 
 
 class HeliusSource(Source):
-    """Helius Enhanced WebSockets: transactionSubscribe по программам Pump.fun и PumpSwap."""
+    """Helius transactionSubscribe (LaserStream WebSocket) по программам Pump.fun и PumpSwap.
+
+    Нужен тариф Developer и выше. Трафик тарифицируется: 20 кредитов за МБ (~1 МБ/с на полном потоке),
+    поэтому по умолчанию работает как резерв: подключается, только когда PumpPortal недоступен."""
 
     name = "helius"
 
@@ -227,8 +300,10 @@ class HeliusSource(Source):
         self.last_signature: str | None = None
 
     async def _session(self, sink: Sink) -> None:
-        async with websockets.connect(self.url, ping_interval=30, max_size=2**24) as ws:
-            self.connected = True
+        async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2**24,
+                                      open_timeout=20) as ws:
+            self._ws = ws
+            self._set_connected(True)
             log.info("helius: подключено")
             await ws.send(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "transactionSubscribe",
@@ -240,6 +315,7 @@ class HeliusSource(Source):
                 ],
             }))
             async for raw in ws:
+                self.bytes_in += len(raw)
                 try:
                     msg = json.loads(raw)
                 except ValueError:
@@ -268,6 +344,9 @@ class HeliusSource(Source):
 class LogsSource(Source):
     """Все создания, сделки и миграции Pump.fun через logsSubscribe стандартного websocket RPC.
 
+    ВНИМАНИЕ: Helius тарифицирует и этот поток (20 кредитов/МБ, ~1 МБ/с) — бесплатного лимита
+    хватает на полдня. По умолчанию выключен (LOGS_STREAM=on — включить).
+
     События Anchor приходят в логах строками «Program data: <base64>» — транзакцию целиком
     скачивать не нужно. Работает на бесплатном тарифе Helius. Неудачные транзакции пропускаются.
     """
@@ -282,12 +361,15 @@ class LogsSource(Source):
         self.last_signature: str | None = None
 
     async def _session(self, sink: Sink) -> None:
-        async with websockets.connect(self.url, ping_interval=30, max_size=2**24, open_timeout=20) as ws:
+        async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2**24,
+                                      open_timeout=20) as ws:
+            self._ws = ws
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                                       "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "processed"}]}))
-            self.connected = True
+            self._set_connected(True)
             log.info("logs: подключено")
             async for raw in ws:
+                self.bytes_in += len(raw)
                 for ev in self.parse_notification(raw, self.stats, self.pool_to_mint):
                     self.mark_event()
                     await sink(ev)

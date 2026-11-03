@@ -344,8 +344,19 @@ def test_logs_source_parses_program_data():
 
 def test_logs_ws_url_derived_from_rpc():
     from scanner.config import Env
-    assert Env(rpc_url="https://mainnet.helius-rpc.com/?api-key=k").logs_ws_url == "wss://mainnet.helius-rpc.com/?api-key=k"
-    assert Env(rpc_url="https://api.mainnet-beta.solana.com").logs_ws_url == ""
+    h = "https://mainnet.helius-rpc.com/?api-key=k"
+    assert Env(rpc_url=h).logs_ws_url == ""                       # по умолчанию выключен: тарифицируется
+    assert Env(rpc_url=h, logs_stream="on").logs_ws_url == "wss://mainnet.helius-rpc.com/?api-key=k"
+    assert Env(rpc_url="https://api.mainnet-beta.solana.com", logs_stream="on").logs_ws_url == ""
+
+
+def test_rpc_only_helius_and_backup_stream():
+    from scanner.config import Env
+    e = Env(rpc_url="https://api.mainnet-beta.solana.com", helius_api_key="KEY")
+    assert e.rpc_endpoint == "https://mainnet.helius-rpc.com/?api-key=KEY"
+    assert e.helius_ws_url == "wss://mainnet.helius-rpc.com/?api-key=KEY" and e.helius_stream == "backup"
+    assert Env(rpc_url="https://mainnet.helius-rpc.com/?api-key=K2").helius_key == "K2"
+    assert Env(helius_api_key="KEY", helius_stream="off").helius_ws_url == ""
 
 
 def test_trend_score():

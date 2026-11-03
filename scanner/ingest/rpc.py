@@ -40,6 +40,10 @@ class SolanaRpc:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._ids = itertools.count(1)
         self._session: aiohttp.ClientSession | None = None
+        self.calls = 0
+        self.rate_limited = 0
+        self.pause_until = 0.0          # общая пауза после 429: запросы ждут, а не долбят RPC
+        self._consecutive_429 = 0
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -50,27 +54,50 @@ class SolanaRpc:
         if self._session:
             await self._session.close()
 
-    async def call(self, method: str, params: list[Any], retries: int = 3) -> Any:
+    async def call(self, method: str, params: list[Any], retries: int = 2) -> Any:
         body = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
-        delay = 0.5
+        delay = 1.0
         for attempt in range(retries + 1):
+            wait = self.pause_until - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)          # во время паузы после 429 запросов нет
             await self.limiter.wait()
             try:
                 async with self.sem:
                     s = await self.session()
+                    self.calls += 1
                     async with s.post(self.url, json=body) as resp:
                         if resp.status == 429:
+                            self._on_429(resp.headers.get("Retry-After"))
                             raise RpcError("rate limited")
                         data = await resp.json(content_type=None)
+                self._consecutive_429 = 0
                 if "error" in data:
-                    raise RpcError(str(data["error"]))
+                    err = data["error"]
+                    if isinstance(err, dict) and err.get("code") in (429, -32429):
+                        self._on_429(None)
+                        raise RpcError("rate limited")
+                    raise RpcError(str(err))   # ошибки запроса не повторяем
                 return data.get("result")
             except (aiohttp.ClientError, asyncio.TimeoutError, RpcError) as exc:
-                if attempt >= retries:
+                retryable = not isinstance(exc, RpcError) or "rate limited" in str(exc)
+                if attempt >= retries or not retryable:
                     raise RpcError(f"{method}: {exc}") from exc
                 await asyncio.sleep(delay)
                 delay *= 2
         return None
+
+    def _on_429(self, retry_after: str | None) -> None:
+        self.rate_limited += 1
+        self._consecutive_429 += 1
+        wait = min(60.0, 2.0 ** self._consecutive_429)
+        try:
+            if retry_after:
+                wait = max(wait, float(retry_after))
+        except ValueError:
+            pass
+        self.pause_until = max(self.pause_until, time.monotonic() + wait)
+        log.warning("RPC 429: пауза %.0f с", wait)
 
     async def signature_slots(self, signatures: list[str]) -> dict[str, int]:
         """Слот для каждой подписи (getSignatureStatuses, до 256 за вызов)."""

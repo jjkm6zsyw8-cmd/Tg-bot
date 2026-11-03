@@ -34,6 +34,8 @@ class Env(BaseSettings):
     helius_ws: str = ""  # Enhanced WebSockets (платный Helius), напр. wss://atlas-mainnet.helius-rpc.com/?api-key=...
     logs_ws: str = ""    # websocket для logsSubscribe; по умолчанию выводится из RPC_URL (https → wss)
     rpc_rps: float = 5   # лимит запросов к RPC в секунду (бесплатный Helius — 10)
+    helius_stream: str = "backup"   # off | backup (только при обрыве PumpPortal) | primary
+    logs_stream: str = "off"        # on — постоянный logsSubscribe (дорого: ~1,7 млн кредитов/сутки)
 
     # внешние источники (необязательно; без ключа источник выключен)
     gmgn_api_key: str = ""
@@ -69,13 +71,36 @@ class Env(BaseSettings):
         return out
 
     @property
+    def helius_key(self) -> str:
+        """HELIUS_API_KEY или ключ из RPC_URL вида ...helius-rpc.com/?api-key=KEY."""
+        if self.helius_api_key:
+            return self.helius_api_key
+        if "helius-rpc.com" in self.rpc_url and "api-key=" in self.rpc_url:
+            return self.rpc_url.split("api-key=", 1)[1].split("&", 1)[0]
+        return ""
+
+    @property
+    def rpc_endpoint(self) -> str:
+        """RPC только через Helius: публичный mainnet-beta заменяется, если есть ключ Helius."""
+        public = (not self.rpc_url) or "api.mainnet-beta.solana.com" in self.rpc_url
+        if public and self.helius_key:
+            return f"https://mainnet.helius-rpc.com/?api-key={self.helius_key}"
+        return self.rpc_url
+
+    @property
     def helius_ws_url(self) -> str:
-        """Helius Enhanced WebSockets (transactionSubscribe) — только платные тарифы, включается явно."""
-        return self.helius_ws
+        """Helius transactionSubscribe (LaserStream WebSocket): тариф Developer+, трафик 20 кредитов/МБ."""
+        if self.helius_stream == "off":
+            return ""
+        if self.helius_ws:
+            return self.helius_ws
+        return f"wss://mainnet.helius-rpc.com/?api-key={self.helius_key}" if self.helius_key else ""
 
     @property
     def logs_ws_url(self) -> str:
-        """Стандартный websocket RPC (logsSubscribe) — работает и на бесплатном Helius."""
+        """websocket RPC для logsSubscribe. Тарифицируется как стриминг — по умолчанию выключен."""
+        if self.logs_stream != "on":
+            return ""
         if self.logs_ws:
             return self.logs_ws
         if self.rpc_url.startswith("https://") and "api.mainnet-beta.solana.com" not in self.rpc_url:
@@ -153,7 +178,7 @@ class Settings:
         return self.yaml.section("reliability")
 
     def topics(self) -> dict[str, str]:
-        return {"new": "Новые монеты", "trend": "Тренды", **self.yaml.section("topics")}
+        return {"new": "Новые монеты", "trend": "Тренды", "paper": "Бумажная торговля", **self.yaml.section("topics")}
 
     def exchanges(self) -> set[str]:
         return set(self.yaml.data.get("exchanges") or [])

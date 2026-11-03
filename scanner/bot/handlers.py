@@ -289,6 +289,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await reply(m, f"🔕 Пауза алертов на {minutes} мин. Экстренные сигналы на выход по открытым монетам "
                        "продолжат приходить. /mute 0 — снять паузу.")
 
+    @router.message(Command("testalert"))
+    async def cmd_testalert(m: Message) -> None:
+        await sender.setup_topics()
+        res = await sender.send_test_alerts()
+        await reply(m, "Тестовые алерты отправлены: " + ", ".join(esc(x) for x in res))
+
     @router.message(Command("health"))
     async def cmd_health(m: Message) -> None:
         await reply(m, await views.health_view(db))

@@ -88,8 +88,20 @@ class Profile:
         return cls(**known)
 
 
+def has_trade_data(launch: dict[str, Any]) -> bool:
+    """Запуск с данными о сделках: есть сделки после создания (или MC менялся)."""
+    tc = launch.get("trades_count")
+    if tc is not None:
+        return tc >= 1
+    init, peak = launch.get("initial_mc"), launch.get("peak_mc")
+    return bool(init and peak and peak > init * 1.01)
+
+
 def build_profile(launches: list[dict[str, Any]], cfg: dict[str, Any], cluster_id: int | None = None,
                   now: datetime | None = None, pattern_weight: float = 1.0) -> Profile:
+    """Профиль по всем запускам кластера, у которых есть данные о сделках (без них — не история)."""
+    total_launches = len(launches)
+    launches = [l for l in launches if has_trade_data(l)]
     now = now or datetime.now(timezone.utc)
     recent_cut = now - timedelta(days=float(cfg.get("recent_days", 30)))
     recent_w = float(cfg.get("recent_weight", 2.0))
@@ -139,6 +151,7 @@ def build_profile(launches: list[dict[str, Any]], cfg: dict[str, Any], cluster_i
         instant_rugs=rugs,
         instant_rugger=bool(len(launches) >= int(cfg.get("min_launches", 3)) and med_ttd is not None and med_ttd < rug_s),
         last_launch_at=last.isoformat() if last else None,
+        extra={"total_launches": total_launches},
     )
 
 

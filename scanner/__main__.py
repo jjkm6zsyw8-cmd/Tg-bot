@@ -39,6 +39,10 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
+    if cmd in ("recluster", "history"):
+        await run_tool(cmd, db)
+        await db.close()
+        return
     tasks = []
     if cmd in ("ingest", "all"):
         from .ingest.receiver import Receiver
@@ -64,6 +68,29 @@ async def main(cmd: str) -> None:
         # terminate, а не close: close ждёт соединения LISTEN и может зависнуть навсегда
         if db.pool is not None:
             db.pool.terminate()
+
+
+async def run_tool(cmd: str, db: Database) -> None:
+    """Разовые операции: отчёт/пересборка кластеров, загрузка истории."""
+    args = sys.argv[2:]
+    if cmd == "recluster":
+        from .analytics.recluster import rebuild, report
+        print(await report(db))
+        if "--report" not in args:
+            print("\nПересборка…")
+            res = await rebuild(db)
+            print(res)
+            print("\nПосле пересборки:\n" + await report(db))
+    elif cmd == "history":
+        from .history.dune import load
+        key = os.environ.get("DUNE_API_KEY", "")
+        if not key:
+            raise SystemExit("Нужен DUNE_API_KEY (dune.com → Settings → API)")
+        days = int(args[args.index("--days") + 1]) if "--days" in args else 30
+        mn = int(args[args.index("--min-launches") + 1]) if "--min-launches" in args else 2
+        print(await load(db, key, days, mn))
+        from .analytics.recluster import rebuild
+        print(await rebuild(db, days=days + 1))
 
 
 if __name__ == "__main__":

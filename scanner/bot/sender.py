@@ -65,6 +65,9 @@ class Sender:
         self.topics: dict[str, int] = {}
         self.limiter = Limiter(20)
         self.styles = True
+        self.sys_buf: list[str] = []      # системные сообщения копятся и уходят не чаще раза в 10 минут
+        self.sys_last = 0.0
+        self.sys_interval = 600.0
 
     @property
     def chat_id(self) -> int | None:
@@ -134,6 +137,7 @@ class Sender:
 
     async def drain(self) -> None:
         self.settings.overrides = await self.db.get_overrides()
+        await self.flush_system()
         rows = await self.db.fetch(
             "SELECT * FROM outbox WHERE sent_at IS NULL AND attempts < 5 ORDER BY priority, id LIMIT 50")
         if not rows:
@@ -145,6 +149,10 @@ class Sender:
                 latest_edit[r["payload"]["mint"]] = max(latest_edit.get(r["payload"]["mint"], 0), r["id"])
         for r in rows:
             kind, p = r["kind"], r["payload"]
+            if kind == "system" or (kind == "text" and p.get("topic") == "system"):
+                self.sys_buf.append(str(p.get("text", "")))
+                await self._done(r["id"], "buffered")
+                continue
             if kind == "edit" and latest_edit.get(p["mint"]) != r["id"]:
                 await self._done(r["id"], "superseded")
                 continue
@@ -179,6 +187,35 @@ class Sender:
                 log.exception("deliver %s", kind)
                 await self.db.execute("UPDATE outbox SET attempts=attempts+1, error=$2 WHERE id=$1",
                                       r["id"], str(exc)[:500])
+
+    async def flush_system(self) -> None:
+        """Только в топик «Система» и не чаще раза в sys_interval: всё накопленное — одним сообщением."""
+        if not self.sys_buf or time.monotonic() - self.sys_last < self.sys_interval:
+            return
+        lines = list(dict.fromkeys(self.sys_buf))      # одинаковые подряд не повторяем
+        self.sys_buf = []
+        text = "\n\n".join(lines)
+        if len(text) > 3800:
+            text = text[:3800] + f"\n… и ещё {len(lines)} сообщ."
+        try:
+            await self.send(text, "system", None, silent=True)
+            self.sys_last = time.monotonic()
+        except Exception:  # noqa: BLE001
+            log.exception("system message")
+            self.sys_buf = lines + self.sys_buf
+
+    async def send_test_alerts(self) -> list[str]:
+        """/testalert: тестовое сообщение в каждый топик."""
+        sent = []
+        for key, name in self.settings.topics().items():
+            try:
+                await self.send(f"🧪 <b>Тестовый алерт</b> · топик «{name}»\nЕсли вы это видите — доставка работает.",
+                                key, [[{"text": "Pump.fun", "url": "https://pump.fun"},
+                                       {"text": "Скопировать", "copy": "test"}]], silent=True)
+                sent.append(name)
+            except Exception as exc:  # noqa: BLE001
+                sent.append(f"{name}: ошибка {exc}")
+        return sent
 
     async def _done(self, oid: int, note: str | None = None) -> None:
         await self.db.execute("UPDATE outbox SET sent_at=now(), error=COALESCE($2, error) WHERE id=$1", oid, note)

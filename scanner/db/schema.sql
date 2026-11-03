@@ -314,3 +314,61 @@ ALTER TABLE wallets ADD COLUMN IF NOT EXISTS tags_source text;
 ALTER TABLE wallets ADD COLUMN IF NOT EXISTS labels_at timestamptz;
 ALTER TABLE traders ADD COLUMN IF NOT EXISTS tags jsonb;
 ALTER TABLE traders ADD COLUMN IF NOT EXISTS tags_source text;
+
+-- Блок A/B: роли кошельков, подозрительные кластеры, число сделок запуска
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS role text;          -- dev | trader | sniper | bundler | kol | exchange | service
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS role_reason text;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS role_source text;
+CREATE INDEX IF NOT EXISTS wallets_role_idx ON wallets (role) WHERE role IS NOT NULL;
+CREATE INDEX IF NOT EXISTS wallets_funded_by_idx ON wallets (funded_by) WHERE funded_by IS NOT NULL;
+ALTER TABLE clusters ADD COLUMN IF NOT EXISTS suspicious boolean NOT NULL DEFAULT false;
+ALTER TABLE clusters ADD COLUMN IF NOT EXISTS suspicious_reason text;
+ALTER TABLE launches ADD COLUMN IF NOT EXISTS trades_count integer;
+ALTER TABLE tokens ADD COLUMN IF NOT EXISTS last_mc_sol double precision;
+ALTER TABLE tokens ADD COLUMN IF NOT EXISTS peak_mc_sol double precision;
+ALTER TABLE tokens ADD COLUMN IF NOT EXISTS identity text;       -- кошелёк, по которому строится кластер
+
+-- Блок E: бумажная торговля (без реальных денег и ключей)
+CREATE TABLE IF NOT EXISTS paper_portfolios (
+    name          text PRIMARY KEY,                 -- A | B | C
+    scheme        jsonb NOT NULL,
+    start_usd     double precision NOT NULL,
+    start_sol     double precision NOT NULL,
+    balance_sol   double precision NOT NULL,
+    paused        boolean NOT NULL DEFAULT false,
+    reset_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id            bigserial PRIMARY KEY,
+    portfolio     text NOT NULL,
+    mint          text NOT NULL,
+    alert_id      bigint,
+    level         text,
+    symbol        text,
+    opened_at     timestamptz NOT NULL,
+    entry_mc      double precision,
+    cost_sol      double precision NOT NULL,           -- потрачено с учётом комиссий
+    tokens        double precision NOT NULL,           -- текущий остаток токенов
+    tokens_initial double precision NOT NULL,
+    proceeds_sol  double precision NOT NULL DEFAULT 0, -- получено от частичных продаж
+    max_mc        double precision,
+    target_mc     double precision,
+    tp_done       boolean NOT NULL DEFAULT false,
+    closed_at     timestamptz,
+    exit_reason   text,
+    pnl_sol       double precision,
+    pnl_pct       double precision
+);
+CREATE INDEX IF NOT EXISTS paper_positions_open_idx ON paper_positions (portfolio) WHERE closed_at IS NULL;
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id            bigserial PRIMARY KEY,
+    position_id   bigint NOT NULL REFERENCES paper_positions (id) ON DELETE CASCADE,
+    portfolio     text NOT NULL,
+    side          text NOT NULL,                       -- buy | sell
+    ts            timestamptz NOT NULL,
+    mc            double precision,
+    sol           double precision NOT NULL,           -- вход: потрачено; выход: получено (после комиссий)
+    tokens        double precision NOT NULL,
+    fee_sol       double precision NOT NULL,
+    reason        text
+);

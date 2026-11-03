@@ -18,6 +18,7 @@ from typing import Any
 from ..db.pool import Database
 from ..ingest.pump_parser import ParseStats, TxContext, sol_transfers
 from ..ingest.rpc import RpcError, SolanaRpc
+from . import services as svc
 
 log = logging.getLogger(__name__)
 CONF_RANK = {"low": 0, "medium": 1, "high": 2}
@@ -73,7 +74,10 @@ class Linker:
         self.stats = ParseStats()
 
     async def is_exchange(self, wallet: str) -> bool:
-        if wallet in self.exchanges:
+        """Биржа или служебный адрес — такие кошельки не участвуют в кластеризации."""
+        if wallet in self.exchanges or wallet in svc.STATIC_SERVICES:
+            return True
+        if await svc.is_service(self.db, wallet):
             return True
         row = await self.db.fetchrow("SELECT is_exchange, checked_at, labels_at FROM wallets WHERE address=$1", wallet)
         if row and row["is_exchange"]:
@@ -143,7 +147,9 @@ class Linker:
         outbound = [t for t in transfers if t.src == deployer and t.dst != deployer and t.ts >= win_start
                     and t.sol >= 0.05]
         for t in outbound[:5]:
-            # в экономном режиме не проверяем получателей на биржу (это ещё по запросу на каждого)
+            if await svc.is_service(self.db, t.dst):
+                continue   # чаевые Jito, комиссии ботов, сервисы — не члены кластера
+            # в экономном режиме не проверяем получателей на биржу по RPC (это ещё запрос на каждого)
             if economy or not await self.is_exchange(t.dst):
                 funded.append((t.dst, f"профинансирован деплоером до запуска ({t.sol:.2f} SOL)"))
         funder = max(inbound, key=lambda t: t.sol, default=None)
@@ -167,16 +173,21 @@ class Linker:
             if fc:
                 await add_link(self.db, fc[0], deployer, "профинансирован кошельком кластера", "high")
                 return Resolution(fc[0], "high", "общий источник финансирования"), funded
-            # другой деплоер кластера получал SOL с того же кошелька
-            sib = await self.db.fetchrow(
-                """SELECT l.cluster_id FROM wallets w JOIN cluster_links l ON l.wallet = w.address
-                   AND l.status IN ('auto','confirmed') AND l.confidence <> 'low'
-                   WHERE w.funded_by = $1 AND w.address <> $2 LIMIT 1""", funder.src, deployer)
-            if sib:
-                await add_link(self.db, sib["cluster_id"], deployer, "общий источник финансирования", "high")
-                return Resolution(sib["cluster_id"], "high", "общий источник финансирования"), funded
+            # другой деплоер кластера получал SOL с того же кошелька (если финансист не «раздаёт» многим)
+            n_funded = await self.db.fetchval("SELECT count(*) FROM wallets WHERE funded_by=$1", funder.src)
+            if (n_funded or 0) > svc.FUNDER_MAX_DEPLOYERS:
+                await svc.mark(self.db, funder.src, "service", f"финансировал {n_funded} деплоеров")
+                sib = None
+            else:
+                sib = await self.db.fetchrow(
+                    """SELECT l.cluster_id FROM wallets w JOIN cluster_links l ON l.wallet = w.address
+                       AND l.status IN ('auto','confirmed') AND l.confidence <> 'low'
+                       WHERE w.funded_by = $1 AND w.address <> $2 LIMIT 1""", funder.src, deployer)
+                if sib:
+                    await add_link(self.db, sib["cluster_id"], deployer, "общий источник финансирования", "high")
+                    return Resolution(sib["cluster_id"], "high", "общий источник финансирования"), funded
 
-        if image:
+        if image and not await svc.generic_image(self.db, image):
             row = await self.db.fetchrow(
                 """SELECT cluster_id FROM tokens WHERE image=$1 AND cluster_id IS NOT NULL AND deployer <> $2
                    ORDER BY created_at DESC LIMIT 1""", image, deployer)
