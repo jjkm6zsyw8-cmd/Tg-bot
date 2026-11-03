@@ -2,8 +2,6 @@
 новые кандидаты, сделки пользователя. Короткая сводка в Telegram + CSV-файлом."""
 from __future__ import annotations
 
-import csv
-import io
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -154,19 +152,10 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
             lines.append(f"  {p['name']}: сделок {r['n']}, удачных {r['w']}, итог {r['pnl']:+.4f} SOL "
                          f"(${r['pnl'] * price:+.2f}); баланс {p['balance_sol']:.4f} SOL без открытых позиций")
 
-    # CSV
-    buf = io.StringIO()
-    w = csv.writer(buf, delimiter=";")
-    w.writerow(["mint", "symbol", "created_at", "cluster_id", "initial_mc_sol", "peak_mc_sol", "dump_mc_sol",
-                "time_to_dump_s", "achievable_profit", "alerted", "decision_reason", "alert_level", "alert_net"])
-    alert_by_mint = {a["mint"]: a for a in alerts}
-    for l in launches:
-        a = alert_by_mint.get(l["mint"])
-        w.writerow([l["mint"], l["symbol"], l["created_at"].astimezone(tz).isoformat(), l["cluster_id"],
-                    _r(l["initial_mc"]), _r(l["peak_mc"]), _r(l["dump_mc"]), _r(l["time_to_dump_s"]),
-                    _r(l["achievable_profit"]), bool(a), (l["features"] or {}).get("decision_reason", ""),
-                    a["level"] if a else "", _r(a["net_result"]) if a else ""])
-    return "\n".join(lines), buf.getvalue().encode("utf-8-sig"), kb
+    # CSV: расширенные колонки (сделки, продажи кластера, причина склейки, окно входа, лучшие трейдеры)
+    from .verify import extended_csv
+    csv_bytes = await extended_csv(db, start, end)
+    return "\n".join(lines), csv_bytes, kb
 
 
 def _r(v: Any) -> Any:

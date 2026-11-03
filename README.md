@@ -105,6 +105,7 @@ web: https://<домен>/p/<mint> → pump://coin/<mint> (или pump.fun на 
 docker compose run --rm analytics recluster --report   # через какие адреса склеились кластеры
 docker compose run --rm analytics recluster            # пересборка кластеров и профилей
 docker compose run --rm -e DUNE_API_KEY=... analytics history --days 30   # история за 30 дней (Dune)
+docker compose run --rm analytics verify --day 2026-11-03 --days 7       # проверка на истории → «Разбор дня»
 ```
 
 Бэкап и проверка восстановления (раз в месяц):

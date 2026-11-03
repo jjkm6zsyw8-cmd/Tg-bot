@@ -206,6 +206,12 @@ async def test_end_to_end(monkeypatch):
         bt = await run_backtest(db, settings, "10d")
         assert "Бэктест" in bt and "проверка" in bt
 
+        # --- блок F: проверка на истории и расширенный CSV
+        from scanner.reports.verify import run_verify
+        vtext, vcsv = await run_verify(db, settings, datetime.now(timezone.utc).date(), 7)
+        assert "Проверка на истории" in vtext and "Воронка" in vtext
+        assert b"glue_reason" in vcsv and b"top_traders" in vcsv and b"entry_window" in vcsv
+
         # --- блок B: разбор монеты и карточка кошелька
         from scanner.bot import views
         hist_mint = await db.fetchval("SELECT mint FROM launches ORDER BY created_at LIMIT 1")

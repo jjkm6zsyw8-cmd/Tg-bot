@@ -39,7 +39,7 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history"):
+    if cmd in ("recluster", "history", "verify"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -81,6 +81,19 @@ async def run_tool(cmd: str, db: Database) -> None:
             res = await rebuild(db)
             print(res)
             print("\nПосле пересборки:\n" + await report(db))
+    elif cmd == "verify":
+        import re
+        from datetime import date
+        from .config import Settings, YamlConfig
+        from .reports.verify import run_verify
+        day = date.fromisoformat(args[args.index("--day") + 1]) if "--day" in args else date.today()
+        days = int(args[args.index("--days") + 1]) if "--days" in args else 7
+        settings = Settings(YamlConfig("config/config.yaml"), await db.get_overrides())
+        text, csv_bytes = await run_verify(db, settings, day, days)
+        print(re.sub(r"<[^>]+>", "", text))
+        await db.enqueue("daily", {"text": text, "csv": csv_bytes.decode("utf-8"),
+                                   "filename": f"verify_{day.isoformat()}_{days}d.csv"}, priority=4)
+        print("\nОтчёт и CSV отправлены в топик «Разбор дня».")
     elif cmd == "history":
         from .history.dune import load
         key = os.environ.get("DUNE_API_KEY", "")
