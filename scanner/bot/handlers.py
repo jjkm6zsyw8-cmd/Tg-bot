@@ -289,6 +289,49 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await reply(m, f"🔕 Пауза алертов на {minutes} мин. Экстренные сигналы на выход по открытым монетам "
                        "продолжат приходить. /mute 0 — снять паузу.")
 
+    @router.message(Command("wallet"))
+    async def cmd_wallet(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /wallet &lt;адрес&gt;")
+        text, kb = await views.wallet_view(db, a, ext)
+        await reply(m, text, kb)
+
+    @router.message(Command("coin"))
+    async def cmd_coin(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /coin &lt;адрес токена&gt;")
+        text, kb = await views.coin_view(db, settings, a, ext)
+        await reply(m, text, kb)
+
+    @router.callback_query(F.data.startswith(("w:", "coin:")))
+    async def cb_wallet_coin(c: CallbackQuery) -> None:
+        kind, _, addr = c.data.partition(":")
+        await c.answer()
+        if not is_valid_address(addr):
+            return
+        text, kb = await (views.wallet_view(db, addr, ext) if kind == "w" else views.coin_view(db, settings, addr, ext))
+        await c.message.answer(text[:4000], parse_mode="HTML", reply_markup=build(kb), link_preview_options=NO_PREVIEW)
+
+    @router.callback_query(F.data.startswith(("wt:", "wb:")))
+    async def cb_wallet_actions(c: CallbackQuery) -> None:
+        kind, _, addr = c.data.partition(":")
+        if not is_valid_address(addr):
+            return await c.answer()
+        if kind == "wt":
+            await db.execute("INSERT INTO watchlist(kind, address) VALUES ('trader', $1) ON CONFLICT DO NOTHING", addr)
+            await db.job("reload")
+            await c.answer("Отслеживаю кошелёк")
+        else:
+            await db.execute("INSERT INTO wallets(address, blacklisted) VALUES ($1, true) "
+                             "ON CONFLICT (address) DO UPDATE SET blacklisted=true", addr)
+            cid = await views.resolve_cluster(db, addr)
+            if cid:
+                await db.execute("UPDATE clusters SET blacklisted=true, blacklist_reason='вручную' WHERE id=$1", cid)
+            await remove(addr)
+            await c.answer("В чёрном списке")
+
     @router.message(Command("testalert"))
     async def cmd_testalert(m: Message) -> None:
         await sender.setup_topics()

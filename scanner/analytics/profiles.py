@@ -151,8 +151,26 @@ def build_profile(launches: list[dict[str, Any]], cfg: dict[str, Any], cluster_i
         instant_rugs=rugs,
         instant_rugger=bool(len(launches) >= int(cfg.get("min_launches", 3)) and med_ttd is not None and med_ttd < rug_s),
         last_launch_at=last.isoformat() if last else None,
-        extra={"total_launches": total_launches},
+        extra=_extras(base, cfg, total_launches),
     )
+
+
+def _extras(base: list[dict[str, Any]], cfg: dict[str, Any], total_launches: int) -> dict[str, Any]:
+    """Блок B: разброс MC дампа (25–75%), типичная последовательность продаж, окно входа."""
+    from .insights import dump_spread, entry_window, typical_sells
+    feats = [l.get("features") or {} for l in base]
+    out: dict[str, Any] = {"total_launches": total_launches}
+    ds = dump_spread([l.get("dump_mc") for l in base])
+    if ds:
+        out["dump_spread"] = ds
+    ts = typical_sells([(f.get("sells") or {}).get("cluster") for f in feats])
+    if ts:
+        out["sell_sequence"] = ts
+    curves = [f["entry_curve"] for f in feats if f.get("entry_curve")]
+    ew = entry_window(curves, float(cfg.get("min_net_profit", 0.3))) if curves else None
+    if ew:
+        out["entry_window"] = ew
+    return out
 
 
 def similar_to_reference(features: dict[str, Any], ref: dict[str, Any], cfg: dict[str, Any]) -> tuple[bool, list[str]]:

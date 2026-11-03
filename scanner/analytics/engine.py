@@ -764,7 +764,9 @@ class Engine:
         text = fmt.render_alert(e.data, self.price.value, bool(cfg.get("compact")))
         profile_kind, profile_ref = ("d", str(e.data.get("cluster_id"))) if e.data.get("cluster_id") else \
             ("t", trader or e.data.get("trader") or "")
-        kb = fmt.alert_keyboard(mint, self.settings.links(), self.env.redirect_base, profile_kind, profile_ref)
+        wallet = (st.deployer if st and profile_kind == "d" else (trader or e.data.get("trader"))) or None
+        kb = fmt.alert_keyboard(mint, self.settings.links(), self.env.redirect_base, profile_kind, profile_ref,
+                                wallet=wallet)
         topic = self._topic_for(e.level, e.modes)
         upgraded = prev_level is not None and LEVELS[e.level] > LEVELS[prev_level]
         if e.has_message and not upgraded:
@@ -898,8 +900,8 @@ class Engine:
             return
         main_id = e.alert_ids.get("dev") or next(iter(e.alert_ids.values()), None)
         text = fmt.render_final({**e.data, "symbol": st.symbol}, outcome, self.price.value)
-        await self.db.enqueue("final", {"mint": e.mint, "text": text,
-                                        "keyboard": fmt.marks_keyboard(main_id) if main_id else None}, priority=5)
+        kb = (fmt.marks_keyboard(main_id) if main_id else []) + [[{"text": "Разбор монеты", "callback": f"coin:{e.mint}"}]]
+        await self.db.enqueue("final", {"mint": e.mint, "text": text, "keyboard": kb}, priority=5)
 
     # ------------------------------------------------------------------ таймеры и обслуживание
     async def _timer_loop(self) -> None:
@@ -1002,7 +1004,19 @@ class Engine:
             e.flags.add("migrated")
 
     async def finalize_launch(self, st: TokenState, info: TokenInfo | None) -> None:
+        from .insights import entry_curve, sell_sequences, top_traders
         s = launch_summary(st, self.cfg, self.costs(), _median(self.latencies) or 1.5)
+        cfg = self.cfg
+        # блок B: продажи по группам, кривая входа, лучшие трейдеры монеты
+        s["features"]["sells"] = sell_sequences(st, set(self.traders))
+        prof = info.profile if info else None
+        target = (float(cfg.get("target_k", 0.8)) * prof.dump_mc) if prof and prof.dump_mc else (
+            0.8 * st.dump_mc if st.dump_mc else None)
+        s["features"]["entry_curve"] = entry_curve(st, target, float(cfg.get("reaction_s", 5)), 2.0,
+                                                   float(cfg.get("position_sol", 0.5)), self.costs())
+        excl = st.cluster_wallets() | st.bundle_wallets() | st.sniper_wallets()
+        tops = top_traders(st, excl) if st.trades_count() >= 5 else []
+        s["features"]["top_traders"] = [t["trader"] for t in tops]
         s["features"]["decision_reason"] = info.last_reason if info else ""
         s["features"]["decision"] = info.last_decision if info else {}
         good_mark = await self.db.fetchval(
@@ -1022,6 +1036,14 @@ class Engine:
             s["achievable_profit"], s["entry_mc"], s["mc_30s"], s["mc_60s"], s["mc_120s"], s["dev_buy_sol"],
             s["bundle_wallets"], s["bundle_share"], s["migrated"], _jsonable(s["features"]), good_mark,
             s["trades_count"])
+        if tops:
+            await self.db.p.executemany(
+                """INSERT INTO coin_top_traders(mint, rank, trader, pnl_sol, entry_mc, exit_mc, hold_s, entry_age_s)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (mint, rank) DO UPDATE SET trader=EXCLUDED.trader,
+                   pnl_sol=EXCLUDED.pnl_sol, entry_mc=EXCLUDED.entry_mc, exit_mc=EXCLUDED.exit_mc,
+                   hold_s=EXCLUDED.hold_s, entry_age_s=EXCLUDED.entry_age_s""",
+                [(st.mint, i + 1, t["trader"], t["pnl_sol"], t["entry_mc"], t["exit_mc"], t["hold_s"],
+                  t["entry_age_s"]) for i, t in enumerate(tops)])
         if st.cluster_id is None:
             return
         await self.linker.promote_slot_buyers(st.cluster_id, s["features"].get("first_slot_buyers") or [])
@@ -1079,6 +1101,13 @@ class Engine:
                 last_nightly = utc.date()
                 try:
                     res = await refresh_traders_adaptive(self.db, cfg, self.costs(), limit=2000, ext=self.ext)
+                    from . import services as svc
+                    from .recluster import mark_suspicious
+                    from .wallets import refresh_roles, refresh_wallet_stats
+                    await svc.detect(self.db)
+                    await mark_suspicious(self.db)
+                    await refresh_wallet_stats(self.db)
+                    await refresh_roles(self.db)
                     await self.recompute_profiles()
                     await self.db.system(f"Ночной пересчёт: трейдеров-кандидатов {res['candidates']}, "
                                          f"прошли фильтр {res['qualified']}.")
@@ -1092,6 +1121,8 @@ class Engine:
         while True:
             try:
                 res = await refresh_traders_adaptive(self.db, self.cfg, self.costs(), limit=500, ext=self.ext)
+                from .wallets import top_trader_candidates
+                res["qualified"] += await top_trader_candidates(self.db, self.cfg, self.costs())
                 await self._load_traders()
                 if res["qualified"] != last_count:
                     last_count = res["qualified"]

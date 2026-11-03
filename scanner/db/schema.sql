@@ -372,3 +372,25 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     fee_sol       double precision NOT NULL,
     reason        text
 );
+
+-- Блок B: лучшие трейдеры по монетам и статистика кошельков
+CREATE TABLE IF NOT EXISTS coin_top_traders (
+    mint        text NOT NULL,
+    rank        integer NOT NULL,
+    trader      text NOT NULL,
+    pnl_sol     double precision,
+    entry_mc    double precision,
+    exit_mc     double precision,
+    hold_s      double precision,
+    entry_age_s double precision,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (mint, rank)
+);
+CREATE INDEX IF NOT EXISTS coin_top_traders_trader_idx ON coin_top_traders (trader, created_at);
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS pnl_7d double precision;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS pnl_30d double precision;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS winrate double precision;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS trades_30d integer;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS avg_hold_s double precision;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS copyability double precision;
+ALTER TABLE wallets ADD COLUMN IF NOT EXISTS stats_at timestamptz;

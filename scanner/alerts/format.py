@@ -65,7 +65,8 @@ def pump_url(links: dict[str, Any], mint: str, redirect_base: str) -> str:
 
 
 def alert_keyboard(mint: str, links: dict[str, Any], redirect_base: str, profile_kind: str,
-                   profile_ref: str, marks_alert_id: int | None = None) -> list[list[dict[str, Any]]]:
+                   profile_ref: str, marks_alert_id: int | None = None,
+                   wallet: str | None = None) -> list[list[dict[str, Any]]]:
     rows: list[list[dict[str, Any]]] = [
         [{"text": "Pump.fun (приложение)", "url": pump_url(links, mint, redirect_base)},
          {"text": "Axiom", "url": link(links["axiom"], mint=mint)}],
@@ -76,6 +77,9 @@ def alert_keyboard(mint: str, links: dict[str, Any], redirect_base: str, profile
          {"text": "GMGN", "url": link(links["gmgn"], mint=mint)},
          {"text": "Отслеживать", "callback": f"trk:{mint}"}],
     ]
+    if wallet:
+        rows.append([{"text": "Кошелёк дева" if profile_kind == "d" else "Кошелёк", "callback": f"w:{wallet}"},
+                     {"text": "Разбор монеты", "callback": f"coin:{mint}"}])
     if marks_alert_id is not None:
         rows.append(marks_keyboard(marks_alert_id)[0])
     return rows

@@ -206,6 +206,14 @@ async def test_end_to_end(monkeypatch):
         bt = await run_backtest(db, settings, "10d")
         assert "Бэктест" in bt and "проверка" in bt
 
+        # --- блок B: разбор монеты и карточка кошелька
+        from scanner.bot import views
+        hist_mint = await db.fetchval("SELECT mint FROM launches ORDER BY created_at LIMIT 1")
+        ctext, ckb = await views.coin_view(db, settings, hist_mint)
+        assert "Разбор монеты" in ctext and "Продажи" in ctext and ckb
+        wtext, wkb = await views.wallet_view(db, dev)
+        assert "Созданные токены" in wtext and wkb[1][1]["callback"] == f"wb:{dev}"
+
         # --- доставка в Telegram: одна монета — одно сообщение, edit вместо новых
         fake = FakeBot()
         sender = Sender(fake, env, settings, db)  # type: ignore[arg-type]

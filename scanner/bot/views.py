@@ -365,3 +365,154 @@ async def data_health(db: Database) -> list[str]:
                    f"Helius стриминг ~{use.get('helius_stream_credits', 0):,} кредитов; RPC "
                    f"{use.get('rpc_calls', 0) + (ua.get('rpc_calls') or 0):,.0f} запросов")
     return out
+
+
+ROLE_NAMES = {"dev": "дев", "trader": "трейдер", "sniper": "снайпер", "bundler": "бандлер", "kol": "KOL",
+              "exchange": "биржа", "service": "служебный адрес"}
+
+
+async def wallet_view(db: Database, address: str, ext: Any = None) -> tuple[str, list[list[dict[str, Any]]]]:
+    """/wallet: роль, статистика, сделки, созданные токены, финансирование и вывод, связи, ссылки."""
+    price = await sol_usd(db)
+    w = await db.fetchrow("SELECT * FROM wallets WHERE address=$1", address)
+    tr = await db.fetchrow("SELECT * FROM traders WHERE address=$1", address)
+    role = ROLE_NAMES.get(w["role"], w["role"]) if w and w["role"] else "не определена"
+    lines = [f"👛 <b>Кошелёк</b> <code>{address}</code>",
+             f"Роль: <b>{esc(role)}</b>" + (f" ({esc(w['role_reason'])}, источник: {esc(w['role_source'])})"
+                                            if w and w["role_reason"] else "")]
+    if w and (w["tags"] or w["label"]):
+        lines.append(f"Метки: {esc(', '.join([*(w['tags'] or []), w['label'] or '']).strip(', '))} "
+                     f"(источник: {esc(w['tags_source'] or w['label_source'] or '—')})")
+    if w and w["stats_at"]:
+        lines.append(f"PnL 7 д {w['pnl_7d'] or 0:+.2f} SOL · 30 д {w['pnl_30d'] or 0:+.2f} SOL · винрейт "
+                     f"{pct(w['winrate'], False)} · сделок {w['trades_30d'] or 0} · удержание "
+                     f"{age(w['avg_hold_s'] or 0)} · копируемость {pct(w['copyability'])} "
+                     f"(обновлено {w['stats_at']:%d.%m %H:%M})")
+    if tr:
+        lines.append(f"Смарт-мани: {'в списке' if tr['active'] else 'не отслеживается'}, уровень "
+                     f"{TIER_NAMES.get(tr['tier'], '—')}, копируемость 30 д {pct(tr['copy_30d'])}")
+    trades = await db.fetch(
+        "SELECT t.*, k.symbol FROM trades t LEFT JOIN tokens k ON k.mint=t.mint WHERE t.trader=$1 "
+        "ORDER BY t.ts DESC LIMIT 20", address)
+    if trades:
+        lines.append("\n<b>Последние сделки</b>")
+        for t in trades:
+            lines.append(f"  {'🟢' if t['is_buy'] else '🔴'} {t['ts']:%d.%m %H:%M} ${esc(t['symbol'] or '?')} "
+                         f"{t['sol_amount']:.2f} SOL · MC {mc_usd(t['mc_sol'], price)}")
+    created = await db.fetch(
+        """SELECT k.mint, k.symbol, k.created_at, l.dump_mc, l.time_to_dump_s, l.achievable_profit, l.peak_mc
+           FROM tokens k LEFT JOIN launches l ON l.mint = k.mint WHERE k.deployer=$1 OR k.identity=$1
+           ORDER BY k.created_at DESC LIMIT 10""", address)
+    if created:
+        lines.append(f"\n<b>Созданные токены</b> (последние {len(created)})")
+        for c in created:
+            res = "—" if c["achievable_profit"] is None else pct(c["achievable_profit"])
+            lines.append(f"  ${esc(c['symbol'] or '?')} {c['created_at']:%d.%m %H:%M} · пик {mc_usd(c['peak_mc'], price)}"
+                         f" · дамп {mc_usd(c['dump_mc'], price)}"
+                         + (f" через {age(c['time_to_dump_s'])}" if c["time_to_dump_s"] is not None else "")
+                         + f" · достижимо {res}")
+    if w and w["funded_by"]:
+        lines.append(f"\nФинансирован: <code>{w['funded_by']}</code> ({w['funded_sol'] or 0:.2f} SOL"
+                     + (f", {w['funded_at']:%d.%m %H:%M})" if w["funded_at"] else ")"))
+    outs = await db.fetch("SELECT dst, sum(sol) s, max(ts) ts FROM sol_transfers WHERE src=$1 GROUP BY 1 "
+                          "ORDER BY 2 DESC LIMIT 5", address)
+    if outs:
+        lines.append("Выводил SOL: " + "; ".join(f"{short(o['dst'])} {o['s']:.2f} SOL" for o in outs))
+    links = await db.fetch(
+        """SELECT l2.wallet, l2.reason, l2.confidence, l2.cluster_id FROM cluster_links l1
+           JOIN cluster_links l2 ON l2.cluster_id = l1.cluster_id AND l2.wallet <> l1.wallet
+           WHERE l1.wallet=$1 AND l1.status IN ('auto','confirmed') AND l2.status IN ('auto','confirmed')
+           LIMIT 10""", address)
+    if links:
+        lines.append(f"\n<b>Связанные кошельки</b> (кластер #{links[0]['cluster_id']})")
+        for ln in links:
+            lines.append(f"  {short(ln['wallet'])} — {esc(ln['reason'])} ({CONF_NAMES.get(ln['confidence'], '')})")
+    if ext is not None:
+        info = await ext.wallet_info(address, timeout=ext.command_timeout)
+        if info and info.get("twitter"):
+            lines.append(f"Twitter: @{esc(info['twitter'])} (GMGN)")
+    kb = [
+        [{"text": "Solscan", "url": f"https://solscan.io/account/{address}"},
+         {"text": "GMGN", "url": f"https://gmgn.ai/sol/address/{address}"}],
+        [{"text": "Отслеживать", "callback": f"wt:{address}"},
+         {"text": "В чёрный список", "callback": f"wb:{address}", "style": "danger"}],
+    ]
+    return "\n".join(lines), kb
+
+
+async def coin_view(db: Database, settings: Settings, mint: str, ext: Any = None) -> tuple[str, list[list[dict[str, Any]]]]:
+    """/coin: разбор монеты — кто дев, когда и на каком MC продавал, куда ушли SOL, похожие запуски."""
+    from ..analytics.insights import GROUP_NAMES
+    price = await sol_usd(db)
+    tok = await db.fetchrow("SELECT * FROM tokens WHERE mint=$1", mint)
+    if not tok:
+        return "Монета не найдена в базе.", []
+    la = await db.fetchrow("SELECT * FROM launches WHERE mint=$1", mint)
+    cl = await db.fetchrow("SELECT * FROM clusters WHERE id=$1", tok["cluster_id"]) if tok["cluster_id"] else None
+    mark = await db.fetchval(
+        "SELECT m.mark FROM user_marks m JOIN alerts a ON a.id=m.alert_id WHERE a.mint=$1 ORDER BY m.id DESC LIMIT 1",
+        mint)
+    ident = tok["identity"] or tok["deployer"]
+    lines = [f"🧾 <b>Разбор монеты ${esc(tok['symbol'] or '?')}</b> {tok['created_at']:%d.%m %H:%M}"]
+    why = []
+    if la and la["achievable_profit"] is not None and la["achievable_profit"] > float(settings.get("min_net_profit", 0.3)):
+        why.append(f"достижимый профит {pct(la['achievable_profit'])}")
+    if tok["migrated_at"]:
+        why.append("мигрировала")
+    if mark in ("good", "great"):
+        why.append("ваша отметка «Успешно»")
+    if why:
+        lines.append("Почему разбираем: " + ", ".join(why))
+    if la:
+        lines.append(f"MC: старт {mc_usd(la['initial_mc'], price)} · пик {mc_usd(la['peak_mc'], price)} · дамп "
+                     f"{mc_usd(la['dump_mc'], price)}"
+                     + (f" через {age(la['time_to_dump_s'])}" if la["time_to_dump_s"] is not None else "")
+                     + f" · сделок {la['trades_count'] or 0}")
+    lines.append(f"\n<b>Дев</b>: <code>{ident}</code>" + (" (создан через сервис запуска)" if ident != tok["deployer"] else ""))
+    if cl:
+        p = cl["profile"] or {}
+        ds = (p.get("extra") or {}).get("dump_spread") or {}
+        lines.append(f"Кластер #{cl['id']}: запусков со сделками {p.get('launches', 0)}, повторяемость "
+                     f"{pct(p.get('repeatability'), False)}"
+                     + (f", MC дампа {mc_usd(ds.get('p25'), price)}–{mc_usd(ds.get('p75'), price)} (медиана "
+                        f"{mc_usd(ds.get('median'), price)})" if ds else "")
+                     + (" · ⚠️ подозрительный" if cl["suspicious"] else ""))
+    w = await db.fetchrow("SELECT funded_by, funded_sol FROM wallets WHERE address=$1", ident)
+    if w and w["funded_by"]:
+        lines.append(f"Финансирование: {short(w['funded_by'])} ({w['funded_sol'] or 0:.2f} SOL)")
+    sells = ((la["features"] or {}).get("sells") or {}) if la else {}
+    if sells:
+        lines.append("\n<b>Продажи</b>")
+        for g, seq in sells.items():
+            parts = []
+            for stage, name in (("first", "первая"), ("half", "50%"), ("full", "90%")):
+                if seq.get(stage):
+                    parts.append(f"{name} через {age(seq[stage]['t'])} при MC {mc_usd(seq[stage]['mc'], price)}")
+            lines.append(f"  {GROUP_NAMES.get(g, g)} ({seq.get('wallets')} кош.): " + ("; ".join(parts) or "не продавали")
+                         + f" · продано {pct(seq.get('sold_frac'), False)}")
+    outs = await db.fetch(
+        """SELECT dst, sum(sol) s FROM sol_transfers WHERE src=$1 AND ts > $2 GROUP BY 1 ORDER BY 2 DESC LIMIT 5""",
+        ident, tok["created_at"])
+    if outs:
+        lines.append("Куда ушли SOL после запуска: " + "; ".join(f"{short(o['dst'])} {o['s']:.2f} SOL" for o in outs))
+    if tok["cluster_id"]:
+        past = await db.fetch(
+            """SELECT k.symbol, l.created_at, l.peak_mc, l.dump_mc, l.achievable_profit FROM launches l
+               JOIN tokens k ON k.mint=l.mint WHERE l.cluster_id=$1 AND l.mint<>$2 ORDER BY l.created_at DESC LIMIT 5""",
+            tok["cluster_id"], mint)
+        if past:
+            lines.append("\n<b>Прошлые и похожие запуски кластера</b>")
+            for r in past:
+                lines.append(f"  ${esc(r['symbol'] or '?')} {r['created_at']:%d.%m %H:%M} · пик {mc_usd(r['peak_mc'], price)}"
+                             f" · дамп {mc_usd(r['dump_mc'], price)} · достижимо {pct(r['achievable_profit'])}")
+    tops = await db.fetch("SELECT * FROM coin_top_traders WHERE mint=$1 ORDER BY rank", mint)
+    if tops:
+        lines.append("\n<b>Лучшие трейдеры</b> (без кластера, бандлов и снайперов)")
+        for t in tops:
+            lines.append(f"  {t['rank']}. {short(t['trader'])} {t['pnl_sol']:+.2f} SOL · вход {mc_usd(t['entry_mc'], price)}"
+                         f" → выход {mc_usd(t['exit_mc'], price)} · держал {age(t['hold_s'])}")
+    lines.append(f"\n<code>{mint}</code>")
+    kb = [[{"text": "Кошелёк дева", "callback": f"w:{ident}"}, {"text": "Отслеживать", "callback": f"trk:{mint}"}]]
+    for t in tops[:3]:
+        kb.append([{"text": f"Трейдер {short(t['trader'])}", "callback": f"w:{t['trader']}"}])
+    return "\n".join(lines), kb
