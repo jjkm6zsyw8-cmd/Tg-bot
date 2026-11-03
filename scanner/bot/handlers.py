@@ -11,7 +11,9 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObject
 
 from ..alerts.format import esc, pct
-from ..analytics.newcoins import DEFAULTS as NEW_DEFAULTS
+from ..analytics.newcoins import DEFAULTS as _NEW_DEFAULTS
+
+NEW_DEFAULTS = {**_NEW_DEFAULTS, "paper_priority_sol": 0.0005}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -118,6 +120,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                      f"Неполные данные: <b>{'ждать' if cfg.get('wait_full_data') else 'слать с пометкой'}</b>")
         kb.append([{"text": "Компактный/подробный", "callback": "tog:compact"},
                    {"text": "Ждать полные данные", "callback": "tog:wait_full_data"}])
+        pl = set(cfg.get("paper_levels") or ["strong", "normal"])
+        lines.append("Бумажная торговля входит по уровням: <b>" + (", ".join(
+            {"strong": "Сильный", "normal": "Обычный", "watch": "Наблюдение"}[x] for x in ("strong", "normal", "watch")
+            if x in pl) or "ни по каким") + "</b>")
+        kb.append([{"text": ("✅ " if x in pl else "⬜ ") + n, "callback": f"pl:{x}"}
+                   for x, n in (("strong", "Сильный"), ("normal", "Обычный"), ("watch", "Наблюдение"))])
         lines.append(f"Тихие часы: <b>{cfg.get('quiet_hours') or 'нет'}</b> · Часовой пояс: <b>{cfg.get('timezone')}</b>"
                      f" · Разбор дня в <b>{cfg.get('daily_report_time')}</b>")
         if cfg.get("trading_wallet"):
@@ -332,6 +340,14 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await remove(addr)
             await c.answer("В чёрном списке")
 
+    @router.message(Command("paper"))
+    async def cmd_paper(m: Message, command: CommandObject) -> None:
+        arg = (command.args or "").strip().lower()
+        cmd = "reset" if arg == "reset" else "history" if arg == "history" else "state"
+        await db.job("paper", {"cmd": cmd})
+        await reply(m, {"reset": "Сбрасываю портфели до $30…", "history": "Готовлю последние 20 сделок…"}.get(
+            cmd, "Готовлю состояние…") + " Ответ придёт в топик «Бумажная торговля» (или сюда, если топиков нет).")
+
     @router.message(Command("testalert"))
     async def cmd_testalert(m: Message) -> None:
         await sender.setup_topics()
@@ -420,6 +436,20 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await db.set_override("filter_preset", rest)
             view = settings_view
         text, kb = view(await reload())
+        await c.answer("Сохранено")
+        try:
+            await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("pl:"))
+    async def cb_paper_levels(c: CallbackQuery) -> None:
+        cfg = await reload()
+        lv = c.data[3:]
+        cur = set(cfg.get("paper_levels") or ["strong", "normal"])
+        cur ^= {lv}
+        await db.set_override("paper_levels", sorted(cur))
+        text, kb = settings_view(await reload())
         await c.answer("Сохранено")
         try:
             await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))

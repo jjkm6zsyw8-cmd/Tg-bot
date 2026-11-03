@@ -196,6 +196,7 @@ EDITABLE: dict[str, tuple[str, float, float, float, str]] = {
     "new_min_buyers": ("Новые: мин. покупателей", 5, 5, 200, "num"),
     "new_min_volume_sol": ("Новые: мин. объём, SOL", 2, 1, 500, "num"),
     "new_mc_min_sol": ("Новые: мин. MC, SOL", 5, 28, 1000, "num"),
+    "paper_priority_sol": ("Бумага: приоритетная комиссия, SOL", 0.0001, 0, 0.01, "num"),
 }
 
 PRESETS = ("cautious", "normal", "aggressive")

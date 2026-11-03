@@ -38,6 +38,16 @@ class Feedback:
         elif kind == "recompute_cluster":
             prof, _ = await cluster_profile(self.db, int(p["cluster_id"]), self.e.cfg)
             await save_profile(self.db, int(p["cluster_id"]), prof, self.e.cfg)
+        elif kind == "paper":
+            cmd = p.get("cmd", "")
+            if cmd == "reset":
+                await self.e.paper.reset()
+                text = "📒 Бумажная торговля сброшена: три портфеля по $30."
+            elif cmd == "history":
+                text = await self.e.paper.history(20)
+            else:
+                text = await self.e.paper.render()
+            await self.db.enqueue("text", {"topic": "paper", "text": text}, priority=4)
         elif kind == "reload":
             await self.e._load_traders()
             await self.e._load_references()

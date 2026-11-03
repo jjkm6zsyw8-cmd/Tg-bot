@@ -62,6 +62,9 @@ class Database:
         return default if v is None else v
 
     async def kv_set(self, key: str, value: Any) -> None:
+        if value is None:
+            await self.execute("DELETE FROM kv WHERE key=$1", key)
+            return
         await self.execute(
             "INSERT INTO kv(key, value, updated_at) VALUES ($1, $2, now()) "
             "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()",

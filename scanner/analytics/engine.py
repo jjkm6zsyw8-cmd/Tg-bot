@@ -25,6 +25,7 @@ from .features import launch_summary
 from .filters import check as check_filters
 from .newcoins import evaluate_new
 from .trends import Trends, Tracked
+from .paper import PaperTrader
 from ..external import ExternalHub
 from .loader import attach_cluster, cluster_profile, load_state, save_profile, state_from_token
 from .price import SolPrice, measured_fee_bps
@@ -109,6 +110,7 @@ class Engine:
         self.watch_tokens: set[str] = set()
         self.new_eval_at: dict[str, float] = {}
         self.trends = Trends(self)
+        self.paper = PaperTrader(self)
         self._ls_cache: set[str] = set()
         self._ls_loaded = 0.0
         self._cl_day: dict[int, tuple[Any, int]] = {}
@@ -167,7 +169,15 @@ class Engine:
                     self.info[a["mint"]] = TokenInfo()
         await self._load_traders()
         await self._load_references()
-        log.info("engine: %d монет в памяти, %d сопровождений", len(self.states), len(self.alerts))
+        await self.paper.start()
+        for p in self.paper.positions.values():   # монеты открытых бумажных позиций держим в памяти
+            if p.mint not in self.states:
+                st = await load_state(self.db, p.mint, cfg)
+                if st:
+                    self.states[p.mint] = st
+                    self.info[p.mint] = TokenInfo()
+        log.info("engine: %d монет в памяти, %d сопровождений, %d бумажных позиций", len(self.states),
+                 len(self.alerts), len(self.paper.positions))
 
     async def _listen(self) -> None:
         conn = await self.db.p.acquire()
@@ -186,7 +196,7 @@ class Engine:
         await self.start()
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
-                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run()]
+                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.paper.tick_loop()]
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий
@@ -393,6 +403,8 @@ class Engine:
             if n >= int(self.cfg.get("resolve_min_buyers", 8)):
                 asyncio.create_task(self._resolve_rpc(st))
         await self._maybe_new_coin(st)
+        if eff is not None and self.paper.positions:
+            await self.paper.on_trade(st, eff, trader, r["is_buy"])
         entry = self.alerts.get(mint)
         if entry and eff is not None and time.monotonic() < entry.follow_until:
             await self._follow(st, entry, eff, r)
@@ -764,6 +776,9 @@ class Engine:
             data.get("extra_reasons") or [], _jsonable(e.data), bool(data.get("incomplete")),
             int(latency * 1000) if latency is not None else None, int(cfg.get("follow_minutes", 60)))
         e.alert_ids[mode] = aid
+        if prev_mode_level is None and not e.manual:
+            # бумажная торговля входит по каждому алерту выбранных уровней (одна позиция на монету)
+            asyncio.create_task(self.paper.on_alert(mint, e.level, aid, dict(e.data), trader or e.data.get("trader")))
         text = fmt.render_alert(e.data, self.price.value, bool(cfg.get("compact")))
         profile_kind, profile_ref = ("d", str(e.data.get("cluster_id"))) if e.data.get("cluster_id") else \
             ("t", trader or e.data.get("trader") or "")
@@ -956,8 +971,9 @@ class Engine:
                 self.fee_bps = await measured_fee_bps(self.db) or self.fee_bps
                 await self._load_traders()
                 window = 60 * float(self.cfg.get("follow_minutes", 60))
+                paper_mints = {p.mint for p in self.paper.positions.values()}
                 old = [m for m, s in self.states.items()
-                       if time.time() - s.created_ts > window and m not in self.alerts]
+                       if time.time() - s.created_ts > window and m not in self.alerts and m not in paper_mints]
                 for m in old:
                     self.new_eval_at.pop(m, None)
                     st = self.states.pop(m)

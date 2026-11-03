@@ -142,6 +142,18 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
         if other:
             lines.append(f"  без алерта: {other} сделок, PnL {sum(t.own_pnl for t in trips if t.mint not in alerted):+.2f} SOL")
 
+    # 6) бумажная торговля
+    ports = await db.fetch("SELECT * FROM paper_portfolios ORDER BY name")
+    if ports:
+        lines.append("\n<b>Бумажная торговля</b> (за день)")
+        for p in ports:
+            r = await db.fetchrow(
+                """SELECT count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w, COALESCE(sum(pnl_sol), 0) pnl
+                   FROM paper_positions WHERE portfolio=$1 AND closed_at >= $2 AND closed_at < $3
+                   AND exit_reason <> 'reset'""", p["name"], start, end)
+            lines.append(f"  {p['name']}: сделок {r['n']}, удачных {r['w']}, итог {r['pnl']:+.4f} SOL "
+                         f"(${r['pnl'] * price:+.2f}); баланс {p['balance_sol']:.4f} SOL без открытых позиций")
+
     # CSV
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
