@@ -227,8 +227,7 @@ class WithdrawalWatcher:
                         t.dst, r["cluster_id"], r["hop"] + 1, r["wallet"], stopped)
                     if added and exch:
                         await self.db.enqueue("text", {"topic": "system", "text":
-                            f"Вывод кластера #{r['cluster_id']}: {t.sol:.2f} SOL ушли на биржу "
-                            f"({short(t.dst)}) — цепочка оборвана."}, priority=7)
+                            f"↗️ Кластер #{r['cluster_id']} → биржа {t.sol:.2f} SOL ({short(t.dst)})"}, priority=7)
             await asyncio.sleep(0.05)
 
     @staticmethod

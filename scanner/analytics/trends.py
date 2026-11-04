@@ -269,12 +269,8 @@ class Trends:
             "metrics": {"top10": top10} if top10 is not None else {}, "violations": [],
             "cluster_id": cluster_id, "stage": "мигрировала" if pi.dex != "pumpfun" else "на кривой",
             "exit_rule": "Выход при развороте (продажи > покупок)",
-            "extra_reasons": [
-                f"5 мин: объём {fmt.usd(pi.vol_m5)}, покупок {pi.buys_m5} / продаж {pi.sells_m5}, цена {pi.pc_m5:+.0f}%",
-                f"1 ч: объём {fmt.usd(pi.vol_h1)}, цена {pi.pc_h1:+.0f}%",
-                f"Ликвидность {fmt.usd(pi.liq_usd)} · {pi.dex} · пара {fmt.age(pi.age_h * 3600)}"
-                + (f" · буст DexScreener ×{boosts}" if boosts else "") + (" · есть соцсети" if pi.socials else ""),
-            ],
+            "trend": {"pc_m5": pi.pc_m5, "buys": pi.buys_m5, "sells": pi.sells_m5, "vol_m5": pi.vol_m5,
+                      "liq": pi.liq_usd, "boosts": boosts, "pc_h1": pi.pc_h1},
         }
         await self.e.compose("trend", pi.mint, level, data, signal="impulse")
 
@@ -301,7 +297,7 @@ class Trends:
                     if drop or rev:
                         tr.exit_price, tr.exit_reason = pi.price, "emergency"
                         await self._msg(m, pi, "trend_exit", emergency=True,
-                                        extra=f"5 мин: цена {pi.pc_m5:+.0f}%, покупок {pi.buys_m5} / продаж {pi.sells_m5}")
+                                        extra=f"разворот 5м {pi.pc_m5:+.0f}% · 🟢{pi.buys_m5}/🔴{pi.sells_m5}")
             if now - tr.alert_ts > 2 * 3600:   # итог подводит engine через finalize(); это страховка от утечки
                 self.tracked.pop(m, None)
 
@@ -332,9 +328,11 @@ class Trends:
         thr = float(self.e.cfg.get("min_net_profit", 0.3))
         auto = "great" if net >= max(1.0, 2 * thr) else "good" if net >= 0.05 else "fail"
         sol = self.e.price.value or 150
-        outcome = {"max_mc": (e.data.get("mc") or 0) * tr.max_price / entry if entry else None,
-                   "exit_mc": None, "exit_reason": reason, "net_result": net, "achievable_profit": best,
-                   "auto_mark": auto}
+        base_mc = e.data.get("entry_mc") or e.data.get("mc") or 0
+        outcome = {"max_mc": base_mc * tr.max_price / entry if entry else None,
+                   "exit_mc": base_mc * exit_p / entry if entry else None, "entry_mc": base_mc,
+                   "exit_reason": "trend_exit" if reason == "emergency" else reason, "net_result": net,
+                   "achievable_profit": best, "auto_mark": auto}
         for aid in e.alert_ids.values():
             await self.e.db.execute(
                 """INSERT INTO alert_outcomes(alert_id, max_mc, exit_reason, net_result, achievable_profit, auto_mark)

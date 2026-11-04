@@ -126,6 +126,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             if x in pl) or "ни по каким") + "</b>")
         kb.append([{"text": ("✅ " if x in pl else "⬜ ") + n, "callback": f"pl:{x}"}
                    for x, n in (("strong", "Сильный"), ("normal", "Обычный"), ("watch", "Наблюдение"))])
+        share = float(cfg.get("paper_position_share") or 0.2)
+        lines.append(f"Бумажная позиция: <b>{share:.0%}</b> баланса")
+        kb.append([{"text": ("● " if abs(share - v) < 1e-6 else "") + f"{v:.0%}", "callback": f"ps:{v}"}
+                   for v in (0.10, 0.15, 0.20, 0.25, 0.35)])
         lines.append(f"Тихие часы: <b>{cfg.get('quiet_hours') or 'нет'}</b> · Часовой пояс: <b>{cfg.get('timezone')}</b>"
                      f" · Разбор дня в <b>{cfg.get('daily_report_time')}</b>")
         if cfg.get("trading_wallet"):
@@ -446,6 +450,17 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             view = settings_view
         text, kb = view(await reload())
         await c.answer("Сохранено")
+        try:
+            await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("ps:"))
+    async def cb_paper_share(c: CallbackQuery) -> None:
+        v = float(c.data[3:])
+        await db.set_override("paper_position_share", min(0.5, max(0.05, v)))
+        text, kb = settings_view(await reload())
+        await c.answer(f"Позиция {v:.0%} баланса")
         try:
             await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
         except Exception:  # noqa: BLE001

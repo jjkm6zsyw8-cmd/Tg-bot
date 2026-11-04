@@ -259,11 +259,14 @@ def test_alert_render_first_three_lines_and_keyboard():
          "metrics": {"cluster": 0.18, "bundles": 0.09, "snipers": 0.04, "top10": 0.22}, "latency_s": 1.2}
     text = fmt.render_alert(a, 150)
     lines = text.split("\n")
-    assert "СИЛЬНЫЙ · ДЕВ" in lines[0] and "x1.9" in lines[0] and "+60%" in lines[0]
-    assert "$TICKER" in lines[1] and "MC $3.2k" in lines[1] and "14 с" in lines[1]
-    assert lines[2].startswith("Покупать до MC $3.6k") and "Цель MC $7.2k" in lines[2]
-    assert "похожих 6/8" in text and "Задержка бота: 1.2 с" in text and f"<code>{a['mint']}</code>" in text
-    assert "в течение 40 с" in lines[2] and "Смарт-мани в монете: 0" in text and "Средний MC дампа" in text
+    assert lines[0].startswith("🟢") and "ДЕВ · $TICKER" in lines[0] and "MC $3.2k" in lines[0] and "14с" in lines[0]
+    assert lines[1] == "🎯 вход ≤ $3.6k (ещё 40с) → цель $7.2k (+60%)"
+    assert lines[2].startswith("💀 сливает ~$9.0k через ~4м") and "похожих 6/8" in lines[2]
+    assert lines[3] == "👥 дев 18% · бандл 9% · снайп 4% · топ-10 22%"
+    assert lines[-1] == f"<code>{a['mint']}</code>" and len(lines) <= 6          # коротко
+    final = fmt.render_final({**a, "symbol": "TICKER"}, {"net_result": 0.24, "exit_reason": "target",
+                                                        "entry_mc": 21.3, "exit_mc": 27.0}, 150)
+    assert final.startswith("✅ <b>$TICKER</b>  прогноз +60% → <b>факт +24%</b>  ($3.2k → $4.0k, по цели)")
     kb = fmt.alert_keyboard(a["mint"], YamlConfig("config/config.yaml").section("links"), "https://bot.example",
                             "t", addr("trader"), marks_alert_id=123456789)
     assert kb[0][0]["url"] == f"https://bot.example/p/{a['mint']}"
@@ -276,7 +279,7 @@ def test_alert_render_first_three_lines_and_keyboard():
 
 def test_exit_keyboard_is_red():
     kb = fmt.exit_keyboard(addr("x"), YamlConfig("config/config.yaml").section("links"), "https://b")
-    assert all(b["style"] == "danger" for b in kb[0])
+    assert kb[0][0]["style"] == "danger" and kb[0][1]["style"] == "danger" and kb[0][2]["copy"]
 
 
 def test_quiet_hours_parsing():

@@ -94,11 +94,11 @@ async def test_paper_trader_full_cycle(monkeypatch):
         assert [r["exit_reason"] for r in rows] == ["emergency", "emergency", "emergency"]
         assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 8     # 3 входа + 2 тейка (A, B) + 3 выхода
         text = await tr.render(hourly=True)
-        assert "B: базовая" in text and "Баланс" in text
+        assert "Бумага · за 1 час" in text and "💼 A $" in text and text.count("\n") <= 6
         period = await tr.render_period(1)
-        assert "за 1 час" in period and "Итог" in period
+        assert "за 1 час" in period and "📈 A" in period
         hist = await tr.history()
-        assert "экстренный выход" in hist
+        assert "дев продал" in hist
         await tr.reset()
         assert tr.balance["A"] == pytest.approx(0.3)
     finally:

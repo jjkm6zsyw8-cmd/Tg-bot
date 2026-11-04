@@ -70,6 +70,22 @@ class TokenCheck:
     kol: int | None = None
     wallets: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    def short(self) -> str:
+        """Одна строка для алерта: 🛡 RugCheck ✓ · GMGN rug 5% · ⚠ … · нет: GMGN."""
+        parts = []
+        rc, gm = self.facts.get("rugcheck"), self.facts.get("gmgn")
+        if rc:
+            parts.append("RugCheck ⚠" if rc.get("danger_risks") else "RugCheck ✓")
+        if gm and gm.get("rug_ratio") is not None:
+            parts.append(f"GMGN rug {gm['rug_ratio']:.0%}")
+        if self.kol:
+            parts.append(f"KOL {self.kol}")
+        for w in self.warnings[:1]:
+            parts.append("⚠ " + w.split(": ", 1)[-1][:40])
+        if self.missing:
+            parts.append("нет: " + ", ".join(SOURCE_NAMES.get(m, m) for m in self.missing))
+        return ("🛡 " + " · ".join(parts)) if parts else ""
+
 
 class ExternalHub:
     def __init__(self, env: Env, db: Database, config_path: str | None = None):

@@ -492,7 +492,7 @@ class Engine:
                     "symbol": st.symbol, "mc": st.mc, "age_s": time.time() - st.created_ts,
                     "entry_max_mc": st.mc * 1.1, "target_mc": ref.get("dump_mc") and 0.8 * ref["dump_mc"],
                     "metrics": metrics, "violations": [], "link_confidence": "low",
-                    "extra_reasons": [f"Похоже на эталон {ref['mint'][:6]}…: " + ", ".join(reasons)],
+                    "note": f"🔍 похоже на эталон {ref['mint'][:6]}…: " + ", ".join(reasons),
                     "cluster_id": st.cluster_id, "stage": self._stage(st),
                 })
                 return
@@ -502,7 +502,7 @@ class Engine:
             "symbol": st.symbol, "mc": st.mc, "age_s": time.time() - st.created_ts,
             "entry_max_mc": st.mc * 1.2, "target_mc": None, "link_confidence": "high",
             "link_reason": res.reason, "cluster_id": res.cluster_id,
-            "extra_reasons": [f"Новый кошелёк известного дева (кластер #{res.cluster_id})"],
+            "note": f"🔗 новый кошелёк известного дева · кластер #{res.cluster_id}",
             "metrics": st.metrics(), "violations": [], "stage": self._stage(st),
         })
 
@@ -549,8 +549,7 @@ class Engine:
             "metrics": chk.metrics, "violations": chk.violations, "cluster_id": st.cluster_id,
             "stage": self._stage(st), "exit_rule": "Выход сразу при первой продаже дева",
             "buy_within_s": 20.0, "smart_in_coin": sum(1 for a in self.traders if st.balances.get(a, 0) > 0),
-            "extra_reasons": [f"Покупателей {chk.buyers} · объём {chk.volume:.1f} SOL · "
-                              f"покупки {chk.buy_share:.0%} объёма за минуту"],
+            "newcoin": {"buyers": chk.buyers, "volume": chk.volume, "buy_share": chk.buy_share},
         }
         if prof and prof.launches:
             data["profile"] = prof.to_json()
@@ -590,7 +589,7 @@ class Engine:
                 if pos and entry.trader_sold[r["trader"]] > 0.5 * pos and f"tsell:{r['trader']}" not in entry.flags:
                     entry.flags.add(f"tsell:{r['trader']}")
                     await self._follow_msg(entry, "trader_sell", st, emergency=True,
-                                           extra=f"Трейдер «{fmt.esc(trader['label'] or r['trader'][:6])}»")
+                                           extra=f"{trader['label'] or r['trader'][:6]} продал")
             return
         if not cfg.get("smart_filtered", True):
             return
@@ -732,8 +731,7 @@ class Engine:
             return
         for mode, m, level, data, signal, trader in queue:
             if chk is not None:
-                data = {**data, "extra_reasons": list(data.get("extra_reasons") or []) + chk.lines,
-                        "ext_missing": chk.missing}
+                data = {**data, "ext_line": chk.short(), "ext_missing": chk.missing}
                 if chk.smart is not None:
                     data["smart_in_coin_ext"] = chk.smart
                 if chk.wallets and data.get("traders"):
@@ -849,11 +847,11 @@ class Engine:
         if eff.cluster_sell and "emergency" not in e.flags:
             # экстренный сигнал — при ПЕРВОЙ продаже кластера дева, любого размера
             e.flags.add("emergency")
-            extra = f"Первая продажа кластера: {eff.sold_fraction:.0%} его позиции"
+            extra = f"дев продал {eff.sold_fraction:.0%}"
             ttd = prof.get("time_to_dump_s")
             age_s = r["ts"].timestamp() - st.created_ts
             if ttd and age_s < 0.5 * ttd:
-                extra += f"\n⚠️ Раньше обычного: через {fmt.age(age_s)} вместо ~{fmt.age(ttd)}"
+                extra += f" · раньше обычного ({fmt.ago(age_s)} вместо ~{fmt.ago(ttd)})"
             await self._follow_msg(e, "emergency", st, emergency=True, extra=extra)
         elif eff.cluster_buy_more and "dev_buys" not in e.flags:
             e.flags.add("dev_buys")
@@ -919,7 +917,7 @@ class Engine:
         auto = "scam" if rug else "great" if net >= max(1.0, 2 * thr) else "good" if net >= 0.05 else "fail"
         seen = sum(1 for t in st.trades if t.ts > t_alert)
         outcome = {"max_mc": max_mc, "exit_mc": exit_mc, "exit_reason": exit_reason, "net_result": net,
-                   "achievable_profit": best, "auto_mark": auto, "trades_after": seen}
+                   "achievable_profit": best, "auto_mark": auto, "trades_after": seen, "entry_mc": entry_mc}
         for aid in e.alert_ids.values():
             await self.db.execute(
                 """INSERT INTO alert_outcomes(alert_id, max_mc, exit_mc, exit_reason, net_result, achievable_profit,
@@ -1169,9 +1167,8 @@ class Engine:
                 await self._load_traders()
                 if res["qualified"] != last_count:
                     last_count = res["qualified"]
-                    note = " (облегчённые пороги: истории меньше 7 дней)" if res.get("bootstrap") else ""
-                    await self.db.system(f"Смарт-мани: в списке {res['qualified']} трейдеров из "
-                                         f"{res['candidates']} кандидатов{note}.")
+                    await self.db.system(f"🧠 Смарт-мани: {res['qualified']} из {res['candidates']}"
+                                         + (" (мало истории)" if res.get("bootstrap") else ""))
             except Exception:  # noqa: BLE001
                 log.exception("traders refresh")
             await asyncio.sleep(60 * float(self.cfg.get("trader_refresh_min", 60)))

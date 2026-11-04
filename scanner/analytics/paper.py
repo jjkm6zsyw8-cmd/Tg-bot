@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 START_USD = 30.0
-POSITION_SHARE = 0.20
+POSITION_SHARE = 0.20                 # по умолчанию; меняется в /settings (paper_position_share)
 MAX_OPEN = 3
 ENTRY_DELAY_S = 5.0
 EXIT_DELAY_S = 2.0
@@ -49,6 +49,8 @@ PERIOD_KEYBOARD = [
     [{"text": "24 ч", "callback": "pp:24"}, {"text": "7 д", "callback": "pp:168"}, {"text": "Всё", "callback": "pp:all"}],
     [{"text": "Последние 20 сделок", "callback": "pp:hist"}],
 ]
+EXIT_SHORT = {"emergency": "дев продал", "trader_sell": "трейдер продал", "stop": "стоп", "take_profit": "тейк",
+              "target": "цель", "trailing": "трейлинг", "time_stop": "нет роста 10м", "max_hold": "2ч без выхода"}
 EXIT_NAMES = {"emergency": "экстренный выход (продажа кластера дева)", "trader_sell": "трейдер-источник продал",
               "stop": "стоп-лосс", "take_profit": "тейк-профит 50%", "target": "цель", "trailing": "трейлинг-стоп",
               "time_stop": "стоп по времени (нет +10% за 10 мин)", "max_hold": "максимальное удержание"}
@@ -139,6 +141,8 @@ class PaperTrader:
         self.paused: dict[str, bool] = {}
         self.skipped: dict[str, str] = {}          # причина, почему не было входов за час
         self.lock = asyncio.Lock()
+        self._buf: list[str] = []                   # входы и выходы копятся и уходят одним сообщением раз в минуту
+        self._last_flush = 0.0
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -149,6 +153,9 @@ class PaperTrader:
 
     def priority(self) -> float:
         return float(self.cfg.get("paper_priority_sol", 0.0005))
+
+    def share(self) -> float:
+        return min(0.5, max(0.05, float(self.cfg.get("paper_position_share") or POSITION_SHARE)))
 
     def levels(self) -> set[str]:
         return set(self.cfg.get("paper_levels") or ["strong", "normal"])
@@ -200,31 +207,37 @@ class PaperTrader:
         if not mc or mc <= 0:
             return
         async with self.lock:
+            sizes = []
             for name in SCHEMES:
-                await self._open(name, mint, level, alert_id, data, trader, mc)
+                size = await self._open(name, mint, level, alert_id, data, trader, mc)
+                sizes.append(f"{name} {size:.3f}" if size else f"{name} —")
+        if any(not x.endswith("—") for x in sizes):
+            sol_usd = self.e.price.value or 150
+            await self._msg(f"📥 ${fmt.esc(data.get('symbol') or '?')} · MC {fmt.mc_usd(mc, sol_usd)} · "
+                            + " · ".join(sizes) + " SOL")
 
     async def _open(self, name: str, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
-                    trader: str | None, mc: float) -> None:
+                    trader: str | None, mc: float) -> float | None:
         open_here = [p for p in self.positions.values() if p.portfolio == name]
         if any(p.mint == mint for p in open_here):
             self.skipped[name] = "уже есть позиция по этой монете"
-            return
+            return None
         if len(open_here) >= MAX_OPEN:
             self.skipped[name] = f"лимит {MAX_OPEN} открытых позиций"
-            return
-        size = self.balance[name] * POSITION_SHARE
+            return None
+        size = self.balance[name] * self.share()
         min_size = max(0.01, 10 * self.priority())
         if size < min_size:
             if not self.paused.get(name):
                 self.paused[name] = True
                 await self.db.execute("UPDATE paper_portfolios SET paused=true WHERE name=$1", name)
                 await self._msg(f"⏸ Портфель {name}: баланс {self.balance[name]:.4f} SOL — меньше минимальной позиции "
-                                f"({min_size / POSITION_SHARE:.3f} SOL). Торговля на паузе, /paper reset — сброс.")
+                                f"({min_size / self.share():.3f} SOL). Торговля на паузе, /paper reset — сброс.")
             self.skipped[name] = "пауза: мал баланс"
-            return
+            return None
         fill = buy_fill(mc, size, self.fee_bps(), self.priority())
         if fill.tokens <= 0:
-            return
+            return None
         self.balance[name] -= size
         target = data.get("target_mc")
         now = datetime.now(timezone.utc)
@@ -241,9 +254,7 @@ class PaperTrader:
                                        trader=trader, symbol=data.get("symbol") or "", max_mc=mc, level=level,
                                        alert_id=alert_id)
         self.skipped.pop(name, None)
-        sol_usd = self.e.price.value or 150
-        await self._msg(f"📥 {name} вход ${fmt.esc(data.get('symbol') or '?')}: {size:.4f} SOL (${size * sol_usd:.2f}) при MC "
-                        f"{fmt.mc_usd(mc, sol_usd)}, комиссии {fill.fee_sol:.4f} SOL")
+        return size
 
     # ------------------------------------------------------------------ сопровождение
     async def on_trade(self, st: "TokenState", eff: Any, trader: str, is_buy: bool) -> None:
@@ -276,6 +287,9 @@ class PaperTrader:
                         # должны срабатывать, иначе позиция зависает навсегда и занимает слот
                         mc = float(p.extra.get("last_mc") or p.entry_mc)
                     await self._check(p, mc, None)
+                if time.time() - self._last_flush >= 60:
+                    self._last_flush = time.time()
+                    await self.flush_messages()
                 if time.time() - last_report >= 3600:
                     last_report = time.time()
                     await self.report_hourly()
@@ -329,8 +343,7 @@ class PaperTrader:
             p.closing = False
             await self.db.execute("UPDATE paper_positions SET tokens=$2, proceeds_sol=$3, tp_done=true, max_mc=$4 "
                                   "WHERE id=$1", p.id, p.tokens, p.proceeds_sol, p.max_mc)
-            await self._msg(f"📤 {p.portfolio} ${fmt.esc(p.symbol or '?')}: {EXIT_NAMES[reason]} — продано "
-                            f"{share:.0%} за {fill.sol:.4f} SOL при MC {fmt.mc_usd(mc, sol_usd)}")
+            await self._msg(f"💰 {p.portfolio} ${fmt.esc(p.symbol or '?')} тейк {share:.0%} · MC {fmt.mc_usd(mc, sol_usd)}")
             return
         pnl = p.proceeds_sol - p.cost_sol
         pct = pnl / p.cost_sol if p.cost_sol else 0.0
@@ -338,14 +351,20 @@ class PaperTrader:
             """UPDATE paper_positions SET tokens=0, proceeds_sol=$2, closed_at=$3, exit_reason=$4, pnl_sol=$5,
                    pnl_pct=$6, max_mc=$7 WHERE id=$1""", p.id, p.proceeds_sol, now, reason, pnl, pct, p.max_mc)
         self.positions.pop(p.id, None)
-        if self.paused.get(p.portfolio) and self.balance[p.portfolio] * POSITION_SHARE >= max(0.01, 10 * self.priority()):
+        if self.paused.get(p.portfolio) and self.balance[p.portfolio] * self.share() >= max(0.01, 10 * self.priority()):
             self.paused[p.portfolio] = False
             await self.db.execute("UPDATE paper_portfolios SET paused=false WHERE name=$1", p.portfolio)
-        await self._msg(f"{'✅' if pnl > 0 else '❌'} {p.portfolio} выход ${fmt.esc(p.symbol or '?')}: {EXIT_NAMES[reason]}, "
-                        f"MC {fmt.mc_usd(mc, sol_usd)}, итог {pnl:+.4f} SOL (${pnl * sol_usd:+.2f}, {pct:+.0%})")
+        await self._msg(f"{'✅' if pnl > 0 else '❌'} {p.portfolio} ${fmt.esc(p.symbol or '?')} {pct:+.0%} · "
+                        f"{EXIT_SHORT.get(reason, reason)} · {pnl:+.4f} SOL")
 
     async def _msg(self, text: str) -> None:
-        await self.db.enqueue("text", {"topic": "paper", "text": text}, priority=7)
+        self._buf.append(text)
+
+    async def flush_messages(self) -> None:
+        if not self._buf:
+            return
+        lines, self._buf = self._buf[:40], self._buf[40:]
+        await self.db.enqueue("text", {"topic": "paper", "text": "\n".join(lines)}, priority=7)
 
     # ------------------------------------------------------------------ отчёты
     async def summary(self, name: str, since: datetime | None = None) -> dict[str, Any]:
@@ -371,71 +390,61 @@ class PaperTrader:
                 "avg_win": sum(wins) / len(wins) if wins else 0.0, "avg_loss": sum(losses) / len(losses) if losses else 0.0,
                 "equity": equity, "open": open_lines, "best": best, "worst": worst}
 
-    async def render(self, hourly: bool = False) -> str:
-        sol_usd = self.e.price.value or 150
-        lines = ["📒 <b>Бумажная торговля</b>" + (" — отчёт за час" if hourly else "")]
-        hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        for name, scheme in SCHEMES.items():
-            s = await self.summary(name)
-            h = await self.summary(name, hour_ago) if hourly else None
-            start = s["port"]["start_sol"]
-            total = s["equity"] - start
-            lines.append(f"\n<b>{fmt.esc(scheme['name'])}</b>" + (" ⏸ пауза" if self.paused.get(name) else ""))
-            lines.append(f"Баланс {s['equity']:.4f} SOL (${s['equity'] * sol_usd:.2f}) · всего {total:+.4f} SOL "
-                         f"(${total * sol_usd:+.2f}, {total / start:+.1%})")
-            if h is not None:
-                if h["trades"]:
-                    lines.append(f"За час: {h['pnl_sol']:+.4f} SOL (${h['pnl_sol'] * sol_usd:+.2f}), сделок {h['trades']}")
-                else:
-                    reason = self.skipped.get(name) or self.skipped.get("*") or "не было алертов нужного уровня"
-                    lines.append(f"За час сделок нет: {reason}")
-            if s["trades"]:
-                lines.append(f"Сделок {s['trades']}, винрейт {s['wins'] / s['trades']:.0%}, средний плюс "
-                             f"{s['avg_win']:+.4f}, средний минус {s['avg_loss']:+.4f} SOL")
-                if s["best"] is not None:
-                    lines.append(f"Лучшая ${fmt.esc(s['best']['symbol'] or '?')} {s['best']['pnl_pct']:+.0%}, худшая "
-                                 f"${fmt.esc(s['worst']['symbol'] or '?')} {s['worst']['pnl_pct']:+.0%}")
-            for p, net in s["open"]:
-                lines.append(f"  открыта ${fmt.esc(p.symbol or '?')}: {net:+.0%}" + (" (тейк 50% взят)" if p.tp_done else ""))
-        self.skipped.clear()
-        return "\n".join(lines)
+    async def _row(self, since: datetime | None) -> dict[str, dict[str, Any]]:
+        return {name: await self.summary(name, since) for name in SCHEMES}
 
-    async def render_period(self, hours: float | None) -> str:
-        """Итог за период: 1 ч, 2 ч, 6 ч, 24 ч, 7 д или всё время после сброса."""
+    async def render_period(self, hours: float | None, hourly: bool = False) -> str:
+        """Все портфели одним компактным сообщением: итог за период, всего, баланс, сделки, открытые."""
         sol_usd = self.e.price.value or 150
         since = datetime.now(timezone.utc) - timedelta(hours=hours) if hours else None
-        title = PERIOD_NAMES.get(hours, f"{hours} ч")
-        lines = [f"📒 <b>Бумажная торговля — {title}</b>"]
-        for name, scheme in SCHEMES.items():
-            s = await self.summary(name, since)
-            start = s["port"]["start_sol"]
-            lines.append(f"\n<b>{fmt.esc(scheme['name'])}</b>")
-            if not s["trades"]:
-                lines.append("Закрытых сделок за период нет")
+        per = await self._row(since)
+        tot = per if hours is None else await self._row(None)
+        title = PERIOD_NAMES.get(hours, f"за {hours:g} ч")
+        lines = [f"📒 <b>Бумага · {title}</b> · позиция {self.share():.0%}"]
+
+        def pctof(name: str, v: float) -> str:
+            return f"{v / per[name]['port']['start_sol']:+.1%}"
+
+        if hours is not None:
+            if any(per[n]["trades"] for n in SCHEMES):
+                lines.append("📈 " + " · ".join(f"{n} {pctof(n, per[n]['pnl_sol'])}" for n in SCHEMES))
             else:
-                lines.append(f"Итог {s['pnl_sol']:+.4f} SOL (${s['pnl_sol'] * sol_usd:+.2f}, {s['pnl_sol'] / start:+.1%} "
-                             f"от старта) · сделок {s['trades']}, винрейт {s['wins'] / s['trades']:.0%}")
-                if s["best"] is not None:
-                    lines.append(f"Лучшая ${fmt.esc(s['best']['symbol'] or '?')} {s['best']['pnl_pct']:+.0%}, худшая "
-                                 f"${fmt.esc(s['worst']['symbol'] or '?')} {s['worst']['pnl_pct']:+.0%}")
-            lines.append(f"Баланс сейчас {s['equity']:.4f} SOL (${s['equity'] * sol_usd:.2f})")
+                why = self.skipped.get("*") or next((v for v in self.skipped.values()), "") or "не было алертов"
+                lines.append(f"⏸ сделок нет: {why}")
+        lines.append("Σ  " + " · ".join(f"{n} {tot[n]['equity'] / tot[n]['port']['start_sol'] - 1:+.0%}" for n in SCHEMES))
+        lines.append("💼 " + " · ".join(f"{n} ${tot[n]['equity'] * sol_usd:.1f}" for n in SCHEMES))
+        lines.append("🔢 " + " · ".join(
+            f"{n} {per[n]['trades']}" + (f" ({per[n]['wins'] / per[n]['trades']:.0%})" if per[n]["trades"] else "")
+            for n in SCHEMES))
+        opened = []
+        for n in SCHEMES:
+            ps = [f"${fmt.esc(p.symbol or '?')} {net:+.0%}" for p, net in tot[n]["open"]]
+            if ps:
+                opened.append(f"{n}: " + ", ".join(ps))
+        if opened:
+            lines.append("🟢 " + " | ".join(opened))
+        if hourly:
+            self.skipped.clear()
         return "\n".join(lines)
 
+    async def render(self, hourly: bool = False) -> str:
+        return await self.render_period(1 if hourly else None, hourly=hourly)
+
     async def report_hourly(self) -> None:
+        await self.flush_messages()
         await self.db.enqueue("text", {"topic": "paper", "text": await self.render(hourly=True),
                                        "keyboard": PERIOD_KEYBOARD}, priority=8)
 
     async def history(self, n: int = 20) -> str:
-        sol_usd = self.e.price.value or 150
         rows = await self.db.fetch("SELECT * FROM paper_positions WHERE closed_at IS NOT NULL AND exit_reason <> 'reset' "
                                    "ORDER BY closed_at DESC LIMIT $1", n)
         if not rows:
-            return "Закрытых бумажных сделок пока нет."
-        out = [f"📒 Последние {len(rows)} бумажных сделок"]
+            return "📒 Закрытых сделок пока нет."
+        out = [f"📒 <b>Последние {len(rows)} сделок</b>"]
         for r in rows:
-            out.append(f"{r['portfolio']} ${fmt.esc(r['symbol'] or '?')} {r['closed_at']:%d.%m %H:%M}: "
-                       f"{r['pnl_sol']:+.4f} SOL (${r['pnl_sol'] * sol_usd:+.2f}, {r['pnl_pct']:+.0%}) — "
-                       f"{EXIT_NAMES.get(r['exit_reason'], r['exit_reason'])}")
+            out.append(f"{'✅' if (r['pnl_sol'] or 0) > 0 else '❌'} {r['portfolio']} ${fmt.esc(r['symbol'] or '?')} "
+                       f"{r['pnl_pct']:+.0%} · {EXIT_SHORT.get(r['exit_reason'], r['exit_reason'])} · "
+                       f"{r['closed_at']:%H:%M}")
         return "\n".join(out)
 
     async def maybe_compare(self) -> None:

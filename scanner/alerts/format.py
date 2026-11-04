@@ -9,7 +9,6 @@ from __future__ import annotations
 import html
 from typing import Any
 
-from ..analytics.filters import compact_line
 from ..solana import short
 
 ICONS = {"strong": "🟢", "normal": "🟡", "watch": "⚪", "exit": "🔴", "info": "🔵"}
@@ -73,116 +72,121 @@ def pump_url(links: dict[str, Any], mint: str, redirect_base: str) -> str:
 def alert_keyboard(mint: str, links: dict[str, Any], redirect_base: str, profile_kind: str,
                    profile_ref: str, marks_alert_id: int | None = None,
                    wallet: str | None = None) -> list[list[dict[str, Any]]]:
+    """Ряд 1 — все площадки, ряд 2 — адрес, разбор, слежение, ряд 3 — дев/трейдер."""
     rows: list[list[dict[str, Any]]] = [
-        [{"text": "Pump.fun (приложение)", "url": pump_url(links, mint, redirect_base)},
-         {"text": "Axiom", "url": link(links["axiom"], mint=mint)}],
-        [{"text": "Скопировать адрес", "copy": mint},
-         {"text": "График", "url": link(links["chart"], mint=mint)}],
-        [{"text": "Профиль дева" if profile_kind == "d" else "Профиль трейдера",
-          "callback": f"prof:{profile_kind}:{profile_ref}"} if profile_ref and profile_ref != "None" else
-         {"text": "GMGN", "url": link(links["gmgn"], mint=mint)},
-         {"text": "Отслеживать", "callback": f"trk:{mint}"}],
+        [{"text": "Pump", "url": pump_url(links, mint, redirect_base)},
+         {"text": "Axiom", "url": link(links["axiom"], mint=mint)},
+         {"text": "DEX", "url": link(links["chart"], mint=mint)},
+         {"text": "GMGN", "url": link(links["gmgn"], mint=mint)}],
+        [{"text": "📋 Адрес", "copy": mint},
+         {"text": "🔍 Разбор", "callback": f"coin:{mint}"},
+         {"text": "👁 Следить", "callback": f"trk:{mint}"}],
     ]
+    third = []
+    if profile_ref and profile_ref != "None" and profile_kind == "d":
+        third.append({"text": "👤 Дев", "callback": f"prof:d:{profile_ref}"})
     if wallet:
-        rows.append([{"text": "Кошелёк дева" if profile_kind == "d" else "Кошелёк", "callback": f"w:{wallet}"},
-                     {"text": "Разбор монеты", "callback": f"coin:{mint}"}])
+        third.append({"text": "👛 Кошелёк", "callback": f"w:{wallet}"})
+    if third:
+        rows.append(third)
     if marks_alert_id is not None:
-        rows.append(marks_keyboard(marks_alert_id)[0])
+        rows += marks_keyboard(marks_alert_id)
     return rows
 
 
 def marks_keyboard(alert_id: int) -> list[list[dict[str, Any]]]:
     return [[
-        {"text": "Очень успешно", "callback": f"mk:{alert_id}:great", "style": "success"},
-        {"text": "Успешно", "callback": f"mk:{alert_id}:good"},
-        {"text": "Провал", "callback": f"mk:{alert_id}:fail"},
-        {"text": "Скам", "callback": f"mk:{alert_id}:scam", "style": "danger"},
+        {"text": "🚀 Отлично", "callback": f"mk:{alert_id}:great", "style": "success"},
+        {"text": "✅ Успех", "callback": f"mk:{alert_id}:good"},
+        {"text": "❌ Провал", "callback": f"mk:{alert_id}:fail"},
+        {"text": "☠️ Скам", "callback": f"mk:{alert_id}:scam", "style": "danger"},
     ]]
 
 
 def exit_keyboard(mint: str, links: dict[str, Any], redirect_base: str) -> list[list[dict[str, Any]]]:
     return [[
-        {"text": "🔴 Выйти: Pump.fun", "url": pump_url(links, mint, redirect_base), "style": "danger"},
-        {"text": "Axiom", "url": link(links["axiom"], mint=mint), "style": "danger"},
+        {"text": "🔴 Pump", "url": pump_url(links, mint, redirect_base), "style": "danger"},
+        {"text": "🔴 Axiom", "url": link(links["axiom"], mint=mint), "style": "danger"},
+        {"text": "📋 Адрес", "copy": mint},
     ]]
 
 
-def dev_block(profile: dict[str, Any] | None, link_conf: str, link_reason: str, sol_usd: float) -> list[str]:
-    if not profile:
-        return []
-    med = profile.get("medians") or {}
-    ttd = med.get("time_to_dump_s")
-    lines = [
-        f"Дев: {profile.get('launches', 0)} запусков, похожих {profile.get('similar_launches', 0)}/"
-        f"{profile.get('launches', 0)}, связь {CONF_NAMES.get(link_conf, link_conf)}"
-        + (f" ({esc(link_reason)})" if link_reason else ""),
-    ]
-    extra = profile.get("extra") or {}
-    ds = extra.get("dump_spread") or {}
-    if ds:
-        lines.append(f"Средний MC дампа: {mc_usd(ds.get('median'), sol_usd)} (25–75%: "
-                     f"{mc_usd(ds.get('p25'), sol_usd)}–{mc_usd(ds.get('p75'), sol_usd)})"
-                     + (f", через ~{age(ttd)}" if ttd else ""))
-    elif med.get("dump_mc"):
-        lines.append(f"Средний MC дампа: {mc_usd(med['dump_mc'], sol_usd)}" + (f" через ~{age(ttd)}" if ttd else ""))
-    ew = extra.get("entry_window")
-    if ew:
-        lines.append(f"Окно входа по истории: {ew['t_from']}–{ew['t_to']} с от запуска, MC "
-                     f"{mc_usd(ew['mc_from'], sol_usd)}–{mc_usd(ew['mc_to'], sol_usd)}")
-    seq = extra.get("sell_sequence") or {}
-    if seq.get("first"):
-        lines.append(f"Дев обычно начинает продавать через ~{age(seq['first']['t'])} при MC "
-                     f"{mc_usd(seq['first']['mc'], sol_usd)}")
-    if profile.get("migrated"):
-        lines.append(f"Мигрировало: {profile['migrated']}")
-    return lines
+def ago(seconds: float | None) -> str:
+    """Короткое время: 14с, 4м, 2ч10м."""
+    if seconds is None:
+        return "—"
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}с"
+    if s < 3600:
+        return f"{s // 60}м"
+    return f"{s // 3600}ч{s % 3600 // 60:02d}м"
+
+
+SHORT_MODES = {"dev": "ДЕВ", "smart": "СМАРТ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ", "trend": "ТРЕНД"}
+
+
+def predicted(a: dict[str, Any]) -> float | None:
+    """Прогноз чистого результата: у дева — расчёт потенциала, иначе — путь до цели от точки входа."""
+    if a.get("net") is not None:
+        return a["net"]
+    entry = a.get("entry_mc") or a.get("mc")
+    if a.get("target_mc") and entry:
+        return a["target_mc"] / entry - 1
+    return None
+
+
+def shares_line(m: dict[str, Any], violations: list[str]) -> str:
+    parts = []
+    for key, name in (("cluster", "дев"), ("bundles", "бандл"), ("snipers", "снайп"), ("top10", "топ-10")):
+        v = m.get(key)
+        if v is not None:
+            parts.append(("⚠" if key in violations else "") + f"{name} {v:.0%}")
+    return "👥 " + " · ".join(parts) if parts else ""
 
 
 def render_alert(a: dict[str, Any], sol_usd: float, compact: bool = False) -> str:
-    """a — объединённый алерт по монете (см. engine.Composer)."""
-    level = a["level"]
-    modes = a["modes"]
-    head_modes = " + ".join(MODE_NAMES.get(m, m.upper()) for m in modes)
-    pot = a.get("potential")
-    net = a.get("net")
-    head = f"{ICONS[level]} <b>{LEVEL_NAMES[level]} · {head_modes}</b>"
-    if pot:
-        head += f" · потенциал x{pot:.1f} (около {pct(net)} чистыми)"
-    elif a.get("signal"):
-        head += f" · {SIGNAL_NAMES.get(a['signal'], a['signal'])}"
-    l2 = f"<b>${esc(a.get('symbol') or '?')}</b> · MC {mc_usd(a['mc'], sol_usd)} · {age(a['age_s'])} от запуска"
-    exit_rule = a.get("exit_rule") or "Выход сразу при продаже кластера"
+    """Главное — в первых двух строках: что, почём, где вход, какая цель и прогноз."""
+    level, modes = a["level"], a["modes"]
+    mode = "+".join(SHORT_MODES.get(m, m.upper()) for m in modes)
+    head = (f"{ICONS[level]} <b>{mode} · ${esc(a.get('symbol') or '?')}</b> · MC {mc_usd(a['mc'], sol_usd)}"
+            f" · {ago(a.get('age_s'))}" + (" · ⏳" if a.get("incomplete") else ""))
+    pred = predicted(a)
     within = a.get("buy_within_s")
-    l3 = (f"Покупать до MC {mc_usd(a.get('entry_max_mc'), sol_usd)}"
-          + (f" в течение {age(within)}" if within else "")
-          + f" · Цель MC {mc_usd(a.get('target_mc'), sol_usd)} · {exit_rule}")
-    lines = [head, l2, l3]
-    if a.get("incomplete"):
-        lines.append("<i>⏳ данные неполные (холдеры/связи ещё досчитываются)</i>")
-    if not compact:
-        lines.append("")
-        lines += dev_block(a.get("profile"), a.get("link_confidence", "high"), a.get("link_reason", ""), sol_usd)
-        for t in a.get("traders") or []:
-            lines.append(
-                f"Трейдер «{esc(t.get('label') or short(t['address']))}» ({esc(t.get('tier_name', ''))}): "
-                f"копируемость {pct(t.get('copy_30d'))}/сделку, {pct(t.get('win_rate'), False)} удачных, "
-                f"купил {t.get('buy_sol', 0):.2f} SOL"
-                + (f" · {esc(', '.join(map(str, t['tags'][:3])))}" if t.get("tags") else "")
-                + (f" · @{esc(t['twitter'])}" if t.get("twitter") else ""))
-        smart_line = f"Смарт-мани в монете: {a.get('smart_in_coin') or 0}"
-        if a.get("smart_in_coin_ext") is not None:
-            smart_line += f" (GMGN: {a['smart_in_coin_ext']})"
-        lines.append(smart_line)
-        for r in a.get("extra_reasons") or []:
-            lines.append(esc(r))
-        metrics = a.get("metrics") or {}
-        if metrics:
-            lines.append(compact_line(metrics, a.get("violations") or []))
-        if a.get("stage"):
-            lines.append(f"Стадия: {esc(a['stage'])}")
-        if a.get("latency_s") is not None:
-            lines.append(f"Задержка бота: {a['latency_s']:.1f} с")
-    lines += ["", f"<code>{esc(a['mint'])}</code>"]
+    entry = (f"🎯 вход ≤ {mc_usd(a.get('entry_max_mc'), sol_usd)}" + (f" (ещё {ago(within)})" if within else "")
+             + f" → цель {mc_usd(a.get('target_mc'), sol_usd)}" + (f" ({pred:+.0%})" if pred is not None else ""))
+    lines = [head, entry]
+    prof = a.get("profile") or {}
+    med = prof.get("medians") or {}
+    ds = (prof.get("extra") or {}).get("dump_spread") or {}
+    dump = ds.get("median") or med.get("dump_mc")
+    if dump:
+        lines.append(f"💀 сливает ~{mc_usd(dump, sol_usd)} через ~{ago(med.get('time_to_dump_s'))} · похожих "
+                     f"{prof.get('similar_launches', 0)}/{prof.get('launches', 0)}")
+    tr = a.get("trend") or {}
+    if tr:
+        lines.append(f"📈 5м {tr.get('pc_m5', 0):+.0f}% · 🟢{tr.get('buys', 0)} / 🔴{tr.get('sells', 0)} · "
+                     f"{usd(tr.get('vol_m5'))} · ликв {usd(tr.get('liq'))}" + (" · буст" if tr.get("boosts") else ""))
+    nc = a.get("newcoin") or {}
+    if nc:
+        lines.append(f"📈 покупателей {nc.get('buyers')} · объём {nc.get('volume', 0):.0f} SOL · "
+                     f"покупки {nc.get('buy_share', 0):.0%}")
+    for t in (a.get("traders") or [])[:2]:
+        tags = ", ".join(map(str, (t.get("tags") or [])[:2]))
+        lines.append(f"🧠 {esc(t.get('label') or short(t['address']))} купил {t.get('buy_sol', 0):.2f} SOL · "
+                     f"копир {pct(t.get('copy_30d'))}" + (f" · {esc(tags)}" if tags else ""))
+    sl = shares_line(a.get("metrics") or {}, a.get("violations") or [])
+    smart = a.get("smart_in_coin") or 0
+    ext_smart = a.get("smart_in_coin_ext")
+    if smart or ext_smart:
+        sl += f" · 🧠 {smart}" + (f"/{ext_smart}" if ext_smart is not None else "")
+    if sl:
+        lines.append(sl)
+    if a.get("ext_line"):
+        lines.append(esc(a["ext_line"]))
+    if a.get("note"):
+        lines.append(esc(a["note"]))
+    lines.append(f"<code>{esc(a['mint'])}</code>")
     return "\n".join(lines)
 
 
@@ -190,38 +194,33 @@ def render_follow(kind: str, a: dict[str, Any], sol_usd: float, extra: str = "")
     sym = f"${esc(a.get('symbol') or '?')}"
     mc = mc_usd(a.get("mc"), sol_usd)
     texts = {
-        "target": f"🎯 <b>Цель достигнута</b> · {sym} · MC {mc}. Фиксируйте прибыль.",
-        "zone70": f"🟠 <b>MC дошёл до 70% типичного дампа</b> · {sym} · MC {mc}. Пора выходить.",
-        "emergency": f"🔴 <b>ВЫХОД: кластер продаёт</b> · {sym} · MC {mc}",
-        "dev_early": f"⚠️ <b>Нетипично: дев продаёт раньше обычного</b> · {sym} · MC {mc}",
-        "dev_buys": f"⚠️ <b>Нетипично: дев докупает</b> · {sym} · MC {mc}",
-        "trader_sell": f"🔴 <b>ВЫХОД: трейдер продал больше половины</b> · {sym} · MC {mc}",
-        "level_up": f"⬆️ <b>Уровень повышен</b> · {sym} · MC {mc}",
-        "pre_migration": f"🚀 <b>Скоро миграция</b> · {sym} · MC {mc}",
-        "migrated": f"🔁 <b>Мигрировала в PumpSwap</b> · {sym} · MC {mc}. Отслеживание продолжается.",
-        "trend_exit": f"🔴 <b>ВЫХОД: тренд развернулся</b> · {sym} · MC {mc}",
+        "target": f"🎯 <b>ЦЕЛЬ</b> · {sym} · MC {mc} → фиксируй",
+        "zone70": f"🟠 <b>зона дампа</b> · {sym} · MC {mc} → выходи",
+        "emergency": f"🔴 <b>ВЫХОД</b> · {sym} · {extra or 'кластер продаёт'} · MC {mc}",
+        "trader_sell": f"🔴 <b>ВЫХОД</b> · {sym} · {extra or 'трейдер продал'} >50% · MC {mc}",
+        "trend_exit": f"🔴 <b>ВЫХОД</b> · {sym} · {extra or 'разворот'} · MC {mc}",
+        "dev_buys": f"⚠️ дев докупает · {sym} · MC {mc}",
+        "level_up": f"⬆️ уровень выше · {sym} · MC {mc}",
+        "pre_migration": f"🚀 скоро миграция · {sym} · MC {mc}",
+        "migrated": f"🔁 миграция · {sym} · MC {mc}",
     }
-    out = texts.get(kind, f"{kind} · {sym} · MC {mc}")
-    if extra:
-        out += "\n" + extra
-    return out + f"\n<code>{esc(a['mint'])}</code>"
+    return texts.get(kind, f"{kind} · {sym} · MC {mc}") + f"\n<code>{esc(a['mint'])}</code>"
+
+
+EXIT_SHORT = {"target": "по цели", "emergency": "дев продал", "timeout": "60 мин", "trader_sell": "трейдер продал",
+              "trend_exit": "разворот"}
 
 
 def render_final(a: dict[str, Any], outcome: dict[str, Any], sol_usd: float) -> str:
+    """Прогноз → факт одной строкой."""
     res = outcome.get("net_result")
-    best = outcome.get("achievable_profit")
-    reason = {"target": "по цели", "emergency": "по экстренному сигналу", "timeout": "через 60 мин",
-              "trader_sell": "по продаже трейдера"}.get(outcome.get("exit_reason"), "")
-    auto = {"great": "Очень успешно", "good": "Успешно", "fail": "Провал", "scam": "Скам"}.get(
-        outcome.get("auto_mark") or "", "—")
+    pred = predicted(a)
     icon = "✅" if (res or 0) > 0 else "❌"
-    return "\n".join([
-        f"📊 <b>Итог 60 минут</b> · ${esc(a.get('symbol') or '?')}",
-        f"{icon} <b>Результат по сигналу: {pct(res)}</b> (вход +{a.get('reaction_s', 5)} с, выход {reason})",
-        f"Для сравнения: максимум MC {mc_usd(outcome.get('max_mc'), sol_usd)}, при идеальном выходе {pct(best)}",
-        f"Предварительная оценка по результату: {auto}. Ваша отметка важнее — бот учится на ней.",
-        f"<code>{esc(a['mint'])}</code>",
-    ])
+    entry, exit_mc = outcome.get("entry_mc"), outcome.get("exit_mc")
+    path = (f"{mc_usd(entry, sol_usd)} → {mc_usd(exit_mc, sol_usd)}, " if entry and exit_mc else "")
+    return (f"{icon} <b>${esc(a.get('symbol') or '?')}</b>  прогноз {pct(pred)} → <b>факт {pct(res)}</b>  "
+            f"({path}{EXIT_SHORT.get(outcome.get('exit_reason'), outcome.get('exit_reason') or '')})"
+            f"\n<code>{esc(a['mint'])}</code>")
 
 
 def render_full_line(t: dict[str, Any], sol_usd: float) -> str:

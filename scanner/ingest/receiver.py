@@ -391,13 +391,12 @@ class Receiver:
                 if pp_down and not self.helius.gate.is_set():
                     self.helius.gate.set()
                     self.helius_opened_at = now
-                    await self.db.system("⚠️ PumpPortal недоступен — включён резервный поток Helius "
-                                         "(тарифицируется по трафику).")
+                    await self.db.system("⚠️ PumpPortal упал → резерв Helius (платный трафик)")
                 elif (self.helius.gate.is_set() and self.pp.connected and now - self.pp.connected_since > 120
                       and now - self.helius_opened_at > 120):
                     self.helius.gate.clear()
                     await self.helius.close_now()
-                    await self.db.system("✅ PumpPortal снова работает — резервный поток Helius выключен.")
+                    await self.db.system("✅ PumpPortal снова в строю → резерв Helius выключен")
             active = [s for s in self.sources if s.gate.is_set()]
             alive = [s for s in active if s.connected]
             if not alive:
@@ -419,12 +418,10 @@ class Receiver:
             if self.pp.has_key and self.pp.connected and now - self.pp.connected_since > 600:
                 trades = sum(self.pp.messages_by_pool.values())
                 if (len(self.pp.token_subs) >= 50 and trades == self._pp_trades_seen
-                        and now - self._pp_warned > 3600):
+                        and now - self._pp_warned > 6 * 3600):
                     self._pp_warned = now
-                    why = f" Ответ PumpPortal: «{self.pp.refused}»." if self.pp.refused else ""
-                    await self.db.system(
-                        "⛔ PumpPortal не присылает сделки: подписок " f"{len(self.pp.token_subs)}, сделок за 10+ мин — 0."
-                        + why + " Проверьте баланс кошелька API-ключа на solscan.io — нужно не меньше 0.02 SOL.")
+                    await self.db.system("⛔ PumpPortal: нет сделок — пополнить кошелёк ключа ≥0.02 SOL"
+                                         + (" (отказ по балансу)" if self.pp.refused else ""))
                 if now - self._pp_mark_at > 600:
                     self._pp_trades_seen, self._pp_mark_at = trades, now
             # всплеск ошибок парсинга → «Система»
@@ -501,8 +498,9 @@ class Receiver:
                 parts.append(f"{r['source']}: {r['c']}/{r['total']} ({cov:.1%})")
                 low |= r["source"] != "rpc" and cov < target
             await self.db.kv_set("coverage", {"at": datetime.now(timezone.utc).isoformat(), "parts": parts})
-            if low or len(rows) < len(self.sources):
-                await self.db.system("📉 Покрытие за час ниже цели: " + "; ".join(parts))
+            active = [x for x in self.sources if x.gate.is_set()]   # выключенный резерв не считается
+            if low or len(rows) < len(active):
+                await self.db.system("📉 Покрытие за час: " + "; ".join(parts))
             await self.db.execute("DELETE FROM source_creates WHERE seen_at < now() - interval '2 days'")
 
     async def accounts_loop(self) -> None:

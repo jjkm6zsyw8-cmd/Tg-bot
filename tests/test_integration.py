@@ -152,7 +152,7 @@ async def test_end_to_end(monkeypatch):
                 break
         assert alert, f"алерт по деву не создан: {engine.info[live].last_decision} {engine.info[live].profile}"
         p = alert["payload"]
-        assert "ДЕВ" in p["text"].split("\n")[0] and "потенциал" in p["text"]
+        assert "ДЕВ" in p["text"].split("\n")[0] and p["text"].split("\n")[1].startswith("🎯 вход")
         assert p["topic"] == "strong" and p["level"] == "strong"
         assert any(b.get("copy") == live for row in p["keyboard"] for b in row)
         row = await db.fetchrow("SELECT * FROM alerts WHERE mint=$1 AND mode='dev'", live)
@@ -175,7 +175,7 @@ async def test_end_to_end(monkeypatch):
         await rec.flush()
         await engine._consume()
         emerg = await db.fetchrow("SELECT * FROM outbox WHERE kind='follow' AND (payload->>'emergency')::bool")
-        assert emerg and "кластер продаёт" in emerg["payload"]["text"]
+        assert emerg and "ВЫХОД" in emerg["payload"]["text"] and "дев продал" in emerg["payload"]["text"]
         assert emerg["priority"] == 0
         assert emerg["payload"]["keyboard"][0][0]["style"] == "danger"
 
@@ -187,7 +187,7 @@ async def test_end_to_end(monkeypatch):
         out = await db.fetchrow("SELECT * FROM alert_outcomes WHERE alert_id=$1", row["id"])
         assert out["exit_reason"] in ("target", "emergency") and out["auto_mark"]
         final = await db.fetchrow("SELECT * FROM outbox WHERE kind='final'")
-        assert "Итог 60 минут" in final["payload"]["text"]
+        assert "прогноз" in final["payload"]["text"] and "факт" in final["payload"]["text"]
         assert final["payload"]["keyboard"][0][0]["callback"] == f"mk:{row['id']}:great"
 
         await db.execute("INSERT INTO user_marks(alert_id, user_id, mark) VALUES ($1, 111, 'good')", row["id"])
@@ -228,7 +228,7 @@ async def test_end_to_end(monkeypatch):
         await sender.drain()
         assert any("ДЕВ" in m["text"] for m in fake.sent)
         assert await db.fetchval("SELECT message_id FROM token_messages WHERE mint=$1", live)
-        emerg_msgs = [m for m in fake.sent if "кластер продаёт" in m["text"]]
+        emerg_msgs = [m for m in fake.sent if "ВЫХОД" in m["text"]]
         assert emerg_msgs and emerg_msgs[0]["disable_notification"] is False
         # пауза глушит обычные алерты, но не экстренные
         await db.kv_set("mute_until", (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
