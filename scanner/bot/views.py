@@ -267,6 +267,11 @@ async def health_view(db: Database) -> str:
     if ing:
         if not ing.get("pumpportal_key"):
             lines.append("  ⚠️ нет PUMPPORTAL_API_KEY — сделки не собираются (нужен ключ с 0.02 SOL)")
+        elif ing.get("pumpportal_refused"):
+            lines.append("  ⛔ PumpPortal отказал в сделках: «" + esc(ing["pumpportal_refused"][:150]) +
+                         "» — пополните кошелёк API-ключа до 0.02 SOL")
+        elif ing.get("pumpportal_subs", 0) >= 50 and not ing.get("pumpportal_trades"):
+            lines.append("  ⛔ подписки есть, а сделок от PumpPortal 0 — проверьте баланс кошелька API-ключа")
         lines.append(f"  подписок на сделки {ing.get('pumpportal_subs', 0)}, продлено {ing.get('extended', 0)}, "
                      f"Helius: {ing.get('helius_mode', 'off')}")
         lines.append(f"  очередь событий {ing.get('queue', 0)} (потеряно {ing.get('dropped', 0)}), досбора "

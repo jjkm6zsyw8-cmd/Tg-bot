@@ -129,6 +129,7 @@ class PumpPortalSource(Source):
         self._pending_unsub: set[str] = set()
         self._lock = asyncio.Lock()
         self.messages_by_pool: dict[str, int] = {"pump": 0, "pump-amm": 0}
+        self.refused = ""          # ответ PumpPortal, если он отказал в подписке на сделки
 
     async def subscribe_tokens(self, mints: list[str]) -> None:
         if not self.has_key:
@@ -215,6 +216,7 @@ class PumpPortalSource(Source):
                     if ev is None:
                         if isinstance(msg, dict) and msg.get("message") and "only available" in str(msg["message"]):
                             log.warning("pumpportal: %s", msg["message"])
+                            self.refused = str(msg["message"])[:300]
                         continue
                     self.mark_event()
                     if isinstance(ev, Trade):

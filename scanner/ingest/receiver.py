@@ -88,6 +88,9 @@ class Receiver:
         self.dropped = 0
         self.backfill_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=5000)
         self.helius_opened_at = 0.0
+        self._pp_trades_seen = -1
+        self._pp_mark_at = 0.0
+        self._pp_warned = 0.0
         self.seen = LruSet()
         self.buf_tokens: list[TokenCreated] = []
         self.buf_trades: list[Trade] = []
@@ -412,6 +415,18 @@ class Receiver:
                     await self.db.system("✅ Соединение восстановлено, досбор пропущенного через RPC (очередь).")
                     asyncio.create_task(self.backfill())
                 all_down_since, gap_id = None, None
+            # подписки на сделки есть, а сделок нет — PumpPortal не принимает ключ (нет 0.02 SOL на кошельке)
+            if self.pp.has_key and self.pp.connected and now - self.pp.connected_since > 600:
+                trades = sum(self.pp.messages_by_pool.values())
+                if (len(self.pp.token_subs) >= 50 and trades == self._pp_trades_seen
+                        and now - self._pp_warned > 3600):
+                    self._pp_warned = now
+                    why = f" Ответ PumpPortal: «{self.pp.refused}»." if self.pp.refused else ""
+                    await self.db.system(
+                        "⛔ PumpPortal не присылает сделки: подписок " f"{len(self.pp.token_subs)}, сделок за 10+ мин — 0."
+                        + why + " Проверьте баланс кошелька API-ключа на solscan.io — нужно не меньше 0.02 SOL.")
+                if now - self._pp_mark_at > 600:
+                    self._pp_trades_seen, self._pp_mark_at = trades, now
             # всплеск ошибок парсинга → «Система»
             threshold = self.settings.reliability().get("parse_error_alert_per_min", 20)
             errs = sum(s.stats.errors_last_minute() for s in self.sources) + self.backfill_stats.errors_last_minute()
@@ -550,6 +565,7 @@ class Receiver:
                     "parse_ok": s.stats.ok, "parse_errors": s.stats.errors,
                 } for s in self.sources],
                 "pumpportal_key": self.pp.has_key, "pumpportal_subs": len(self.pp.token_subs),
+                "pumpportal_trades": sum(self.pp.messages_by_pool.values()), "pumpportal_refused": self.pp.refused,
                 "helius_mode": self.env.helius_stream if self.helius else "off",
                 "queue": self.queue.qsize(), "dropped": self.dropped, "extended": len(self.extended),
                 "tracked_mints": len(self.tracked_mints), "backfill_queue": self.backfill_q.qsize(),
