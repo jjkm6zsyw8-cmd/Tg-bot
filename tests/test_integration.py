@@ -133,6 +133,7 @@ async def test_end_to_end(monkeypatch):
 
         # --- живой запуск: алерт в первые секунды
         await engine.start()
+        engine._feed_ts.extend([time.monotonic()] * 25)   # поток сделок жив
         t0 = datetime.now(timezone.utc)
         live = rand_addr()
         c = Curve()

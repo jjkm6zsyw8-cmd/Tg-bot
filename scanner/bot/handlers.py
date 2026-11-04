@@ -348,6 +348,15 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await reply(m, {"reset": "Сбрасываю портфели до $30…", "history": "Готовлю последние 20 сделок…"}.get(
             cmd, "Готовлю состояние…") + " Ответ придёт в топик «Бумажная торговля» (или сюда, если топиков нет).")
 
+    @router.callback_query(F.data.startswith("pp:"))
+    async def cb_paper_period(c: CallbackQuery) -> None:
+        arg = c.data[3:]
+        if arg == "hist":
+            await db.job("paper", {"cmd": "history"})
+        else:
+            await db.job("paper", {"cmd": "period", "hours": None if arg == "all" else float(arg)})
+        await c.answer("Считаю…")
+
     @router.message(Command("testalert"))
     async def cmd_testalert(m: Message) -> None:
         await sender.setup_topics()

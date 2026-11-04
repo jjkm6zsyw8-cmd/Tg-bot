@@ -114,6 +114,8 @@ class Engine:
         self._ls_cache: set[str] = set()
         self._ls_loaded = 0.0
         self._cl_day: dict[int, tuple[Any, int]] = {}
+        from collections import deque
+        self._feed_ts: deque[float] = deque(maxlen=5000)
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -372,9 +374,19 @@ class Engine:
                                   {"text": "Отклонить", "callback": f"lk:{lid}:n", "style": "danger"}]],
                 }, priority=6)
 
+    def trade_feed_ok(self) -> bool:
+        """Есть ли живой поток сделок: за 5 минут пришло 20+ сделок помимо покупок дева в транзакции создания.
+        Без него алерты «Девы» и «Новые монеты» вслепую: нет цены после алерта и не видно продажи дева."""
+        cut = time.monotonic() - 300
+        while self._feed_ts and self._feed_ts[0] < cut:
+            self._feed_ts.popleft()
+        return len(self._feed_ts) >= 20
+
     async def _on_trade(self, r: Any) -> None:
         mint = r["mint"]
         st = self.states.get(mint)
+        if st is None or r["trader"] != st.deployer or r["ts"].timestamp() - st.created_ts > 2:
+            self._feed_ts.append(time.monotonic())
         trader = r["trader"]
         tracked = trader in self.traders
         if st is None and (tracked or mint in self.alerts or mint in self.watch_tokens):
@@ -435,6 +447,10 @@ class Engine:
             return
         st, info = self.states.get(mint), self.info.get(mint)
         if not st or not info:
+            return
+        if not self.trade_feed_ok():
+            info.last_reason = "no_trade_data"
+            info.last_decision.update({"reason": "no_trade_data"})
             return
         snap = self._snapshot(st, info)
         dec = evaluate_dev(info.profile, snap, cfg, self.costs())
@@ -507,7 +523,7 @@ class Engine:
         if e and "new" in e.modes:
             return
         now = time.time()
-        if now - self.new_eval_at.get(st.mint, 0) < 1.0:
+        if now - self.new_eval_at.get(st.mint, 0) < 1.0 or not self.trade_feed_ok():
             return
         self.new_eval_at[st.mint] = now
         info = self.info.get(st.mint)
@@ -899,9 +915,11 @@ class Engine:
         best = trade_net_profit(entry_mc, max_mc, pos, costs)
         thr = float(cfg.get("min_net_profit", 0.3))
         rug = st.big_sell_ts is not None and st.big_sell_ts - t_alert < 30 and st.mc_at(st.big_sell_ts + 5) < 0.5 * entry_mc
-        auto = "scam" if rug else "great" if best >= max(1.0, 2 * thr) else "good" if best >= thr else "fail"
+        # предварительная оценка — по фактическому результату сигнала, а не по достижимому максимуму
+        auto = "scam" if rug else "great" if net >= max(1.0, 2 * thr) else "good" if net >= 0.05 else "fail"
+        seen = sum(1 for t in st.trades if t.ts > t_alert)
         outcome = {"max_mc": max_mc, "exit_mc": exit_mc, "exit_reason": exit_reason, "net_result": net,
-                   "achievable_profit": best, "auto_mark": auto}
+                   "achievable_profit": best, "auto_mark": auto, "trades_after": seen}
         for aid in e.alert_ids.values():
             await self.db.execute(
                 """INSERT INTO alert_outcomes(alert_id, max_mc, exit_mc, exit_reason, net_result, achievable_profit,
@@ -916,6 +934,9 @@ class Engine:
             text = fmt.render_final({**e.data, "mint": e.mint, "symbol": st.symbol}, outcome, self.price.value)
             await self.db.enqueue("follow", {"mint": e.mint, "text": text, "keyboard": None, "emergency": False,
                                              "kind": "final"}, priority=5)
+            return
+        if seen == 0:
+            # после алерта не было ни одной сделки (нет данных) — итог записан, но в чат не шлём
             return
         main_id = e.alert_ids.get("dev") or next(iter(e.alert_ids.values()), None)
         text = fmt.render_final({**e.data, "symbol": st.symbol}, outcome, self.price.value)
@@ -988,6 +1009,7 @@ class Engine:
                 await self.db.kv_set("health:analytics", {
                     "at": datetime.now(timezone.utc).isoformat(), "tokens_in_memory": len(self.states),
                     "following": len(self.alerts), "tracked_traders": len(self.traders),
+                    "trade_feed_ok": self.trade_feed_ok(),
                     "sol_usd": self.price.value, "fee_bps": self.fee_bps,
                     "latency_median_s": _median(self.latencies), "latency_p95_s": _pct(self.latencies, 0.95),
                 })
@@ -1018,9 +1040,10 @@ class Engine:
             self.trends.tracked[r["mint"]] = Tracked(r["mint"], alert_price, e.alert_ts or time.time(),
                                                       target_price, max_price=price,
                                                       flags={"target"} if "target" in e.flags else set())
-            await self._follow_msg(e, "migrated", st or TokenState(mint=r["mint"], deployer="", created_ts=0,
-                                                                 symbol=e.data.get("symbol") or ""),
-                                   extra="Сопровождение продолжается по данным DexScreener.")
+            from types import SimpleNamespace
+            view = SimpleNamespace(symbol=(st.symbol if st else e.data.get("symbol")) or "", mc=mc_usd / sol)
+            await self._follow_msg(e, "migrated", view,  # type: ignore[arg-type]
+                                   extra="MC — по DexScreener. Сопровождение продолжается по его данным.")
             e.flags.add("migrated")
 
     async def finalize_launch(self, st: TokenState, info: TokenInfo | None) -> None:

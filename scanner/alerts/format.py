@@ -214,11 +214,12 @@ def render_final(a: dict[str, Any], outcome: dict[str, Any], sol_usd: float) -> 
               "trader_sell": "по продаже трейдера"}.get(outcome.get("exit_reason"), "")
     auto = {"great": "Очень успешно", "good": "Успешно", "fail": "Провал", "scam": "Скам"}.get(
         outcome.get("auto_mark") or "", "—")
+    icon = "✅" if (res or 0) > 0 else "❌"
     return "\n".join([
         f"📊 <b>Итог 60 минут</b> · ${esc(a.get('symbol') or '?')}",
-        f"Максимум MC {mc_usd(outcome.get('max_mc'), sol_usd)} · достижимый профит {pct(best)}",
-        f"Результат алерта (вход +{a.get('reaction_s', 5)} с, выход {reason}): {pct(res)}",
-        f"Предварительная оценка: {auto}. Отметьте результат — отметка важнее авторазметки.",
+        f"{icon} <b>Результат по сигналу: {pct(res)}</b> (вход +{a.get('reaction_s', 5)} с, выход {reason})",
+        f"Для сравнения: максимум MC {mc_usd(outcome.get('max_mc'), sol_usd)}, при идеальном выходе {pct(best)}",
+        f"Предварительная оценка по результату: {auto}. Ваша отметка важнее — бот учится на ней.",
         f"<code>{esc(a['mint'])}</code>",
     ])
 

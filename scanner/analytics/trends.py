@@ -330,7 +330,7 @@ class Trends:
         net = (exit_p / entry) * (1 - f) ** 2 - 1 if entry else 0.0
         best = (tr.max_price / entry) * (1 - f) ** 2 - 1 if entry else 0.0
         thr = float(self.e.cfg.get("min_net_profit", 0.3))
-        auto = "great" if best >= max(1.0, 2 * thr) else "good" if best >= thr else "fail"
+        auto = "great" if net >= max(1.0, 2 * thr) else "good" if net >= 0.05 else "fail"
         sol = self.e.price.value or 150
         outcome = {"max_mc": (e.data.get("mc") or 0) * tr.max_price / entry if entry else None,
                    "exit_mc": None, "exit_reason": reason, "net_result": net, "achievable_profit": best,

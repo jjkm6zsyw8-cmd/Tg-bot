@@ -25,6 +25,7 @@ REASONS = {
     "no_profile": "нет кластера",
     "suspicious": "подозрительный кластер (50+ запусков в сутки)",
     "external_filters": "внешние фильтры безопасности",
+    "no_trade_data": "нет потока сделок (PumpPortal)",
 }
 
 

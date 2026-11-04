@@ -42,6 +42,13 @@ SCHEMES: dict[str, dict[str, Any]] = {
     "C": {"name": "C: только экстренный выход и цель", "stop": None, "tp_net": None, "tp_share": 0.0, "trail": None,
           "target": True, "time_stop_s": None, "time_stop_gain": None},
 }
+PERIOD_NAMES = {1: "за 1 час", 2: "за 2 часа", 6: "за 6 часов", 24: "за 24 часа", 168: "за 7 дней",
+                None: "за всё время"}
+PERIOD_KEYBOARD = [
+    [{"text": "1 ч", "callback": "pp:1"}, {"text": "2 ч", "callback": "pp:2"}, {"text": "6 ч", "callback": "pp:6"}],
+    [{"text": "24 ч", "callback": "pp:24"}, {"text": "7 д", "callback": "pp:168"}, {"text": "Всё", "callback": "pp:all"}],
+    [{"text": "Последние 20 сделок", "callback": "pp:hist"}],
+]
 EXIT_NAMES = {"emergency": "экстренный выход (продажа кластера дева)", "trader_sell": "трейдер-источник продал",
               "stop": "стоп-лосс", "take_profit": "тейк-профит 50%", "target": "цель", "trailing": "трейлинг-стоп",
               "time_stop": "стоп по времени (нет +10% за 10 мин)", "max_hold": "максимальное удержание"}
@@ -393,8 +400,30 @@ class PaperTrader:
         self.skipped.clear()
         return "\n".join(lines)
 
+    async def render_period(self, hours: float | None) -> str:
+        """Итог за период: 1 ч, 2 ч, 6 ч, 24 ч, 7 д или всё время после сброса."""
+        sol_usd = self.e.price.value or 150
+        since = datetime.now(timezone.utc) - timedelta(hours=hours) if hours else None
+        title = PERIOD_NAMES.get(hours, f"{hours} ч")
+        lines = [f"📒 <b>Бумажная торговля — {title}</b>"]
+        for name, scheme in SCHEMES.items():
+            s = await self.summary(name, since)
+            start = s["port"]["start_sol"]
+            lines.append(f"\n<b>{fmt.esc(scheme['name'])}</b>")
+            if not s["trades"]:
+                lines.append("Закрытых сделок за период нет")
+            else:
+                lines.append(f"Итог {s['pnl_sol']:+.4f} SOL (${s['pnl_sol'] * sol_usd:+.2f}, {s['pnl_sol'] / start:+.1%} "
+                             f"от старта) · сделок {s['trades']}, винрейт {s['wins'] / s['trades']:.0%}")
+                if s["best"] is not None:
+                    lines.append(f"Лучшая ${fmt.esc(s['best']['symbol'] or '?')} {s['best']['pnl_pct']:+.0%}, худшая "
+                                 f"${fmt.esc(s['worst']['symbol'] or '?')} {s['worst']['pnl_pct']:+.0%}")
+            lines.append(f"Баланс сейчас {s['equity']:.4f} SOL (${s['equity'] * sol_usd:.2f})")
+        return "\n".join(lines)
+
     async def report_hourly(self) -> None:
-        await self.db.enqueue("text", {"topic": "paper", "text": await self.render(hourly=True)}, priority=8)
+        await self.db.enqueue("text", {"topic": "paper", "text": await self.render(hourly=True),
+                                       "keyboard": PERIOD_KEYBOARD}, priority=8)
 
     async def history(self, n: int = 20) -> str:
         sol_usd = self.e.price.value or 150

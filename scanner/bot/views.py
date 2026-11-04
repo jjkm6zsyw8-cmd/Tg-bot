@@ -280,6 +280,8 @@ async def health_view(db: Database) -> str:
     lines += await data_health(db)
     lines.append(f"Аналитика: обновлено {ago(ana.get('at'))}, монет в памяти {ana.get('tokens_in_memory', 0)}, "
                  f"сопровождений {ana.get('following', 0)}, трейдеров {ana.get('tracked_traders', 0)}")
+    if ana and not ana.get("trade_feed_ok", True):
+        lines.append("⛔ Потока сделок нет — алерты «Девы» и «Новые монеты» на паузе (работают «Тренды»)")
     med, p95 = ana.get("latency_median_s"), ana.get("latency_p95_s")
     lines.append(f"Задержка до алерта: медиана {med:.1f} с, p95 {p95:.1f} с (цель ≤1.5 / ≤3 с)" if med else
                  "Задержка до алерта: ещё нет алертов")

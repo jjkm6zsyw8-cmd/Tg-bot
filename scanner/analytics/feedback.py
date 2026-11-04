@@ -45,9 +45,13 @@ class Feedback:
                 text = "📒 Бумажная торговля сброшена: три портфеля по $30."
             elif cmd == "history":
                 text = await self.e.paper.history(20)
+            elif cmd == "period":
+                h = p.get("hours")
+                text = await self.e.paper.render_period(float(h) if h else None)
             else:
                 text = await self.e.paper.render()
-            await self.db.enqueue("text", {"topic": "paper", "text": text}, priority=4)
+            from .paper import PERIOD_KEYBOARD
+            await self.db.enqueue("text", {"topic": "paper", "text": text, "keyboard": PERIOD_KEYBOARD}, priority=4)
         elif kind == "reload":
             await self.e._load_traders()
             await self.e._load_references()
