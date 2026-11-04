@@ -113,3 +113,11 @@ async def test_exit_uses_current_price_not_peak(monkeypatch):
     p.max_mc = 400.0                       # когда-то был пик ×10
     p.extra["last_mc"] = 30.0              # сейчас цена упала
     assert await tr.current_mc(p) == 30.0
+
+
+def test_position_without_price_still_hits_time_rules():
+    """Регрессия: позиция без источника цены висела часами и не закрывалась."""
+    p = pos(entry=40.0)
+    assert decide_exit(p, 40.0, 601, pp.SCHEMES["A"], 125, 0.0005) == ("time_stop", 1.0)
+    p2 = pos(entry=40.0)
+    assert decide_exit(p2, 40.0, pp.MAX_HOLD_S + 1, pp.SCHEMES["C"], 125, 0.0005) == ("max_hold", 1.0)

@@ -264,8 +264,11 @@ class PaperTrader:
                         pair = await self.e.ext.dex_pair(p.mint, timeout=2.0)   # после миграции — DexScreener
                         if pair and pair.get("market_cap_usd"):
                             mc = pair["market_cap_usd"] / (self.e.price.value or 150)
-                    if mc:
-                        await self._check(p, mc, None)
+                    if not mc:
+                        # цены нет (монета без сделок и без пары на DexScreener): правила по времени всё равно
+                        # должны срабатывать, иначе позиция зависает навсегда и занимает слот
+                        mc = float(p.extra.get("last_mc") or p.entry_mc)
+                    await self._check(p, mc, None)
                 if time.time() - last_report >= 3600:
                     last_report = time.time()
                     await self.report_hourly()
