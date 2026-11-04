@@ -184,7 +184,12 @@ class PaperTrader:
             return
         await asyncio.sleep(ENTRY_DELAY_S)          # реакция пользователя
         st = self.e.states.get(mint)
-        mc = st.mc if st is not None else data.get("mc")
+        mc = st.mc if st is not None else None
+        if mc is None and getattr(self.e, "ext", None) is not None:
+            pair = await self.e.ext.dex_pair(mint, timeout=2.0)       # цена через 5 с после алерта
+            if pair and pair.get("market_cap_usd"):
+                mc = pair["market_cap_usd"] / (self.e.price.value or 150)
+        mc = mc or data.get("mc")
         if not mc or mc <= 0:
             return
         async with self.lock:
@@ -270,6 +275,7 @@ class PaperTrader:
 
     async def _check(self, p: Position, mc: float, emergency: str | None) -> None:
         scheme = SCHEMES[p.portfolio]
+        p.extra["last_mc"] = mc
         decision = decide_exit(p, mc, time.time(), scheme, self.fee_bps(), self.priority(), emergency)
         if decision is None or p.closing:
             return
@@ -279,10 +285,21 @@ class PaperTrader:
 
     async def _exit_later(self, p: Position, reason: str, share: float) -> None:
         await asyncio.sleep(EXIT_DELAY_S)            # реакция на сигнал выхода
-        st = self.e.states.get(p.mint)
-        mc = st.mc if st is not None else p.max_mc
+        mc = await self.current_mc(p)                # ТЕКУЩАЯ цена через 2 с, а не максимум за позицию
         async with self.lock:
             await self._sell(p, reason, share, mc)
+
+    async def current_mc(self, p: Position) -> float:
+        """Текущий MC: свой поток сделок → DexScreener → последнее наблюдённое значение (не максимум)."""
+        st = self.e.states.get(p.mint)
+        if st is not None and st.mc > 0:
+            return st.mc
+        ext = getattr(self.e, "ext", None)
+        if ext is not None:
+            pair = await ext.dex_pair(p.mint, timeout=2.0)
+            if pair and pair.get("market_cap_usd"):
+                return pair["market_cap_usd"] / (self.e.price.value or 150)
+        return float(p.extra.get("last_mc") or p.entry_mc)
 
     async def _sell(self, p: Position, reason: str, share: float, mc: float) -> None:
         tokens = p.tokens * share if share < 1 else p.tokens

@@ -101,3 +101,15 @@ async def test_paper_trader_full_cycle(monkeypatch):
         assert tr.balance["A"] == pytest.approx(0.3)
     finally:
         await db.close()
+
+
+async def test_exit_uses_current_price_not_peak(monkeypatch):
+    """Регрессия: монета без своего потока сделок закрывалась по максимуму за позицию."""
+    monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
+    eng = SimpleNamespace(states={}, ext=None, price=SimpleNamespace(value=100.0))
+    tr = pp.PaperTrader.__new__(pp.PaperTrader)
+    tr.e = eng
+    p = pos(entry=40.0)
+    p.max_mc = 400.0                       # когда-то был пик ×10
+    p.extra["last_mc"] = 30.0              # сейчас цена упала
+    assert await tr.current_mc(p) == 30.0
