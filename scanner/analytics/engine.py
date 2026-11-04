@@ -198,7 +198,7 @@ class Engine:
         await self.start()
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
-                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.paper.tick_loop()]
+                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.paper.tick_loop()]
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий
@@ -1152,6 +1152,11 @@ class Engine:
                     await self.recompute_profiles()
                     await self.db.system(f"Ночной пересчёт: трейдеров-кандидатов {res['candidates']}, "
                                          f"прошли фильтр {res['qualified']}.")
+                    if cfg.get("trend_autotune", True):
+                        from .tuning import tune_trends
+                        tr = await tune_trends(self.db, cfg)
+                        self.trends.tuned = await self.db.kv_get("trends:tuned") or {}
+                        await self.db.system(tr.text(cfg))
                 except Exception:  # noqa: BLE001
                     log.exception("nightly")
 

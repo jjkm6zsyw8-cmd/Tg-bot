@@ -73,10 +73,11 @@ async def test_paper_trader_full_cycle(monkeypatch):
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         assert tr.balance["B"] == pytest.approx(0.3)                    # $30 при SOL = $100
+        n = len(pp.SCHEMES)
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0, "target_mc": 90.0}, None)
-        assert len(tr.positions) == 3 and tr.balance["B"] == pytest.approx(0.24)   # 20% баланса
+        assert len(tr.positions) == n and tr.balance["B"] == pytest.approx(0.21)   # «Сильный»: 20% × 1.5 = 30%
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0}, None)
-        assert len(tr.positions) == 3                                    # одна позиция на монету
+        assert len(tr.positions) == n                                    # одна позиция на монету
         st.mc = 56.0
         for p in list(tr.positions.values()):
             await tr._check(p, 56.0, None)
@@ -85,18 +86,27 @@ async def test_paper_trader_full_cycle(monkeypatch):
         assert b.tp_done                                                 # B продал 50% на +30%
         assert next(p for p in tr.positions.values() if p.portfolio == "A").tp_done
         assert not any(p.tp_done for p in tr.positions.values() if p.portfolio == "C")
+        assert next(p for p in tr.positions.values() if p.portfolio == "D").tp_done   # тейк 50% на +20%
+        assert not any(p.portfolio == "G" for p in tr.positions.values())             # скальп: всё на +25%
         st.mc = 45.0
         for p in list(tr.positions.values()):
             await tr._check(p, 45.0, "emergency")
         await __import__("asyncio").sleep(0.05)
         assert not tr.positions
         rows = await db.fetch("SELECT portfolio, pnl_sol, exit_reason FROM paper_positions ORDER BY portfolio")
-        assert [r["exit_reason"] for r in rows] == ["emergency", "emergency", "emergency"]
-        assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 8     # 3 входа + 2 тейка (A, B) + 3 выхода
+        assert [r["exit_reason"] for r in rows] == ["emergency"] * 6 + ["take_profit"]
+        # 7 входов + 3 частичных тейка (A, B, D) + 7 полных выходов
+        assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 17
+        await tr.flush_messages()
+        exits = await db.fetchval("SELECT payload->>'text' FROM outbox WHERE kind='text' ORDER BY id DESC LIMIT 1")
+        closed = [x for x in exits.split("\n") if x[:1] in "✅❌"]
+        assert len(closed) == 1 and "G +" in closed[0]          # выходы по монете из 7 портфелей — одной строкой
         text = await tr.render(hourly=True)
-        assert "Бумага · за 1 час" in text and "💼 A $" in text and text.count("\n") <= 6
+        assert "Бумага · за 1 час" in text and "<pre>" in text and "G" in text and text.count("\n") <= 12
         period = await tr.render_period(1)
-        assert "за 1 час" in period and "📈 A" in period
+        assert "за 1 час" in period and "★" in period and "скальп" in period
+        whole = await tr.render()                                 # /paper и кнопка «Всё» (hours=None)
+        assert "за всё время" in whole and "период" not in whole
         hist = await tr.history()
         assert "дев продал" in hist
         await tr.reset()
@@ -123,3 +133,35 @@ def test_position_without_price_still_hits_time_rules():
     assert decide_exit(p, 40.0, 601, pp.SCHEMES["A"], 125, 0.0005) == ("time_stop", 1.0)
     p2 = pos(entry=40.0)
     assert decide_exit(p2, 40.0, pp.MAX_HOLD_S + 1, pp.SCHEMES["C"], 125, 0.0005) == ("max_hold", 1.0)
+
+
+def test_new_schemes_d_to_g():
+    d = pp.SCHEMES["D"]
+    assert decide_exit(pos(), 51.0, 10, d, 125, 0.0005) == ("take_profit", 0.5)        # +20% чистыми
+    assert decide_exit(pos(), 35.5, 10, d, 125, 0.0005) == ("stop", 1.0)               # −11%
+    e = pp.SCHEMES["E"]
+    assert decide_exit(pos(), 56.0, 10, e, 125, 0.0005) is None                         # +30% ещё мало
+    assert decide_exit(pos(), 42.0, 700, e, 125, 0.0005) is None                        # стоп по времени — 15 мин
+    f = pp.SCHEMES["F"]
+    p = pos()
+    assert decide_exit(p, 46.0, 10, f, 125, 0.0005) is None                             # +15% цены ≈ +10% чистыми
+    assert decide_exit(p, 52.0, 20, f, 125, 0.0005) is None                             # трейлинг включился
+    assert decide_exit(p, 44.0, 30, f, 125, 0.0005) == ("trailing", 1.0)               # −15% от пика
+    p2 = pos()
+    assert decide_exit(p2, 44.0, 30, f, 125, 0.0005) is None                            # без +15% трейлинга нет
+    g = pp.SCHEMES["G"]
+    assert decide_exit(pos(), 53.0, 10, g, 125, 0.0005) == ("take_profit", 1.0)        # всё на +25%
+    assert decide_exit(pos(), 42.0, 301, g, 125, 0.0005) == ("time_stop", 1.0)          # 5 минут
+    assert decide_exit(pos(target=50.0), 50.0, 10, g, 125, 0.0005) is None             # цель алерта не используется
+
+
+def test_position_size_by_signal_level():
+    tr = pp.PaperTrader.__new__(pp.PaperTrader)
+    tr.e = SimpleNamespace(cfg={"paper_position_share": 0.2})
+    assert tr.share_for("strong") == pytest.approx(0.30)
+    assert tr.share_for("normal") == pytest.approx(0.15)
+    assert tr.share_for("watch") == pytest.approx(0.10)
+    tr.e = SimpleNamespace(cfg={"paper_position_share": 0.4})
+    assert tr.share_for("strong") == pytest.approx(0.5)                                 # потолок 50%
+    tr.e = SimpleNamespace(cfg={"paper_position_share": 0.2, "paper_size_by_level": False})
+    assert tr.share_for("strong") == pytest.approx(0.2)

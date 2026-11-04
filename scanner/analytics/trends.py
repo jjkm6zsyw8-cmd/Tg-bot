@@ -6,6 +6,7 @@
   * Solana RPC — топ-10 холдеров (getTokenLargestAccounts) для отсечения монет «у одного кошелька».
 
 Каждые 30 с: собрать кандидатов → пакетно получить пары → проверить импульс → алерт.
+Сопровождение открытых — каждые 5 с (пачкой до 30 монет за запрос).
 Сопровождение 60 минут по данным DexScreener: цель, разворот (экстренный выход), итог.
 """
 from __future__ import annotations
@@ -134,6 +135,8 @@ class Trends:
         self.boosts: dict[str, int] = {}
         self.alerted_at: dict[str, float] = {}
         self.tracked: dict[str, Tracked] = {}
+        self.edited: dict[str, float] = {}
+        self.tuned: dict[str, Any] = {}        # пороги, подобранные по истории (analytics/tuning.py)
         self.tick = 0
         self.stats = {"candidates": 0, "checked": 0, "alerts": 0, "errors": 0}
 
@@ -213,24 +216,50 @@ class Trends:
             accs = accs[1:]          # на кривой крупнейший — аккаунт bonding curve
         return sum(accs[:10]) / total
 
+    def tcfg(self) -> dict[str, Any]:
+        """Настройки режима: подобранные по истории пороги поверх базовых; ручные настройки — главнее."""
+        cfg = dict(self.e.cfg)
+        if cfg.get("trend_autotune", True):
+            manual = self.e.settings.overrides
+            for k, v in self.tuned.items():
+                if k not in manual:
+                    cfg[k] = v
+        return cfg
+
     async def run(self) -> None:
+        from .tuning import KV_KEY
         await asyncio.sleep(20)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
             while True:
                 try:
-                    cfg = self.e.cfg
+                    if self.tick % 10 == 0:
+                        self.tuned = await self.e.db.kv_get(KV_KEY) or {}
+                    cfg = self.tcfg()
                     if cfg.get("modes", {}).get("trend", True):
                         await self.discover(http)
                         await self.scan(http, cfg)
-                    await self.follow(http, cfg)
                     await self.e.db.kv_set("health:trends", {**self.stats, "tracked": len(self.tracked)})
                 except Exception:  # noqa: BLE001
                     log.exception("trends")
                 self.tick += 1
                 await asyncio.sleep(30)
 
+    async def fast_follow_loop(self) -> None:
+        """Сопровождение тренд-монет каждые 5 с (пачкой до 30 монет за запрос) — выход по развороту раньше."""
+        await asyncio.sleep(25)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
+            while True:
+                try:
+                    await self.follow(http, self.e.cfg)
+                except Exception:  # noqa: BLE001
+                    log.exception("trends follow")
+                await asyncio.sleep(5)
+
     async def scan(self, http: aiohttp.ClientSession, cfg: dict[str, Any]) -> None:
         now = time.time()
+        bad_hours = set(cfg.get("trend_bad_hours") or [])
+        if time.gmtime(now).tm_hour in bad_hours:
+            return   # по истории алерты в этот час (UTC) проигрывают — автоподбор фильтров
         mints = [m for m in self.cands if now - self.alerted_at.get(m, 0) > 6 * 3600 and m not in self.tracked]
         info = await self.pairs(http, mints)
         self.stats["checked"] = len(info)
@@ -270,7 +299,8 @@ class Trends:
             "cluster_id": cluster_id, "stage": "мигрировала" if pi.dex != "pumpfun" else "на кривой",
             "exit_rule": "Выход при развороте (продажи > покупок)",
             "trend": {"pc_m5": pi.pc_m5, "buys": pi.buys_m5, "sells": pi.sells_m5, "vol_m5": pi.vol_m5,
-                      "liq": pi.liq_usd, "boosts": boosts, "pc_h1": pi.pc_h1},
+                      "liq": pi.liq_usd, "boosts": boosts, "pc_h1": pi.pc_h1, "mc_usd": pi.mc_usd,
+                      "age_h": pi.age_h},
         }
         await self.e.compose("trend", pi.mint, level, data, signal="impulse")
 
@@ -286,7 +316,9 @@ class Trends:
                 tr.max_price = max(tr.max_price, pi.price)
                 if e is not None:
                     e.data["mc"] = pi.mc_usd / (self.e.price.value or 150)
-                    await self.e._edit(e)
+                    if now - self.edited.get(m, 0) >= 30:   # проверяем каждые 5 с, а сообщение правим раз в 30 с
+                        self.edited[m] = now
+                        await self.e._edit(e)
                 if tr.exit_price is None:
                     if pi.price >= tr.target_price and "target" not in tr.flags:
                         tr.flags.add("target")
@@ -300,6 +332,7 @@ class Trends:
                                         extra=f"разворот 5м {pi.pc_m5:+.0f}% · 🟢{pi.buys_m5}/🔴{pi.sells_m5}")
             if now - tr.alert_ts > 2 * 3600:   # итог подводит engine через finalize(); это страховка от утечки
                 self.tracked.pop(m, None)
+                self.edited.pop(m, None)
 
     async def _msg(self, mint: str, pi: PairInfo, kind: str, emergency: bool = False, extra: str = "") -> None:
         mc_sol = pi.mc_usd / (self.e.price.value or 150)
@@ -311,6 +344,7 @@ class Trends:
     async def finalize(self, e: "AlertEntry") -> None:
         """Итог алерта «Тренды» по ценам DexScreener."""
         tr = self.tracked.pop(e.mint, None)
+        self.edited.pop(e.mint, None)
         if tr is None:
             return
         costs = self.e.costs()

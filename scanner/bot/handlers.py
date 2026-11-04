@@ -59,6 +59,9 @@ HELP = """<b>Pump.fun Dev Scanner</b>
 /quiet 01:00-08:00 · /tz Europe/Moscow · /dailytime 21:00 · /mywallet &lt;адрес&gt;"""
 
 
+TOGGLES_ON_BY_DEFAULT = {"smart_filtered", "paper_size_by_level", "trend_autotune"}
+
+
 def setup(router: Router, env: Env, settings: Settings, db: Database, sender: Any) -> None:
     from ..external import ExternalHub
     ext = ExternalHub(env, db)   # внешние источники только по командам /token, /dev, /trader
@@ -101,6 +104,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             [{"text": f"{on(cfg.get('smart_full_feed'))} Лента полного режима вместе с фильтрованным",
               "callback": "tog:smart_full_feed"}],
             [{"text": f"{on(cfg.get('watch_level_enabled'))} Уровень «Наблюдение»", "callback": "tog:watch_level_enabled"}],
+            [{"text": f"{on(cfg.get('trend_autotune', True))} Тренды: автоподбор фильтров по истории",
+              "callback": "tog:trend_autotune"}],
         ]
         return text, kb
 
@@ -127,9 +132,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         kb.append([{"text": ("✅ " if x in pl else "⬜ ") + n, "callback": f"pl:{x}"}
                    for x, n in (("strong", "Сильный"), ("normal", "Обычный"), ("watch", "Наблюдение"))])
         share = float(cfg.get("paper_position_share") or 0.2)
-        lines.append(f"Бумажная позиция: <b>{share:.0%}</b> баланса")
+        by_level = cfg.get("paper_size_by_level", True)
+        lines.append(f"Бумажная позиция: <b>{share:.0%}</b> баланса"
+                     + (" · по силе сигнала: Сильный ×1.5, Обычный ×0.75" if by_level else ""))
         kb.append([{"text": ("● " if abs(share - v) < 1e-6 else "") + f"{v:.0%}", "callback": f"ps:{v}"}
                    for v in (0.10, 0.15, 0.20, 0.25, 0.35)])
+        kb.append([{"text": f"{'✅' if by_level else '⬜'} Размер по силе сигнала", "callback": "tog:paper_size_by_level"}])
         lines.append(f"Тихие часы: <b>{cfg.get('quiet_hours') or 'нет'}</b> · Часовой пояс: <b>{cfg.get('timezone')}</b>"
                      f" · Разбор дня в <b>{cfg.get('daily_report_time')}</b>")
         if cfg.get("trading_wallet"):
@@ -352,6 +360,16 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await reply(m, {"reset": "Сбрасываю портфели до $30…", "history": "Готовлю последние 20 сделок…"}.get(
             cmd, "Готовлю состояние…") + " Ответ придёт в топик «Бумажная торговля» (или сюда, если топиков нет).")
 
+    @router.message(Command("tune"))
+    async def cmd_tune(m: Message) -> None:
+        """Автоподбор фильтров «Трендов» по истории (обучение 2/3, проверка 1/3)."""
+        from ..analytics.tuning import tune_trends
+        cfg = await reload()
+        res = await tune_trends(db, cfg)
+        tail = ("\nПрименится в течение 5 минут. Ночью (03:00 UTC) подбор повторяется сам."
+                if res.adopted else "")
+        await reply(m, res.text(cfg) + tail)
+
     @router.callback_query(F.data.startswith("pp:"))
     async def cb_paper_period(c: CallbackQuery) -> None:
         arg = c.data[3:]
@@ -437,8 +455,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await db.set_override("modes", modes)
             view = mode_view
         elif kind == "tog":
-            await db.set_override(rest, not cfg.get(rest, rest == "smart_filtered"))
-            view = mode_view if rest in ("smart_filtered", "smart_full_feed", "watch_level_enabled") else settings_view
+            await db.set_override(rest, not cfg.get(rest, rest in TOGGLES_ON_BY_DEFAULT))
+            view = mode_view if rest in ("smart_filtered", "smart_full_feed", "watch_level_enabled",
+                                         "trend_autotune") else settings_view
         elif kind == "set":
             key, _, sign = rest.partition(":")
             label, step, lo, hi, _k = EDITABLE[key]

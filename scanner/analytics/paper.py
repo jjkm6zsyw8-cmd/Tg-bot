@@ -41,7 +41,18 @@ SCHEMES: dict[str, dict[str, Any]] = {
           "time_stop_s": 600, "time_stop_gain": 0.10},
     "C": {"name": "C: только экстренный выход и цель", "stop": None, "tp_net": None, "tp_share": 0.0, "trail": None,
           "target": True, "time_stop_s": None, "time_stop_gain": None},
+    "D": {"name": "D: тейк 50% на +20%, трейл 10%, стоп −10%", "stop": 0.10, "tp_net": 0.20, "tp_share": 0.5,
+          "trail": 0.10, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
+    "E": {"name": "E: тейк 50% на +50%, трейл 20%, стоп −15%", "stop": 0.15, "tp_net": 0.50, "tp_share": 0.5,
+          "trail": 0.20, "target": True, "time_stop_s": 900, "time_stop_gain": 0.10},
+    "F": {"name": "F: без тейка, трейл 15% после +15%, стоп −10%", "stop": 0.10, "tp_net": None, "tp_share": 0.0,
+          "trail": 0.15, "trail_after_net": 0.15, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
+    "G": {"name": "G: скальп — всё на +25%, стоп −8%, 5 мин", "stop": 0.08, "tp_net": 0.25, "tp_share": 1.0,
+          "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
 }
+LEGEND = "A стоп−6% · B база · C только цель · D тейк+20% · E тейк+50% · F трейл после +15% · G скальп +25%"
+TICK_S = 2.0          # проверка открытых позиций (стоп/тейк/трейлинг) раз в 2 с
+LEVEL_SIZE = {"strong": 1.5, "normal": 0.75, "watch": 0.5}   # размер позиции по силе сигнала (× базовая доля)
 PERIOD_NAMES = {1: "за 1 час", 2: "за 2 часа", 6: "за 6 часов", 24: "за 24 часа", 168: "за 7 дней",
                 None: "за всё время"}
 PERIOD_KEYBOARD = [
@@ -50,10 +61,10 @@ PERIOD_KEYBOARD = [
     [{"text": "Последние 20 сделок", "callback": "pp:hist"}],
 ]
 EXIT_SHORT = {"emergency": "дев продал", "trader_sell": "трейдер продал", "stop": "стоп", "take_profit": "тейк",
-              "target": "цель", "trailing": "трейлинг", "time_stop": "нет роста 10м", "max_hold": "2ч без выхода"}
+              "target": "цель", "trailing": "трейлинг", "time_stop": "нет роста", "max_hold": "2ч без выхода"}
 EXIT_NAMES = {"emergency": "экстренный выход (продажа кластера дева)", "trader_sell": "трейдер-источник продал",
               "stop": "стоп-лосс", "take_profit": "тейк-профит 50%", "target": "цель", "trailing": "трейлинг-стоп",
-              "time_stop": "стоп по времени (нет +10% за 10 мин)", "max_hold": "максимальное удержание"}
+              "time_stop": "стоп по времени (нет +10% за 5–15 мин)", "max_hold": "максимальное удержание"}
 
 
 # ---------------------------------------------------------------------- исполнение (чистые функции)
@@ -121,7 +132,8 @@ def decide_exit(pos: Position, mc: float, now: float, scheme: dict[str, Any], fe
         return "target", 1.0
     if scheme.get("tp_net") is not None and not pos.tp_done and net >= scheme["tp_net"]:
         return "take_profit", scheme["tp_share"]
-    if scheme.get("trail") is not None and pos.tp_done and mc <= pos.max_mc * (1 - scheme["trail"]):
+    trail_on = pos.tp_done or (scheme.get("trail_after_net") is not None and pos.max_net >= scheme["trail_after_net"])
+    if scheme.get("trail") is not None and trail_on and mc <= pos.max_mc * (1 - scheme["trail"]):
         return "trailing", 1.0
     if (scheme.get("time_stop_s") and now - pos.opened_ts >= scheme["time_stop_s"]
             and pos.max_net < scheme["time_stop_gain"] and not pos.tp_done):
@@ -142,6 +154,7 @@ class PaperTrader:
         self.skipped: dict[str, str] = {}          # причина, почему не было входов за час
         self.lock = asyncio.Lock()
         self._buf: list[str] = []                   # входы и выходы копятся и уходят одним сообщением раз в минуту
+        self._exits: dict[str, list[tuple[str, float, str]]] = {}
         self._last_flush = 0.0
 
     @property
@@ -156,6 +169,13 @@ class PaperTrader:
 
     def share(self) -> float:
         return min(0.5, max(0.05, float(self.cfg.get("paper_position_share") or POSITION_SHARE)))
+
+    def share_for(self, level: str) -> float:
+        """Базовая доля × сила сигнала: «Сильный» ×1.5, «Обычный» ×0.75 (если включено), не больше 50%."""
+        base = self.share()
+        if self.cfg.get("paper_size_by_level", True):
+            base *= LEVEL_SIZE.get(level, 1.0)
+        return min(0.5, base)
 
     def levels(self) -> set[str]:
         return set(self.cfg.get("paper_levels") or ["strong", "normal"])
@@ -200,7 +220,7 @@ class PaperTrader:
         st = self.e.states.get(mint)
         mc = st.mc if st is not None else None
         if mc is None and getattr(self.e, "ext", None) is not None:
-            pair = await self.e.ext.dex_pair(mint, timeout=2.0)       # цена через 5 с после алерта
+            pair = await self.e.ext.dex_pair(mint, timeout=2.0, ttl=1.0)   # цена через 5 с после алерта
             if pair and pair.get("market_cap_usd"):
                 mc = pair["market_cap_usd"] / (self.e.price.value or 150)
         mc = mc or data.get("mc")
@@ -225,7 +245,7 @@ class PaperTrader:
         if len(open_here) >= MAX_OPEN:
             self.skipped[name] = f"лимит {MAX_OPEN} открытых позиций"
             return None
-        size = self.balance[name] * self.share()
+        size = self.balance[name] * self.share_for(level)
         min_size = max(0.01, 10 * self.priority())
         if size < min_size:
             if not self.paused.get(name):
@@ -273,15 +293,21 @@ class PaperTrader:
     async def tick_loop(self) -> None:
         last_report = time.time()
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(TICK_S)
             try:
-                for p in list(self.positions.values()):
+                ps = list(self.positions.values())
+                # монеты без своего потока сделок — одной пачкой в DexScreener (до 30 за запрос)
+                need = [p.mint for p in ps if self.e.states.get(p.mint) is None]
+                ext = getattr(self.e, "ext", None)
+                pairs = await ext.dex_pairs(need, timeout=3.0, ttl=TICK_S) if need and ext is not None else {}
+                sol_usd = self.e.price.value or 150
+                for p in ps:
                     st = self.e.states.get(p.mint)
                     mc = st.mc if st is not None else None
                     if mc is None:
-                        pair = await self.e.ext.dex_pair(p.mint, timeout=2.0)   # после миграции — DexScreener
+                        pair = pairs.get(p.mint)
                         if pair and pair.get("market_cap_usd"):
-                            mc = pair["market_cap_usd"] / (self.e.price.value or 150)
+                            mc = pair["market_cap_usd"] / sol_usd
                     if not mc:
                         # цены нет (монета без сделок и без пары на DexScreener): правила по времени всё равно
                         # должны срабатывать, иначе позиция зависает навсегда и занимает слот
@@ -320,7 +346,7 @@ class PaperTrader:
             return st.mc
         ext = getattr(self.e, "ext", None)
         if ext is not None:
-            pair = await ext.dex_pair(p.mint, timeout=2.0)
+            pair = await ext.dex_pair(p.mint, timeout=2.0, ttl=1.0)
             if pair and pair.get("market_cap_usd"):
                 return pair["market_cap_usd"] / (self.e.price.value or 150)
         return float(p.extra.get("last_mc") or p.entry_mc)
@@ -354,13 +380,18 @@ class PaperTrader:
         if self.paused.get(p.portfolio) and self.balance[p.portfolio] * self.share() >= max(0.01, 10 * self.priority()):
             self.paused[p.portfolio] = False
             await self.db.execute("UPDATE paper_portfolios SET paused=false WHERE name=$1", p.portfolio)
-        await self._msg(f"{'✅' if pnl > 0 else '❌'} {p.portfolio} ${fmt.esc(p.symbol or '?')} {pct:+.0%} · "
-                        f"{EXIT_SHORT.get(reason, reason)} · {pnl:+.4f} SOL")
+        self._exits.setdefault(p.symbol or "?", []).append((p.portfolio, pct, EXIT_SHORT.get(reason, reason)))
 
     async def _msg(self, text: str) -> None:
         self._buf.append(text)
 
     async def flush_messages(self) -> None:
+        # выходы по одной монете из всех портфелей — одной строкой: ✅ $SYM A +12% цель · B +8% трейлинг …
+        for sym, xs in sorted(self._exits.items()):
+            avg = sum(x[1] for x in xs) / len(xs)
+            self._buf.append(f"{'✅' if avg > 0 else '❌'} ${fmt.esc(sym)} " + " · ".join(
+                f"{n} {pct:+.0%} {why}" for n, pct, why in sorted(xs)))
+        self._exits.clear()
         if not self._buf:
             return
         lines, self._buf = self._buf[:40], self._buf[40:]
@@ -379,7 +410,7 @@ class PaperTrader:
         open_lines = []
         for p in open_ps:
             st = self.e.states.get(p.mint)
-            mc = st.mc if st is not None else p.max_mc
+            mc = st.mc if st is not None else float(p.extra.get("last_mc") or p.entry_mc)   # текущая, не максимум
             v = sell_fill(mc, p.tokens, self.fee_bps(), self.priority()).sol if p.tokens else 0.0
             open_value += v
             open_lines.append((p, (p.proceeds_sol + v) / p.cost_sol - 1 if p.cost_sol else 0.0))
@@ -399,30 +430,38 @@ class PaperTrader:
         since = datetime.now(timezone.utc) - timedelta(hours=hours) if hours else None
         per = await self._row(since)
         tot = per if hours is None else await self._row(None)
-        title = PERIOD_NAMES.get(hours, f"за {hours:g} ч")
-        lines = [f"📒 <b>Бумага · {title}</b> · позиция {self.share():.0%}"]
+        title = PERIOD_NAMES.get(hours) or f"за {hours:g} ч"   # f-строка в get() считалась и при hours=None
+        lines = [f"📒 <b>Бумага · {title}</b> · позиция {self.share():.0%}"
+                 + (" (×1.5 сильный / ×0.75 обычный)" if self.cfg.get("paper_size_by_level", True) else "")]
 
-        def pctof(name: str, v: float) -> str:
-            return f"{v / per[name]['port']['start_sol']:+.1%}"
-
-        if hours is not None:
-            if any(per[n]["trades"] for n in SCHEMES):
-                lines.append("📈 " + " · ".join(f"{n} {pctof(n, per[n]['pnl_sol'])}" for n in SCHEMES))
-            else:
-                why = self.skipped.get("*") or next((v for v in self.skipped.values()), "") or "не было алертов"
-                lines.append(f"⏸ сделок нет: {why}")
-        lines.append("Σ  " + " · ".join(f"{n} {tot[n]['equity'] / tot[n]['port']['start_sol'] - 1:+.0%}" for n in SCHEMES))
-        lines.append("💼 " + " · ".join(f"{n} ${tot[n]['equity'] * sol_usd:.1f}" for n in SCHEMES))
-        lines.append("🔢 " + " · ".join(
-            f"{n} {per[n]['trades']}" + (f" ({per[n]['wins'] / per[n]['trades']:.0%})" if per[n]["trades"] else "")
-            for n in SCHEMES))
-        opened = []
+        no_trades = hours is not None and not any(per[n]["trades"] for n in SCHEMES)
+        if no_trades:
+            why = self.skipped.get("*") or next((v for v in self.skipped.values()), "") or "не было алертов"
+            lines.append(f"⏸ сделок нет: {why}")
+        # таблица: портфель · за период · всего · баланс · сделки (доля прибыльных); ★ — лидер по «всего»
+        leader = max(SCHEMES, key=lambda n: tot[n]["equity"] / tot[n]["port"]["start_sol"])
+        head = ("    " + (f"{'период':>7}" if hours is not None else "") + f"{'всего':>7}{'баланс':>8}  сделки")
+        rows = [head]
         for n in SCHEMES:
-            ps = [f"${fmt.esc(p.symbol or '?')} {net:+.0%}" for p, net in tot[n]["open"]]
-            if ps:
-                opened.append(f"{n}: " + ", ".join(ps))
-        if opened:
-            lines.append("🟢 " + " | ".join(opened))
+            start_sol = tot[n]["port"]["start_sol"]
+            cnt = per[n]["trades"]
+            row = f"{n}{'★' if n == leader else ' '}  "
+            if hours is not None:
+                row += f"{per[n]['pnl_sol'] / per[n]['port']['start_sol']:>+7.1%}"
+            row += f"{tot[n]['equity'] / start_sol - 1:>+7.0%}{'$' + format(tot[n]['equity'] * sol_usd, '.1f'):>8}  {cnt}"
+            if cnt:
+                row += f" ({per[n]['wins'] / cnt:.0%})"
+            rows.append(row)
+        lines.append("<pre>" + "\n".join(rows) + "</pre>")
+        # открытые позиции — по монетам: 🟢 $SYM A +5% B +3% …
+        by_mint: dict[str, list[str]] = {}
+        for n in SCHEMES:
+            for p, net in tot[n]["open"]:
+                by_mint.setdefault(p.symbol or "?", []).append(f"{n} {net:+.0%}")
+        for sym, xs in by_mint.items():
+            lines.append(f"🟢 ${fmt.esc(sym)} " + " ".join(xs))
+        if not hourly:
+            lines.append(f"<i>{LEGEND}</i>")
         if hourly:
             self.skipped.clear()
         return "\n".join(lines)

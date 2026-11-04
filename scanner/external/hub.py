@@ -274,11 +274,18 @@ class ExternalHub:
         return None if info is None else bool(info.get("is_exchange"))
 
     # ------------------------------------------------------------------ цены и пары
-    async def dex_pair(self, mint: str, timeout: float | None = None) -> dict[str, Any] | None:
-        ok, v = await self._call(self.dex, self.dex.pair(mint), timeout or self.timeout)
+    async def dex_pair(self, mint: str, timeout: float | None = None, ttl: float = 15.0) -> dict[str, Any] | None:
+        ok, v = await self._call(self.dex, self.dex.pair(mint, ttl), timeout or self.timeout)
         if v:
             await self._save_facts(f"token:{mint}", {"dexscreener": v})
         return v
+
+    async def dex_pairs(self, mints: list[str], timeout: float = 3.0, ttl: float = 2.0) -> dict[str, dict[str, Any] | None]:
+        """Пакетные цены DexScreener (без записи в источники — цены живут секунды)."""
+        if not mints:
+            return {}
+        _ok, v = await self._call(self.dex, self.dex.pairs_many(mints, ttl), timeout)
+        return v or {}
 
     async def sol_usd(self) -> float | None:
         _ok, v = await self._call(self.jupiter, self.jupiter.sol_usd(), 3.0)

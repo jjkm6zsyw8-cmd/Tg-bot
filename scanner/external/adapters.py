@@ -40,12 +40,33 @@ class DexScreener(ExternalSource):
     rate_per_s = 4.5     # пары/токены: 300/мин
     capacity = 5
 
-    async def pair(self, mint: str) -> dict[str, Any] | None:
+    async def pair(self, mint: str, ttl: float = TTL_PRICE) -> dict[str, Any] | None:
+        """ttl — сколько секунд годится кеш; для открытых позиций — 3 с."""
         async def fetch() -> dict[str, Any] | None:
             data = await self.request("GET", f"https://api.dexscreener.com/tokens/v1/solana/{mint}",
                                       path_key="tokens")
             return parse_dex_pairs(data, mint)
-        return await self.cached("pair", mint, TTL_PRICE, fetch)
+        return await self.cached(f"pair{int(ttl)}", mint, ttl, fetch)
+
+    async def pairs_many(self, mints: list[str], ttl: float = 2.0) -> dict[str, dict[str, Any] | None]:
+        """Цены пачкой: до 30 монет за один запрос (для открытых бумажных позиций). Кладёт в кеш pair{ttl}."""
+        out: dict[str, dict[str, Any] | None] = {}
+        need: list[str] = []
+        for m in dict.fromkeys(mints):
+            hit, v = self.cache.get(f"pair{int(ttl)}:{m}")
+            if hit:
+                self.stats.cache_hits += 1
+                out[m] = v
+            else:
+                need.append(m)
+        for i in range(0, len(need), 30):
+            chunk = need[i:i + 30]
+            data = await self.request("GET", f"https://api.dexscreener.com/tokens/v1/solana/{','.join(chunk)}",
+                                      path_key="tokens")
+            for m in chunk:
+                out[m] = parse_dex_pairs(data, m)
+                self.cache.set(f"pair{int(ttl)}:{m}", out[m], ttl)
+        return out
 
     async def get_json(self, url: str, path_key: str, timeout_s: float = 8.0) -> Any:
         """Для режима «Тренды» (опрос раз в 30 с) — через общий лимит адаптера."""
