@@ -263,6 +263,51 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                        "Слежка в реальном времени начнётся в течение минуты. Проверяю историю каждого "
                        "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в топик «Смарт-мани».")
 
+    @router.message(Command("diag"))
+    async def cmd_diag(m: Message) -> None:
+        """Диагностика без терминала: живы ли процессы, не застряли ли задачи и сообщения, ошибки."""
+        from datetime import datetime, timezone
+
+        from ..alerts import format as fmt
+        now = datetime.now(timezone.utc)
+
+        def age(iso: str | None) -> str:
+            if not iso:
+                return "нет данных"
+            sec = (now - datetime.fromisoformat(iso)).total_seconds()
+            return f"{fmt.ago(sec)} назад" + (" ⚠️" if sec > 120 else "")
+        ing = await db.kv_get("health:ingest", {}) or {}
+        ana = await db.kv_get("health:analytics", {}) or {}
+        lines = ["🔧 <b>Диагностика</b>",
+                 f"Приёмник: {age(ing.get('at'))} · Аналитика: {age(ana.get('at'))}",
+                 f"Бумага: открыто {ana.get('paper_open', '—')}, ложных ценовых выходов отменено "
+                 f"{ana.get('paper_false_exits', 0)}, сбойных цен отброшено {ana.get('paper_bad_prices', 0)}"]
+        pend = await db.fetchrow("SELECT count(*) n, min(created_at) oldest FROM jobs WHERE done_at IS NULL")
+        lines.append(f"\n<b>Задачи</b> (команды бота → аналитика): в очереди {pend['n']}"
+                     + (f", самая старая {fmt.ago((now - pend['oldest']).total_seconds())} назад ⚠️"
+                        if pend["n"] and (now - pend["oldest"]).total_seconds() > 60 else ""))
+        for j in await db.fetch("SELECT * FROM jobs ORDER BY id DESC LIMIT 6"):
+            took = (f"за {fmt.ago((j['done_at'] - j['created_at']).total_seconds())}" if j["done_at"]
+                    else "ещё не выполнена")
+            cmd = (j["payload"] or {}).get("cmd", "")
+            lines.append(f"• {j['kind']}{' ' + str(cmd) if cmd else ''} · {fmt.ago((now - j['created_at']).total_seconds())} "
+                         f"назад · {took}" + (f" · ❌ {esc(j['error'][:120])}" if j["error"] else ""))
+        ob = await db.fetchrow(
+            """SELECT count(*) FILTER (WHERE sent_at IS NULL AND attempts < 5) pending,
+                      count(*) FILTER (WHERE sent_at IS NULL AND attempts >= 5 AND created_at > now() - interval '1 day') failed,
+                      min(created_at) FILTER (WHERE sent_at IS NULL AND attempts < 5) oldest
+               FROM outbox""")
+        lines.append(f"\n<b>Отправка в Telegram</b>: ждут {ob['pending']}"
+                     + (f" (самое старое {fmt.ago((now - ob['oldest']).total_seconds())})" if ob["pending"] else "")
+                     + f", не отправлено за сутки {ob['failed']}")
+        for r in await db.fetch(
+                """SELECT kind, payload->>'topic' topic, attempts, error, created_at FROM outbox
+                   WHERE error IS NOT NULL AND error NOT IN ('buffered', 'superseded', 'muted', 'stale')
+                   AND created_at > now() - interval '1 day' ORDER BY id DESC LIMIT 5"""):
+            lines.append(f"• {r['kind']}/{r['topic'] or '—'} · {fmt.ago((now - r['created_at']).total_seconds())} назад · "
+                         f"попыток {r['attempts']} · {esc((r['error'] or '')[:150])}")
+        await reply(m, "\n".join(lines)[:4000])
+
     @router.message(Command("copylog"))
     async def cmd_copylog(m: Message) -> None:
         """Журнал копитрейда: по каждому своему кошельку — скопировано/пропущено, дельта входа, анти-PVP."""

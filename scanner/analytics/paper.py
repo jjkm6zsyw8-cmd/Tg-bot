@@ -165,6 +165,7 @@ class PaperTrader:
         self._buf: list[str] = []                   # входы и выходы копятся и уходят одним сообщением раз в минуту
         self._exits: dict[str, list[tuple[str, float, str]]] = {}
         self.bad_prices = 0                         # отброшенных сбойных цен DexScreener
+        self.false_exits = 0                        # ценовых выходов, не подтвердившихся через 2 с
         self._last_flush = 0.0
 
     @property
@@ -421,8 +422,28 @@ class PaperTrader:
     async def _exit_later(self, p: Position, reason: str, share: float) -> None:
         await asyncio.sleep(EXIT_DELAY_S)            # реакция на сигнал выхода
         mc = await self.current_mc(p)                # ТЕКУЩАЯ цена через 2 с, а не максимум за позицию
+        if not self.still_valid(p, reason, mc):
+            # один «провальный» замер цены (смена пары у DexScreener, сбой) выбивал стоп во всех портфелях,
+            # а продажа шла уже по нормальной цене: «−5% стоп» у схем со стопом −15%. Ценовой выход —
+            # только если через 2 с условие всё ещё выполняется; экстренные выходы — без проверки
+            p.closing = False
+            self.false_exits += 1
+            log.info("paper %s %s: %s не подтвердился (MC %.1f) — позиция остаётся", p.portfolio, p.symbol, reason, mc)
+            return
         async with self.lock:
             await self._sell(p, reason, share, mc)
+
+    def still_valid(self, p: Position, reason: str, mc: float) -> bool:
+        scheme = SCHEMES[p.portfolio]
+        if reason == "stop" and scheme.get("stop") is not None:
+            return mc <= p.entry_mc * (1 - scheme["stop"])
+        if reason == "trailing" and scheme.get("trail") is not None:
+            return mc <= p.max_mc * (1 - scheme["trail"])
+        if reason == "target" and p.target_mc:
+            return mc >= p.target_mc
+        if reason == "take_profit" and scheme.get("tp_net") is not None:
+            return p.net_if_sold(mc, self.fee_bps(), self.priority()) >= scheme["tp_net"]
+        return True
 
     async def current_mc(self, p: Position) -> float:
         """Текущий MC: свежий свой поток → DexScreener → последнее подтверждённое значение (не максимум).

@@ -308,3 +308,32 @@ async def test_entry_skipped_when_jupiter_disagrees(monkeypatch):
     tr.e.ext = FakeExt(300_000, jup=None)                # Jupiter молчит — входим по DexScreener
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
     assert opened
+
+
+async def test_price_exit_needs_confirmation_after_delay(monkeypatch):
+    """Регрессия: один низкий замер выбивал стоп −15%, а продажа шла по нормальной цене («−5% стоп»)."""
+    monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
+    st = SimpleNamespace(mc=40.0, mint="M", trades=[SimpleNamespace(ts=time.time())])
+    tr = bare_trader({"M": st})
+    tr.false_exits = 0
+    tr.fee_bps = lambda: 125
+    tr.priority = lambda: 0.0005
+    sold = []
+
+    async def fake_sell(p, reason, share, mc):
+        sold.append((reason, mc))
+    tr._sell = fake_sell
+    tr.lock = __import__("asyncio").Lock()
+    p = pos(entry=40.0)
+    p.portfolio = "B"
+    p.extra["last_mc"] = 40.0
+    await tr._check(p, 33.0, None)                       # замер −17.5% → стоп B
+    await __import__("asyncio").sleep(0.01)
+    assert not sold and tr.false_exits == 1 and not p.closing   # через 2 с цена 40 — стоп не подтвердился
+    st.mc = 33.0
+    await tr._check(p, 33.0, None)
+    await __import__("asyncio").sleep(0.01)
+    assert sold == [("stop", 33.0)]                     # падение настоящее — продаём по текущей цене
+    await tr._check(pos(entry=40.0), 20.0, "emergency")
+    await __import__("asyncio").sleep(0.01)
+    assert sold[-1][0] == "emergency"                   # экстренный выход — без проверки
