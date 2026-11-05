@@ -164,3 +164,18 @@ async def test_disabled_source_is_not_missing():
     hub.disable_all()
     chk = await hub.token_checks("M", timeout=0.5)
     assert chk.missing == [] and chk.block == []
+
+
+def test_dex_pair_prefers_sol_quote_over_exotic():
+    """Пара к экзотическому токену (токенизированная акция) с большей «ликвидностью» не должна выигрывать."""
+    from scanner.external.adapters import SOL_MINT
+    data = [
+        {"baseToken": {"address": "M"}, "quoteToken": {"address": "AMDxxx"}, "liquidity": {"usd": 9e9},
+         "priceUsd": "0.3", "marketCap": 306e6},
+        {"baseToken": {"address": "M"}, "quoteToken": {"address": SOL_MINT}, "liquidity": {"usd": 40_000},
+         "priceUsd": "0.00002", "marketCap": 20_000},
+    ]
+    p = parse_dex_pairs(data, "M")
+    assert p["market_cap_usd"] == 20_000 and p["good_quote"]
+    only_exotic = parse_dex_pairs(data[:1], "M")
+    assert only_exotic["market_cap_usd"] == 306e6 and not only_exotic["good_quote"]

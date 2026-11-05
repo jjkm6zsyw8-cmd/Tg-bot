@@ -173,11 +173,16 @@ def test_position_size_by_signal_level():
 
 
 class FakeExt:
-    def __init__(self, mc_usd):
+    """DexScreener: MC и цена за токен (MC / 1e9); Jupiter — своя цена (None — нет ответа)."""
+    def __init__(self, mc_usd, jup=None):
         self.mc_usd = mc_usd
+        self.jup = jup
 
     async def dex_pair(self, mint, timeout=None, ttl=15.0):
-        return {"market_cap_usd": self.mc_usd} if self.mc_usd else None
+        return {"market_cap_usd": self.mc_usd, "price_usd": self.mc_usd / 1e9} if self.mc_usd else None
+
+    async def jup_price(self, mint):
+        return self.jup
 
 
 def bare_trader(states, ext=None) -> pp.PaperTrader:
@@ -260,3 +265,46 @@ async def test_exit_price_capped_against_glitch():
     assert await tr.current_mc(p) == 45.0          # выход не по сбойной цене
     tr.e.ext = FakeExt(5_000)
     assert await tr.current_mc(p) == 50.0
+
+
+async def test_persistent_dexscreener_glitch_needs_jupiter(monkeypatch):
+    """Регрессия: DexScreener несколько проверок подряд показывал $306M вместо $20k (пара к экзотическому токену)."""
+    tr = bare_trader({}, FakeExt(0, jup=None))
+    tr.bad_prices = 0
+    sold = []
+
+    async def fake_exit(p, reason, share):
+        sold.append(reason)
+    tr._exit_later = fake_exit
+    tr.fee_bps = lambda: 125
+    tr.priority = lambda: 0.0005
+    p = pos(entry=200.0, target=300.0)
+    p.opened_ts = time.time()
+    p.extra.update({"src": "dex", "last_mc": 200.0})
+    glitch_usd = 306e6 / 1e9
+    for _ in range(3):                                   # сбой держится — Jupiter не отвечает
+        await tr._check(p, 3_000_000.0, None, glitch_usd)
+    assert not sold and p.extra["last_mc"] == 200.0 and tr.bad_prices == 3
+    tr.e.ext = FakeExt(0, jup=2e-5)                      # Jupiter: $20k — сбой DexScreener
+    await tr._check(p, 3_000_000.0, None, glitch_usd)
+    assert not sold
+    tr.e.ext = FakeExt(0, jup=glitch_usd * 1.1)          # Jupiter подтверждает — рост настоящий
+    await tr._check(p, 3_000_000.0, None, glitch_usd)
+    await __import__("asyncio").sleep(0)
+    assert sold == ["target"]
+
+
+async def test_entry_skipped_when_jupiter_disagrees(monkeypatch):
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    tr = bare_trader({}, FakeExt(300_000, jup=0.03))     # DexScreener $0.0003, Jupiter $0.03 — в 100 раз
+    tr.lock = __import__("asyncio").Lock()
+    opened = []
+
+    async def fake_open(*a, **k):
+        opened.append(a)
+    tr._open = fake_open
+    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
+    assert not opened and "Jupiter" in tr.skipped["*"]
+    tr.e.ext = FakeExt(300_000, jup=None)                # Jupiter молчит — входим по DexScreener
+    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
+    assert opened

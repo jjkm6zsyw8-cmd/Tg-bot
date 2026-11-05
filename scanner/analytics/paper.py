@@ -164,6 +164,7 @@ class PaperTrader:
         self.lock = asyncio.Lock()
         self._buf: list[str] = []                   # входы и выходы копятся и уходят одним сообщением раз в минуту
         self._exits: dict[str, list[tuple[str, float, str]]] = {}
+        self.bad_prices = 0                         # отброшенных сбойных цен DexScreener
         self._last_flush = 0.0
 
     @property
@@ -186,6 +187,14 @@ class PaperTrader:
         if not trades or time.time() - trades[-1].ts > FRESH_S:
             return None
         return float(st.mc)
+
+    async def jupiter_agrees(self, mint: str, price_usd: float) -> bool:
+        ext = getattr(self.e, "ext", None)
+        jp = await ext.jup_price(mint) if ext is not None else None
+        ok = bool(jp) and price_usd > 0 and 0.5 <= price_usd / jp <= 2.0
+        if not ok:
+            log.warning("paper %s: DexScreener %.3g $, Jupiter %s — скачок не подтверждён, пропускаю", mint, price_usd, jp)
+        return ok
 
     async def dex_price(self, mint: str, ttl: float = 1.0) -> float | None:
         ext = getattr(self.e, "ext", None)
@@ -256,6 +265,15 @@ class PaperTrader:
         src = "dex" if data.get("trend") else "auto"
         own = None if src == "dex" else self.state_price(mint)
         dex = await self.dex_price(mint)            # цена через 5 с после алерта
+        ext = getattr(self.e, "ext", None)
+        if dex and ext is not None and not own:
+            pair = await ext.dex_pair(mint, timeout=2.0, ttl=1.0)
+            jp = await ext.jup_price(mint)
+            pu = (pair or {}).get("price_usd")
+            if jp and pu and not 0.5 <= pu / jp <= 2.0:
+                log.warning("paper %s: DexScreener %.3g $ и Jupiter %.3g $ расходятся — не входим", mint, pu, jp)
+                self.skipped.setdefault("*", "цена DexScreener не сходится с Jupiter")
+                return
         if own and dex and max(own, dex) / min(own, dex) > MISMATCH_X:
             log.warning("paper %s: свой поток %.1f и DexScreener %.1f SOL расходятся — берём DexScreener",
                         mint, own, dex)
@@ -346,15 +364,17 @@ class PaperTrader:
                 sol_usd = self.e.price.value or 150
                 for p in ps:
                     mc = own[p.id]
+                    price_usd = None
                     if mc is None:
                         pair = pairs.get(p.mint)
                         if pair and pair.get("market_cap_usd"):
                             mc = pair["market_cap_usd"] / sol_usd
+                            price_usd = pair.get("price_usd")
                     if not mc:
                         # цены нет (монета без сделок и без пары на DexScreener): правила по времени всё равно
                         # должны срабатывать, иначе позиция зависает навсегда и занимает слот
                         mc = float(p.extra.get("last_mc") or p.entry_mc)
-                    await self._check(p, mc, None)
+                    await self._check(p, mc, None, price_usd)
                 if time.time() - self._last_flush >= 60:
                     self._last_flush = time.time()
                     await self.flush_messages()
@@ -365,14 +385,22 @@ class PaperTrader:
             except Exception:  # noqa: BLE001
                 log.exception("paper tick")
 
-    async def _check(self, p: Position, mc: float, emergency: str | None) -> None:
+    async def _check(self, p: Position, mc: float, emergency: str | None, price_usd: float | None = None) -> None:
+        """price_usd — цена DexScreener для этой проверки (None — цена из своего потока сделок)."""
         scheme = SCHEMES[p.portfolio]
         last = p.extra.get("last_mc")
         if emergency is None and last and (mc > JUMP_X * last or mc < last / JUMP_X):
-            pending = p.extra.get("jump")
-            if pending is None or not (0.5 < mc / pending < 2.0):
-                p.extra["jump"] = mc     # скачок в 5+ раз за одну проверку — ждём, подтвердится ли через 2 с
-                return
+            if price_usd is not None:
+                # DexScreener может стабильно показывать неверную цену (пара к экзотическому токену):
+                # скачок принимаем, только если его подтверждает независимый Jupiter
+                if not await self.jupiter_agrees(p.mint, price_usd):
+                    self.bad_prices += 1
+                    return
+            else:
+                pending = p.extra.get("jump")
+                if pending is None or not (0.5 < mc / pending < 2.0):
+                    p.extra["jump"] = mc     # свой поток: скачок в 5+ раз ждёт подтверждения следующей проверкой
+                    return
         p.extra.pop("jump", None)
         p.extra["last_mc"] = mc
         decision = decide_exit(p, mc, time.time(), scheme, self.fee_bps(), self.priority(), emergency)

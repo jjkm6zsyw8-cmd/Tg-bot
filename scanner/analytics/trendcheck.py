@@ -38,7 +38,7 @@ REASONS = {
     "bots": "боты в сделках", "staircase": "лесенка", "flat_volume": "ровный объём (бот)",
     "holders_fresh": "свежие кошельки", "holders_funder": "общий источник денег",
     "holders_time": "пополнены в одно время", "no_pullback": "не было отката", "fell": "обвал после сигнала",
-    "no_data": "нет данных GeckoTerminal",
+    "no_data": "нет данных GeckoTerminal", "bad_price": "цена не сходится с Jupiter",
 }
 
 

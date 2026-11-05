@@ -205,6 +205,8 @@ async def load_samples(db: Any) -> list[Sample]:
            WHERE a.mode = 'trend' AND o.net_result IS NOT NULL ORDER BY a.created_at""")
     out = []
     for r in rows:
+        if r["net_result"] > 10:
+            continue          # больше +1000% — сбой цены (пара к экзотическому токену), не учим на нём
         s = sample_from(r["payload"] or {}, r["created_at"].astimezone(timezone.utc).hour, r["net_result"])
         if s is not None:
             out.append(s)

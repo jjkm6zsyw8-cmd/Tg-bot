@@ -18,6 +18,14 @@ from typing import Any
 from .base import ExternalSource
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
+# надёжные котировки: у пар к экзотическим токенам (токенизированные акции, мемы) DexScreener
+# иногда считает цену и MC с ошибкой в тысячи раз
+GOOD_QUOTES = {SOL_MINT, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
+               "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}                # USDT
+
+
+def good_quote(d: dict[str, Any]) -> bool:
+    return ((d.get("quoteToken") or {}).get("address")) in GOOD_QUOTES
 
 TTL_LABELS = 24 * 3600
 TTL_SECURITY = 600
@@ -75,11 +83,14 @@ class DexScreener(ExternalSource):
 
 def parse_dex_pairs(data: Any, mint: str) -> dict[str, Any] | None:
     best = None
+    rank: tuple[bool, float] = (False, -1.0)
     for d in data or []:
         if ((d.get("baseToken") or {}).get("address")) != mint:
             continue
         liq = float((d.get("liquidity") or {}).get("usd") or 0)
-        if best is None or liq > best["liquidity_usd"]:
+        r = (good_quote(d), liq)            # сначала пары к SOL/USDC/USDT, потом — по ликвидности
+        if best is None or r > rank:
+            rank = r
             tx = (d.get("txns") or {}).get("m5") or {}
             best = {
                 "dex": d.get("dexId"), "pair": d.get("pairAddress"), "price_usd": _f(d.get("priceUsd")),
@@ -89,6 +100,7 @@ def parse_dex_pairs(data: Any, mint: str) -> dict[str, Any] | None:
                 "price_change_m5": _f((d.get("priceChange") or {}).get("m5")),
                 "price_change_h1": _f((d.get("priceChange") or {}).get("h1")),
                 "boosts": int((d.get("boosts") or {}).get("active") or 0),
+                "good_quote": r[0],
             }
     return best
 

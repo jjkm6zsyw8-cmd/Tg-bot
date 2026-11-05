@@ -23,6 +23,7 @@ import aiohttp
 from ..alerts import format as fmt
 from ..ingest.rpc import RpcError
 from ..solana import is_valid_address
+from ..external.adapters import good_quote
 from . import trendcheck as tc
 
 if TYPE_CHECKING:
@@ -75,6 +76,7 @@ class PairInfo:
     boosts: int
     socials: int
     liq_base: float
+    good_quote: bool = True
 
     @classmethod
     def from_pair(cls, d: dict[str, Any]) -> "PairInfo":
@@ -96,6 +98,7 @@ class PairInfo:
             boosts=int((d.get("boosts") or {}).get("active") or 0),
             socials=len(info.get("socials") or []) + len(info.get("websites") or []),
             liq_base=float(liq.get("base") or 0),
+            good_quote=good_quote(d),
         )
 
 
@@ -127,6 +130,7 @@ class Tracked:
     max_price: float = 0.0
     exit_price: float | None = None
     exit_reason: str | None = None
+    last_price: float = 0.0
     flags: set[str] = field(default_factory=set)
 
 
@@ -207,7 +211,8 @@ class Trends:
             data = await self._get(http, f"{DEX}/tokens/v1/solana/{','.join(mints[i:i + 30])}")
             for d in data or []:
                 pi = PairInfo.from_pair(d)
-                if pi.mint in mints[i:i + 30] and (pi.mint not in out or pi.liq_usd > out[pi.mint].liq_usd):
+                cur = out.get(pi.mint)
+                if pi.mint in mints[i:i + 30] and (cur is None or (pi.good_quote, pi.liq_usd) > (cur.good_quote, cur.liq_usd)):
                     out[pi.mint] = pi
             await asyncio.sleep(0.25)
         return out
@@ -433,6 +438,17 @@ class Trends:
             return None
         return ((data.get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
 
+    async def plausible(self, mint: str, price: float, last: float) -> bool:
+        """Цена DexScreener правдоподобна: без скачка в 5+ раз или скачок подтверждён Jupiter (±2×)."""
+        if last <= 0 or 1 / 5 <= price / last <= 5:
+            return True
+        jp = await self.e.ext.jup_price(mint) if getattr(self.e, "ext", None) is not None else None
+        ok = bool(jp) and 0.5 <= price / jp <= 2.0
+        if not ok:
+            self.stats["bad_prices"] = self.stats.get("bad_prices", 0) + 1
+            log.warning("тренды: %s цена %.3g при прошлой %.3g, Jupiter %s — сбой, пропускаю", mint, price, last, jp)
+        return ok
+
     def reject(self, pi: PairInfo, code: str, detail: str = "") -> None:
         now = time.time()
         self.rejected_at[pi.mint] = now
@@ -465,6 +481,11 @@ class Trends:
 
     async def final_checks(self, pi: PairInfo, cfg: dict[str, Any], extra: dict[str, Any]) -> None:
         """3) холдеры — прямо перед алертом (дорого по RPC, поэтому последним)."""
+        ext = getattr(self.e, "ext", None)
+        jp = await ext.jup_price(pi.mint) if ext is not None else None
+        if jp and not 0.5 <= pi.price / jp <= 2.0:
+            self.reject(pi, "bad_price", f"DexScreener {pi.price:.3g} $, Jupiter {jp:.3g} $")
+            return
         hs = await self.holder_check(extra.get("accounts") or [])
         bad = tc.holder_verdict(hs or {}, cfg)
         if bad:
@@ -537,7 +558,10 @@ class Trends:
         for m, tr in list(self.tracked.items()):
             pi = info.get(m)
             e = self.e.alerts.get(m)
+            if pi and pi.price > 0 and not await self.plausible(m, pi.price, tr.last_price or tr.alert_price):
+                pi = None            # скачок в 5+ раз, который Jupiter не подтвердил — сбой данных, пропускаем
             if pi and pi.price > 0:
+                tr.last_price = pi.price
                 tr.max_price = max(tr.max_price, pi.price)
                 if e is not None:
                     e.data["mc"] = pi.mc_usd / (self.e.price.value or 150)
