@@ -314,7 +314,7 @@ class HeliusSource(Source):
                     # узкий фильтр подписки: потоки Helius тарифицируются по объёму
                     {"accountInclude": [PUMP_PROGRAM, PUMP_AMM_PROGRAM], "failed": False, "vote": False},
                     {"commitment": "processed", "encoding": "jsonParsed", "transactionDetails": "full",
-                     "showRewards": False, "maxSupportedTransactionVersion": 0},
+                     "showRewards": False, "maxSupportedTransactionVersion": 1},   # 2026: есть транзакции v1
                 ],
             }))
             async for raw in ws:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import re
 import logging
 import time
 from typing import Any
@@ -42,6 +43,7 @@ class SolanaRpc:
         self._session: aiohttp.ClientSession | None = None
         self.calls = 0
         self.rate_limited = 0
+        self.max_tx_version = 1         # Solana: транзакции v0 и v1 (2026); выше — поднимется по ответу узла
         self.pause_until = 0.0          # общая пауза после 429: запросы ждут, а не долбят RPC
         self._consecutive_429 = 0
         self.day = time.strftime("%Y-%m-%d", time.gmtime())
@@ -135,10 +137,24 @@ class SolanaRpc:
         return await self.call("getSignaturesForAddress", [address, cfg]) or []
 
     async def transaction(self, signature: str) -> dict[str, Any] | None:
-        return await self.call(
-            "getTransaction",
-            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}],
-        )
+        """Транзакция целиком. С 2026 в Solana есть транзакции версии 1: с maxSupportedTransactionVersion=0 узел
+        их не отдаёт (-32015) — и бот «не видел» транзакций многих кошельков. Узел сам называет нужную версию:
+        поднимаем её и повторяем."""
+        for _ in range(3):
+            try:
+                return await self.call(
+                    "getTransaction",
+                    [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": self.max_tx_version,
+                                 "commitment": "confirmed"}],
+                )
+            except RpcError as exc:
+                m = re.search(r"maxSupportedTransactionVersion\W+(\d+)", str(exc))
+                if m and int(m.group(1)) > self.max_tx_version:
+                    log.warning("RPC: транзакции версии %s — поднимаю maxSupportedTransactionVersion", m.group(1))
+                    self.max_tx_version = int(m.group(1))
+                    continue
+                raise
+        return None
 
     async def block_time(self, slot: int) -> int | None:
         try:

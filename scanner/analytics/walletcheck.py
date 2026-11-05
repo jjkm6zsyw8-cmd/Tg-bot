@@ -186,7 +186,13 @@ async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
             if is_dev(label, prof):
                 await save_dev(e, addr, label, prof)
                 dev_lines.append(dev_line(name, prof, sol_usd))
-                continue
+                if prof.get("launches"):
+                    continue
+                # дев только по подписи, своих запусков в истории нет (запускает с твинков?) — заодно копируем
+                # его покупки: алерт придёт и при запуске, и при покупке
+                await e.db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $2) "
+                                   "ON CONFLICT (kind, address) DO NOTHING", addr, label)
+                dev_lines[-1] += " · пока копирую его покупки"
             s7, s30, _trips = await compute_trader(e.db, addr, cfg, costs)
             linked = await linked_to_dev(e.db, addr)
             ok, _fails = qualifies(s7, s30, linked, cfg)
