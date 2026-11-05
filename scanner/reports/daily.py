@@ -18,6 +18,9 @@ MISSED_REASONS = {**REASONS, "": "нет решения (не оценивала
                   "outage": "сбой источника", "latency": "задержка"}
 
 
+GLITCH_NET = 10.0   # результат больше +1000% за сделку — сбой цены, а не торговля
+
+
 async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str, bytes, list[list[dict[str, Any]]]]:
     cfg = settings.effective()
     tz = ZoneInfo(cfg.get("timezone", "UTC"))
@@ -37,8 +40,12 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
     lines.append("\n<b>Итог сигналов</b> (вход +{} с, выход по цели или экстренному сигналу)".format(
         cfg.get("reaction_s", 5)))
     sims: dict[str, list[SimTrade]] = {}
+    glitches = 0
     for a in alerts:
         if a["net_result"] is None:
+            continue
+        if a["net_result"] > GLITCH_NET:
+            glitches += 1      # сбой цены источника (пара к экзотическому токену) — в статистику не берём
             continue
         p = a["payload"] or {}
         sims.setdefault(a["mode"], []).append(SimTrade(
@@ -54,6 +61,8 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
             lines.append(f"  · {mode}: {s['n']} сделок, итог {pct(s['series'])}")
     else:
         lines.append(f"Алертов {len(alerts)}, закрытых с итогом пока нет.")
+    if glitches:
+        lines.append(f"⚠ Не учтено {glitches} сделок с результатом больше +{GLITCH_NET:.0%} — сбой цены источника")
 
     # 2) упущенные возможности
     launches = await db.fetch(
@@ -151,11 +160,14 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
         lines.append("\n<b>Бумажная торговля</b> (за день)")
         for p in ports:
             r = await db.fetchrow(
-                """SELECT count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w, COALESCE(sum(pnl_sol), 0) pnl
+                """SELECT count(*) FILTER (WHERE pnl_pct <= $4) n, count(*) FILTER (WHERE pnl_sol > 0 AND pnl_pct <= $4) w,
+                          COALESCE(sum(pnl_sol) FILTER (WHERE pnl_pct <= $4), 0) pnl,
+                          count(*) FILTER (WHERE pnl_pct > $4) odd
                    FROM paper_positions WHERE portfolio=$1 AND closed_at >= $2 AND closed_at < $3
-                   AND exit_reason <> 'reset'""", p["name"], start, end)
+                   AND exit_reason <> 'reset'""", p["name"], start, end, GLITCH_NET)
+            odd = f" · не учтено сбойных {r['odd']}" if r["odd"] else ""
             lines.append(f"  {p['name']}: сделок {r['n']}, удачных {r['w']}, итог {r['pnl']:+.4f} SOL "
-                         f"(${r['pnl'] * price:+.2f}); баланс {p['balance_sol']:.4f} SOL без открытых позиций")
+                         f"(${r['pnl'] * price:+.2f}){odd}")
 
     # CSV: расширенные колонки (сделки, продажи кластера, причина склейки, окно входа, лучшие трейдеры)
     from .verify import extended_csv
