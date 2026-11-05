@@ -52,6 +52,10 @@ SCHEMES: dict[str, dict[str, Any]] = {
 }
 LEGEND = "A стоп−6% · B база · C только цель · D тейк+20% · E тейк+50% · F трейл после +15% · G скальп +25%"
 TICK_S = 2.0          # проверка открытых позиций (стоп/тейк/трейлинг) раз в 2 с
+FRESH_S = 120.0       # цена из своего потока сделок годится, только если по монете были сделки за 2 минуты
+JUMP_X = 5.0          # скачок цены больше чем в 5 раз за одну проверку — ждём подтверждения
+MISMATCH_X = 2.0      # свой поток и DexScreener расходятся больше чем в 2 раза — верим DexScreener
+ANOMALY_PCT = 10.0    # результат больше +1000% — помечаем ⚠ для проверки
 LEVEL_SIZE = {"strong": 1.5, "normal": 0.75, "watch": 0.5}   # размер позиции по силе сигнала (× базовая доля)
 PERIOD_NAMES = {1: "за 1 час", 2: "за 2 часа", 6: "за 6 часов", 24: "за 24 часа", 168: "за 7 дней",
                 None: "за всё время"}
@@ -161,6 +165,26 @@ class PaperTrader:
     def cfg(self) -> dict[str, Any]:
         return self.e.cfg
 
+    def state_price(self, mint: str) -> float | None:
+        """MC из своего потока сделок — только если он свежий. Без сделок (PumpPortal не отдаёт)
+        цена монеты застревает на стартовой (~28 SOL), и по ней нельзя ни входить, ни выходить."""
+        st = self.e.states.get(mint)
+        if st is None or not st.mc or st.mc <= 0:
+            return None
+        trades = getattr(st, "trades", None)
+        if not trades or time.time() - trades[-1].ts > FRESH_S:
+            return None
+        return float(st.mc)
+
+    async def dex_price(self, mint: str, ttl: float = 1.0) -> float | None:
+        ext = getattr(self.e, "ext", None)
+        if ext is None:
+            return None
+        pair = await ext.dex_pair(mint, timeout=2.0, ttl=ttl)
+        if pair and pair.get("market_cap_usd"):
+            return pair["market_cap_usd"] / (self.e.price.value or 150)
+        return None
+
     def fee_bps(self) -> float:
         return float(self.e.fee_bps or self.e.settings.costs().get("curve_fee_bps", 125))
 
@@ -217,19 +241,24 @@ class PaperTrader:
             self.skipped.setdefault("*", f"уровень «{level}» не выбран для бумажной торговли")
             return
         await asyncio.sleep(ENTRY_DELAY_S)          # реакция пользователя
-        st = self.e.states.get(mint)
-        mc = st.mc if st is not None else None
-        if mc is None and getattr(self.e, "ext", None) is not None:
-            pair = await self.e.ext.dex_pair(mint, timeout=2.0, ttl=1.0)   # цена через 5 с после алерта
-            if pair and pair.get("market_cap_usd"):
-                mc = pair["market_cap_usd"] / (self.e.price.value or 150)
-        mc = mc or data.get("mc")
+        # «Тренды» — только по DexScreener (по нему дан алерт); остальное — свой свежий поток, сверка с DexScreener
+        src = "dex" if data.get("trend") else "auto"
+        own = None if src == "dex" else self.state_price(mint)
+        dex = await self.dex_price(mint)            # цена через 5 с после алерта
+        if own and dex and max(own, dex) / min(own, dex) > MISMATCH_X:
+            log.warning("paper %s: свой поток %.1f и DexScreener %.1f SOL расходятся — берём DexScreener",
+                        mint, own, dex)
+            own, src = None, "dex"
+        mc = own or dex
+        if mc is None and src == "dex":
+            mc = data.get("mc")                     # цена алерта «Трендов» (тоже DexScreener)
         if not mc or mc <= 0:
+            self.skipped.setdefault("*", "нет свежей цены монеты")
             return
         async with self.lock:
             sizes = []
             for name in SCHEMES:
-                size = await self._open(name, mint, level, alert_id, data, trader, mc)
+                size = await self._open(name, mint, level, alert_id, data, trader, mc, src)
                 sizes.append(f"{name} {size:.3f}" if size else f"{name} —")
         if any(not x.endswith("—") for x in sizes):
             sol_usd = self.e.price.value or 150
@@ -237,7 +266,7 @@ class PaperTrader:
                             + " · ".join(sizes) + " SOL")
 
     async def _open(self, name: str, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
-                    trader: str | None, mc: float) -> float | None:
+                    trader: str | None, mc: float, src: str = "auto") -> float | None:
         open_here = [p for p in self.positions.values() if p.portfolio == name]
         if any(p.mint == mint for p in open_here):
             self.skipped[name] = "уже есть позиция по этой монете"
@@ -272,7 +301,7 @@ class PaperTrader:
         self.positions[pid] = Position(id=pid, portfolio=name, mint=mint, opened_ts=time.time(), entry_mc=mc,
                                        cost_sol=size, tokens=fill.tokens, tokens_initial=fill.tokens, target_mc=target,
                                        trader=trader, symbol=data.get("symbol") or "", max_mc=mc, level=level,
-                                       alert_id=alert_id)
+                                       alert_id=alert_id, extra={"src": src, "last_mc": mc})
         self.skipped.pop(name, None)
         return size
 
@@ -288,6 +317,8 @@ class PaperTrader:
             reason = emergency
             if reason is None and p.trader and trader == p.trader and not is_buy:
                 reason = "trader_sell"
+            if reason is None and p.extra.get("src") == "dex":
+                continue          # цену «Трендов» ведём по DexScreener, из своего потока — только экстренные сигналы
             await self._check(p, st.mc, reason)
 
     async def tick_loop(self) -> None:
@@ -296,14 +327,14 @@ class PaperTrader:
             await asyncio.sleep(TICK_S)
             try:
                 ps = list(self.positions.values())
-                # монеты без своего потока сделок — одной пачкой в DexScreener (до 30 за запрос)
-                need = [p.mint for p in ps if self.e.states.get(p.mint) is None]
+                own = {p.id: (None if p.extra.get("src") == "dex" else self.state_price(p.mint)) for p in ps}
+                # без свежего своего потока — одной пачкой в DexScreener (до 30 монет за запрос)
+                need = [p.mint for p in ps if own[p.id] is None]
                 ext = getattr(self.e, "ext", None)
                 pairs = await ext.dex_pairs(need, timeout=3.0, ttl=TICK_S) if need and ext is not None else {}
                 sol_usd = self.e.price.value or 150
                 for p in ps:
-                    st = self.e.states.get(p.mint)
-                    mc = st.mc if st is not None else None
+                    mc = own[p.id]
                     if mc is None:
                         pair = pairs.get(p.mint)
                         if pair and pair.get("market_cap_usd"):
@@ -325,6 +356,13 @@ class PaperTrader:
 
     async def _check(self, p: Position, mc: float, emergency: str | None) -> None:
         scheme = SCHEMES[p.portfolio]
+        last = p.extra.get("last_mc")
+        if emergency is None and last and (mc > JUMP_X * last or mc < last / JUMP_X):
+            pending = p.extra.get("jump")
+            if pending is None or not (0.5 < mc / pending < 2.0):
+                p.extra["jump"] = mc     # скачок в 5+ раз за одну проверку — ждём, подтвердится ли через 2 с
+                return
+        p.extra.pop("jump", None)
         p.extra["last_mc"] = mc
         decision = decide_exit(p, mc, time.time(), scheme, self.fee_bps(), self.priority(), emergency)
         if decision is None or p.closing:
@@ -340,16 +378,15 @@ class PaperTrader:
             await self._sell(p, reason, share, mc)
 
     async def current_mc(self, p: Position) -> float:
-        """Текущий MC: свой поток сделок → DexScreener → последнее наблюдённое значение (не максимум)."""
-        st = self.e.states.get(p.mint)
-        if st is not None and st.mc > 0:
-            return st.mc
-        ext = getattr(self.e, "ext", None)
-        if ext is not None:
-            pair = await ext.dex_pair(p.mint, timeout=2.0, ttl=1.0)
-            if pair and pair.get("market_cap_usd"):
-                return pair["market_cap_usd"] / (self.e.price.value or 150)
-        return float(p.extra.get("last_mc") or p.entry_mc)
+        """Текущий MC: свежий свой поток → DexScreener → последнее подтверждённое значение (не максимум).
+        Цена выхода не может быть в 5+ раз выше последней подтверждённой (защита от сбоя данных)."""
+        last = float(p.extra.get("last_mc") or p.entry_mc)
+        mc = None if p.extra.get("src") == "dex" else self.state_price(p.mint)
+        if mc is None:
+            mc = await self.dex_price(p.mint)
+        if mc is None:
+            return last
+        return last if mc > JUMP_X * last else mc
 
     async def _sell(self, p: Position, reason: str, share: float, mc: float) -> None:
         tokens = p.tokens * share if share < 1 else p.tokens
@@ -409,15 +446,15 @@ class PaperTrader:
         open_value = 0.0
         open_lines = []
         for p in open_ps:
-            st = self.e.states.get(p.mint)
-            mc = st.mc if st is not None else float(p.extra.get("last_mc") or p.entry_mc)   # текущая, не максимум
+            mc = float(p.extra.get("last_mc") or p.entry_mc)   # последняя подтверждённая цена, не максимум
             v = sell_fill(mc, p.tokens, self.fee_bps(), self.priority()).sol if p.tokens else 0.0
             open_value += v
             open_lines.append((p, (p.proceeds_sol + v) / p.cost_sol - 1 if p.cost_sol else 0.0))
         equity = self.balance.get(name, port["balance_sol"]) + open_value
         best = max(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
         worst = min(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
-        return {"port": port, "trades": len(rows), "wins": len(wins), "pnl_sol": sum(r["pnl_sol"] or 0 for r in rows),
+        return {"port": port, "trades": len(rows), "wins": len(wins),
+                "anomalies": sum(1 for r in rows if (r["pnl_pct"] or 0) > ANOMALY_PCT), "pnl_sol": sum(r["pnl_sol"] or 0 for r in rows),
                 "avg_win": sum(wins) / len(wins) if wins else 0.0, "avg_loss": sum(losses) / len(losses) if losses else 0.0,
                 "equity": equity, "open": open_lines, "best": best, "worst": worst}
 
@@ -460,6 +497,10 @@ class PaperTrader:
                 by_mint.setdefault(p.symbol or "?", []).append(f"{n} {net:+.0%}")
         for sym, xs in by_mint.items():
             lines.append(f"🟢 ${fmt.esc(sym)} " + " ".join(xs))
+        odd = sum(per[n]["anomalies"] for n in SCHEMES)
+        if odd:
+            lines.append(f"⚠ {odd} сделок с результатом больше +{ANOMALY_PCT:.0%} — похоже на сбой цены, "
+                         "см. «Последние 20 сделок»")
         if not hourly:
             lines.append(f"<i>{LEGEND}</i>")
         if hourly:
@@ -475,15 +516,22 @@ class PaperTrader:
                                        "keyboard": PERIOD_KEYBOARD}, priority=8)
 
     async def history(self, n: int = 20) -> str:
-        rows = await self.db.fetch("SELECT * FROM paper_positions WHERE closed_at IS NOT NULL AND exit_reason <> 'reset' "
-                                   "ORDER BY closed_at DESC LIMIT $1", n)
+        rows = await self.db.fetch(
+            """SELECT p.*, (SELECT t.mc FROM paper_trades t WHERE t.position_id = p.id AND t.side = 'sell'
+                            ORDER BY t.ts DESC LIMIT 1) AS exit_mc
+               FROM paper_positions p WHERE p.closed_at IS NOT NULL AND p.exit_reason <> 'reset'
+               ORDER BY p.closed_at DESC LIMIT $1""", n)
         if not rows:
             return "📒 Закрытых сделок пока нет."
+        sol_usd = self.e.price.value or 150
         out = [f"📒 <b>Последние {len(rows)} сделок</b>"]
         for r in rows:
-            out.append(f"{'✅' if (r['pnl_sol'] or 0) > 0 else '❌'} {r['portfolio']} ${fmt.esc(r['symbol'] or '?')} "
-                       f"{r['pnl_pct']:+.0%} · {EXIT_SHORT.get(r['exit_reason'], r['exit_reason'])} · "
-                       f"{r['closed_at']:%H:%M}")
+            pct = r["pnl_pct"] or 0
+            mark = "⚠" if pct > ANOMALY_PCT else "✅" if (r["pnl_sol"] or 0) > 0 else "❌"
+            mcs = (f" · {fmt.mc_usd(r['entry_mc'], sol_usd)}→{fmt.mc_usd(r['exit_mc'], sol_usd)}"
+                   if r["entry_mc"] and r["exit_mc"] else "")
+            out.append(f"{mark} {r['portfolio']} ${fmt.esc(r['symbol'] or '?')} {pct:+.0%} · "
+                       f"{EXIT_SHORT.get(r['exit_reason'], r['exit_reason'])}{mcs} · {r['closed_at']:%H:%M}")
         return "\n".join(out)
 
     async def maybe_compare(self) -> None:

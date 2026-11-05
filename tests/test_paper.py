@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -66,7 +67,7 @@ async def test_paper_trader_full_cycle(monkeypatch):
         await db.migrate()
         monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
         monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
-        st = SimpleNamespace(mc=40.0, mint="MINT1")
+        st = SimpleNamespace(mc=40.0, mint="MINT1", trades=[SimpleNamespace(ts=__import__("time").time())])
         settings = Settings(YamlConfig("config/config.yaml"))
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
                               cfg=settings.effective(), states={"MINT1": st}, ext=None)
@@ -165,3 +166,93 @@ def test_position_size_by_signal_level():
     assert tr.share_for("strong") == pytest.approx(0.5)                                 # потолок 50%
     tr.e = SimpleNamespace(cfg={"paper_position_share": 0.2, "paper_size_by_level": False})
     assert tr.share_for("strong") == pytest.approx(0.2)
+
+
+class FakeExt:
+    def __init__(self, mc_usd):
+        self.mc_usd = mc_usd
+
+    async def dex_pair(self, mint, timeout=None, ttl=15.0):
+        return {"market_cap_usd": self.mc_usd} if self.mc_usd else None
+
+
+def bare_trader(states, ext=None) -> pp.PaperTrader:
+    tr = pp.PaperTrader.__new__(pp.PaperTrader)
+    tr.e = SimpleNamespace(states=states, ext=ext, price=SimpleNamespace(value=100.0), cfg={})
+    tr.skipped = {}
+    tr.positions = {}
+    return tr
+
+
+def fresh_state(mc, age_s=1.0):
+    return SimpleNamespace(mc=mc, mint="M", trades=[SimpleNamespace(ts=time.time() - age_s)])
+
+
+async def test_stale_own_price_is_not_used():
+    """Регрессия: без сделок цена застревала на стартовой (~28 SOL), бумага покупала «по $2.7k» монету за $3M."""
+    tr = bare_trader({"M": fresh_state(28.0, age_s=600)})
+    assert tr.state_price("M") is None
+    tr2 = bare_trader({"M": fresh_state(28.0, age_s=5)})
+    assert tr2.state_price("M") == 28.0
+
+
+async def test_entry_price_sources(monkeypatch):
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    opened = []
+
+    async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((mc, src))
+        return None
+    # «Тренды»: только DexScreener, даже если свой поток свежий
+    tr = bare_trader({"M": fresh_state(28.0)}, FakeExt(300_000))     # $300k при SOL $100 = 3000 SOL
+    tr._open = fake_open
+    tr.lock = __import__("asyncio").Lock()
+    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
+    assert opened and opened[0] == (3000.0, "dex")
+    # девы/новые: свой свежий поток, но при расхождении с DexScreener > 2× — DexScreener
+    opened.clear()
+    tr.e.ext = FakeExt(4_000)                                       # 40 SOL
+    await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)
+    assert opened[0] == (40.0, "auto") or opened[0] == (28.0, "auto")
+    opened.clear()
+    tr.e.ext = FakeExt(300_000)
+    await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)
+    assert opened[0] == (3000.0, "dex")
+    # свой поток устарел и DexScreener нет — не входим
+    opened.clear()
+    tr.e.states = {"M": fresh_state(28.0, age_s=600)}
+    tr.e.ext = None
+    await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)
+    assert not opened and "нет свежей цены" in tr.skipped["*"]
+
+
+async def test_price_jump_needs_confirmation(monkeypatch):
+    monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
+    tr = bare_trader({})
+    sold = []
+
+    async def fake_exit(p, reason, share):
+        sold.append(reason)
+    tr._exit_later = fake_exit
+    tr.fee_bps = lambda: 125
+    tr.priority = lambda: 0.0005
+    p = pos(entry=40.0, target=80.0)
+    p.opened_ts = time.time()
+    p.extra["last_mc"] = 40.0
+    await tr._check(p, 40_000.0, None)            # ×1000 за одну проверку — сбой? ждём подтверждения
+    assert not sold and p.extra["last_mc"] == 40.0
+    await tr._check(p, 41.0, None)                 # не подтвердилось
+    assert not sold and "jump" not in p.extra
+    await tr._check(p, 400.0, None)
+    await tr._check(p, 410.0, None)                # подтвердилось через проверку — работаем
+    await __import__("asyncio").sleep(0)
+    assert sold == ["target"]
+
+
+async def test_exit_price_capped_against_glitch():
+    tr = bare_trader({}, FakeExt(4_000_000))       # DexScreener внезапно показывает 40 000 SOL
+    p = pos(entry=40.0)
+    p.extra["last_mc"] = 45.0
+    assert await tr.current_mc(p) == 45.0          # выход не по сбойной цене
+    tr.e.ext = FakeExt(5_000)
+    assert await tr.current_mc(p) == 50.0
