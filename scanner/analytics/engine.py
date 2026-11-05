@@ -118,6 +118,8 @@ class Engine:
         self._feed_ts: deque[float] = deque(maxlen=5000)
         self.watch_ok = False          # слежка Helius за выбранными кошельками и монетами подключена
         self.my_devs: dict[str, dict[str, Any]] = {}
+        from .copyguard import CopyGuard
+        self.copyguard = CopyGuard(self)
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -180,6 +182,7 @@ class Engine:
         await self._load_traders()
         await self._load_references()
         await self.paper.start()
+        await self.copyguard.load()
         for p in self.paper.positions.values():   # монеты открытых бумажных позиций держим в памяти
             if p.mint not in self.states:
                 st = await load_state(self.db, p.mint, cfg)
@@ -583,6 +586,18 @@ class Engine:
         cfg = self.cfg
         if not cfg.get("modes", {}).get("copy", True):
             return
+        dev_addr = dev.get("address") or st.deployer
+        g = self.copyguard
+        skip = g.dev_gap_reason(dev_addr)
+        if skip is None and dev.get("once") and dev.get("once_done"):
+            skip = "режим «один раз»: к этому деву уже заходили"
+        if skip:
+            await g.log(dev_addr, st.mint, st.symbol, "launch", None, st.mc, "skipped", skip)
+            return
+        if dev.get("once"):
+            dev["once_done"] = True
+            await self.db.execute("UPDATE my_devs SET once_done=true WHERE address=$1", dev_addr)
+        await g.log(dev_addr, st.mint, st.symbol, "launch", None, st.mc, "copied", "дев запустил монету")
         start = st.mc
         p25, p75, med = dev.get("p25_sell_mc"), dev.get("p75_sell_mc"), dev.get("med_sell_mc")
         sol = self.price.value or 150
@@ -634,7 +649,7 @@ class Engine:
         # девы из своего списка: алерт в момент запуска, цели — по их почерку (analytics/walletcheck.py)
         self.my_devs = {r["address"]: dict(r) for r in await self.db.fetch(
             """SELECT w.address, w.label, m.launches, m.sold, m.med_sell_mc, m.p25_sell_mc, m.p75_sell_mc,
-                      m.med_sell_s, m.hit_rate
+                      m.med_sell_s, m.hit_rate, COALESCE(m.once, false) once, COALESCE(m.once_done, false) once_done
                FROM watchlist w LEFT JOIN my_devs m ON m.address = w.address WHERE w.kind = 'dev'""")}
 
     async def _load_references(self) -> None:
@@ -653,6 +668,15 @@ class Engine:
         if not cfg.get("smart_filtered", True) or cfg.get("smart_full_feed"):
             await self.db.enqueue("full", {"text": fmt.render_full_line(line, self.price.value)}, priority=7)
         entry = self.alerts.get(st.mint)
+        g = self.copyguard
+        ts = r["ts"].timestamp()
+        if own and r["trader"] != st.deployer:
+            if r["is_buy"]:
+                g.on_buy(r["trader"], st.mint, ts)
+            else:
+                hold = await g.on_sell(r["trader"], st.mint, ts)
+                await g.log(r["trader"], st.mint, st.symbol, "sell", r["sol_amount"], r["mc_sol"], "info",
+                            f"держал {fmt.ago(hold)}" if hold is not None else None)
         if not r["is_buy"]:
             if entry and r["trader"] in entry.trigger_traders:
                 entry.trader_sold[r["trader"]] = entry.trader_sold.get(r["trader"], 0.0) + r["token_amount"]
@@ -673,9 +697,17 @@ class Engine:
         # без рамок MC и роста за минуту (вы сами выбрали этих трейдеров)
         if own and r["trader"] == st.deployer:
             return                       # дев покупает свою монету при запуске — это алерт «мой дев», не копия
+
+        async def skip(reason: str) -> None:
+            if own:
+                await g.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"], "skipped", reason)
+        if own:
+            why = g.pause_reason(r["trader"]) or g.delta_reason(r["trader"])
+            if why:
+                return await skip(why)
         min_buy = float(cfg.get("copy_min_buy_sol", 0.1)) if own else float(cfg.get("smart_min_buy_sol", 0.5))
         if r["sol_amount"] < min_buy:
-            return
+            return await skip(f"мелкая покупка {r['sol_amount']:.3f} SOL < {min_buy:g}")
         if not own and not (float(cfg.get("smart_mc_min_sol", 0)) <= st.mc <= float(cfg.get("smart_mc_max_sol", 1e9))):
             return
         if not own and st.growth(now) > float(cfg.get("smart_max_growth_1m", 1.0)):
@@ -686,7 +718,7 @@ class Engine:
                            and self.info[st.mint].cluster_row["blacklisted"])
         filt = check_filters(metrics, self.settings.filters(), "smart", blacklisted)
         if not filt.passed:
-            return
+            return await skip("фильтры безопасности: " + ", ".join(filt.violations))
         distinct = {b[1] for b in buys}
         signal, level = "single", "normal"
         if len(distinct) >= 2:
@@ -714,6 +746,11 @@ class Engine:
             "exit_rule": "Выход при продаже трейдера или кластера", "trader": r["trader"],
             "cluster_id": st.cluster_id, "stage": self._stage(st),
         }
+        if own:
+            # для бумаги: размер копии от суммы цели (Ratio) и дельта входа относительно её покупки
+            data.update(copy_wallet=r["trader"], copy_sol=r["sol_amount"], copy_ref_mc=r["mc_sol"])
+            await g.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"], "copied",
+                        "консенсус: второй кошелёк" if signal == "consensus" else None, ref_mc=r["mc_sol"])
         await self.compose("copy" if own else "smart", st.mint, level, data, signal=signal, trader=r["trader"])
         e = self.alerts.get(st.mint)
         if e:
@@ -1067,6 +1104,7 @@ class Engine:
             try:
                 self.fee_bps = await measured_fee_bps(self.db) or self.fee_bps
                 await self._load_traders()
+                await self.copyguard.tick()
                 ing = await self.db.kv_get("health:ingest", {}) or {}
                 self.watch_ok = bool((ing.get("watch") or {}).get("connected"))
                 window = 60 * float(self.cfg.get("follow_minutes", 60))

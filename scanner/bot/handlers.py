@@ -13,7 +13,9 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObj
 from ..alerts.format import esc, pct
 from ..analytics.newcoins import DEFAULTS as _NEW_DEFAULTS
 
-NEW_DEFAULTS = {**_NEW_DEFAULTS, "paper_priority_sol": 0.0005}
+from ..analytics.copyguard import DEFAULTS as _COPY_DEFAULTS  # noqa: E402
+
+NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -260,6 +262,63 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await reply(m, f"📥 Принял кошельков: <b>{len(found)}</b> (новых {new}).\n{sample}{more}\n\n"
                        "Слежка в реальном времени начнётся в течение минуты. Проверяю историю каждого "
                        "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в топик «Смарт-мани».")
+
+    @router.message(Command("copylog"))
+    async def cmd_copylog(m: Message) -> None:
+        """Журнал копитрейда: по каждому своему кошельку — скопировано/пропущено, дельта входа, анти-PVP."""
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        from ..alerts import format as fmt
+        cfg = await reload()
+        try:
+            tz = ZoneInfo(str(cfg.get("timezone") or "UTC"))
+        except Exception:  # noqa: BLE001
+            tz = ZoneInfo("UTC")
+        labels = {r["address"]: r["label"] for r in await db.fetch(
+            "SELECT address, label FROM watchlist WHERE kind IN ('trader', 'dev')")}
+        name = lambda w: esc(labels.get(w) or f"{w[:4]}…{w[-4:]}")  # noqa: E731
+        paused = await db.kv_get("copy:paused", {}) or {}
+        now = datetime.now(timezone.utc).timestamp()
+        stats = await db.fetch(
+            """SELECT wallet, count(*) FILTER (WHERE action='copied') c, count(*) FILTER (WHERE action='skipped') s,
+                      avg(delta) d, count(delta) dn
+               FROM copy_log WHERE ts > now() - interval '24 hours' GROUP BY wallet ORDER BY c DESC, s DESC""")
+        sol = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+        lines = ["📒 <b>Копитрейд за 24 ч</b>"]
+        for r in stats:
+            p_until = float(paused.get(r["wallet"], 0) or 0)
+            lines.append(f"• {name(r['wallet'])}: скопировано {r['c']}, пропущено {r['s']}"
+                         + (f" · дельта входа {r['d']:+.0%} ({r['dn']})" if r["dn"] else "")
+                         + (f" · ⏸ анти-PVP ещё {fmt.ago(p_until - now)}" if p_until > now else ""))
+        if len(lines) == 1:
+            lines.append("Сделок своих кошельков пока не было.")
+        rows = await db.fetch("SELECT * FROM copy_log ORDER BY id DESC LIMIT 15")
+        if rows:
+            lines.append("\n<b>Последние</b>")
+        for r in rows:
+            icon = {"copied": "✅", "skipped": "⛔"}.get(r["action"], "↘")
+            verb = {"buy": "купил", "sell": "продал", "launch": "запустил"}.get(r["side"], r["side"])
+            sol_part = f" {r['sol']:.2f} SOL" if r["sol"] else ""
+            delta = f" · вход {r['delta']:+.0%}" if r["delta"] is not None else ""
+            lines.append(f"{icon} {r['ts'].astimezone(tz):%H:%M} {name(r['wallet'])} {verb}{sol_part} "
+                         f"${esc(r['symbol'] or '?')} · MC {fmt.mc_usd(r['mc'], sol)}{delta}"
+                         + (f" — {esc(r['reason'])}" if r["reason"] else ""))
+        await reply(m, "\n".join(lines)[:4000])
+
+    @router.message(Command("devonce"))
+    async def cmd_devonce(m: Message, command: CommandObject) -> None:
+        addr = (command.args or "").strip().split(" ")[0]
+        if not is_valid_address(addr):
+            return await reply(m, "Формат: <code>/devonce адрес</code> — заходить к этому деву только один раз "
+                                  "(повтор команды выключает).")
+        cur = await db.fetchval("SELECT once FROM my_devs WHERE address=$1", addr)
+        new = not bool(cur)
+        await db.execute("INSERT INTO my_devs(address, once, once_done) VALUES ($1, $2, false) "
+                         "ON CONFLICT (address) DO UPDATE SET once=EXCLUDED.once, once_done=false", addr, new)
+        await db.execute("INSERT INTO watchlist(kind, address) VALUES ('dev', $1) ON CONFLICT DO NOTHING", addr)
+        await reply(m, "✅ Режим «один раз» включён: после первого алерта по этому деву — пауза."
+                    if new else "Режим «один раз» выключен: алерты по каждому запуску.")
 
     @router.message(Command("import"))
     async def cmd_import(m: Message, command: CommandObject) -> None:

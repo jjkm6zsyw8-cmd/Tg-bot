@@ -421,3 +421,24 @@ CREATE TABLE IF NOT EXISTS my_devs (
     hit_rate     double precision,                -- доля запусков, где продал на ×1.5 и выше от старта
     updated_at   timestamptz NOT NULL DEFAULT now()
 );
+
+-- Журнал копитрейда: каждая сделка своих кошельков — скопировано или пропущено и почему (/copylog)
+CREATE TABLE IF NOT EXISTS copy_log (
+    id        bigserial PRIMARY KEY,
+    ts        timestamptz NOT NULL DEFAULT now(),
+    wallet    text NOT NULL,
+    mint      text NOT NULL,
+    symbol    text,
+    side      text NOT NULL,             -- buy | sell | launch
+    sol       double precision,
+    mc        double precision,          -- MC (SOL) сразу после сделки цели
+    action    text NOT NULL,             -- copied | skipped | info
+    reason    text,
+    ref_mc    double precision,          -- MC цели для дельты
+    entry_mc  double precision,          -- MC нашего входа (бумага, +5 с)
+    delta     double precision           -- entry_mc / ref_mc − 1
+);
+CREATE INDEX IF NOT EXISTS copy_log_wallet_idx ON copy_log (wallet, id);
+CREATE INDEX IF NOT EXISTS copy_log_ts_idx ON copy_log (ts);
+ALTER TABLE my_devs ADD COLUMN IF NOT EXISTS once boolean NOT NULL DEFAULT false;       -- зайти к деву один раз
+ALTER TABLE my_devs ADD COLUMN IF NOT EXISTS once_done boolean NOT NULL DEFAULT false;

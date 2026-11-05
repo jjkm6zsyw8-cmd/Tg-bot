@@ -284,6 +284,10 @@ class PaperTrader:
         if not mc or mc <= 0:
             self.skipped.setdefault("*", "нет свежей цены монеты")
             return
+        guard = getattr(self.e, "copyguard", None)
+        if guard is not None and data.get("copy_wallet") and data.get("copy_ref_mc"):
+            # Price Delta: насколько дороже цели мы входим (+5 с реакции) — копить по кошельку
+            await guard.record_delta(data["copy_wallet"], mint, float(data["copy_ref_mc"]), float(mc))
         async with self.lock:
             sizes = []
             for name in SCHEMES:
@@ -305,6 +309,10 @@ class PaperTrader:
             return None
         size = self.balance[name] * self.share_for(level)
         min_size = max(0.01, 10 * self.priority())
+        if data.get("copy_sol") and size >= min_size:
+            # Ratio: копия — доля от суммы покупки цели (её уверенность), потолок — обычная доля портфеля
+            ratio = float(self.cfg.get("copy_ratio", 0.10))
+            size = min(size, max(min_size, ratio * float(data["copy_sol"])))
         if size < min_size:
             if not self.paused.get(name):
                 self.paused[name] = True

@@ -212,6 +212,11 @@ EDITABLE: dict[str, tuple[str, float, float, float, str]] = {
     "new_min_volume_sol": ("Новые: мин. объём, SOL", 2, 1, 500, "num"),
     "new_mc_min_sol": ("Новые: мин. MC, SOL", 5, 28, 1000, "num"),
     "paper_priority_sol": ("Бумага: приоритетная комиссия, SOL", 0.0001, 0, 0.01, "num"),
+    "copy_ratio": ("Копия: доля от суммы цели", 0.05, 0.01, 1.0, "pct"),
+    "copy_min_buy_sol": ("Копия: мин. покупка цели, SOL", 0.05, 0.01, 10, "num"),
+    "antipvp_hold_s": ("Анти-PVP: продал быстрее, с", 5, 5, 300, "num"),
+    "copy_max_delta": ("Копия: макс. дельта входа", 0.05, 0.05, 1.0, "pct"),
+    "copy_dev_min_gap_min": ("Мой дев: пауза между запусками, мин", 1, 0, 60, "num"),
 }
 
 PRESETS = ("cautious", "normal", "aggressive")
