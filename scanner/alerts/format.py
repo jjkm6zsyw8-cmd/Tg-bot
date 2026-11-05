@@ -13,7 +13,8 @@ from ..solana import short
 
 ICONS = {"strong": "🟢", "normal": "🟡", "watch": "⚪", "exit": "🔴", "info": "🔵"}
 LEVEL_NAMES = {"strong": "СИЛЬНЫЙ", "normal": "ОБЫЧНЫЙ", "watch": "НАБЛЮДЕНИЕ"}
-MODE_NAMES = {"dev": "ДЕВ", "smart": "СМАРТ-МАНИ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ МОНЕТА", "trend": "ТРЕНД"}
+MODE_NAMES = {"dev": "ДЕВ", "smart": "СМАРТ-МАНИ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ МОНЕТА", "trend": "ТРЕНД",
+              "copy": "КОПИТРЕЙД", "mydev": "МОЙ ДЕВ"}
 CONF_NAMES = {"high": "высокая", "medium": "средняя", "low": "низкая"}
 SIGNAL_NAMES = {"single": "покупка трейдера", "consensus": "консенсус", "dev_match": "совпадение с девом",
                 "impulse": "импульс"}
@@ -123,7 +124,8 @@ def ago(seconds: float | None) -> str:
     return f"{s // 3600}ч{s % 3600 // 60:02d}м"
 
 
-SHORT_MODES = {"dev": "ДЕВ", "smart": "СМАРТ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ", "trend": "ТРЕНД"}
+SHORT_MODES = {"dev": "ДЕВ", "smart": "СМАРТ", "new_dev_wallet": "НОВЫЙ КОШЕЛЁК ДЕВА", "new": "НОВАЯ", "trend": "ТРЕНД",
+               "copy": "КОПИЯ", "mydev": "МОЙ ДЕВ"}
 
 
 def predicted(a: dict[str, Any]) -> float | None:

@@ -42,6 +42,8 @@ class SolanaRpc:
         self._session: aiohttp.ClientSession | None = None
         self.calls = 0
         self.rate_limited = 0
+        self.pause_until = 0.0          # общая пауза после 429: запросы ждут, а не долбят RPC
+        self._consecutive_429 = 0
         self.day = time.strftime("%Y-%m-%d", time.gmtime())
         self.day_calls = 0
         self.budget: int | None = None      # запросов в сутки (UTC) на «необязательные» задачи; None — без лимита
@@ -55,8 +57,6 @@ class SolanaRpc:
         today = time.strftime("%Y-%m-%d", time.gmtime())
         if today != self.day:
             self.day, self.day_calls = today, 0
-        self.pause_until = 0.0          # общая пауза после 429: запросы ждут, а не долбят RPC
-        self._consecutive_429 = 0
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:

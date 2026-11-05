@@ -126,3 +126,58 @@ async def test_wallet_history_backfill_and_report():
         assert wc.verdict(20, -0.05, 300)[1] == "копия в минусе" and wc.verdict(20, 0.1, 300)[0] == "✅"
     finally:
         await db.close()
+
+
+def test_dev_profile_from_history():
+    """Почерк дева: на каком MC и через сколько он впервые продаёт; монеты без его продажи не считаются."""
+    from datetime import datetime, timedelta, timezone
+
+    from scanner.analytics import walletcheck as wc
+    from scanner.analytics.curve import mc_sol
+    from scanner.models import TokenCreated, Trade
+    dev = addr("slingtwink")
+    t0 = datetime(2026, 11, 5, 12, 0, tzinfo=timezone.utc)
+    creates, trades = [], []
+    # 4 запуска: продаёт на ~2.9×, ~3.4×, ~3.9× от старта через 60/90/120 с, четвёртый — без продажи
+    for i, (v_sol_after, secs) in enumerate([(50, 60), (55, 90), (60, 120)]):
+        m = addr(f"dm{i}")
+        creates.append(TokenCreated(signature=f"c{i}", mint=m, deployer=dev, creator=dev, name="n", symbol="S", uri="",
+                                    bonding_curve="", v_sol=30, v_tokens=1.073e9, real_tokens=7.931e8,
+                                    initial_buy_tokens=0, initial_buy_sol=0, ts=t0 + timedelta(minutes=10 * i)))
+        trades.append(Trade(signature=f"s{i}", mint=m, trader=dev, is_buy=False, sol_amount=5.0, token_amount=5e7,
+                            v_sol=v_sol_after, v_tokens=6.4e8, ts=t0 + timedelta(minutes=10 * i, seconds=secs)))
+    creates.append(TokenCreated(signature="c9", mint=addr("dm9"), deployer=dev, creator=dev, name="n", symbol="S",
+                                uri="", bonding_curve="", v_sol=30, v_tokens=1.073e9, real_tokens=7.931e8,
+                                initial_buy_tokens=0, initial_buy_sol=0, ts=t0))
+    prof = wc.dev_profile(dev, creates, trades)
+    assert prof["launches"] == 4 and prof["sold"] == 3 and prof["hit_rate"] == 1.0
+    assert prof["med_sell_s"] == 90
+    before = mc_sol(55 + 5.0, 6.4e8 - 5e7)                    # MC до продажи, а не после
+    assert abs(prof["med_sell_mc"] - before) < 1e-6 and prof["med_sell_mc"] > mc_sol(55, 6.4e8)
+    assert wc.is_dev(None, prof) and wc.is_dev("твинк слингура", {"launches": 0})
+    assert not wc.is_dev("хороший пнл", {"launches": 0})
+    line = wc.dev_line("твинк", prof, 100.0)
+    assert "продаёт на" in line and "через ~1м" in line
+    assert "запусков в последних транзакциях нет" in wc.dev_line("x", {"launches": 0, "sold": 0}, 100.0)
+
+
+def test_copy_topic_routing():
+    from scanner.analytics.engine import Engine
+    e = Engine.__new__(Engine)
+    assert e._topic_for("strong", {"copy": "strong"}) == "copy"
+    assert e._topic_for("normal", {"mydev": "normal", "dev": "normal"}) == "copy"
+    assert e._topic_for("strong", {"smart": "strong"}) == "strong"
+
+
+async def test_rpc_client_init_and_daily_budget():
+    """Регрессия: правка дневного лимита унесла поля паузы после 429 из __init__ — RPC падал на первом запросе."""
+    from scanner.ingest.rpc import SolanaRpc
+    rpc = SolanaRpc("http://127.0.0.1:9")
+    assert rpc.pause_until == 0.0 and rpc._consecutive_429 == 0
+    rpc.pause_until = 123.0
+    rpc.budget = 2
+    rpc.day_calls = 2
+    assert rpc.over_budget() and rpc.pause_until == 123.0          # проверка лимита не сбрасывает паузу
+    rpc.day = "2000-01-01"
+    assert not rpc.over_budget() and rpc.day_calls == 0             # новые сутки — счётчик с нуля
+    await rpc.close()

@@ -408,3 +408,16 @@ CREATE TABLE IF NOT EXISTS trend_shadow (
     last_price  double precision
 );
 CREATE INDEX IF NOT EXISTS trend_shadow_created_idx ON trend_shadow (created_at);
+
+-- Девы из своего списка (импорт из Axiom, /import): почерк по их истории — где и как быстро продают
+CREATE TABLE IF NOT EXISTS my_devs (
+    address      text PRIMARY KEY,
+    launches     integer NOT NULL DEFAULT 0,      -- запусков в просмотренной истории
+    sold         integer NOT NULL DEFAULT 0,      -- из них дев продавал (есть точка продажи)
+    med_sell_mc  double precision,                -- MC (SOL) перед первой продажей дева: медиана
+    p25_sell_mc  double precision,
+    p75_sell_mc  double precision,
+    med_sell_s   double precision,                -- через сколько секунд после запуска первая продажа
+    hit_rate     double precision,                -- доля запусков, где продал на ×1.5 и выше от старта
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);

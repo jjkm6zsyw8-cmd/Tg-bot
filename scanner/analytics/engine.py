@@ -117,6 +117,7 @@ class Engine:
         from collections import deque
         self._feed_ts: deque[float] = deque(maxlen=5000)
         self.watch_ok = False          # слежка Helius за выбранными кошельками и монетами подключена
+        self.my_devs: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -245,6 +246,9 @@ class Engine:
         info = self.info[st.mint]
         info.resolving = True
         info.created_at = rec["created_at"]
+        mine = self.my_devs.get(st.deployer) or (self.my_devs.get(st.creator) if st.creator else None)
+        if mine is not None:
+            asyncio.create_task(self._my_dev_launch(st, mine))
         try:
             if not cfg.get("modes", {}).get("dev", True):
                 return
@@ -573,6 +577,34 @@ class Engine:
         await self.compose("new", st.mint, "normal", data)
 
     # ------------------------------------------------------------------ режим 2: смарт-мани
+    async def _my_dev_launch(self, st: TokenState, dev: dict[str, Any]) -> None:
+        """Дев из своего списка запустил монету — алерт сразу, без внешних проверок (каждая секунда — это MC).
+        Вход и цель — по его истории: цель чуть ниже нижней четверти его точек первой продажи."""
+        cfg = self.cfg
+        if not cfg.get("modes", {}).get("copy", True):
+            return
+        start = st.mc
+        p25, p75, med = dev.get("p25_sell_mc"), dev.get("p75_sell_mc"), dev.get("med_sell_mc")
+        sol = self.price.value or 150
+        label = dev.get("label") or f"{st.deployer[:4]}…"
+        if med and med > start * 1.2:
+            target = max(start * 1.25, 0.9 * (p25 or med))
+            entry_max = max(start * 1.05, min(0.6 * med, target / 1.25))
+            note = (f"👻 {label}: продаёт на {fmt.mc_usd(p25, sol)}–{fmt.mc_usd(p75, sol)} через "
+                    f"~{fmt.ago(dev.get('med_sell_s'))} · запусков {dev.get('launches') or 0}, "
+                    f"×1.5+ в {float(dev.get('hit_rate') or 0):.0%}")
+        else:
+            target, entry_max = start * 1.5, start * 1.2
+            note = f"👻 {label}: почерка ещё нет — цель ×1.5 по умолчанию, выход при первой продаже дева"
+        strong = int(dev.get("sold") or 0) >= 3 and float(dev.get("hit_rate") or 0) >= 0.6
+        data = {
+            "symbol": st.symbol, "mc": st.mc, "age_s": time.time() - st.created_ts, "entry_mc": st.mc,
+            "entry_max_mc": entry_max, "target_mc": target, "dump_mc": med, "note": note,
+            "signal": "мой дев", "metrics": {}, "violations": [], "cluster_id": st.cluster_id,
+            "exit_rule": "Выход при первой продаже дева", "stage": "на кривой",
+        }
+        await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev")
+
     def _candidate_coin(self, mint: str) -> bool:
         """Монета дева-кандидата (кластер прошёл пороги профиля или отмечен «Успешно»): приёмник подписал её сделки
         через слежку Helius сразу при создании — те же условия, что в Receiver.watch_targets."""
@@ -599,6 +631,11 @@ class Engine:
                                                    "copy_30d": None, "win_rate": None, "manual": True})
         self.watch_tokens = {r["address"] for r in await self.db.fetch(
             "SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())")}
+        # девы из своего списка: алерт в момент запуска, цели — по их почерку (analytics/walletcheck.py)
+        self.my_devs = {r["address"]: dict(r) for r in await self.db.fetch(
+            """SELECT w.address, w.label, m.launches, m.sold, m.med_sell_mc, m.p25_sell_mc, m.p75_sell_mc,
+                      m.med_sell_s, m.hit_rate
+               FROM watchlist w LEFT JOIN my_devs m ON m.address = w.address WHERE w.kind = 'dev'""")}
 
     async def _load_references(self) -> None:
         rows = await self.db.fetch(
@@ -607,9 +644,10 @@ class Engine:
 
     async def _on_smart_trade(self, st: TokenState, r: Any) -> None:
         cfg = self.cfg
-        if not cfg.get("modes", {}).get("smart", True):
-            return
         trader = self.traders[r["trader"]]
+        own = bool(trader.get("manual"))      # свой список → раздел «Копитрейд», включается отдельно
+        if not cfg.get("modes", {}).get("copy" if own else "smart", True):
+            return
         line = {"is_buy": r["is_buy"], "label": trader["label"], "trader": r["trader"], "sol": r["sol_amount"],
                 "symbol": st.symbol, "mc": st.mc, "mint": st.mint}
         if not cfg.get("smart_filtered", True) or cfg.get("smart_full_feed"):
@@ -624,20 +662,23 @@ class Engine:
                     await self._follow_msg(entry, "trader_sell", st, emergency=True,
                                            extra=f"{trader['label'] or r['trader'][:6]} продал")
             return
-        if not cfg.get("smart_filtered", True):
+        if not own and not cfg.get("smart_filtered", True):
             return
         now = time.time()
         buys = [b for b in self.smart_buys.get(st.mint, [])
                 if now - b[0] <= 60 * float(cfg.get("consensus_window_min", 10))]
         buys.append((now, r["trader"], r["sol_amount"]))
         self.smart_buys[st.mint] = buys
-        # свой список (импорт из Axiom, /addwallet) — копируем и небольшие покупки
-        min_buy = float(cfg.get("copy_min_buy_sol", 0.1)) if trader.get("manual") else float(cfg.get("smart_min_buy_sol", 0.5))
+        # свой список (импорт из Axiom, /addwallet) — раздел «Копитрейд»: копируем и небольшие покупки,
+        # без рамок MC и роста за минуту (вы сами выбрали этих трейдеров)
+        if own and r["trader"] == st.deployer:
+            return                       # дев покупает свою монету при запуске — это алерт «мой дев», не копия
+        min_buy = float(cfg.get("copy_min_buy_sol", 0.1)) if own else float(cfg.get("smart_min_buy_sol", 0.5))
         if r["sol_amount"] < min_buy:
             return
-        if not (float(cfg.get("smart_mc_min_sol", 0)) <= st.mc <= float(cfg.get("smart_mc_max_sol", 1e9))):
+        if not own and not (float(cfg.get("smart_mc_min_sol", 0)) <= st.mc <= float(cfg.get("smart_mc_max_sol", 1e9))):
             return
-        if st.growth(now) > float(cfg.get("smart_max_growth_1m", 1.0)):
+        if not own and st.growth(now) > float(cfg.get("smart_max_growth_1m", 1.0)):
             return
         fresh = await self._fresh_share(st)
         metrics = st.metrics(fresh)
@@ -673,7 +714,7 @@ class Engine:
             "exit_rule": "Выход при продаже трейдера или кластера", "trader": r["trader"],
             "cluster_id": st.cluster_id, "stage": self._stage(st),
         }
-        await self.compose("smart", st.mint, level, data, signal=signal, trader=r["trader"])
+        await self.compose("copy" if own else "smart", st.mint, level, data, signal=signal, trader=r["trader"])
         e = self.alerts.get(st.mint)
         if e:
             e.trigger_traders[r["trader"]] = e.trigger_traders.get(r["trader"], 0.0) + r["token_amount"]
@@ -719,6 +760,8 @@ class Engine:
 
     # ------------------------------------------------------------------ сборка алерта
     def _topic_for(self, level: str, modes: dict[str, str]) -> str:
+        if "copy" in modes or "mydev" in modes:
+            return "copy"            # свой список — отдельный раздел «Копитрейд»
         if level == "strong":
             return "strong"
         if level == "watch":
