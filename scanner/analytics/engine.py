@@ -132,6 +132,12 @@ class Engine:
     async def reload_settings(self) -> None:
         self.settings.overrides = await self.db.get_overrides()
 
+    def rpc_over_budget(self) -> bool:
+        """Бесплатный Helius — ~1 млн запросов в месяц на ВСЕ процессы (~33 тыс. в сутки), приёмнику нужно ~15 тыс.
+        Аналитике по умолчанию — 15 тыс. в сутки на фоновые задачи; сверх лимита они ждут следующих суток (UTC)."""
+        self.rpc.budget = int(self.cfg.get("rpc_daily_budget_analytics", 15_000))
+        return self.rpc.over_budget()
+
     # ------------------------------------------------------------------ запуск
     async def start(self) -> None:
         await self.reload_settings()
@@ -303,7 +309,7 @@ class Engine:
 
     async def _resolve_rpc(self, st: TokenState) -> None:
         info = self.info.get(st.mint)
-        if info is None or info.rpc_started:
+        if info is None or info.rpc_started or self.rpc_over_budget():
             return
         info.rpc_started = True
         cfg = self.cfg
@@ -646,7 +652,7 @@ class Engine:
     async def _fresh_share(self, st: TokenState, top: int = 15) -> float | None:
         """Доля холдеров (из топа), созданных за последние 24 часа."""
         holders = sorted(st.holders().items(), key=lambda x: -x[1])[:top]
-        if not holders:
+        if not holders or self.rpc_over_budget():
             return None
         addrs = [a for a, _ in holders]
         known = {r["address"]: r["created_est"] for r in await self.db.fetch(
@@ -999,7 +1005,10 @@ class Engine:
                     info = self.info.pop(m, None)
                     await self.finalize_launch(st, info)
                 await self.ext.publish_health("analytics")
-                await self.db.kv_set("usage:analytics", {"rpc_calls": self.rpc.calls, "rpc_429": self.rpc.rate_limited})
+                await self.db.kv_set("usage:analytics", {"rpc_calls": self.rpc.calls, "rpc_429": self.rpc.rate_limited,
+                                                          "rpc_today": self.rpc.day_calls,
+                                                          "rpc_budget": self.rpc.budget,
+                                                          "rpc_over": self.rpc_over_budget()})
                 await self._follow_migrated()
                 cut = time.time() - 600
                 for m in [m for m, t in self.ext_blocked.items() if t < cut]:

@@ -149,6 +149,7 @@ class Trends:
         self.gecko_budget = tc.RateBudget(12, 60)    # GeckoTerminal: бесплатный лимит небольшой, держим запас
         self.gecko_pause_until = 0.0                 # после 429 — минута тишины
         self.ohlcv_misses: dict[str, int] = {}
+        self.largest_cache: dict[str, tuple[float, float | None, list[dict[str, Any]]]] = {}
         self.holder_budget = tc.RateBudget(30, 3600) # проверка холдеров: ~22 запроса RPC, не больше 30 в час
         self.tick = 0
         self.stats: dict[str, Any] = {"candidates": 0, "checked": 0, "alerts": 0, "errors": 0, "rejected": {}}
@@ -222,7 +223,20 @@ class Trends:
         return share
 
     async def largest(self, pi: PairInfo) -> tuple[float | None, list[dict[str, Any]]]:
-        """Доля топ-10 холдеров без кошелька пула и сами токен-аккаунты (RPC: 2 запроса)."""
+        """Доля топ-10 холдеров без кошелька пула и сами токен-аккаунты (RPC: 2 запроса, кеш 10 минут)."""
+        hit = self.largest_cache.get(pi.mint)
+        if hit and time.time() - hit[0] < 600:
+            return hit[1], hit[2]
+        if self.e.rpc_over_budget():
+            return None, []
+        share, accs = await self._largest(pi)
+        self.largest_cache[pi.mint] = (time.time(), share, accs)
+        if len(self.largest_cache) > 2000:
+            cut = time.time() - 600
+            self.largest_cache = {k: v for k, v in self.largest_cache.items() if v[0] > cut}
+        return share, accs
+
+    async def _largest(self, pi: PairInfo) -> tuple[float | None, list[dict[str, Any]]]:
         rpc = self.e.rpc
         try:
             supply = await rpc.call("getTokenSupply", [pi.mint])
@@ -243,7 +257,7 @@ class Trends:
     async def holder_check(self, accounts: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Топ-10 холдеров: свежие, общий источник денег, пополнены в одно время. ~22 запроса RPC,
         кошельки кешируются в таблице wallets. Не больше 30 проверок в час."""
-        if not accounts or not self.holder_budget.take():
+        if not accounts or self.e.rpc_over_budget() or not self.holder_budget.take():
             return None
         from datetime import datetime, timedelta, timezone
 
@@ -377,10 +391,7 @@ class Trends:
             st = self.e.states.get(m)
             if st is not None and (st.big_sell_ts or any(not t.is_buy and t.trader == st.deployer for t in st.trades)):
                 continue  # дев уже сливал — не входим
-            top10, accs = await self.largest(pi)
-            if top10 is not None and top10 > p(cfg, "trend_max_top10"):
-                continue
-            passed.append((pi, top10, accs, row["cluster_id"] if row else None))
+            passed.append((pi, None, [], row["cluster_id"] if row else None))
         if not passed:
             return
         # 1) боты: разные покупатели и продавцы за 5 минут (GeckoTerminal, до 30 пулов одним запросом)
@@ -409,6 +420,11 @@ class Trends:
             stair = tc.staircase(ohlcv, cfg)
             if stair:
                 self.reject(pi, *stair)
+                continue
+            # топ-10 холдеров (2 запроса RPC) — только для прошедших бесплатные фильтры, с кешем на 10 минут
+            top10, accs = await self.largest(pi)
+            if top10 is not None and top10 > p(cfg, "trend_max_top10"):
+                self.reject(pi, "top10", f"топ-10 держат {top10:.0%}")
                 continue
             m5 = (g.get("transactions") or {}).get("m5") or {}
             extra = {"top10": top10, "accounts": accs, "cluster_id": cid, "buyers": int(m5.get("buyers") or 0),
@@ -502,8 +518,8 @@ class Trends:
         now = time.time()
         for m, sh in list(self.shadow.items()):
             pi = info.get(m)
-            if pi and pi.price > 0:
-                sh.max_price = max(sh.max_price, pi.price)
+            if pi and pi.price > 0 and 1 / 5 <= pi.price / (sh.last_price or sh.price) <= 5:
+                sh.max_price = max(sh.max_price, pi.price)   # скачки в 5+ раз за 30 с — сбой цены, не учитываем
                 sh.last_price = pi.price
             if now - sh.ts >= 3600:
                 self.shadow.pop(m, None)

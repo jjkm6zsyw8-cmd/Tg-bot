@@ -386,6 +386,9 @@ async def data_health(db: Database) -> list[str]:
                    f"+ {use.get('pp_amm_msgs', 0):.0f} PumpSwap (~{use.get('pp_amm_msgs', 0) / 10000 * 0.01:.4f} SOL); "
                    f"Helius стриминг ~{use.get('helius_stream_credits', 0):,} кредитов; RPC "
                    f"{use.get('rpc_calls', 0) + (ua.get('rpc_calls') or 0):,.0f} запросов")
+        if ua.get("rpc_budget"):
+            out.append(f"RPC аналитики сегодня: {ua.get('rpc_today', 0):,} из {ua['rpc_budget']:,}"
+                       + (" — лимит исчерпан, фоновые проверки ждут завтра (UTC)" if ua.get("rpc_over") else ""))
     return out
 
 

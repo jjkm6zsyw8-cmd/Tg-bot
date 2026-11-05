@@ -198,18 +198,24 @@ class WithdrawalWatcher:
     async def run(self) -> None:
         while True:
             rel = self.e.settings.reliability()
-            await asyncio.sleep(float(rel.get("withdrawal_poll_s", 15)))
+            await asyncio.sleep(float(rel.get("withdrawal_poll_s_v2", 60)))
             try:
                 await self.tick(int(rel.get("withdrawal_hops", 3)))
             except Exception:  # noqa: BLE001
                 log.exception("withdrawal watcher")
 
     async def tick(self, max_hops: int) -> None:
+        # слежка за выводом SOL — 48 часов после отметки, не больше 30 кошельков: раньше кошельки «вечно» опрашивались
+        # каждые 15 с, и на активных девах это съедало дневной лимит RPC
+        await self.db.execute("UPDATE withdrawal_watch SET stopped='expired' WHERE stopped IS NULL "
+                              "AND created_at < now() - interval '48 hours'")
         rows = await self.db.fetch(
             """SELECT w.* FROM withdrawal_watch w JOIN clusters c ON c.id = w.cluster_id
-               WHERE w.stopped IS NULL AND c.priority AND NOT c.blacklisted ORDER BY w.created_at DESC LIMIT 300""")
+               WHERE w.stopped IS NULL AND c.priority AND NOT c.blacklisted ORDER BY w.created_at DESC LIMIT 30""")
         rpc = self.e.rpc
         for r in rows:
+            if self.e.rpc_over_budget():
+                return
             try:
                 sigs = await rpc.signatures_for(r["wallet"], limit=25, until=r["last_sig"])
             except RpcError:
@@ -220,7 +226,7 @@ class WithdrawalWatcher:
                                   sigs[0]["signature"])
             if r["last_sig"] is None:
                 continue  # первая проверка — только запоминаем точку отсчёта
-            for s in reversed(sigs):
+            for s in list(reversed(sigs))[-5:]:     # активный кошелёк: только 5 последних транзакций за опрос
                 if s.get("err"):
                     continue
                 try:

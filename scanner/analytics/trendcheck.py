@@ -38,7 +38,7 @@ REASONS = {
     "bots": "боты в сделках", "staircase": "лесенка", "flat_volume": "ровный объём (бот)",
     "holders_fresh": "свежие кошельки", "holders_funder": "общий источник денег",
     "holders_time": "пополнены в одно время", "no_pullback": "не было отката", "fell": "обвал после сигнала",
-    "no_data": "нет данных GeckoTerminal", "bad_price": "цена не сходится с Jupiter",
+    "no_data": "нет данных GeckoTerminal", "bad_price": "цена не сходится с Jupiter", "top10": "топ-10 держат много",
 }
 
 
@@ -214,23 +214,33 @@ class RateBudget:
 
 async def shadow_summary(db: Any, start: datetime, end: datetime) -> list[str]:
     """Отсеянные «Трендами» монеты: что было с ними через час — и для сравнения алерты за тот же период."""
+    # медиана, а не среднее: одна монета со сбойной ценой (×10 000) делала «среднее» бессмысленным;
+    # записи с ростом больше ×20 за час считаем сбоем данных и не учитываем
+    clean = "price > 0 AND max_price < price * 20 AND last_price < price * 20"
     rows = await db.fetch(
-        """SELECT reason, count(*) AS n, avg(last_price / NULLIF(price, 0) - 1) AS after,
-                  count(*) FILTER (WHERE max_price >= price * 1.3) AS up30
-           FROM trend_shadow WHERE created_at >= $1 AND created_at < $2 GROUP BY 1 ORDER BY 2 DESC""", start, end)
+        f"""SELECT reason, count(*) AS n,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY last_price / price - 1) AS after,
+                   count(*) FILTER (WHERE max_price >= price * 1.3) AS up30,
+                   count(*) FILTER (WHERE last_price <= price * 0.7) AS down30
+            FROM trend_shadow WHERE created_at >= $1 AND created_at < $2 AND {clean}
+            GROUP BY 1 ORDER BY 2 DESC""", start, end)
     if not rows:
         return []
     total = sum(r["n"] for r in rows)
     up = sum(r["up30"] for r in rows)
-    out = [f"🧹 <b>Тренды: отсеяно {total}</b> · через час они в среднем "
-           f"{sum((r['after'] or 0) * r['n'] for r in rows) / total:+.0%} · выросли бы на +30% и выше: {up} ({up / total:.0%})"]
+    down = sum(r["down30"] for r in rows)
+    out = [f"🧹 <b>Тренды: отсеяно {total}</b> · через час: упали на 30%+ {down} ({down / total:.0%}), "
+           f"на пике было +30%↑ {up} ({up / total:.0%})"]
     for r in rows:
-        out.append(f"  {REASONS.get(r['reason'], r['reason'])}: {r['n']} · через час {(r['after'] or 0):+.0%} · "
-                   f"+30%↑ {r['up30']}")
+        out.append(f"  {REASONS.get(r['reason'], r['reason'])}: {r['n']} · медиана через час {(r['after'] or 0):+.0%} · "
+                   f"+30%↑ {r['up30']} · −30%↓ {r['down30']}")
     a = await db.fetchrow(
-        """SELECT count(*) AS n, count(*) FILTER (WHERE o.max_mc >= a.entry_mc * 1.3) AS up30
+        """SELECT count(*) AS n, count(*) FILTER (WHERE o.max_mc >= a.entry_mc * 1.3) AS up30,
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY o.net_result) AS med
            FROM alerts a JOIN alert_outcomes o ON o.alert_id = a.id
-           WHERE a.mode = 'trend' AND a.created_at >= $1 AND a.created_at < $2""", start, end)
+           WHERE a.mode = 'trend' AND a.created_at >= $1 AND a.created_at < $2
+             AND a.entry_mc > 0 AND o.max_mc < a.entry_mc * 20""", start, end)
     if a and a["n"]:
-        out.append(f"  для сравнения, алерты: {a['n']} · +30%↑ {a['up30']} ({a['up30'] / a['n']:.0%})")
+        out.append(f"  для сравнения, алерты: {a['n']} · +30%↑ {a['up30']} ({a['up30'] / a['n']:.0%}) · "
+                   f"медиана итога {(a['med'] or 0):+.0%}")
     return out
