@@ -15,11 +15,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
+import base58
 import websockets
 
 from ..models import Event, Migration, TokenCreated, Trade
 from ..solana import PUMP_AMM_PROGRAM, PUMP_PROGRAM, TOTAL_SUPPLY
-from .pump_parser import KNOWN, ParseStats, TxContext, decode_event, parse_transaction
+from .pump_parser import D_AMM_BUY, D_AMM_SELL, KNOWN, ParseStats, TxContext, decode_event, parse_transaction
 
 log = logging.getLogger(__name__)
 
@@ -379,19 +380,22 @@ class LogsSource(Source):
                     self.last_slot = getattr(ev, "slot", None) or self.last_slot
 
     @staticmethod
-    def parse_notification(raw: str | bytes, stats: ParseStats,
-                           pool_to_mint: dict[str, str] | None = None) -> list[Event]:
-        try:
-            msg = json.loads(raw)
-        except ValueError:
-            return []
+    def parse_notification(raw: str | bytes | dict[str, Any], stats: ParseStats,
+                           pool_to_mint: dict[str, str] | None = None, source: str = "logs") -> list[Event]:
+        if isinstance(raw, dict):
+            msg = raw
+        else:
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                return []
         result = (msg.get("params") or {}).get("result") if isinstance(msg, dict) else None
         if not result:
             return []
         value = result.get("value") or {}
         if value.get("err") is not None or not value.get("signature"):
             return []
-        ctx = TxContext(value["signature"], (result.get("context") or {}).get("slot"), None, None, "logs")
+        ctx = TxContext(value["signature"], (result.get("context") or {}).get("slot"), None, None, source)
         out: list[Event] = []
         seen: set[bytes] = set()
         for line in value.get("logs") or []:
@@ -412,4 +416,167 @@ class LogsSource(Source):
             if ev is not None:
                 stats.ok += 1
                 out.append(ev)
+        return out
+
+
+class WatchSource(Source):
+    """Сделки только нужных кошельков и монет: logsSubscribe {"mentions": [адрес]} на стандартном websocket Helius.
+
+    Замена платной подписки PumpPortal на сделки: приходят транзакции только этих адресов (покупки и продажи
+    отслеживаемых трейдеров, созданные ими монеты, сделки по монетам открытых позиций и девов-кандидатов).
+    Бесплатный тариф Helius: 5 соединений × 1000 подписок, трафик 20 кредитов за МБ — на ~100 кошельков и
+    десятки монет это тысячи кредитов в сутки. Источник не участвует в сверке покрытия и в поиске обрывов —
+    он видит не весь рынок, а только выбранные адреса.
+    """
+
+    name = "watch"
+    MAX_SUBS = 950
+
+    def __init__(self, url: str, pool_to_mint: dict[str, str]):
+        super().__init__()
+        self.url = url
+        self.pool_to_mint = pool_to_mint
+        self.want: dict[str, str] = {}          # адрес → "wallet" | "coin"
+        self.subs: dict[str, int] = {}          # адрес → id подписки
+        self.pending: dict[int, str] = {}       # id запроса → адрес
+        self.unsub_pending: set[int] = set()
+        self._ids = iter(range(10, 1 << 62))
+        self._changed = asyncio.Event()
+        self.last_slot: int | None = None
+        self.notifications = 0
+        self.sid_addr: dict[int, str] = {}      # id подписки → адрес
+        # processed присылает одну транзакцию дважды (двойной трафик и кредиты); confirmed — один раз, +~0.5 с
+        self.commitment = "confirmed"
+        # пул PumpSwap → монета через DexScreener (для покупок кошельков в уже мигрировавших монетах)
+        self.resolve_pool: Callable[[str], Awaitable[str | None]] | None = None
+        self.unresolved = 0
+
+    def set_targets(self, wallets: list[str], coins: list[str]) -> None:
+        """Кошельки важнее монет: при переполнении режем монеты."""
+        want: dict[str, str] = {}
+        for a in wallets:
+            if len(want) >= self.MAX_SUBS:
+                break
+            want.setdefault(a, "wallet")
+        for a in coins:
+            if len(want) >= self.MAX_SUBS:
+                break
+            want.setdefault(a, "coin")
+        if want != self.want:
+            self.want = want
+            self._changed.set()
+
+    def add_coin(self, mint: str) -> None:
+        """Мгновенно (не дожидаясь минутного обновления) — монета дева-кандидата сразу после создания."""
+        if mint not in self.want and len(self.want) < self.MAX_SUBS:
+            self.want[mint] = "coin"
+            self._changed.set()
+
+    def counts(self) -> dict[str, int]:
+        kinds = list(self.want.values())
+        return {"wallets": kinds.count("wallet"), "coins": kinds.count("coin"), "active": len(self.subs)}
+
+    async def _sync(self, ws: Any) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+            self._changed.clear()
+            asked = set(self.pending.values())
+            for addr in [a for a in self.want if a not in self.subs and a not in asked]:
+                rid = next(self._ids)
+                self.pending[rid] = addr
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsSubscribe",
+                                          "params": [{"mentions": [addr]}, {"commitment": self.commitment}]}))
+                await asyncio.sleep(0.02)
+            for addr in [a for a in self.subs if a not in self.want]:
+                sid = self.subs.pop(addr)
+                rid = next(self._ids)
+                self.unsub_pending.add(rid)
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsUnsubscribe", "params": [sid]}))
+                await asyncio.sleep(0.02)
+
+    async def _session(self, sink: Sink) -> None:
+        async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2**24,
+                                      open_timeout=20) as ws:
+            self._ws = ws
+            self.subs.clear()
+            self.pending.clear()
+            self.sid_addr.clear()
+            self._set_connected(True)
+            self._changed.set()
+            log.info("watch: подключено, адресов %d", len(self.want))
+            sync = asyncio.create_task(self._sync(ws))
+            try:
+                async for raw in ws:
+                    self.bytes_in += len(raw)
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    rid = msg.get("id")
+                    if rid is not None:
+                        if rid in self.pending:
+                            addr = self.pending.pop(rid)
+                            if isinstance(msg.get("result"), int) and addr in self.want:
+                                self.subs[addr] = msg["result"]
+                                self.sid_addr[msg["result"]] = addr
+                            elif "error" in msg:
+                                log.warning("watch: подписка на %s отклонена: %s", addr, msg["error"])
+                        self.unsub_pending.discard(rid)
+                        continue
+                    if msg.get("method") != "logsNotification":
+                        continue
+                    self.notifications += 1
+                    addr = self.sid_addr.get((msg.get("params") or {}).get("subscription"))
+                    unknown = self.unknown_pools(msg)
+                    if unknown:
+                        if self.want.get(addr) == "coin" and len(unknown) == 1:
+                            # подписка на монету: единственный незнакомый пул PumpSwap — пул этой монеты
+                            self.pool_to_mint[unknown[0]] = addr
+                        elif self.resolve_pool is not None:
+                            asyncio.create_task(self._resolve_and_emit(msg, unknown, sink))
+                            continue
+                    await self._emit(msg, sink)
+            finally:
+                sync.cancel()
+
+    async def _emit(self, msg: dict[str, Any], sink: Sink) -> None:
+        for ev in LogsSource.parse_notification(msg, self.stats, self.pool_to_mint, source="watch"):
+            self.mark_event()
+            await sink(ev)
+            self.last_slot = getattr(ev, "slot", None) or self.last_slot
+
+    async def _resolve_and_emit(self, msg: dict[str, Any], pools: list[str], sink: Sink) -> None:
+        for pool in pools:
+            try:
+                mint = await self.resolve_pool(pool) if self.resolve_pool else None
+            except Exception:  # noqa: BLE001
+                mint = None
+            if mint:
+                self.pool_to_mint[pool] = mint
+            else:
+                self.unresolved += 1
+        await self._emit(msg, sink)
+
+    def unknown_pools(self, msg: dict[str, Any]) -> list[str]:
+        """Пулы PumpSwap из событий покупки/продажи, для которых монета ещё не известна."""
+        value = (((msg.get("params") or {}).get("result") or {}).get("value") or {})
+        if value.get("err") is not None:
+            return []
+        out: list[str] = []
+        for line in value.get("logs") or []:
+            if not line.startswith("Program data: "):
+                continue
+            try:
+                data = base64.b64decode(line[14:])
+            except ValueError:
+                continue
+            if data[:8] in (D_AMM_BUY, D_AMM_SELL) and len(data) >= 152:
+                pool = base58.b58encode(data[120:152]).decode()
+                if pool not in self.pool_to_mint and pool not in out:
+                    out.append(pool)
         return out

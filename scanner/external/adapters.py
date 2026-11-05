@@ -94,6 +94,7 @@ def parse_dex_pairs(data: Any, mint: str) -> dict[str, Any] | None:
             tx = (d.get("txns") or {}).get("m5") or {}
             best = {
                 "dex": d.get("dexId"), "pair": d.get("pairAddress"), "price_usd": _f(d.get("priceUsd")),
+                "symbol": (d.get("baseToken") or {}).get("symbol"),
                 "market_cap_usd": _f(d.get("marketCap") or d.get("fdv")), "liquidity_usd": liq,
                 "volume_m5": _f((d.get("volume") or {}).get("m5")), "volume_h1": _f((d.get("volume") or {}).get("h1")),
                 "buys_m5": int(tx.get("buys") or 0), "sells_m5": int(tx.get("sells") or 0),

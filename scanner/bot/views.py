@@ -265,13 +265,23 @@ async def health_view(db: Database) -> str:
                      f", событий {s['events']}, {s.get('mb_in', 0)} МБ, переподключений {s['reconnects']}, "
                      f"ошибок парсинга {s['parse_errors']}")
     if ing:
-        if not ing.get("pumpportal_key"):
+        watch_on = bool((ing.get("watch") or {}).get("connected"))
+        if watch_on and (not ing.get("pumpportal_key") or ing.get("pumpportal_refused")):
+            lines.append("  ℹ️ PumpPortal отдаёт только новые монеты — это нормально: сделки нужных кошельков "
+                         "и монет идут через слежку Helius")
+        elif not ing.get("pumpportal_key"):
             lines.append("  ⚠️ нет PUMPPORTAL_API_KEY — сделки не собираются (нужен ключ с 0.02 SOL)")
         elif ing.get("pumpportal_refused"):
             lines.append("  ⛔ PumpPortal отказал в сделках: «" + esc(ing["pumpportal_refused"][:150]) +
                          "» — пополните кошелёк API-ключа до 0.02 SOL")
         elif ing.get("pumpportal_subs", 0) >= 50 and not ing.get("pumpportal_trades"):
             lines.append("  ⛔ подписки есть, а сделок от PumpPortal 0 — проверьте баланс кошелька API-ключа")
+        wt = ing.get("watch")
+        if wt:
+            lines.append(f"  {'🟢' if wt.get('connected') else '🔴'} слежка Helius: кошельков {wt.get('wallets', 0)}, "
+                         f"монет {wt.get('coins', 0)} (девов-кандидатов {wt.get('devs', 0)}), событий {wt.get('events', 0)}, "
+                         f"за сутки {wt.get('mb_today', 0)} МБ ≈ {wt.get('mb_today', 0) * 20:,.0f} кредитов"
+                         + (" — дневной лимит, монеты на паузе" if wt.get("capped") else ""))
         lines.append(f"  подписок на сделки {ing.get('pumpportal_subs', 0)}, продлено {ing.get('extended', 0)}, "
                      f"Helius: {ing.get('helius_mode', 'off')}")
         lines.append(f"  очередь событий {ing.get('queue', 0)} (потеряно {ing.get('dropped', 0)}), досбора "

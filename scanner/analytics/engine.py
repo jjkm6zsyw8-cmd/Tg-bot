@@ -116,6 +116,7 @@ class Engine:
         self._cl_day: dict[int, tuple[Any, int]] = {}
         from collections import deque
         self._feed_ts: deque[float] = deque(maxlen=5000)
+        self.watch_ok = False          # слежка Helius за выбранными кошельками и монетами подключена
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -134,8 +135,8 @@ class Engine:
 
     def rpc_over_budget(self) -> bool:
         """Бесплатный Helius — ~1 млн запросов в месяц на ВСЕ процессы (~33 тыс. в сутки), приёмнику нужно ~15 тыс.
-        Аналитике по умолчанию — 15 тыс. в сутки на фоновые задачи; сверх лимита они ждут следующих суток (UTC)."""
-        self.rpc.budget = int(self.cfg.get("rpc_daily_budget_analytics", 15_000))
+        Аналитике по умолчанию — 12 тыс. в сутки на фоновые задачи; сверх лимита они ждут следующих суток (UTC)."""
+        self.rpc.budget = int(self.cfg.get("rpc_daily_budget_analytics", 12_000))
         return self.rpc.over_budget()
 
     # ------------------------------------------------------------------ запуск
@@ -380,9 +381,12 @@ class Engine:
                                   {"text": "Отклонить", "callback": f"lk:{lid}:n", "style": "danger"}]],
                 }, priority=6)
 
-    def trade_feed_ok(self) -> bool:
+    def trade_feed_ok(self, mint: str | None = None) -> bool:
         """Есть ли живой поток сделок: за 5 минут пришло 20+ сделок помимо покупок дева в транзакции создания.
-        Без него алерты «Девы» и «Новые монеты» вслепую: нет цены после алерта и не видно продажи дева."""
+        Без него алерты «Девы» и «Новые монеты» вслепую: нет цены после алерта и не видно продажи дева.
+        Монеты девов-кандидатов идут через слежку Helius (сделки именно этой монеты) — им общий поток не нужен."""
+        if mint is not None and self.watch_ok and self._candidate_coin(mint):
+            return True
         cut = time.monotonic() - 300
         while self._feed_ts and self._feed_ts[0] < cut:
             self._feed_ts.popleft()
@@ -397,6 +401,11 @@ class Engine:
         tracked = trader in self.traders
         if st is None and (tracked or mint in self.alerts or mint in self.watch_tokens):
             st = await load_state(self.db, mint, self.cfg)
+            if st is None and tracked:
+                # монета появилась до запуска бота (или во время обрыва): заводим заглушку по сделке трейдера,
+                # иначе покупку отслеживаемого кошелька пропустим
+                await self._stub_token(mint, r)
+                st = await load_state(self.db, mint, self.cfg)
             if st is None:
                 return
             self.states[mint] = st
@@ -454,7 +463,7 @@ class Engine:
         st, info = self.states.get(mint), self.info.get(mint)
         if not st or not info:
             return
-        if not self.trade_feed_ok():
+        if not self.trade_feed_ok(mint):
             info.last_reason = "no_trade_data"
             info.last_decision.update({"reason": "no_trade_data"})
             return
@@ -564,12 +573,30 @@ class Engine:
         await self.compose("new", st.mint, "normal", data)
 
     # ------------------------------------------------------------------ режим 2: смарт-мани
+    def _candidate_coin(self, mint: str) -> bool:
+        """Монета дева-кандидата (кластер прошёл пороги профиля или отмечен «Успешно»): приёмник подписал её сделки
+        через слежку Helius сразу при создании — те же условия, что в Receiver.watch_targets."""
+        info = self.info.get(mint)
+        row = info.cluster_row if info is not None else None
+        return bool(row and (row["priority"] or row["qualified_at"]) and not row["blacklisted"]
+                    and not row.get("suspicious"))
+
+    async def _stub_token(self, mint: str, r: Any) -> None:
+        symbol = ""
+        pair = await self.ext.dex_pair(mint, timeout=2.0) if getattr(self, "ext", None) is not None else None
+        if pair:
+            symbol = str(pair.get("symbol") or "")
+        await self.db.execute(
+            """INSERT INTO tokens(mint, signature, deployer, current_owner, symbol, created_at, initial_mc_sol, source)
+               VALUES ($1, $2, '', '', $3, $4, $5, 'stub') ON CONFLICT (mint) DO NOTHING""",
+            mint, f"stub:{mint}", symbol, r["ts"], r["mc_sol"])
+
     async def _load_traders(self) -> None:
         rows = await self.db.fetch("SELECT * FROM traders WHERE active")
         self.traders = {r["address"]: r for r in rows}
         for r in await self.db.fetch("SELECT address, label FROM watchlist WHERE kind='trader'"):
             self.traders.setdefault(r["address"], {"address": r["address"], "label": r["label"], "tier": None,
-                                                   "copy_30d": None, "win_rate": None})
+                                                   "copy_30d": None, "win_rate": None, "manual": True})
         self.watch_tokens = {r["address"] for r in await self.db.fetch(
             "SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())")}
 
@@ -604,7 +631,9 @@ class Engine:
                 if now - b[0] <= 60 * float(cfg.get("consensus_window_min", 10))]
         buys.append((now, r["trader"], r["sol_amount"]))
         self.smart_buys[st.mint] = buys
-        if r["sol_amount"] < float(cfg.get("smart_min_buy_sol", 0.5)):
+        # свой список (импорт из Axiom, /addwallet) — копируем и небольшие покупки
+        min_buy = float(cfg.get("copy_min_buy_sol", 0.1)) if trader.get("manual") else float(cfg.get("smart_min_buy_sol", 0.5))
+        if r["sol_amount"] < min_buy:
             return
         if not (float(cfg.get("smart_mc_min_sol", 0)) <= st.mc <= float(cfg.get("smart_mc_max_sol", 1e9))):
             return
@@ -995,6 +1024,8 @@ class Engine:
             try:
                 self.fee_bps = await measured_fee_bps(self.db) or self.fee_bps
                 await self._load_traders()
+                ing = await self.db.kv_get("health:ingest", {}) or {}
+                self.watch_ok = bool((ing.get("watch") or {}).get("connected"))
                 window = 60 * float(self.cfg.get("follow_minutes", 60))
                 paper_mints = {p.mint for p in self.paper.positions.values()}
                 old = [m for m, s in self.states.items()

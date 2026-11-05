@@ -36,6 +36,7 @@ class Env(BaseSettings):
     rpc_rps: float = 5   # лимит запросов к RPC в секунду (бесплатный Helius — 10)
     helius_stream: str = "backup"   # off | backup (только при обрыве PumpPortal) | primary
     logs_stream: str = "off"        # on — постоянный logsSubscribe (дорого: ~1,7 млн кредитов/сутки)
+    watch_stream: str = "on"        # on — сделки только нужных кошельков и монет через Helius (дёшево)
 
     # внешние источники (необязательно; без ключа источник выключен)
     gmgn_api_key: str = ""
@@ -95,6 +96,19 @@ class Env(BaseSettings):
         if self.helius_ws:
             return self.helius_ws
         return f"wss://mainnet.helius-rpc.com/?api-key={self.helius_key}" if self.helius_key else ""
+
+    @property
+    def watch_ws_url(self) -> str:
+        """Стандартный websocket Helius для подписок на отдельные адреса (WATCH_STREAM=off — выключить)."""
+        if self.watch_stream != "on":
+            return ""
+        if self.logs_ws:
+            return self.logs_ws
+        if self.helius_key:
+            return f"wss://mainnet.helius-rpc.com/?api-key={self.helius_key}"
+        if self.rpc_url.startswith("https://") and "api.mainnet-beta.solana.com" not in self.rpc_url:
+            return "wss://" + self.rpc_url[len("https://"):]
+        return ""
 
     @property
     def logs_ws_url(self) -> str:

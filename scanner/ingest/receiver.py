@@ -25,7 +25,7 @@ from ..models import Event, Migration, SolTransfer, TokenCreated, Trade
 from ..solana import PUMP_PROGRAM
 from .pump_parser import ParseStats, parse_transaction
 from .rpc import RpcError, SolanaRpc
-from .sources import HeliusSource, LogsSource, PumpPortalSource, Source
+from .sources import HeliusSource, LogsSource, PumpPortalSource, Source, WatchSource
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +78,16 @@ class Receiver:
             self.sources.append(self.helius)
         if env.logs_ws_url:
             self.sources.append(LogsSource(env.logs_ws_url, self.pool_to_mint))
+        # слежка за выбранными адресами (Helius, дёшево) — отдельно от основных источников:
+        # не участвует в сверке покрытия и в поиске обрывов, видит только свои кошельки и монеты
+        self.watch: WatchSource | None = WatchSource(env.watch_ws_url, self.pool_to_mint) if env.watch_ws_url else None
+        self.watch_devs: set[str] = set()         # девы-кандидаты: их новые монеты — в слежку сразу при создании
+        self.watch_coin_until: dict[str, float] = {}   # монета → до какого времени следить
+        self.watch_capped = False
+        self._pool_miss: dict[str, float] = {}
+        self._http: aiohttp.ClientSession | None = None
+        if self.watch is not None:
+            self.watch.resolve_pool = self.resolve_pool
         self.store_hours = float(rel.get("trade_store_hours", 24))
         self.known_mints: dict[str, float] = {}   # mint → unix-время создания
         self.tracked_wallets: set[str] = set()
@@ -160,8 +170,11 @@ class Receiver:
         is_new = self.seen.add(key)
         src = getattr(ev, "source", "") or "rpc"
         if isinstance(ev, TokenCreated):
-            self.buf_source_creates.append((src, ev.mint))
+            if src != "watch":                   # слежка видит не весь рынок — в сверку покрытия не идёт
+                self.buf_source_creates.append((src, ev.mint))
             self._count(src, creates=1)
+            if is_new and self.watch is not None and ev.deployer in self.watch_devs:
+                self.watch_coin(ev.mint, 1800)   # монета дева-кандидата: сделки — сразу, а не через минуту
         elif isinstance(ev, Trade):
             self._count(src, trades=1)
         if not is_new:
@@ -189,6 +202,11 @@ class Receiver:
                 if isinstance(s, PumpPortalSource):
                     await s.subscribe_tokens([ev.mint])
         elif isinstance(ev, Trade):
+            if ev.trader in self.tracked_wallets and ev.is_buy:
+                # отслеживаемый трейдер купил — сделки монеты нужны для цены и выхода (30 минут)
+                self.extended[ev.mint] = max(self.extended.get(ev.mint, 0), time.time() + 1800)
+                if self.watch is not None:
+                    self.watch_coin(ev.mint, 1800)
             if not self.should_store(ev):
                 return
             self._track_mc(ev)
@@ -202,6 +220,72 @@ class Receiver:
                 self.pool_to_mint[ev.pool] = ev.mint
         elif isinstance(ev, SolTransfer):
             self.buf_transfers.append(ev)
+
+    async def resolve_pool(self, pool: str) -> str | None:
+        """Пул PumpSwap → монета: сначала своя база (миграции), потом DexScreener. Неудачи — не чаще раза в 10 мин."""
+        mint = await self.db.fetchval("SELECT mint FROM tokens WHERE amm_pool=$1", pool)
+        if mint:
+            return mint
+        if time.time() - self._pool_miss.get(pool, 0) < 600:
+            return None
+        try:
+            if self._http is None:
+                self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+            async with self._http.get(f"https://api.dexscreener.com/latest/dex/pairs/solana/{pool}") as r:
+                data = await r.json(content_type=None) if r.status == 200 else None
+        except Exception:  # noqa: BLE001
+            data = None
+        pairs = (data or {}).get("pairs") or ([data["pair"]] if (data or {}).get("pair") else [])
+        for p in pairs:
+            base = (p.get("baseToken") or {}).get("address")
+            if base and base != "So11111111111111111111111111111111111111112":
+                await self.db.execute("UPDATE tokens SET amm_pool = COALESCE(amm_pool, $2) WHERE mint=$1", base, pool)
+                return base
+        self._pool_miss[pool] = time.time()
+        return None
+
+    def watch_coin(self, mint: str, seconds: float) -> None:
+        if self.watch is None or self.watch_capped:
+            return
+        self.watch_coin_until[mint] = max(self.watch_coin_until.get(mint, 0), time.time() + seconds)
+        self.watch.add_coin(mint)
+
+    async def watch_targets(self) -> None:
+        """Раз в минуту: кошельки (трейдеры, девы из списка) и монеты (позиции, наблюдение, свежие монеты девов)."""
+        if self.watch is None:
+            return
+        rows = await self.db.fetch(
+            """SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')""")
+        wallets = [r["address"] for r in rows]
+        self.watch_devs = {r["wallet"] for r in await self.db.fetch(
+            """SELECT l.wallet FROM cluster_links l JOIN clusters c ON c.id = l.cluster_id
+               WHERE l.status <> 'rejected' AND l.confidence <> 'low' AND NOT c.blacklisted AND NOT c.suspicious
+                 AND (c.priority OR c.qualified_at IS NOT NULL)
+               LIMIT 5000""")} | {r["address"] for r in await self.db.fetch(
+            "SELECT address FROM watchlist WHERE kind='dev'")}
+        # монеты: открытые позиции и наблюдение — только молодые монеты на кривой (у мигрировавших слишком
+        # много сделок, их цену берём из DexScreener)
+        coin_rows = await self.db.fetch(
+            """SELECT DISTINCT x.mint FROM (
+                   SELECT mint FROM paper_positions WHERE closed_at IS NULL
+                   UNION SELECT address AS mint FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())
+               ) x JOIN tokens t ON t.mint = x.mint
+               WHERE t.migrated_at IS NULL AND t.created_at > now() - interval '12 hours'""")
+        now = time.time()
+        for r in coin_rows:
+            self.watch_coin_until[r["mint"]] = max(self.watch_coin_until.get(r["mint"], 0), now + 120)
+        self.watch_coin_until = {m: t for m, t in self.watch_coin_until.items() if t > now}
+        # дневной лимит трафика: кошельки остаются всегда, монеты — пока укладываемся
+        # ~5 КБ на сделку: 250 МБ ≈ 50 тыс. сделок ≈ 5 тыс. кредитов Helius в сутки
+        limit_mb = float(self.settings.reliability().get("watch_daily_mb", 250))
+        used_mb = (self.watch.bytes_in - self._usage_base.get("bytes_watch", 0)) / 1e6
+        capped = used_mb >= limit_mb
+        if capped and not self.watch_capped:
+            await self.db.system(f"⚠️ Слежка Helius: за сутки {used_mb:.0f} МБ (лимит {limit_mb:.0f}). Сделки монет "
+                                 "до конца суток (UTC) не собираю, кошельки — по-прежнему.")
+        self.watch_capped = capped
+        coins = [] if capped else sorted(self.watch_coin_until, key=lambda m: -self.watch_coin_until[m])
+        self.watch.set_targets(wallets, coins)
 
     def logs_alive(self) -> bool:
         """Поток со слотами (Helius/logs) подключён — слоты придут с ним, RPC для слотов не тратим."""
@@ -224,6 +308,9 @@ class Receiver:
             "WHERE created_at > now() - make_interval(hours => $1)", int(self.store_hours))
         for r in rows:
             self.known_mints[r["mint"]] = float(r["ts"])
+        for r in await self.db.fetch("SELECT amm_pool, mint FROM tokens WHERE amm_pool IS NOT NULL "
+                                     "AND created_at > now() - interval '30 days'"):
+            self.pool_to_mint.setdefault(r["amm_pool"], r["mint"])
 
     def prune_known(self) -> None:
         cut = time.time() - self.store_hours * 3600
@@ -415,7 +502,8 @@ class Receiver:
                     asyncio.create_task(self.backfill())
                 all_down_since, gap_id = None, None
             # подписки на сделки есть, а сделок нет — PumpPortal не принимает ключ (нет 0.02 SOL на кошельке)
-            if self.pp.has_key and self.pp.connected and now - self.pp.connected_since > 600:
+            watch_ok = self.watch is not None and self.watch.connected
+            if self.pp.has_key and self.pp.connected and now - self.pp.connected_since > 600 and not watch_ok:
                 trades = sum(self.pp.messages_by_pool.values())
                 if (len(self.pp.token_subs) >= 50 and trades == self._pp_trades_seen
                         and now - self._pp_warned > 6 * 3600):
@@ -516,6 +604,7 @@ class Receiver:
                        UNION SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())
                        UNION SELECT mint FROM paper_positions WHERE closed_at IS NULL""")}
                 self.prune_known()
+                await self.watch_targets()
                 for s in self.sources:
                     if isinstance(s, PumpPortalSource):
                         await s.set_accounts(wallets)
@@ -552,7 +641,7 @@ class Receiver:
             cur = self._usage_snapshot()
             usage = {k: cur[k] - self._usage_base.get(k, 0) for k in cur}
             usage["helius_stream_credits"] = round(
-                (usage.get("bytes_helius", 0) + usage.get("bytes_logs", 0)) / 1e6 * 20)
+                (usage.get("bytes_helius", 0) + usage.get("bytes_logs", 0) + usage.get("bytes_watch", 0)) / 1e6 * 20)
             await self.db.kv_set("usage:ingest", {"day": day, **usage})
             await self.db.kv_set("health:ingest", {
                 "at": datetime.now(timezone.utc).isoformat(),
@@ -569,6 +658,10 @@ class Receiver:
                 "tracked_mints": len(self.tracked_mints), "backfill_queue": self.backfill_q.qsize(),
                 "slot_queue": len(self.slot_queue), "meta_queue": self.meta_queue.qsize(),
                 "rpc_calls": self.rpc.calls, "rpc_429": self.rpc.rate_limited,
+                "watch": None if self.watch is None else {
+                    "connected": self.watch.connected, **self.watch.counts(), "events": self.watch.events,
+                    "mb_today": round(usage.get("bytes_watch", 0) / 1e6, 1), "capped": self.watch_capped,
+                    "devs": len(self.watch_devs), "reconnects": self.watch.reconnects},
             })
 
     def _usage_snapshot(self) -> dict[str, float]:
@@ -576,6 +669,9 @@ class Receiver:
         for src in self.sources:
             snap[f"bytes_{src.name}"] = src.bytes_in
             snap[f"events_{src.name}"] = src.events
+        if self.watch is not None:
+            snap["bytes_watch"] = self.watch.bytes_in
+            snap["events_watch"] = self.watch.events
         snap["pp_pump_msgs"] = self.pp.messages_by_pool.get("pump", 0)
         snap["pp_amm_msgs"] = self.pp.messages_by_pool.get("pump-amm", 0)
         return snap
@@ -597,6 +693,8 @@ class Receiver:
             await self.db.system("⚠️ RPC_URL указывает на публичный RPC Solana — нужен Helius (HELIUS_API_KEY).")
         self._usage_day, self._usage_base = "", {}
         tasks = [asyncio.create_task(s.run(self.enqueue), name=s.name) for s in self.sources]
+        if self.watch is not None:
+            tasks.append(asyncio.create_task(self.watch.run(self.enqueue), name="watch"))
         tasks += [asyncio.create_task(c()) for c in (
             self.worker, self.flush_loop, self.slot_loop, self.watchdog_loop, self.coverage_loop,
             self.accounts_loop, self.health_loop, self.retention_loop, self.extend_loop, self.backfill_worker)]

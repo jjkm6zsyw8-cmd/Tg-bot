@@ -66,6 +66,10 @@ class Feedback:
             else:
                 text = await self.e.paper.render()
             await self.db.enqueue("text", {"topic": "paper", "text": text, "keyboard": PERIOD_KEYBOARD}, priority=4)
+        elif kind == "import_wallets":
+            from .walletcheck import import_report
+            # история ~150 транзакций на кошелёк — минуты; в фоне, чтобы не держать другие задачи
+            asyncio.create_task(import_report(self.e, p.get("wallets") or []))
         elif kind == "reload":
             await self.e._load_traders()
             await self.e._load_references()

@@ -239,6 +239,46 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr, ext),
                     [[{"text": "Убрать из списка", "callback": f"wl:t:{addr}"}]])
 
+    async def import_wallets(m: Message, text: str) -> None:
+        from .importer import extract_wallets
+        found = extract_wallets(text)
+        if not found:
+            return await reply(m, "Не нашёл адресов кошельков. Пришлите файл экспорта из Axiom (JSON/CSV/TXT) "
+                                  "или адреса списком: <code>/import адрес подпись</code>, по одному в строке.")
+        new = 0
+        for addr, label in found:
+            existed = await db.fetchval("SELECT 1 FROM watchlist WHERE kind='trader' AND address=$1", addr)
+            new += not existed
+            await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $2) "
+                             "ON CONFLICT (kind, address) DO UPDATE SET label=COALESCE(EXCLUDED.label, watchlist.label)",
+                             addr, label)
+        await db.job("reload")
+        await db.job("import_wallets", {"wallets": [[a, lb] for a, lb in found]})
+        sample = "\n".join(f"• {esc(lb or '')} <code>{a[:4]}…{a[-4:]}</code>" for a, lb in found[:10])
+        more = f"\n… и ещё {len(found) - 10}" if len(found) > 10 else ""
+        await reply(m, f"📥 Принял кошельков: <b>{len(found)}</b> (новых {new}).\n{sample}{more}\n\n"
+                       "Слежка в реальном времени начнётся в течение минуты. Проверяю историю каждого "
+                       "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в топик «Смарт-мани».")
+
+    @router.message(Command("import"))
+    async def cmd_import(m: Message, command: CommandObject) -> None:
+        if m.document is not None:          # файл с подписью /import
+            return await on_document(m)
+        if not command.args:
+            return await reply(m, "Пришлите файл экспорта из трекера Axiom (JSON/CSV/TXT) прямо в этот чат "
+                                  "или адреса: <code>/import адрес подпись</code>, по одному в строке.")
+        await import_wallets(m, command.args)
+
+    @router.message(F.document)
+    async def on_document(m: Message) -> None:
+        doc = m.document
+        if doc is None or (doc.file_size or 0) > 2_000_000:
+            return await reply(m, "Файл больше 2 МБ — это не похоже на список кошельков.")
+        buf = await m.bot.download(doc)
+        raw = buf.read() if buf is not None else b""
+        text = raw.decode("utf-8-sig", errors="ignore")
+        await import_wallets(m, text)
+
     @router.message(Command("removewallet"))
     async def cmd_removewallet(m: Message, command: CommandObject) -> None:
         a = arg_addr(command)
