@@ -12,11 +12,14 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from ..alerts import format as fmt
 from .curve import buy_tokens_out, reserves_for_mc, sell_sol_out
@@ -62,8 +65,10 @@ PERIOD_NAMES = {1: "за 1 час", 2: "за 2 часа", 6: "за 6 часов"
 PERIOD_KEYBOARD = [
     [{"text": "1 ч", "callback": "pp:1"}, {"text": "2 ч", "callback": "pp:2"}, {"text": "6 ч", "callback": "pp:6"}],
     [{"text": "24 ч", "callback": "pp:24"}, {"text": "7 д", "callback": "pp:168"}, {"text": "Всё", "callback": "pp:all"}],
-    [{"text": "Последние 20 сделок", "callback": "pp:hist"}],
+    [{"text": "Последние 20", "callback": "pp:hist"}, {"text": "Все сделки за 24 ч", "callback": "pp:day"}],
+    [{"text": "📄 Файл всех сделок (Excel)", "callback": "pp:csv"}],
 ]
+MODE_SHORT = {"trend": "тренд", "dev": "дев", "smart": "смарт", "new": "новая", "new_dev_wallet": "дев"}
 EXIT_SHORT = {"emergency": "дев продал", "trader_sell": "трейдер продал", "stop": "стоп", "take_profit": "тейк",
               "target": "цель", "trailing": "трейлинг", "time_stop": "нет роста", "max_hold": "2ч без выхода"}
 EXIT_NAMES = {"emergency": "экстренный выход (продажа кластера дева)", "trader_sell": "трейдер-источник продал",
@@ -164,6 +169,12 @@ class PaperTrader:
     @property
     def cfg(self) -> dict[str, Any]:
         return self.e.cfg
+
+    def tz(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(str(self.cfg.get("timezone") or "UTC"))
+        except Exception:  # noqa: BLE001
+            return ZoneInfo("UTC")
 
     def state_price(self, mint: str) -> float | None:
         """MC из своего потока сделок — только если он свежий. Без сделок (PumpPortal не отдаёт)
@@ -531,8 +542,75 @@ class PaperTrader:
             mcs = (f" · {fmt.mc_usd(r['entry_mc'], sol_usd)}→{fmt.mc_usd(r['exit_mc'], sol_usd)}"
                    if r["entry_mc"] and r["exit_mc"] else "")
             out.append(f"{mark} {r['portfolio']} ${fmt.esc(r['symbol'] or '?')} {pct:+.0%} · "
-                       f"{EXIT_SHORT.get(r['exit_reason'], r['exit_reason'])}{mcs} · {r['closed_at']:%H:%M}")
+                       f"{EXIT_SHORT.get(r['exit_reason'], r['exit_reason'])}{mcs} · "
+                       f"{r['closed_at'].astimezone(self.tz()):%H:%M}")
         return "\n".join(out)
+
+    async def _closed(self, since: datetime | None) -> list[Any]:
+        return await self.db.fetch(
+            """SELECT p.*, a.mode, (SELECT t.mc FROM paper_trades t WHERE t.position_id = p.id AND t.side = 'sell'
+                                    ORDER BY t.ts DESC LIMIT 1) AS exit_mc
+               FROM paper_positions p LEFT JOIN alerts a ON a.id = p.alert_id
+               WHERE p.closed_at IS NOT NULL AND p.exit_reason <> 'reset'
+                 AND ($1::timestamptz IS NULL OR p.closed_at >= $1) ORDER BY p.opened_at, p.portfolio""", since)
+
+    async def trades_text(self, hours: float = 24) -> list[str]:
+        """Все сделки за период: одна строка на монету (вход), в ней результаты всех портфелей.
+        Возвращает части по ≤ 3800 символов — лимит сообщения Telegram."""
+        rows = await self._closed(datetime.now(timezone.utc) - timedelta(hours=hours))
+        if not rows:
+            return [f"📒 За {hours:g} ч закрытых сделок нет."]
+        sol_usd = self.e.price.value or 150
+        groups: dict[tuple[str, Any], list[Any]] = {}
+        for r in rows:
+            groups.setdefault((r["mint"], r["alert_id"] or r["opened_at"].replace(second=0, microsecond=0)), []).append(r)
+        lines = []
+        for rs in groups.values():
+            first = rs[0]
+            avg = sum(r["pnl_pct"] or 0 for r in rs) / len(rs)
+            odd = any((r["pnl_pct"] or 0) > ANOMALY_PCT for r in rs)
+            mark = "⚠" if odd else "✅" if avg > 0 else "❌"
+            res = " · ".join(f"{r['portfolio']} {(r['pnl_pct'] or 0):+.0%} {EXIT_SHORT.get(r['exit_reason'], r['exit_reason'])}"
+                             for r in sorted(rs, key=lambda x: x["portfolio"]))
+            head_parts = [mark, f"{first['opened_at'].astimezone(self.tz()):%H:%M}",
+                          f"${fmt.esc(first['symbol'] or '?')}", MODE_SHORT.get(first["mode"] or "", ""),
+                          fmt.mc_usd(first["entry_mc"], sol_usd)]
+            lines.append(" ".join(x for x in head_parts if x) + f" · {res}")
+        wins = sum(1 for r in rows if (r["pnl_sol"] or 0) > 0)
+        head = (f"📒 <b>Все сделки за {hours:g} ч</b> · монет {len(groups)}, сделок {len(rows)} "
+                f"(✅ {wins} / ❌ {len(rows) - wins})")
+        chunks, cur = [], head
+        for line in lines:
+            if len(cur) + len(line) + 1 > 3800:
+                chunks.append(cur)
+                cur = "📒 <i>продолжение</i>"
+            cur += "\n" + line
+        chunks.append(cur)
+        return chunks
+
+    async def trades_csv(self, hours: float | None = None) -> str:
+        """Все закрытые сделки с последнего сброса (или за hours) — файл для Excel / Numbers."""
+        since = datetime.now(timezone.utc) - timedelta(hours=hours) if hours else None
+        if since is None:
+            since = await self.db.fetchval("SELECT max(reset_at) FROM paper_portfolios")
+        sol_usd = self.e.price.value or 150
+        out = io.StringIO()
+        w = csv.writer(out, delimiter=";")
+        tz = self.tz()
+        w.writerow(["портфель", "монета", "адрес", "режим", "уровень", "вход", "выход", "MC вход $",
+                    "MC выход $", "MC максимум $", "вложено SOL", "получено SOL", "результат SOL", "результат %",
+                    "причина выхода"])
+        for r in await self._closed(since):
+            w.writerow([
+                r["portfolio"], r["symbol"] or "", r["mint"], MODE_SHORT.get(r["mode"] or "", r["mode"] or ""),
+                r["level"] or "", f"{r['opened_at'].astimezone(tz):%Y-%m-%d %H:%M:%S}",
+                f"{r['closed_at'].astimezone(tz):%Y-%m-%d %H:%M:%S}",
+                round((r["entry_mc"] or 0) * sol_usd), round((r["exit_mc"] or 0) * sol_usd),
+                round((r["max_mc"] or 0) * sol_usd), round(r["cost_sol"] or 0, 5), round(r["proceeds_sol"] or 0, 5),
+                round(r["pnl_sol"] or 0, 5), round((r["pnl_pct"] or 0) * 100, 1),
+                EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""),
+            ])
+        return out.getvalue()
 
     async def maybe_compare(self) -> None:
         """Через 7 дней после сброса — сравнение портфелей и предложение лучшей схемы (один раз)."""

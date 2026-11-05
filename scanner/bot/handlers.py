@@ -355,9 +355,11 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     @router.message(Command("paper"))
     async def cmd_paper(m: Message, command: CommandObject) -> None:
         arg = (command.args or "").strip().lower()
-        cmd = "reset" if arg == "reset" else "history" if arg == "history" else "state"
-        await db.job("paper", {"cmd": cmd})
-        await reply(m, {"reset": "Сбрасываю портфели до $30…", "history": "Готовлю последние 20 сделок…"}.get(
+        cmd = {"reset": "reset", "history": "history", "day": "trades", "24": "trades", "csv": "csv",
+               "file": "csv"}.get(arg, "state")
+        await db.job("paper", {"cmd": cmd, "hours": 24 if cmd == "trades" else None})
+        await reply(m, {"reset": "Сбрасываю портфели до $30…", "history": "Готовлю последние 20 сделок…",
+                        "trades": "Готовлю все сделки за 24 ч…", "csv": "Готовлю файл со всеми сделками…"}.get(
             cmd, "Готовлю состояние…") + " Ответ придёт в топик «Бумажная торговля» (или сюда, если топиков нет).")
 
     @router.message(Command("tune"))
@@ -375,6 +377,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         arg = c.data[3:]
         if arg == "hist":
             await db.job("paper", {"cmd": "history"})
+        elif arg == "day":
+            await db.job("paper", {"cmd": "trades", "hours": 24})
+        elif arg == "csv":
+            await db.job("paper", {"cmd": "csv"})
         else:
             await db.job("paper", {"cmd": "period", "hours": None if arg == "all" else float(arg)})
         await c.answer("Считаю…")

@@ -40,9 +40,24 @@ class Feedback:
             await save_profile(self.db, int(p["cluster_id"]), prof, self.e.cfg)
         elif kind == "paper":
             cmd = p.get("cmd", "")
+            from .paper import PERIOD_KEYBOARD, SCHEMES
+            if cmd == "trades":
+                parts = await self.e.paper.trades_text(float(p.get("hours") or 24))
+                for i, part in enumerate(parts):
+                    last = i == len(parts) - 1
+                    await self.db.enqueue("text", {"topic": "paper", "text": part,
+                                                   "keyboard": PERIOD_KEYBOARD if last else None}, priority=4)
+                return
+            if cmd == "csv":
+                data = await self.e.paper.trades_csv(p.get("hours"))
+                n = max(0, data.count("\n") - 1)
+                await self.db.enqueue("file", {"topic": "paper", "csv": data, "filename": "paper_trades.csv",
+                                               "caption": f"📄 Все сделки с последнего сброса: {n}. "
+                                                          "Открывается в Numbers / Excel."}, priority=4)
+                return
             if cmd == "reset":
                 await self.e.paper.reset()
-                text = "📒 Бумажная торговля сброшена: три портфеля по $30."
+                text = f"📒 Бумажная торговля сброшена: {len(SCHEMES)} портфелей по $30."
             elif cmd == "history":
                 text = await self.e.paper.history(20)
             elif cmd == "period":
@@ -50,7 +65,6 @@ class Feedback:
                 text = await self.e.paper.render_period(float(h) if h else None)
             else:
                 text = await self.e.paper.render()
-            from .paper import PERIOD_KEYBOARD
             await self.db.enqueue("text", {"topic": "paper", "text": text, "keyboard": PERIOD_KEYBOARD}, priority=4)
         elif kind == "reload":
             await self.e._load_traders()
