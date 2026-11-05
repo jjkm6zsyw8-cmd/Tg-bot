@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-DEV_HINTS = ("дев", "dev", "твинк", "twink", "кап")
+DEV_HINTS = ("дев", "дэв", "dev", "твинк", "twink", "кап")
 
 
 def sell_mc_before(t: Trade) -> float:
