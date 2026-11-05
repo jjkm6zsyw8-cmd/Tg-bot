@@ -138,8 +138,12 @@ class Sender:
     async def drain(self) -> None:
         self.settings.overrides = await self.db.get_overrides()
         await self.flush_system()
+        # Telegram пускает в группу ~20 сообщений в минуту. Строго по приоритету правки алертов и сопровождение
+        # съедали весь лимит, а отчёты, «Копитрейд», сводки ждали часами и потом приходили пачкой.
+        # Старение: каждая минута ожидания повышает приоритет на 1 (до 6) — через ~5 мин сообщение наверху очереди
         rows = await self.db.fetch(
-            "SELECT * FROM outbox WHERE sent_at IS NULL AND attempts < 5 ORDER BY priority, id LIMIT 50")
+            """SELECT * FROM outbox WHERE sent_at IS NULL AND attempts < 5
+               ORDER BY priority - LEAST(6, EXTRACT(EPOCH FROM (now() - created_at)) / 60.0), id LIMIT 50""")
         if not rows:
             return
         muted = await self.muted()
@@ -161,15 +165,23 @@ class Sender:
                 continue
             urgent = r["priority"] <= 1 or p.get("emergency")
             need = 2 if kind == "follow" and p.get("emergency") else 1
-            if not urgent and self.limiter.budget() < (6 if kind in ("edit", "full") else need):
-                if kind == "edit" and time.time() - r["created_at"].timestamp() > 30:
-                    await self._done(r["id"], "stale")
+            age = time.time() - r["created_at"].timestamp()
+            if kind == "edit" and age > 20:
+                await self._done(r["id"], "stale")       # правка цены устарела — следующая придёт сама
+                continue
+            # правки и полная лента — только при заметном запасе лимита: обычные сообщения важнее
+            if not urgent and self.limiter.budget() < (10 if kind in ("edit", "full") else need):
                 continue
             try:
                 await self.deliver(kind, p)
                 await self._done(r["id"])
             except TelegramRetryAfter as exc:
                 log.warning("flood control: %s с", exc.retry_after)
+                try:
+                    await self.db.kv_set("sender:flood", {"at": datetime.now(timezone.utc).isoformat(),
+                                                          "seconds": exc.retry_after})
+                except Exception:  # noqa: BLE001
+                    pass
                 await asyncio.sleep(exc.retry_after + 0.5)
                 return
             except TelegramBadRequest as exc:

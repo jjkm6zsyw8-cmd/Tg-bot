@@ -333,6 +333,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                    AND created_at > now() - interval '1 day' ORDER BY id DESC LIMIT 5"""):
             lines.append(f"• {r['kind']}/{r['topic'] or '—'} · {fmt.ago((now - r['created_at']).total_seconds())} назад · "
                          f"попыток {r['attempts']} · {esc((r['error'] or '')[:150])}")
+        flood = await db.kv_get("sender:flood", {}) or {}
+        if flood.get("at"):
+            lines.append(f"Последнее ограничение Telegram (flood): пауза {flood.get('seconds')} с, "
+                         f"{fmt.ago((now - datetime.fromisoformat(flood['at'])).total_seconds())} назад")
         errs = await db.kv_get("bot:errors", []) or []
         if errs:
             lines.append("\n<b>Ошибки команд бота</b>")

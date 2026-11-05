@@ -955,7 +955,8 @@ class Engine:
 
     async def _edit(self, e: AlertEntry, text: str | None = None, kb: Any = None, force: bool = False) -> None:
         now = time.monotonic()
-        if not e.has_message or (not force and now - e.last_edit < 5):
+        # правка цены в алерте — не чаще раза в 30 с: лимит Telegram на группу ~20 сообщений в минуту общий
+        if not e.has_message or (not force and now - e.last_edit < float(self.cfg.get("edit_min_interval_s", 30))):
             return
         if text is None:
             text = fmt.render_alert(e.data, self.price.value, bool(self.cfg.get("compact")))

@@ -581,7 +581,7 @@ class Trends:
                 tr.max_price = max(tr.max_price, pi.price)
                 if e is not None:
                     e.data["mc"] = pi.mc_usd / (self.e.price.value or 150)
-                    if now - self.edited.get(m, 0) >= 30:   # проверяем каждые 5 с, а сообщение правим раз в 30 с
+                    if now - self.edited.get(m, 0) >= 90:   # проверяем каждые 5 с, а сообщение правим раз в 90 с
                         self.edited[m] = now
                         await self.e._edit(e)
                 if tr.exit_price is None:
