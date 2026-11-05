@@ -651,6 +651,11 @@ class Engine:
             """SELECT w.address, w.label, m.launches, m.sold, m.med_sell_mc, m.p25_sell_mc, m.p75_sell_mc,
                       m.med_sell_s, m.hit_rate, COALESCE(m.once, false) once, COALESCE(m.once_done, false) once_done
                FROM watchlist w LEFT JOIN my_devs m ON m.address = w.address WHERE w.kind = 'dev'""")}
+        # девы из своего списка — заодно и трейдеры: их покупки чужих монет тоже копируем
+        # (покупку своей монеты при запуске пропускает _on_smart_trade — это алерт «мой дев»)
+        for addr, d in self.my_devs.items():
+            self.traders.setdefault(addr, {"address": addr, "label": d.get("label"), "tier": None,
+                                           "copy_30d": None, "win_rate": None, "manual": True})
 
     async def _load_references(self) -> None:
         rows = await self.db.fetch(
@@ -712,11 +717,18 @@ class Engine:
             return
         if not own and st.growth(now) > float(cfg.get("smart_max_growth_1m", 1.0)):
             return
-        fresh = await self._fresh_share(st)
-        metrics = st.metrics(fresh)
         blacklisted = bool(self.info.get(st.mint) and self.info[st.mint].cluster_row
                            and self.info[st.mint].cluster_row["blacklisted"])
-        filt = check_filters(metrics, self.settings.filters(), "smart", blacklisted)
+        if own:
+            # свой список: по монете мы видим только сделки своих кошельков — доли холдеров, свежих кошельков,
+            # бандлов по таким данным ложные (твинк = «100% свежих»). Отсекаем только чёрный список;
+            # мусор и раги ловят внешние проверки (RugCheck: mint/freeze, раг) перед алертом
+            metrics = st.metrics(None)
+            filt = check_filters({}, self.settings.filters(), "smart", blacklisted)
+        else:
+            fresh = await self._fresh_share(st)
+            metrics = st.metrics(fresh)
+            filt = check_filters(metrics, self.settings.filters(), "smart", blacklisted)
         if not filt.passed:
             return await skip("фильтры безопасности: " + ", ".join(filt.violations))
         distinct = {b[1] for b in buys}

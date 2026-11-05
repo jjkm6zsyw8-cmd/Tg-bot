@@ -596,7 +596,8 @@ class Receiver:
         while True:
             try:
                 rows = await self.db.fetch(
-                    "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist WHERE kind='trader'")
+                    "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist "
+                    "WHERE kind IN ('trader', 'dev')")
                 wallets = {r["address"] for r in rows}
                 self.tracked_wallets = wallets
                 self.tracked_mints = {r["mint"] for r in await self.db.fetch(

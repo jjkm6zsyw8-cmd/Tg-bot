@@ -149,7 +149,6 @@ async def save_dev(e: "Engine", addr: str, label: str | None, prof: dict[str, An
     await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('dev', $1, $2) "
                      "ON CONFLICT (kind, address) DO UPDATE SET label=COALESCE(EXCLUDED.label, watchlist.label)",
                      addr, label)
-    await db.execute("UPDATE traders SET active=false WHERE address=$1", addr)   # своих монет дев не «копируем»
     await db.execute(
         """INSERT INTO my_devs(address, launches, sold, med_sell_mc, p25_sell_mc, p75_sell_mc, med_sell_s, hit_rate,
                updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
@@ -188,14 +187,10 @@ async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
             prof = dev_profile(addr, creates, trades)
             if is_dev(label, prof):
                 await save_dev(e, addr, label, prof)
-                dev_lines.append(dev_line(name, prof, sol_usd))
-                if prof.get("launches"):
-                    continue
-                # дев только по подписи, своих запусков в истории нет (запускает с твинков?) — заодно копируем
-                # его покупки: алерт придёт и при запуске, и при покупке
+                dev_lines.append(dev_line(name, prof, sol_usd) + " · покупки чужих монет тоже копирую")
+                # дев — заодно и трейдер: алерт придёт и при его запуске, и при его покупке чужой монеты
                 await e.db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $2) "
                                    "ON CONFLICT (kind, address) DO NOTHING", addr, label)
-                dev_lines[-1] += " · пока копирую его покупки"
             s7, s30, _trips = await compute_trader(e.db, addr, cfg, costs)
             linked = await linked_to_dev(e.db, addr)
             ok, _fails = qualifies(s7, s30, linked, cfg)

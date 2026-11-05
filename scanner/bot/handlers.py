@@ -74,6 +74,33 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         settings.overrides = await db.get_overrides()
         return settings.effective()
 
+    @router.errors()
+    async def on_error(event: Any) -> bool:
+        """Команда упала — не молчим: ответ с ошибкой в тот же чат/топик и запись для /diag."""
+        exc = event.exception
+        log.error("ошибка обработчика: %r", exc, exc_info=exc)
+        upd = event.update
+        msg = upd.message or (upd.callback_query.message if upd.callback_query else None)
+        text = f"{type(exc).__name__}: {exc}"[:300]
+        try:
+            errs = (await db.kv_get("bot:errors", []) or [])[-9:]
+            from datetime import datetime, timezone
+            errs.append({"at": datetime.now(timezone.utc).isoformat(), "text": text,
+                         "cmd": ((upd.message.text or "") if upd.message else "")[:40]})
+            await db.kv_set("bot:errors", errs)
+        except Exception:  # noqa: BLE001
+            pass
+        if msg is not None:
+            try:
+                await msg.answer(f"⚠️ Команда упала: <code>{esc(text)}</code>\nПришлите скрин — разберу.",
+                                 parse_mode="HTML")
+            except Exception:  # noqa: BLE001
+                try:
+                    await msg.answer(f"Команда упала: {text}")
+                except Exception:  # noqa: BLE001
+                    pass
+        return True
+
     async def reply(m: Message, text: str, kb: Any = None) -> None:
         try:
             await ext.publish_health("bot")
@@ -306,6 +333,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                    AND created_at > now() - interval '1 day' ORDER BY id DESC LIMIT 5"""):
             lines.append(f"• {r['kind']}/{r['topic'] or '—'} · {fmt.ago((now - r['created_at']).total_seconds())} назад · "
                          f"попыток {r['attempts']} · {esc((r['error'] or '')[:150])}")
+        errs = await db.kv_get("bot:errors", []) or []
+        if errs:
+            lines.append("\n<b>Ошибки команд бота</b>")
+            for e_ in errs[-5:]:
+                lines.append(f"• {fmt.ago((now - datetime.fromisoformat(e_['at'])).total_seconds())} назад · "
+                             f"{esc(e_.get('cmd') or '')} · {esc(e_['text'][:150])}")
         await reply(m, "\n".join(lines)[:4000])
 
     @router.message(Command("copylog"))
