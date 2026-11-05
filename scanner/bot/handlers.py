@@ -532,15 +532,45 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await remove(addr)
             await c.answer("В чёрном списке")
 
+    async def paper_view() -> Any:
+        """Отчёт бумажной торговли строит сам бот по БД — не зависит от того, занята ли аналитика."""
+        from types import SimpleNamespace
+
+        from ..analytics.paper import PaperTrader
+        cfg = await reload()
+        price = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+        eng = SimpleNamespace(db=db, price=SimpleNamespace(value=price), fee_bps=None, settings=settings, cfg=cfg,
+                              states={}, ext=None)
+        tr = PaperTrader(eng)  # type: ignore[arg-type]
+        await tr.start()
+        return tr
+
+    async def paper_answer(target: Message, cmd: str, hours: float | None = None) -> None:
+        from ..analytics.paper import PERIOD_KEYBOARD
+        tr = await paper_view()
+        if cmd == "csv":
+            data = await tr.trades_csv(None)
+            n = max(0, data.count("\n") - 1)
+            await target.answer_document(BufferedInputFile(data.encode("utf-8-sig"), filename="paper_trades.csv"),
+                                         caption=f"📄 Все сделки с последнего сброса: {n}. Открывается в Numbers / Excel.")
+            return
+        if cmd == "trades":
+            parts = await tr.trades_text(hours or 24)
+            for i, part in enumerate(parts):
+                await reply(target, part, PERIOD_KEYBOARD if i == len(parts) - 1 else None)
+            return
+        text = await tr.history(20) if cmd == "history" else await tr.render_period(hours)
+        await reply(target, text, PERIOD_KEYBOARD)
+
     @router.message(Command("paper"))
     async def cmd_paper(m: Message, command: CommandObject) -> None:
         arg = (command.args or "").strip().lower()
         cmd = {"reset": "reset", "history": "history", "day": "trades", "24": "trades", "csv": "csv",
                "file": "csv"}.get(arg, "state")
-        await db.job("paper", {"cmd": cmd, "hours": 24 if cmd == "trades" else None})
-        await reply(m, {"reset": "Сбрасываю портфели до $30…", "history": "Готовлю последние 20 сделок…",
-                        "trades": "Готовлю все сделки за 24 ч…", "csv": "Готовлю файл со всеми сделками…"}.get(
-            cmd, "Готовлю состояние…") + " Ответ придёт в топик «Бумажная торговля» (или сюда, если топиков нет).")
+        if cmd == "reset":
+            await db.job("paper", {"cmd": "reset"})
+            return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
+        await paper_answer(m, cmd, 24 if cmd == "trades" else None)
 
     @router.message(Command("tune"))
     async def cmd_tune(m: Message) -> None:
@@ -555,15 +585,17 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     @router.callback_query(F.data.startswith("pp:"))
     async def cb_paper_period(c: CallbackQuery) -> None:
         arg = c.data[3:]
-        if arg == "hist":
-            await db.job("paper", {"cmd": "history"})
-        elif arg == "day":
-            await db.job("paper", {"cmd": "trades", "hours": 24})
-        elif arg == "csv":
-            await db.job("paper", {"cmd": "csv"})
-        else:
-            await db.job("paper", {"cmd": "period", "hours": None if arg == "all" else float(arg)})
         await c.answer("Считаю…")
+        if c.message is None:
+            return
+        if arg == "hist":
+            await paper_answer(c.message, "history")
+        elif arg == "day":
+            await paper_answer(c.message, "trades", 24)
+        elif arg == "csv":
+            await paper_answer(c.message, "csv")
+        else:
+            await paper_answer(c.message, "period", None if arg == "all" else float(arg))
 
     @router.message(Command("testalert"))
     async def cmd_testalert(m: Message) -> None:

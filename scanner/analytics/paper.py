@@ -241,7 +241,7 @@ class PaperTrader:
                 entry_mc=r["entry_mc"], cost_sol=r["cost_sol"], tokens=r["tokens"], tokens_initial=r["tokens_initial"],
                 target_mc=r["target_mc"], symbol=r["symbol"] or "", proceeds_sol=r["proceeds_sol"],
                 max_mc=r["max_mc"] or r["entry_mc"], tp_done=r["tp_done"], level=r["level"] or "normal",
-                alert_id=r["alert_id"])
+                alert_id=r["alert_id"], extra={"last_mc": r["last_mc"]} if r.get("last_mc") else {})
 
     async def reset(self) -> None:
         async with self.lock:
@@ -387,6 +387,10 @@ class PaperTrader:
                 if time.time() - self._last_flush >= 60:
                     self._last_flush = time.time()
                     await self.flush_messages()
+                    # последняя цена открытых позиций — в БД: отчёт /paper строит бот сам, без аналитики
+                    marks = [(p.id, float(p.extra["last_mc"])) for p in self.positions.values() if p.extra.get("last_mc")]
+                    if marks:
+                        await self.db.p.executemany("UPDATE paper_positions SET last_mc=$2 WHERE id=$1", marks)
                 if time.time() - last_report >= 3600:
                     last_report = time.time()
                     await self.report_hourly()

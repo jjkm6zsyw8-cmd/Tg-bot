@@ -442,3 +442,4 @@ CREATE INDEX IF NOT EXISTS copy_log_wallet_idx ON copy_log (wallet, id);
 CREATE INDEX IF NOT EXISTS copy_log_ts_idx ON copy_log (ts);
 ALTER TABLE my_devs ADD COLUMN IF NOT EXISTS once boolean NOT NULL DEFAULT false;       -- зайти к деву один раз
 ALTER TABLE my_devs ADD COLUMN IF NOT EXISTS once_done boolean NOT NULL DEFAULT false;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS last_mc double precision;   -- последняя цена (для отчёта из бота)
