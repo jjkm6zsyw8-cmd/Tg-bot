@@ -56,6 +56,7 @@ class Source:
         self._stop = asyncio.Event()
         self.gate = asyncio.Event()   # резервный поток подключается только при открытом «шлагбауме»
         self.gate.set()
+        self.last_error = ""
         self._ws: Any = None
 
     def mark_event(self) -> None:
@@ -88,6 +89,8 @@ class Source:
                 raise
             except Exception as exc:  # noqa: BLE001 — любой сбой сети → переподключение
                 log.warning("%s: соединение потеряно: %s", self.name, exc)
+                self.last_error = str(exc)[:200]
+                self.on_failure(exc)
             self._set_connected(False)
             self._ws = None
             if not self.gate.is_set():
@@ -97,6 +100,9 @@ class Source:
                 backoff = self.min_backoff   # соединение жило долго — начинаем паузы сначала
             await asyncio.sleep(backoff + random.random())
             backoff = min(backoff * 2, self.max_backoff)
+
+    def on_failure(self, exc: Exception) -> None:
+        """Подкласс может сменить адрес (например, на запасной узел)."""
 
     async def close_now(self) -> None:
         ws = self._ws
@@ -429,9 +435,13 @@ class WatchSource(Source):
     name = "watch"
     MAX_SUBS = 950
 
-    def __init__(self, url: str, pool_to_mint: dict[str, str]):
+    def __init__(self, url: str, pool_to_mint: dict[str, str], fallback: str = ""):
         super().__init__()
         self.url = url
+        self.primary = url
+        self.fallback = fallback if fallback and fallback != url else ""
+        self.fails = 0
+        self.fallback_until = 0.0
         self.pool_to_mint = pool_to_mint
         self.want: dict[str, str] = {}          # адрес → "wallet" | "coin"
         self.subs: dict[str, int] = {}          # адрес → id подписки
@@ -494,10 +504,29 @@ class WatchSource(Source):
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsUnsubscribe", "params": [sid]}))
                 await asyncio.sleep(0.02)
 
+    def on_failure(self, exc: Exception) -> None:
+        """Основной узел не пускает (429/401/403 — у Helius так выглядят кончившиеся кредиты) или 3 сбоя подряд —
+        час работаем через запасной публичный узел Solana, потом пробуем основной снова."""
+        self.fails += 1
+        text = str(exc)
+        refused = any(code in text for code in ("429", "401", "403"))
+        if self.fallback and self.url == self.primary and (refused or self.fails >= 3):
+            self.url = self.fallback
+            self.fallback_until = time.monotonic() + 3600
+            self.fails = 0
+            log.warning("watch: основной узел недоступен (%s) — переключаюсь на запасной", text[:120])
+
+    @property
+    def on_fallback(self) -> bool:
+        return self.url != self.primary
+
     async def _session(self, sink: Sink) -> None:
+        if self.on_fallback and time.monotonic() > self.fallback_until:
+            self.url = self.primary
         async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2**24,
                                       open_timeout=20) as ws:
             self._ws = ws
+            self.fails = 0
             self.subs.clear()
             self.pending.clear()
             self.sid_addr.clear()

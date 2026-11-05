@@ -281,7 +281,13 @@ async def health_view(db: Database) -> str:
             lines.append(f"  {'🟢' if wt.get('connected') else '🔴'} слежка Helius: кошельков {wt.get('wallets', 0)}, "
                          f"монет {wt.get('coins', 0)} (девов-кандидатов {wt.get('devs', 0)}), событий {wt.get('events', 0)}, "
                          f"за сутки {wt.get('mb_today', 0)} МБ ≈ {wt.get('mb_today', 0) * 20:,.0f} кредитов"
-                         + (" — дневной лимит, монеты на паузе" if wt.get("capped") else ""))
+                         + (" — дневной лимит, монеты на паузе" if wt.get("capped") else "")
+                         + (" · через запасной публичный узел Solana" if wt.get("fallback") else ""))
+            if not wt.get("connected") and wt.get("last_error"):
+                lines.append(f"    причина: {esc(wt['last_error'][:150])}")
+        if ing.get("rpc_fallback"):
+            lines.append("  ⚠️ Helius RPC отвечает 429 (похоже, кончились кредиты месяца) — работаю через публичный "
+                         "узел Solana. Проверьте dashboard.helius.dev → Usage")
         lines.append(f"  подписок на сделки {ing.get('pumpportal_subs', 0)}, продлено {ing.get('extended', 0)}, "
                      f"Helius: {ing.get('helius_mode', 'off')}")
         lines.append(f"  очередь событий {ing.get('queue', 0)} (потеряно {ing.get('dropped', 0)}), досбора "

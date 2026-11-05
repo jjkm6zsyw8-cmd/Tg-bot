@@ -83,7 +83,7 @@ class Engine:
         self.env = env
         self.settings = settings
         self.db = db
-        self.rpc = SolanaRpc(env.rpc_endpoint, rps=env.rpc_rps)
+        self.rpc = SolanaRpc(env.rpc_endpoint, rps=env.rpc_rps, fallback=env.rpc_fallback_url or None)
         rel = settings.reliability()
         self.ext = ExternalHub(env, db)
         self.linker = cl.Linker(db, self.rpc, settings.exchanges(), int(rel.get("exchange_tx_heuristic", 1000)),

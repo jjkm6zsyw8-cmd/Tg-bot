@@ -213,3 +213,39 @@ def test_zero_sol_trade_events_skipped():
     ctx = TxContext("s", 1, None, None, "rpc")
     assert decode_event(trade_event(addr("m"), addr("u"), 0.0, 4.8e7, False, 30, 1.0e9), ctx) is None
     assert decode_event(trade_event(addr("m"), addr("u"), 0.5, 1e7, True, 31, 1.04e9), ctx) is not None
+
+
+def test_rpc_switches_to_fallback_on_repeated_429():
+    """Кончились кредиты Helius (429 на всё) — RPC сам уходит на публичный узел, через 30 мин пробует основной."""
+    import time as _t
+
+    from scanner.ingest.rpc import SolanaRpc
+    rpc = SolanaRpc("https://helius", fallback="https://public")
+    for _ in range(4):
+        rpc._on_429(None)
+    assert not rpc.on_fallback
+    rpc._on_429(None)
+    assert rpc.on_fallback and rpc.url == "https://public" and rpc.pause_until == 0.0
+    rpc.fallback_until = _t.monotonic() - 1
+    assert SolanaRpc("https://x").fallback is None            # без запасного — как раньше
+
+
+def test_watch_switches_to_fallback():
+    w = WatchSource("wss://helius", {}, "wss://public")
+    w.on_failure(Exception("server rejected WebSocket connection: HTTP 429"))
+    assert w.on_fallback and w.url == "wss://public"
+    w2 = WatchSource("wss://helius", {}, "wss://public")
+    for _ in range(2):
+        w2.on_failure(Exception("timeout"))
+    assert not w2.on_fallback
+    w2.on_failure(Exception("timeout"))                      # 3 сбоя подряд
+    assert w2.on_fallback
+    assert not WatchSource("wss://a", {}).fallback
+
+
+def test_fallback_urls_from_env():
+    from scanner.config import Env
+    e = Env(helius_api_key="K")
+    assert e.rpc_fallback_url == "https://api.mainnet-beta.solana.com"
+    assert e.watch_fallback_ws == "wss://api.mainnet-beta.solana.com"
+    assert Env(rpc_fallback_url="").watch_fallback_ws == ""

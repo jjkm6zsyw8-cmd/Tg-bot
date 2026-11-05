@@ -37,6 +37,8 @@ class Env(BaseSettings):
     helius_stream: str = "backup"   # off | backup (только при обрыве PumpPortal) | primary
     logs_stream: str = "off"        # on — постоянный logsSubscribe (дорого: ~1,7 млн кредитов/сутки)
     watch_stream: str = "on"        # on — сделки только нужных кошельков и монет через Helius (дёшево)
+    # запасной узел, если основной (Helius) отвечает 429 — например, кончились кредиты месяца; "" — без запаса
+    rpc_fallback_url: str = "https://api.mainnet-beta.solana.com"
 
     # внешние источники (необязательно; без ключа источник выключен)
     gmgn_api_key: str = ""
@@ -109,6 +111,11 @@ class Env(BaseSettings):
         if self.rpc_url.startswith("https://") and "api.mainnet-beta.solana.com" not in self.rpc_url:
             return "wss://" + self.rpc_url[len("https://"):]
         return ""
+
+    @property
+    def watch_fallback_ws(self) -> str:
+        u = self.rpc_fallback_url
+        return ("wss://" + u[len("https://"):]) if u.startswith("https://") else ""
 
     @property
     def logs_ws_url(self) -> str:

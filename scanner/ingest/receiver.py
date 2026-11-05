@@ -62,7 +62,7 @@ class Receiver:
         self.settings = settings
         self.db = db
         rel = settings.reliability()
-        self.rpc = SolanaRpc(env.rpc_endpoint, rps=env.rpc_rps)
+        self.rpc = SolanaRpc(env.rpc_endpoint, rps=env.rpc_rps, fallback=env.rpc_fallback_url or None)
         self.pool_to_mint: dict[str, str] = {}
         # сделки каждой новой монеты — первые trade_window_min минут, дольше — если монету нужно держать
         self.window_s = 60 * float(rel.get("trade_window_min", 30))
@@ -80,7 +80,8 @@ class Receiver:
             self.sources.append(LogsSource(env.logs_ws_url, self.pool_to_mint))
         # слежка за выбранными адресами (Helius, дёшево) — отдельно от основных источников:
         # не участвует в сверке покрытия и в поиске обрывов, видит только свои кошельки и монеты
-        self.watch: WatchSource | None = WatchSource(env.watch_ws_url, self.pool_to_mint) if env.watch_ws_url else None
+        self.watch: WatchSource | None = (WatchSource(env.watch_ws_url, self.pool_to_mint, env.watch_fallback_ws)
+                                          if env.watch_ws_url else None)
         self.watch_devs: set[str] = set()         # девы-кандидаты: их новые монеты — в слежку сразу при создании
         self.watch_coin_until: dict[str, float] = {}   # монета → до какого времени следить
         self.watch_capped = False
@@ -662,7 +663,9 @@ class Receiver:
                 "watch": None if self.watch is None else {
                     "connected": self.watch.connected, **self.watch.counts(), "events": self.watch.events,
                     "mb_today": round(usage.get("bytes_watch", 0) / 1e6, 1), "capped": self.watch_capped,
-                    "devs": len(self.watch_devs), "reconnects": self.watch.reconnects},
+                    "devs": len(self.watch_devs), "reconnects": self.watch.reconnects,
+                    "fallback": self.watch.on_fallback, "last_error": self.watch.last_error},
+                "rpc_fallback": self.rpc.on_fallback,
             })
 
     def _usage_snapshot(self) -> dict[str, float]:

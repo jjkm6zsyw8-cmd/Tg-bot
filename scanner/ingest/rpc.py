@@ -34,7 +34,11 @@ class RateLimiter:
 
 
 class SolanaRpc:
-    def __init__(self, url: str, rps: float = 20, concurrency: int = 8, timeout: float = 10):
+    def __init__(self, url: str, rps: float = 20, concurrency: int = 8, timeout: float = 10,
+                 fallback: str | None = None):
+        self.primary = url
+        self.fallback = fallback if fallback and fallback != url else None
+        self.fallback_until = 0.0       # до какого времени ходим на запасной узел
         self.url = url
         self.limiter = RateLimiter(rps)
         self.sem = asyncio.Semaphore(concurrency)
@@ -69,7 +73,13 @@ class SolanaRpc:
         if self._session:
             await self._session.close()
 
+    @property
+    def on_fallback(self) -> bool:
+        return self.url != self.primary
+
     async def call(self, method: str, params: list[Any], retries: int = 2) -> Any:
+        if self.on_fallback and time.monotonic() > self.fallback_until:
+            self.url = self.primary            # пробуем вернуться на основной
         body = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
         delay = 1.0
         for attempt in range(retries + 1):
@@ -107,6 +117,15 @@ class SolanaRpc:
     def _on_429(self, retry_after: str | None) -> None:
         self.rate_limited += 1
         self._consecutive_429 += 1
+        if self.fallback and self.url == self.primary and self._consecutive_429 >= 5:
+            # основной узел отвечает 429 подряд — у Helius так выглядят кончившиеся кредиты месяца:
+            # 30 минут работаем через запасной (публичный) узел, потом пробуем основной снова
+            self.url = self.fallback
+            self.fallback_until = time.monotonic() + 1800
+            self._consecutive_429 = 0
+            self.pause_until = 0.0
+            log.warning("RPC: основной узел отвечает 429 — 30 мин работаю через запасной")
+            return
         wait = min(60.0, 2.0 ** self._consecutive_429)
         try:
             if retry_after:
