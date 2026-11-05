@@ -394,3 +394,17 @@ ALTER TABLE wallets ADD COLUMN IF NOT EXISTS trades_30d integer;
 ALTER TABLE wallets ADD COLUMN IF NOT EXISTS avg_hold_s double precision;
 ALTER TABLE wallets ADD COLUMN IF NOT EXISTS copyability double precision;
 ALTER TABLE wallets ADD COLUMN IF NOT EXISTS stats_at timestamptz;
+
+-- «Тренды»: теневой учёт отсеянных монет — что было бы через час (проверка, не режут ли фильтры хорошие монеты)
+CREATE TABLE IF NOT EXISTS trend_shadow (
+    id          bigserial PRIMARY KEY,
+    mint        text NOT NULL,
+    symbol      text,
+    reason      text NOT NULL,
+    detail      text,
+    created_at  timestamptz NOT NULL,
+    price       double precision,
+    max_price   double precision,
+    last_price  double precision
+);
+CREATE INDEX IF NOT EXISTS trend_shadow_created_idx ON trend_shadow (created_at);

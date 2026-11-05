@@ -59,7 +59,7 @@ HELP = """<b>Pump.fun Dev Scanner</b>
 /quiet 01:00-08:00 · /tz Europe/Moscow · /dailytime 21:00 · /mywallet &lt;адрес&gt;"""
 
 
-TOGGLES_ON_BY_DEFAULT = {"smart_filtered", "paper_size_by_level", "trend_autotune"}
+TOGGLES_ON_BY_DEFAULT = {"smart_filtered", "paper_size_by_level", "trend_autotune", "trend_wait_pullback"}
 
 
 def setup(router: Router, env: Env, settings: Settings, db: Database, sender: Any) -> None:
@@ -106,6 +106,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             [{"text": f"{on(cfg.get('watch_level_enabled'))} Уровень «Наблюдение»", "callback": "tog:watch_level_enabled"}],
             [{"text": f"{on(cfg.get('trend_autotune', True))} Тренды: автоподбор фильтров по истории",
               "callback": "tog:trend_autotune"}],
+            [{"text": f"{on(cfg.get('trend_wait_pullback', True))} Тренды: вход только на откате",
+              "callback": "tog:trend_wait_pullback"}],
         ]
         return text, kb
 
@@ -463,7 +465,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         elif kind == "tog":
             await db.set_override(rest, not cfg.get(rest, rest in TOGGLES_ON_BY_DEFAULT))
             view = mode_view if rest in ("smart_filtered", "smart_full_feed", "watch_level_enabled",
-                                         "trend_autotune") else settings_view
+                                         "trend_autotune", "trend_wait_pullback") else settings_view
         elif kind == "set":
             key, _, sign = rest.partition(":")
             label, step, lo, hi, _k = EDITABLE[key]

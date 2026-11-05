@@ -291,7 +291,22 @@ async def health_view(db: Database) -> str:
     tr = await db.kv_get("health:trends", {}) or {}
     if tr:
         lines.append(f"Тренды: кандидатов {tr.get('candidates', 0)}, проверено {tr.get('checked', 0)}, "
-                     f"алертов {tr.get('alerts', 0)}, на сопровождении {tr.get('tracked', 0)}, ошибок API {tr.get('errors', 0)}")
+                     f"алертов {tr.get('alerts', 0)}, ждут отката {tr.get('pending', 0)}, "
+                     f"на сопровождении {tr.get('tracked', 0)}, ошибок API {tr.get('errors', 0)}"
+                     + (f", лимит GeckoTerminal {tr['gecko_429']} раз" if tr.get("gecko_429") else ""))
+        rej = tr.get("rejected") or {}
+        if rej:
+            from ..analytics.trendcheck import REASONS
+            lines.append("  отсеяно с запуска: " + ", ".join(
+                f"{REASONS.get(k, k)} {v}" for k, v in sorted(rej.items(), key=lambda x: -x[1])))
+        from datetime import timedelta
+
+        from ..analytics.trendcheck import shadow_summary
+        now_utc = datetime.now(timezone.utc)
+        try:
+            lines += await shadow_summary(db, now_utc - timedelta(hours=24), now_utc)
+        except Exception:  # noqa: BLE001 — таблица появится после первого запуска analytics
+            pass
     if cov.get("parts"):
         lines.append("Покрытие за час: " + "; ".join(cov["parts"]))
     lines.append(f"Очередь сообщений: {backlog}")
