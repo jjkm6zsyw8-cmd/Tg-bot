@@ -309,17 +309,20 @@ class PaperTrader:
             self.skipped[name] = f"лимит {MAX_OPEN} открытых позиций"
             return None
         size = self.balance[name] * self.share_for(level)
-        min_size = max(0.01, 10 * self.priority())
-        if data.get("copy_sol") and size >= min_size:
+        # минимальная позиция: на ~$2 фиксированные комиссии (приоритет 2×0.0005 SOL + pump.fun) съедали ~7% сделки
+        min_size = max(float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
+        if data.get("copy_sol"):
             # Ratio: копия — доля от суммы покупки цели (её уверенность), потолок — обычная доля портфеля
             ratio = float(self.cfg.get("copy_ratio", 0.10))
-            size = min(size, max(min_size, ratio * float(data["copy_sol"])))
+            size = min(size, ratio * float(data["copy_sol"]))
+        size = max(size, min_size)                    # не мельче минимума…
+        size = min(size, self.balance[name] * 0.5)    # …но и не больше половины баланса
         if size < min_size:
             if not self.paused.get(name):
                 self.paused[name] = True
                 await self.db.execute("UPDATE paper_portfolios SET paused=true WHERE name=$1", name)
-                await self._msg(f"⏸ Портфель {name}: баланс {self.balance[name]:.4f} SOL — меньше минимальной позиции "
-                                f"({min_size / self.share():.3f} SOL). Торговля на паузе, /paper reset — сброс.")
+                await self._msg(f"⏸ Портфель {name}: баланс {self.balance[name]:.4f} SOL — меньше двух минимальных "
+                                f"позиций ({2 * min_size:.3f} SOL). Торговля на паузе, /paper reset — сброс.")
             self.skipped[name] = "пауза: мал баланс"
             return None
         fill = buy_fill(mc, size, self.fee_bps(), self.priority())
@@ -486,7 +489,8 @@ class PaperTrader:
             """UPDATE paper_positions SET tokens=0, proceeds_sol=$2, closed_at=$3, exit_reason=$4, pnl_sol=$5,
                    pnl_pct=$6, max_mc=$7 WHERE id=$1""", p.id, p.proceeds_sol, now, reason, pnl, pct, p.max_mc)
         self.positions.pop(p.id, None)
-        if self.paused.get(p.portfolio) and self.balance[p.portfolio] * self.share() >= max(0.01, 10 * self.priority()):
+        min_pos = max(float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
+        if self.paused.get(p.portfolio) and self.balance[p.portfolio] >= 2 * min_pos:
             self.paused[p.portfolio] = False
             await self.db.execute("UPDATE paper_portfolios SET paused=false WHERE name=$1", p.portfolio)
         self._exits.setdefault(p.symbol or "?", []).append((p.portfolio, pct, EXIT_SHORT.get(reason, reason)))

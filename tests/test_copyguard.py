@@ -111,7 +111,14 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
                                                   "copy_ref_mc": 40.0}, "W")
         big = await db.fetchval("SELECT cost_sol FROM paper_positions WHERE portfolio='A' AND mint='M2'")
         bal = await db.fetchval("SELECT start_sol FROM paper_portfolios WHERE name='A'")
-        assert big == pytest.approx((bal - 0.05) * 0.15)                  # 10% от 10 SOL = 1 → потолок доли портфеля
+        # 10% от 10 SOL = 1 → потолок доли портфеля (0.25 × 15% = 0.0375) → но не меньше минимума 0.05
+        assert big == pytest.approx(max(0.05, (bal - 0.05) * 0.15))
+        st3 = SimpleNamespace(mc=40.0, mint="M3", trades=[SimpleNamespace(ts=time.time())])
+        eng.states["M3"] = st3
+        await tr.on_alert("M3", "normal", None, {"symbol": "TINY", "mc": 40.0, "copy_wallet": "W", "copy_sol": 0.1,
+                                                  "copy_ref_mc": 40.0}, "W")
+        tiny = await db.fetchval("SELECT cost_sol FROM paper_positions WHERE portfolio='B' AND mint='M3'")
+        assert tiny == pytest.approx(0.05)                                 # 10% от 0.1 = 0.01 → минимум 0.05 SOL
         row = await db.fetchrow("SELECT entry_mc, delta FROM copy_log WHERE wallet='W'")
         assert row["entry_mc"] == 40.0 and row["delta"] == pytest.approx(40 / 38 - 1)
         await eng.copyguard.load()
