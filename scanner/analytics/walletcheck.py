@@ -46,6 +46,9 @@ def dev_profile(wallet: str, creates: list[TokenCreated], trades: list[Trade]) -
         ss = sorted(sells.get(c.mint, []), key=lambda x: x.ts)
         if not ss:
             continue
+        ss = [x for x in ss if x.sol_amount > 0 and sell_mc_before(x) > 0]
+        if not ss:
+            continue
         first = ss[0]
         start = mc_sol(c.v_sol, c.v_tokens) or 27.96
         mc = sell_mc_before(first)

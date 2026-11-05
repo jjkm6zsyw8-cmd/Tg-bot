@@ -139,6 +139,10 @@ def decode_event(data: bytes, ctx: TxContext, pool_to_mint: dict[str, str] | Non
         v_tok = r.u64() / TOK
         _real_sol = r.u64()
         real_tok = r.u64() / TOK
+        if v_sol <= 0 or v_tok <= 0 or (sol_amount <= 0 and token_amount > 0):
+            # не рыночная сделка: служебное движение токенов программы запуска (0 SOL, нулевые резервы) —
+            # иначе «продажа на MC 0» портила почерк дева и цену монеты
+            return None
         fee_sol = None
         if r.remaining() >= 32 + 8 + 8:
             r.pubkey()  # fee_recipient

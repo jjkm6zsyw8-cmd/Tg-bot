@@ -205,3 +205,11 @@ def test_events_of_other_launchpads_are_ignored():
     assert pump_log_events(logs) == [ev]                          # событие другого лаунчпада отброшено
     assert pump_log_events([data]) == []                          # без контекста вызова — не берём
     assert pump_log_events([f"Program {other} invoke [1]", data, f"Program {other} success"]) == []
+
+
+def test_zero_sol_trade_events_skipped():
+    """Регрессия: «продажи» с 0 SOL и нулевыми резервами (служебные движения) давали MC 0 и «продажу через 5 с»."""
+    from scanner.ingest.pump_parser import TxContext, decode_event
+    ctx = TxContext("s", 1, None, None, "rpc")
+    assert decode_event(trade_event(addr("m"), addr("u"), 0.0, 4.8e7, False, 30, 1.0e9), ctx) is None
+    assert decode_event(trade_event(addr("m"), addr("u"), 0.5, 1e7, True, 31, 1.04e9), ctx) is not None
