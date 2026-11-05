@@ -333,9 +333,11 @@ def test_logs_source_parses_program_data():
 
     from scanner.ingest.sources import LogsSource
     mint, dev = addr("lmint"), addr("ldev")
-    logs = ["Program 6EF8 invoke [1]",
+    from scanner.solana import PUMP_PROGRAM
+    logs = [f"Program {PUMP_PROGRAM} invoke [1]",
             "Program data: " + b64.b64encode(create_event(mint, dev)).decode(),
-            "Program data: " + b64.b64encode(trade_event(mint, dev, 1.0, 3e7, True, 31, 1.04e9)).decode()]
+            "Program data: " + b64.b64encode(trade_event(mint, dev, 1.0, 3e7, True, 31, 1.04e9)).decode(),
+            f"Program {PUMP_PROGRAM} success"]
     msg = js.dumps({"params": {"result": {"context": {"slot": 777},
                                           "value": {"signature": "sigL", "err": None, "logs": logs}}}})
     evs = LogsSource.parse_notification(msg, ParseStats())

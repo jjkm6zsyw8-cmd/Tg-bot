@@ -197,18 +197,49 @@ def decode_event(data: bytes, ctx: TxContext, pool_to_mint: dict[str, str] | Non
 KNOWN = {D_CREATE, D_TRADE, D_MIGRATION, D_COMPLETE, D_AMM_BUY, D_AMM_SELL}
 
 
-def _event_payloads(tx: dict[str, Any]) -> Iterable[bytes]:
-    meta = tx.get("meta") or {}
+def pump_log_events(logs: Iterable[str]) -> list[bytes]:
+    """События из строк «Program data:» — только те, что вывела САМА программа Pump.fun или PumpSwap.
+
+    Имя события Anchor (TradeEvent, BuyEvent…) не уникально: у других лаунчпадов (letsbonk/LaunchLab и т. п.)
+    события с тем же именем и тем же дискриминатором, но другой раскладкой — разбор их как pump.fun давал мусор
+    (MC 0, чужие суммы). Поэтому по строкам «Program X invoke [N]» / «Program X success|failed» ведём стек
+    вызовов и берём данные, только когда сверху стека — программа Pump.fun или PumpSwap."""
+    stack: list[str] = []
+    out: list[bytes] = []
     seen: set[bytes] = set()
-    for line in meta.get("logMessages") or []:
+    for line in logs:
         if line.startswith("Program data: "):
+            if not stack or stack[-1] not in (PUMP_PROGRAM, PUMP_AMM_PROGRAM):
+                continue
             try:
                 raw = base64.b64decode(line[14:])
             except ValueError:
                 continue
             if raw[:8] in KNOWN and raw not in seen:
                 seen.add(raw)
-                yield raw
+                out.append(raw)
+            continue
+        if not line.startswith("Program "):
+            continue
+        parts = line.split(" ")
+        if len(parts) >= 3 and parts[2] == "invoke":
+            stack.append(parts[1])
+        elif len(parts) >= 3 and (parts[2] == "success" or parts[2].startswith("failed")):
+            if stack and stack[-1] == parts[1]:
+                stack.pop()
+            elif parts[1] in stack:            # лог обрезан/пропущена строка — восстанавливаем стек
+                while stack and stack.pop() != parts[1]:
+                    pass
+    return out
+
+
+def _event_payloads(tx: dict[str, Any]) -> Iterable[bytes]:
+    meta = tx.get("meta") or {}
+    seen: set[bytes] = set()
+    for raw in pump_log_events(meta.get("logMessages") or []):
+        if raw not in seen:
+            seen.add(raw)
+            yield raw
     for group in meta.get("innerInstructions") or []:
         for ix in group.get("instructions") or []:
             pid = ix.get("programId")

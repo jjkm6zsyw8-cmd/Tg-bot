@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import random
@@ -20,7 +19,15 @@ import websockets
 
 from ..models import Event, Migration, TokenCreated, Trade
 from ..solana import PUMP_AMM_PROGRAM, PUMP_PROGRAM, TOTAL_SUPPLY
-from .pump_parser import D_AMM_BUY, D_AMM_SELL, KNOWN, ParseStats, TxContext, decode_event, parse_transaction
+from .pump_parser import (
+    D_AMM_BUY,
+    D_AMM_SELL,
+    ParseStats,
+    TxContext,
+    decode_event,
+    parse_transaction,
+    pump_log_events,
+)
 
 log = logging.getLogger(__name__)
 
@@ -397,17 +404,7 @@ class LogsSource(Source):
             return []
         ctx = TxContext(value["signature"], (result.get("context") or {}).get("slot"), None, None, source)
         out: list[Event] = []
-        seen: set[bytes] = set()
-        for line in value.get("logs") or []:
-            if not line.startswith("Program data: "):
-                continue
-            try:
-                data = base64.b64decode(line[14:])
-            except ValueError:
-                continue
-            if data[:8] not in KNOWN or data in seen:
-                continue
-            seen.add(data)
+        for data in pump_log_events(value.get("logs") or []):   # только события самих Pump.fun / PumpSwap
             try:
                 ev = decode_event(data, ctx, pool_to_mint)
             except (ValueError, struct.error) as exc:
@@ -568,13 +565,7 @@ class WatchSource(Source):
         if value.get("err") is not None:
             return []
         out: list[str] = []
-        for line in value.get("logs") or []:
-            if not line.startswith("Program data: "):
-                continue
-            try:
-                data = base64.b64decode(line[14:])
-            except ValueError:
-                continue
+        for data in pump_log_events(value.get("logs") or []):
             if data[:8] in (D_AMM_BUY, D_AMM_SELL) and len(data) >= 152:
                 pool = base58.b58encode(data[120:152]).decode()
                 if pool not in self.pool_to_mint and pool not in out:

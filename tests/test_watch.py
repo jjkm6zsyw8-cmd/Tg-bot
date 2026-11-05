@@ -47,8 +47,11 @@ def test_watch_targets_priority_and_cap(monkeypatch):
 
 
 def test_watch_notification_parsed_as_watch_source():
+    from scanner.solana import PUMP_PROGRAM
     mint, dev = addr("wmint"), addr("wdev")
-    logs = [f"Program data: {__import__('base64').b64encode(trade_event(mint, dev, 0.5, 1e7, True, 31, 1.04e9)).decode()}"]
+    logs = [f"Program {PUMP_PROGRAM} invoke [1]",
+            f"Program data: {__import__('base64').b64encode(trade_event(mint, dev, 0.5, 1e7, True, 31, 1.04e9)).decode()}",
+            f"Program {PUMP_PROGRAM} success"]
     msg = {"method": "logsNotification",
            "params": {"result": {"context": {"slot": 9}, "value": {"signature": "s1", "err": None, "logs": logs}}}}
     evs = LogsSource.parse_notification(msg, ParseStats(), source="watch")
@@ -181,3 +184,24 @@ async def test_rpc_client_init_and_daily_budget():
     rpc.day = "2000-01-01"
     assert not rpc.over_budget() and rpc.day_calls == 0             # новые сутки — счётчик с нуля
     await rpc.close()
+
+
+
+def test_events_of_other_launchpads_are_ignored():
+    """Регрессия: «TradeEvent» другого лаунчпада (то же имя → тот же дискриминатор) разбирался как pump.fun → MC 0."""
+    import base64
+
+    from scanner.ingest.pump_parser import pump_log_events
+    from scanner.solana import PUMP_PROGRAM
+    ev = trade_event(addr("m"), addr("u"), 0.5, 1e7, True, 31, 1.04e9)
+    other = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+    data = f"Program data: {base64.b64encode(ev).decode()}"
+    other_data = f"Program data: {base64.b64encode(trade_event(addr('m2'), addr('u2'), 0.7, 2e7, False, 33, 1e9)).decode()}"
+    router = "6Vo3245eRouterProgram1111111111111111111111"
+    logs = [f"Program {router} invoke [1]",                       # роутер бота вызывает pump.fun (CPI) — берём
+            f"Program {PUMP_PROGRAM} invoke [2]", data, f"Program {PUMP_PROGRAM} success",
+            f"Program {router} success",
+            f"Program {other} invoke [1]", other_data, f"Program {other} success"]
+    assert pump_log_events(logs) == [ev]                          # событие другого лаунчпада отброшено
+    assert pump_log_events([data]) == []                          # без контекста вызова — не берём
+    assert pump_log_events([f"Program {other} invoke [1]", data, f"Program {other} success"]) == []
