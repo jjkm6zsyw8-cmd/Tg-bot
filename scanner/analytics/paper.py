@@ -53,7 +53,14 @@ SCHEMES: dict[str, dict[str, Any]] = {
     "G": {"name": "G: скальп — всё на +25%, стоп −8%, 5 мин", "stop": 0.08, "tp_net": 0.25, "tp_share": 1.0,
           "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
 }
-LEGEND = "A стоп−6% · B база · C только цель · D тейк+20% · E тейк+50% · F трейл после +15% · G скальп +25%"
+LEGEND = ("A стоп−6% · B база · C только цель · D тейк+20% · E тейк+50% · F трейл после +15% · G скальп +25% · "
+          "копии во всех: ½ на +30%, трейл 15%, стоп −20%")
+# Копии своих кошельков выходят по своему правилу во всех портфелях: по данным, весь плюс копий давали выходы
+# по цели (в среднем +82%), а ожидание продажи трейдера — в среднем −20%. Половина на +30% чистыми, остаток —
+# трейлинг 15% от пика, стоп −20% (тесные −6…−10% выбивали на обычных колебаниях); продал трейдер — продаём остаток
+COPY_SCHEME: dict[str, Any] = {"name": "копия: ½ на +30%, трейлинг 15%, стоп −20%", "stop": 0.20, "tp_net": 0.30,
+                               "tp_share": 0.5, "trail": 0.15, "target": False, "time_stop_s": None,
+                               "time_stop_gain": None}
 TICK_S = 2.0          # проверка открытых позиций (стоп/тейк/трейлинг) раз в 2 с
 FRESH_S = 120.0       # цена из своего потока сделок годится, только если по монете были сделки за 2 минуты
 JUMP_X = 5.0          # скачок цены больше чем в 5 раз за одну проверку — ждём подтверждения
@@ -121,6 +128,7 @@ class Position:
     level: str = "normal"
     alert_id: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    rule: str | None = None          # "copy" — копия своего кошелька, выход по COPY_SCHEME
 
     def net_if_sold(self, mc: float, fee_bps: float, priority_sol: float) -> float:
         value = sell_fill(mc, self.tokens, fee_bps, priority_sol).sol if self.tokens > 0 else 0.0
@@ -247,7 +255,8 @@ class PaperTrader:
                 entry_mc=r["entry_mc"], cost_sol=r["cost_sol"], tokens=r["tokens"], tokens_initial=r["tokens_initial"],
                 target_mc=r["target_mc"], symbol=r["symbol"] or "", proceeds_sol=r["proceeds_sol"],
                 max_mc=r["max_mc"] or r["entry_mc"], tp_done=r["tp_done"], level=r["level"] or "normal",
-                alert_id=r["alert_id"], extra={"last_mc": r["last_mc"]} if r.get("last_mc") else {})
+                alert_id=r["alert_id"], extra={"last_mc": r["last_mc"]} if r.get("last_mc") else {},
+                rule=r.get("rule"))
 
     async def reset(self) -> None:
         async with self.lock:
@@ -266,6 +275,9 @@ class PaperTrader:
                        trader: str | None) -> None:
         if level not in self.levels():
             self.skipped.setdefault("*", f"уровень «{level}» не выбран для бумажной торговли")
+            return
+        if data.get("trend") and not self.cfg.get("paper_trends", False):
+            self.skipped.setdefault("*", "«Тренды» не входят в бумажную торговлю (настройка)")
             return
         await asyncio.sleep(ENTRY_DELAY_S)          # реакция пользователя
         # «Тренды» — только по DexScreener (по нему дан алерт); остальное — свой свежий поток, сверка с DexScreener
@@ -336,11 +348,13 @@ class PaperTrader:
             return None
         self.balance[name] -= size
         target = data.get("target_mc")
+        rule = "copy" if data.get("copy_wallet") else None
         now = datetime.now(timezone.utc)
         pid = await self.db.fetchval(
             """INSERT INTO paper_positions(portfolio, mint, alert_id, level, symbol, opened_at, entry_mc, cost_sol,
-                   tokens, tokens_initial, max_mc, target_mc) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$7,$10) RETURNING id""",
-            name, mint, alert_id, level, data.get("symbol"), now, mc, size, fill.tokens, target)
+                   tokens, tokens_initial, max_mc, target_mc, rule)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$7,$10,$11) RETURNING id""",
+            name, mint, alert_id, level, data.get("symbol"), now, mc, size, fill.tokens, target, rule)
         await self.db.execute(
             "INSERT INTO paper_trades(position_id, portfolio, side, ts, mc, sol, tokens, fee_sol, reason) "
             "VALUES ($1,$2,'buy',$3,$4,$5,$6,$7,'алерт')", pid, name, now, mc, size, fill.tokens, fill.fee_sol)
@@ -348,7 +362,7 @@ class PaperTrader:
         self.positions[pid] = Position(id=pid, portfolio=name, mint=mint, opened_ts=time.time(), entry_mc=mc,
                                        cost_sol=size, tokens=fill.tokens, tokens_initial=fill.tokens, target_mc=target,
                                        trader=trader, symbol=data.get("symbol") or "", max_mc=mc, level=level,
-                                       alert_id=alert_id, extra={"src": src, "last_mc": mc})
+                                       alert_id=alert_id, extra={"src": src, "last_mc": mc}, rule=rule)
         self.skipped.pop(name, None)
         return size
 
@@ -403,13 +417,14 @@ class PaperTrader:
                 if time.time() - last_report >= 3600:
                     last_report = time.time()
                     await self.report_hourly()
+                await self.maybe_daily_reset()
                 await self.maybe_compare()
             except Exception:  # noqa: BLE001
                 log.exception("paper tick")
 
     async def _check(self, p: Position, mc: float, emergency: str | None, price_usd: float | None = None) -> None:
         """price_usd — цена DexScreener для этой проверки (None — цена из своего потока сделок)."""
-        scheme = SCHEMES[p.portfolio]
+        scheme = self.scheme_for(p)
         last = p.extra.get("last_mc")
         if emergency is None and last and (mc > JUMP_X * last or mc < last / JUMP_X):
             if price_usd is not None:
@@ -454,8 +469,12 @@ class PaperTrader:
         async with self.lock:
             await self._sell(p, reason, share, mc)
 
+    @staticmethod
+    def scheme_for(p: Position) -> dict[str, Any]:
+        return COPY_SCHEME if p.rule == "copy" else SCHEMES[p.portfolio]
+
     def still_valid(self, p: Position, reason: str, mc: float) -> bool:
-        scheme = SCHEMES[p.portfolio]
+        scheme = self.scheme_for(p)
         if reason == "stop" and scheme.get("stop") is not None:
             return mc <= p.entry_mc * (1 - scheme["stop"])
         if reason == "trailing" and scheme.get("trail") is not None:
@@ -695,6 +714,54 @@ class PaperTrader:
                 EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""),
             ])
         return out.getvalue()
+
+    async def maybe_daily_reset(self) -> None:
+        """В 00:00 по часовому поясу сброса (по умолчанию Батуми) — итог дня по каждой схеме и сброс до $30:
+        все схемы каждый день торгуют в равных условиях, ни одна не стоит полдня на паузе."""
+        if not self.cfg.get("paper_daily_reset", True):
+            return
+        try:
+            tz = ZoneInfo(str(self.cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
+        except Exception:  # noqa: BLE001
+            tz = ZoneInfo("Asia/Tbilisi")
+        today = datetime.now(tz).date().isoformat()
+        last = await self.db.kv_get("paper:daily_reset")
+        if last == today:
+            return
+        await self.db.kv_set("paper:daily_reset", today)
+        if last is None:
+            return                                   # первый запуск — только запомнить день
+        text = await self.day_summary(tz)
+        await self.flush_messages()
+        await self.db.enqueue("text", {"topic": "paper", "text": text}, priority=4)
+        await self.reset()
+        await self._msg(f"🔄 Новый день ({today}): все портфели снова по ${START_USD:.0f}")
+
+    async def day_summary(self, tz: ZoneInfo) -> str:
+        """Итог дня: схемы (с открытыми позициями по последней цене) и закрытые сделки по 6-часовым отрезкам."""
+        sol_usd = self.e.price.value or 150
+        tot = await self._row(None)
+        res = sorted(((tot[n]["equity"] / tot[n]["port"]["start_sol"] - 1, n) for n in SCHEMES), reverse=True)
+        lines = ["🏁 <b>Итог дня бумаги</b> (сброс в 00:00 по Батуми)"]
+        for r, n in res:
+            t = tot[n]
+            wr = f", прибыльных {t['wins'] / t['trades']:.0%}" if t["trades"] else ""
+            lines.append(f"{'🥇' if n == res[0][1] else '•'} {n}: <b>{r:+.0%}</b> · ${t['equity'] * sol_usd:.1f} · "
+                         f"сделок {t['trades']}{wr}")
+        rows = await self.db.fetch(
+            """SELECT closed_at, pnl_sol FROM paper_positions p JOIN paper_portfolios f ON f.name = p.portfolio
+               WHERE p.closed_at IS NOT NULL AND p.exit_reason <> 'reset' AND NOT p.suspect AND p.opened_at >= f.reset_at""")
+        buckets: dict[int, list[float]] = {}
+        for r in rows:
+            buckets.setdefault(r["closed_at"].astimezone(tz).hour // 6, []).append(r["pnl_sol"] or 0.0)
+        if buckets:
+            names = {0: "ночь 00–06", 1: "утро 06–12", 2: "день 12–18", 3: "вечер 18–24"}
+            lines.append("\n<b>По времени суток</b> (все схемы вместе)")
+            for b in sorted(buckets):
+                xs = buckets[b]
+                lines.append(f"• {names[b]}: сделок {len(xs)}, прибыльных {sum(x > 0 for x in xs) / len(xs):.0%}, "
+                             f"итог {sum(xs) * sol_usd:+.1f}$")
+        return "\n".join(lines)
 
     async def maybe_compare(self) -> None:
         """Через 7 дней после сброса — сравнение портфелей и предложение лучшей схемы (один раз)."""

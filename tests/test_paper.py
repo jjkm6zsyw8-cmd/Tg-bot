@@ -214,6 +214,7 @@ async def test_entry_price_sources(monkeypatch):
         return None
     # «Тренды»: только DexScreener, даже если свой поток свежий
     tr = bare_trader({"M": fresh_state(28.0)}, FakeExt(300_000))     # $300k при SOL $100 = 3000 SOL
+    tr.e.cfg = {"paper_trends": True}
     tr._open = fake_open
     tr.lock = __import__("asyncio").Lock()
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
@@ -297,6 +298,7 @@ async def test_persistent_dexscreener_glitch_needs_jupiter(monkeypatch):
 async def test_entry_skipped_when_jupiter_disagrees(monkeypatch):
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
     tr = bare_trader({}, FakeExt(300_000, jup=0.03))     # DexScreener $0.0003, Jupiter $0.03 — в 100 раз
+    tr.e.cfg = {"paper_trends": True}
     tr.lock = __import__("asyncio").Lock()
     opened = []
 
@@ -393,5 +395,74 @@ async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
         assert rows == {"REAL": False, "FAKE": True}
         text = await tr.render_period(None)
         assert "1 сделок с ценой, которую не подтвердил Jupiter" in text
+    finally:
+        await db.close()
+
+
+def test_copy_exit_rule():
+    """Копия: половина на +30% чистыми, остаток — трейлинг 15%, стоп −20%; без «нет роста» и без выхода по цели."""
+    s = pp.COPY_SCHEME
+    p = pos(entry=40.0, target=50.0)
+    assert decide_exit(p, 34.0, 10, s, 125, 0.0005) is None                       # −15% — держим
+    assert decide_exit(p, 31.0, 10, s, 125, 0.0005) == ("stop", 1.0)             # −22.5% — стоп
+    p2 = pos(entry=40.0, target=50.0)
+    assert decide_exit(p2, 51.0, 10, s, 125, 0.0005) is None                     # цель алерта не продаёт всё
+    assert decide_exit(p2, 56.0, 10, s, 125, 0.0005) == ("take_profit", 0.5)     # +30% чистыми — половина
+    p2.tp_done = True
+    assert decide_exit(p2, 90.0, 20, s, 125, 0.0005) is None                     # остаток летит дальше
+    assert decide_exit(p2, 76.0, 30, s, 125, 0.0005) == ("trailing", 1.0)        # −15% от пика 90
+    assert decide_exit(pos(entry=40.0), 41.0, 900, s, 125, 0.0005) is None       # без стопа по времени
+    tr = pp.PaperTrader.__new__(pp.PaperTrader)
+    assert tr.scheme_for(Position(id=1, portfolio="A", mint="M", opened_ts=0, entry_mc=1, cost_sol=1, tokens=1,
+                                  tokens_initial=1, target_mc=None, rule="copy")) is s
+
+
+async def test_trends_not_in_paper_by_default(monkeypatch):
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    tr = bare_trader({}, FakeExt(300_000))
+    opened = []
+
+    async def fake_open(*a, **k):
+        opened.append(a)
+    tr._open = fake_open
+    tr.lock = __import__("asyncio").Lock()
+    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
+    assert not opened and "Тренды" in tr.skipped["*"]
+    tr.e.cfg = {"paper_trends": True}
+    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
+    assert opened
+
+
+async def test_daily_reset_with_summary(monkeypatch):
+    from scanner.config import Settings, YamlConfig
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+        settings = Settings(YamlConfig("config/config.yaml"))
+        st = SimpleNamespace(mc=40.0, mint="M1", trades=[SimpleNamespace(ts=time.time())])
+        eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
+                              cfg=settings.effective(), states={"M1": st}, ext=None)
+        tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
+        await tr.start()
+        await tr.maybe_daily_reset()                                 # первый запуск — только запомнить день
+        assert await db.kv_get("paper:daily_reset") and not await db.fetchval("SELECT count(*) FROM outbox")
+        await tr.on_alert("M1", "strong", None, {"symbol": "T", "mc": 40.0, "copy_wallet": "W", "copy_sol": 1.0}, "W")
+        assert {p.rule for p in tr.positions.values()} == {"copy"}
+        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE rule='copy'") == 7
+        p = next(iter(tr.positions.values()))
+        await tr._sell(p, "take_profit", 1.0, 60.0)
+        await db.kv_set("paper:daily_reset", "2000-01-01")           # наступил новый день
+        await tr.maybe_daily_reset()
+        texts = [r["payload"]["text"] for r in await db.fetch("SELECT payload FROM outbox ORDER BY id")]
+        assert any("Итог дня бумаги" in t and "По времени суток" in t for t in texts)
+        assert not tr.positions and tr.balance["A"] == pytest.approx(0.3)
+        await tr.flush_messages()
+        assert "Новый день" in (await db.fetchval("SELECT payload->>'text' FROM outbox ORDER BY id DESC LIMIT 1"))
     finally:
         await db.close()

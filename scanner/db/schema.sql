@@ -444,3 +444,4 @@ ALTER TABLE my_devs ADD COLUMN IF NOT EXISTS once boolean NOT NULL DEFAULT false
 ALTER TABLE my_devs ADD COLUMN IF NOT EXISTS once_done boolean NOT NULL DEFAULT false;
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS last_mc double precision;   -- последняя цена (для отчёта из бота)
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS suspect boolean NOT NULL DEFAULT false;   -- цена выхода не подтверждена
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS rule text;   -- copy — выход копии по своему правилу
