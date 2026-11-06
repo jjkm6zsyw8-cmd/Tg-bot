@@ -411,6 +411,7 @@ class PaperTrader:
                     self._last_flush = time.time()
                     await self.flush_messages()
                     # последняя цена открытых позиций — в БД: отчёт /paper строит бот сам, без аналитики
+                    await self.db.kv_set("paper:skipped", dict(self.skipped) or None)   # причины — для отчёта из бота
                     marks = [(p.id, float(p.extra["last_mc"])) for p in self.positions.values() if p.extra.get("last_mc")]
                     if marks:
                         await self.db.p.executemany("UPDATE paper_positions SET last_mc=$2 WHERE id=$1", marks)
@@ -587,8 +588,18 @@ class PaperTrader:
 
         no_trades = hours is not None and not any(per[n]["trades"] for n in SCHEMES)
         if no_trades:
-            why = self.skipped.get("*") or next((v for v in self.skipped.values()), "") or "не было алертов"
-            lines.append(f"⏸ сделок нет: {why}")
+            # сколько алертов было за период (по базе) и последняя причина, по которой бумага не вошла
+            # (её пишет аналитика: бот, который строит этот отчёт, сам её не знает)
+            cnt = await self.db.fetch(
+                "SELECT mode, count(*) n FROM alerts WHERE created_at > now() - make_interval(mins => $1) GROUP BY 1",
+                int(hours * 60))
+            names = {"copy": "копии", "mydev": "мои девы", "dev": "девы", "new": "новые", "trend": "тренды",
+                     "smart": "смарт"}
+            parts = ", ".join(f"{names.get(r['mode'], r['mode'])} {r['n']}" for r in cnt)
+            saved = await self.db.kv_get("paper:skipped", {}) or {}
+            why = (self.skipped.get("*") or next((v for v in self.skipped.values()), "")
+                   or saved.get("*") or next((v for v in saved.values()), ""))
+            lines.append(f"⏸ сделок нет · алертов за период: {parts or '0'}" + (f" · бумага не вошла: {why}" if why else ""))
         # таблица: портфель · за период · всего · баланс · сделки (доля прибыльных); ★ — лидер по «всего»
         leader = max(SCHEMES, key=lambda n: tot[n]["equity"] / tot[n]["port"]["start_sol"])
         head = ("    " + (f"{'период':>7}" if hours is not None else "") + f"{'всего':>7}{'баланс':>8}  сделки")
