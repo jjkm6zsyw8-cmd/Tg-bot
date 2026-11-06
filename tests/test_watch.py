@@ -249,3 +249,90 @@ def test_fallback_urls_from_env():
     assert e.rpc_fallback_url == "https://api.mainnet-beta.solana.com"
     assert e.watch_fallback_ws == "wss://api.mainnet-beta.solana.com"
     assert Env(rpc_fallback_url="").watch_fallback_ws == ""
+
+
+def amm_buy_event(pool: str, user: str, base_out: float = 1e6, quote_in: float = 0.5,
+                  pool_base: float = 2e8, pool_quote: float = 100.0) -> bytes:
+    import struct
+
+    import base58
+
+    from scanner.ingest.pump_parser import D_AMM_BUY
+    u = [int(base_out * 1e6), int(quote_in * 1e9), 0, 0, int(pool_base * 1e6), int(pool_quote * 1e9),
+         int(quote_in * 1e9), 20, 1000, 5, 250, 0, 0]
+    return D_AMM_BUY + struct.pack("<q", 1_800_000_000) + struct.pack("<13Q", *u) + base58.b58decode(pool) \
+        + base58.b58decode(user)
+
+
+async def test_watch_resolves_pools_and_skips_non_sol():
+    """Регрессия: пул монеты к токену PUMP читался как SOL → MC ×15–20 («Diamond +1500%»). Пул не угадываем."""
+    import base64
+
+    from scanner.solana import PUMP_AMM_PROGRAM
+    pool_sol, pool_pump, user = addr("poolsol"), addr("poolpump"), addr("buyer")
+
+    def note(pool):
+        logs = [f"Program {PUMP_AMM_PROGRAM} invoke [1]",
+                f"Program data: {base64.b64encode(amm_buy_event(pool, user)).decode()}",
+                f"Program {PUMP_AMM_PROGRAM} success"]
+        return {"method": "logsNotification", "params": {"subscription": 7, "result": {
+            "context": {"slot": 1}, "value": {"signature": f"s{pool[:4]}", "err": None, "logs": logs}}}}
+
+    w = WatchSource("wss://x", {})
+    w.sid_addr[7] = addr("coin")
+    w.want[addr("coin")] = "coin"
+    asked = []
+
+    async def resolver(pool):
+        asked.append(pool)
+        return addr("coin") if pool == pool_sol else None      # пул к PUMP — приёмник отказал
+    w.resolve_pool = resolver
+    got = []
+
+    async def sink(ev):
+        got.append(ev)
+    for pool in (pool_pump, pool_sol):
+        assert w.unknown_pools(note(pool)) == [pool]
+        await w._resolve_and_emit(note(pool), [pool], sink)
+    assert [e.mint for e in got] == [addr("coin")] and got[0].v_sol == 100.0     # только сделка пула к SOL
+    assert w.unknown_pools(note(pool_pump)) == []                                 # 10 минут не спрашиваем
+    assert asked == [pool_pump, pool_sol]
+
+
+async def test_receiver_resolve_pool_checks_quote():
+    from scanner.config import Env, Settings, YamlConfig
+    from scanner.ingest.receiver import Receiver
+
+    class Resp:
+        def __init__(self, data):
+            self.status, self.data = 200, data
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self, content_type=None):
+            return self.data
+
+    class Http:
+        def __init__(self, data):
+            self.data = data
+
+        def get(self, url):
+            return Resp(self.data)
+
+    class Db:
+        async def fetchval(self, *a):
+            return None
+
+        async def execute(self, *a):
+            return None
+    wsol = "So11111111111111111111111111111111111111112"
+    rec = Receiver(Env(helius_api_key="K"), Settings(YamlConfig("config/config.yaml")), Db())
+    rec._http = Http({"pairs": [{"pairAddress": "P1", "baseToken": {"address": "MINT"}, "quoteToken": {"address": wsol}}]})
+    assert await rec.resolve_pool("P1") == "MINT"
+    rec._http = Http({"pairs": [{"pairAddress": "P2", "baseToken": {"address": "MINT"},
+                                 "quoteToken": {"address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"}}]})
+    assert await rec.resolve_pool("P2") is None and "P2" in rec.non_sol_pools

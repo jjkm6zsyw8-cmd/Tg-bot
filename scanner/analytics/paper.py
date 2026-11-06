@@ -58,7 +58,7 @@ TICK_S = 2.0          # проверка открытых позиций (сто
 FRESH_S = 120.0       # цена из своего потока сделок годится, только если по монете были сделки за 2 минуты
 JUMP_X = 5.0          # скачок цены больше чем в 5 раз за одну проверку — ждём подтверждения
 MISMATCH_X = 2.0      # свой поток и DexScreener расходятся больше чем в 2 раза — верим DexScreener
-ANOMALY_PCT = 10.0    # результат больше +1000% — помечаем ⚠ для проверки
+ANOMALY_PCT = 10.0    # результат больше +1000% — проверяем цену выхода через Jupiter (⚠, если не подтвердилась)
 LEVEL_SIZE = {"strong": 1.5, "normal": 0.75, "watch": 0.5}   # размер позиции по силе сигнала (× базовая доля)
 PERIOD_NAMES = {1: "за 1 час", 2: "за 2 часа", 6: "за 6 часов", 24: "за 24 часа", 168: "за 7 дней",
                 None: "за всё время"}
@@ -189,12 +189,18 @@ class PaperTrader:
             return None
         return float(st.mc)
 
-    async def jupiter_agrees(self, mint: str, price_usd: float) -> bool:
+    async def jupiter_check(self, mint: str, price_usd: float) -> bool | None:
+        """True — Jupiter подтверждает цену (±2×), False — расходится, None — у Jupiter нет цены."""
         ext = getattr(self.e, "ext", None)
         jp = await ext.jup_price(mint) if ext is not None else None
-        ok = bool(jp) and price_usd > 0 and 0.5 <= price_usd / jp <= 2.0
+        if not jp or price_usd <= 0:
+            return None
+        return 0.5 <= price_usd / jp <= 2.0
+
+    async def jupiter_agrees(self, mint: str, price_usd: float) -> bool:
+        ok = await self.jupiter_check(mint, price_usd) is True
         if not ok:
-            log.warning("paper %s: DexScreener %.3g $, Jupiter %s — скачок не подтверждён, пропускаю", mint, price_usd, jp)
+            log.warning("paper %s: цена %.3g $ не подтверждена Jupiter — скачок пропускаю", mint, price_usd)
         return ok
 
     async def dex_price(self, mint: str, ttl: float = 1.0) -> float | None:
@@ -413,10 +419,18 @@ class PaperTrader:
                     self.bad_prices += 1
                     return
             else:
-                pending = p.extra.get("jump")
-                if pending is None or not (0.5 < mc / pending < 2.0):
-                    p.extra["jump"] = mc     # свой поток: скачок в 5+ раз ждёт подтверждения следующей проверкой
+                # свой поток: неверный пул или котировка дают СТАБИЛЬНО неверную цену — повтор её не опровергает.
+                # Сверяем с Jupiter (pump.fun: 1 млрд токенов → цена = MC / 1e9); нет цены у Jupiter — ждём повтора
+                verdict = await self.jupiter_check(p.mint, mc * (self.e.price.value or 150) / 1e9)
+                if verdict is False:
+                    self.bad_prices += 1
+                    log.warning("paper %s: свой поток MC %.0f SOL не сходится с Jupiter — пропускаю", p.symbol, mc)
                     return
+                if verdict is None:
+                    pending = p.extra.get("jump")
+                    if pending is None or not (0.5 < mc / pending < 2.0):
+                        p.extra["jump"] = mc     # скачок в 5+ раз ждёт подтверждения следующей проверкой
+                        return
         p.extra.pop("jump", None)
         p.extra["last_mc"] = mc
         decision = decide_exit(p, mc, time.time(), scheme, self.fee_bps(), self.priority(), emergency)
@@ -485,9 +499,14 @@ class PaperTrader:
             return
         pnl = p.proceeds_sol - p.cost_sol
         pct = pnl / p.cost_sol if p.cost_sol else 0.0
+        suspect = False
+        if pct > ANOMALY_PCT:
+            # больше +1000%: настоящая ракета или сбой цены? Спрашиваем Jupiter про цену выхода
+            suspect = await self.jupiter_check(p.mint, mc * (self.e.price.value or 150) / 1e9) is False
         await self.db.execute(
             """UPDATE paper_positions SET tokens=0, proceeds_sol=$2, closed_at=$3, exit_reason=$4, pnl_sol=$5,
-                   pnl_pct=$6, max_mc=$7 WHERE id=$1""", p.id, p.proceeds_sol, now, reason, pnl, pct, p.max_mc)
+                   pnl_pct=$6, max_mc=$7, suspect=$8 WHERE id=$1""", p.id, p.proceeds_sol, now, reason, pnl, pct,
+            p.max_mc, suspect)
         self.positions.pop(p.id, None)
         min_pos = max(float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
         if self.paused.get(p.portfolio) and self.balance[p.portfolio] >= 2 * min_pos:
@@ -530,7 +549,7 @@ class PaperTrader:
         best = max(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
         worst = min(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
         return {"port": port, "trades": len(rows), "wins": len(wins),
-                "anomalies": sum(1 for r in rows if (r["pnl_pct"] or 0) > ANOMALY_PCT), "pnl_sol": sum(r["pnl_sol"] or 0 for r in rows),
+                "anomalies": sum(1 for r in rows if r.get("suspect")), "pnl_sol": sum(r["pnl_sol"] or 0 for r in rows),
                 "avg_win": sum(wins) / len(wins) if wins else 0.0, "avg_loss": sum(losses) / len(losses) if losses else 0.0,
                 "equity": equity, "open": open_lines, "best": best, "worst": worst}
 
@@ -575,7 +594,7 @@ class PaperTrader:
             lines.append(f"🟢 ${fmt.esc(sym)} " + " ".join(xs))
         odd = sum(per[n]["anomalies"] for n in SCHEMES)
         if odd:
-            lines.append(f"⚠ {odd} сделок с результатом больше +{ANOMALY_PCT:.0%} — похоже на сбой цены, "
+            lines.append(f"⚠ {odd} сделок с ценой, которую не подтвердил Jupiter (вероятный сбой) — "
                          "см. «Последние 20 сделок»")
         if not hourly:
             lines.append(f"<i>{LEGEND}</i>")
@@ -603,7 +622,7 @@ class PaperTrader:
         out = [f"📒 <b>Последние {len(rows)} сделок</b>"]
         for r in rows:
             pct = r["pnl_pct"] or 0
-            mark = "⚠" if pct > ANOMALY_PCT else "✅" if (r["pnl_sol"] or 0) > 0 else "❌"
+            mark = "⚠" if r.get("suspect") else "✅" if (r["pnl_sol"] or 0) > 0 else "❌"
             mcs = (f" · {fmt.mc_usd(r['entry_mc'], sol_usd)}→{fmt.mc_usd(r['exit_mc'], sol_usd)}"
                    if r["entry_mc"] and r["exit_mc"] else "")
             out.append(f"{mark} {r['portfolio']} ${fmt.esc(r['symbol'] or '?')} {pct:+.0%} · "
@@ -633,7 +652,7 @@ class PaperTrader:
         for rs in groups.values():
             first = rs[0]
             avg = sum(r["pnl_pct"] or 0 for r in rs) / len(rs)
-            odd = any((r["pnl_pct"] or 0) > ANOMALY_PCT for r in rs)
+            odd = any(r.get("suspect") for r in rs)
             mark = "⚠" if odd else "✅" if avg > 0 else "❌"
             res = " · ".join(f"{r['portfolio']} {(r['pnl_pct'] or 0):+.0%} {EXIT_SHORT.get(r['exit_reason'], r['exit_reason'])}"
                              for r in sorted(rs, key=lambda x: x["portfolio"]))

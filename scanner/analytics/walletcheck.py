@@ -86,7 +86,8 @@ async def backfill_wallet(e: "Engine", wallet: str, max_tx: int = 150,
         "SELECT DISTINCT signature FROM trades WHERE trader = $1 AND signature = ANY($2)",
         wallet, [s["signature"] for s in sigs])}
     pool_map = {r["amm_pool"]: r["mint"] for r in await db.fetch(
-        "SELECT amm_pool, mint FROM tokens WHERE amm_pool IS NOT NULL AND created_at > now() - interval '30 days'")}
+        "SELECT amm_pool, mint FROM tokens WHERE amm_pool IS NOT NULL AND migrated_at IS NOT NULL "
+        "AND created_at > now() - interval '30 days'")}   # только пулы из миграций pump.fun — они к SOL
     stats = ParseStats()
     found: list[Trade] = []
     creates: list[TokenCreated] = []

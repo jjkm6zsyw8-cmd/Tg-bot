@@ -86,6 +86,7 @@ class Receiver:
         self.watch_coin_until: dict[str, float] = {}   # монета → до какого времени следить
         self.watch_capped = False
         self._pool_miss: dict[str, float] = {}
+        self.non_sol_pools: set[str] = set()
         self._http: aiohttp.ClientSession | None = None
         if self.watch is not None:
             self.watch.resolve_pool = self.resolve_pool
@@ -223,8 +224,10 @@ class Receiver:
             self.buf_transfers.append(ev)
 
     async def resolve_pool(self, pool: str) -> str | None:
-        """Пул PumpSwap → монета: сначала своя база (миграции), потом DexScreener. Неудачи — не чаще раза в 10 мин."""
-        mint = await self.db.fetchval("SELECT mint FROM tokens WHERE amm_pool=$1", pool)
+        """Пул PumpSwap → монета, ТОЛЬКО если пул к SOL. Бывают пулы монеты к PUMP, USDC и т. п.: бот читал их
+        суммы как SOL, и капитализация выходила завышенной в 15–20 раз (фальшивые «+1500%» у Diamond).
+        Сначала своя база (пулы из миграций pump.fun — всегда к SOL), потом DexScreener с проверкой котировки."""
+        mint = await self.db.fetchval("SELECT mint FROM tokens WHERE amm_pool=$1 AND migrated_at IS NOT NULL", pool)
         if mint:
             return mint
         if time.time() - self._pool_miss.get(pool, 0) < 600:
@@ -237,11 +240,18 @@ class Receiver:
         except Exception:  # noqa: BLE001
             data = None
         pairs = (data or {}).get("pairs") or ([data["pair"]] if (data or {}).get("pair") else [])
+        wsol = "So11111111111111111111111111111111111111112"
         for p in pairs:
+            if (p.get("pairAddress") or pool) != pool:
+                continue
             base = (p.get("baseToken") or {}).get("address")
-            if base and base != "So11111111111111111111111111111111111111112":
+            quote = (p.get("quoteToken") or {}).get("address")
+            if base and base != wsol and quote == wsol:
                 await self.db.execute("UPDATE tokens SET amm_pool = COALESCE(amm_pool, $2) WHERE mint=$1", base, pool)
                 return base
+            if quote and quote != wsol:
+                self.non_sol_pools.add(pool)       # пул не к SOL: его сделки не разбираем вовсе
+                return None
         self._pool_miss[pool] = time.time()
         return None
 
@@ -309,8 +319,11 @@ class Receiver:
             "WHERE created_at > now() - make_interval(hours => $1)", int(self.store_hours))
         for r in rows:
             self.known_mints[r["mint"]] = float(r["ts"])
+        # пулы, записанные старым резолвером без проверки котировки, могли быть не к SOL — сбрасываем,
+        # их заново определит DexScreener; пулы из миграций pump.fun (migrated_at) всегда к SOL
+        await self.db.execute("UPDATE tokens SET amm_pool=NULL WHERE amm_pool IS NOT NULL AND migrated_at IS NULL")
         for r in await self.db.fetch("SELECT amm_pool, mint FROM tokens WHERE amm_pool IS NOT NULL "
-                                     "AND created_at > now() - interval '30 days'"):
+                                     "AND migrated_at IS NOT NULL AND created_at > now() - interval '30 days'"):
             self.pool_to_mint.setdefault(r["amm_pool"], r["mint"])
 
     def prune_known(self) -> None:

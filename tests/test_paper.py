@@ -337,3 +337,61 @@ async def test_price_exit_needs_confirmation_after_delay(monkeypatch):
     await tr._check(pos(entry=40.0), 20.0, "emergency")
     await __import__("asyncio").sleep(0.01)
     assert sold[-1][0] == "emergency"                   # экстренный выход — без проверки
+
+
+async def test_own_stream_jump_checked_with_jupiter(monkeypatch):
+    """Свой поток стабильно показывал ×17 (пул не к SOL) — подтверждение повтором не спасало. Теперь — Jupiter."""
+    monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
+    tr = bare_trader({}, FakeExt(0, jup=40 * 100 / 1e9))       # Jupiter: MC 40 SOL при SOL $100
+    tr.bad_prices = 0
+    sold = []
+
+    async def fake_exit(p, reason, share):
+        sold.append(reason)
+    tr._exit_later = fake_exit
+    tr.fee_bps = lambda: 125
+    tr.priority = lambda: 0.0005
+    p = pos(entry=40.0, target=80.0)
+    p.opened_ts = time.time()
+    p.extra["last_mc"] = 40.0
+    for _ in range(3):
+        await tr._check(p, 700.0, None)                         # свой поток: ×17.5, Jupiter не согласен
+    assert not sold and tr.bad_prices == 3 and p.extra["last_mc"] == 40.0
+    tr.e.ext = FakeExt(0, jup=700 * 100 / 1e9)                  # Jupiter подтверждает — рост настоящий
+    await tr._check(p, 700.0, None)
+    await __import__("asyncio").sleep(0)
+    assert sold == ["target"]
+
+
+async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
+    """Настоящая ракета (×56) не помечается сбоем; выход по цене, которую Jupiter не подтвердил, — помечается."""
+    from scanner.config import Settings, YamlConfig
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+        settings = Settings(YamlConfig("config/config.yaml"))
+        sts = {m: SimpleNamespace(mc=28.0, mint=m, trades=[SimpleNamespace(ts=time.time())]) for m in ("REAL", "FAKE")}
+        eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
+                              cfg=settings.effective(), states=sts, ext=None)
+        tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
+        await tr.start()
+        for m in ("REAL", "FAKE"):
+            await tr.on_alert(m, "strong", None, {"symbol": m, "mc": 28.0}, None)
+        real = next(p for p in tr.positions.values() if p.mint == "REAL" and p.portfolio == "F")
+        fake = next(p for p in tr.positions.values() if p.mint == "FAKE" and p.portfolio == "F")
+        eng.ext = FakeExt(0, jup=1500 * 100 / 1e9)                 # Jupiter: MC 1500 SOL
+        await tr._sell(real, "trailing", 1.0, 1500.0)               # ×54 — подтверждено
+        await tr._sell(fake, "trailing", 1.0, 1500.0 * 20)          # ×1000 — у Jupiter в 20 раз меньше
+        rows = {r["mint"]: r["suspect"] for r in await db.fetch(
+            "SELECT mint, suspect FROM paper_positions WHERE portfolio='F' AND closed_at IS NOT NULL")}
+        assert rows == {"REAL": False, "FAKE": True}
+        text = await tr.render_period(None)
+        assert "1 сделок с ценой, которую не подтвердил Jupiter" in text
+    finally:
+        await db.close()

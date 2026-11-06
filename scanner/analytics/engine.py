@@ -620,6 +620,16 @@ class Engine:
         }
         await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev")
 
+    async def _price_glitch(self, mint: str, mc_sol: float) -> bool:
+        """Наш MC выше реального больше чем в 5 раз (по Jupiter сейчас, pump.fun: 1 млрд токенов)?
+        Нет цены у Jupiter — не судим (False)."""
+        ext = getattr(self, "ext", None)
+        jp = await ext.jup_price(mint) if ext is not None else None
+        if not jp:
+            return False
+        ours = mc_sol * (self.price.value or 150) / 1e9
+        return ours > 5 * jp
+
     def _candidate_coin(self, mint: str) -> bool:
         """Монета дева-кандидата (кластер прошёл пороги профиля или отмечен «Успешно»): приёмник подписал её сделки
         через слежку Helius сразу при создании — те же условия, что в Receiver.watch_targets."""
@@ -1040,6 +1050,16 @@ class Engine:
         max_mc = st.max_mc_between(t_entry, max(end, t_entry))
         best = trade_net_profit(entry_mc, max_mc, pos, costs)
         thr = float(cfg.get("min_net_profit", 0.3))
+        if net > 10 and await self._price_glitch(e.mint, max(exit_mc, max_mc)):
+            # «+354 660%» по монете, которая столько не стоила: неверный пул/котировка. Итог не считаем и не шлём
+            for aid in e.alert_ids.values():
+                await self.db.execute(
+                    """INSERT INTO alert_outcomes(alert_id, max_mc, exit_mc, exit_reason, net_result, auto_mark)
+                       VALUES ($1, NULL, NULL, 'glitch', NULL, 'glitch') ON CONFLICT (alert_id) DO UPDATE SET
+                       exit_reason='glitch', net_result=NULL, auto_mark='glitch', computed_at=now()""", aid)
+                await self.db.execute("UPDATE alerts SET closed_at=now() WHERE id=$1", aid)
+            log.warning("итог %s: MC %.0f SOL не подтверждён Jupiter — сбой цены, итог не учитываю", st.symbol, exit_mc)
+            return
         rug = st.big_sell_ts is not None and st.big_sell_ts - t_alert < 30 and st.mc_at(st.big_sell_ts + 5) < 0.5 * entry_mc
         # предварительная оценка — по фактическому результату сигнала, а не по достижимому максимуму
         auto = "scam" if rug else "great" if net >= max(1.0, 2 * thr) else "good" if net >= 0.05 else "fail"

@@ -18,9 +18,6 @@ MISSED_REASONS = {**REASONS, "": "нет решения (не оценивала
                   "outage": "сбой источника", "latency": "задержка"}
 
 
-GLITCH_NET = 10.0   # результат больше +1000% за сделку — сбой цены, а не торговля
-
-
 async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str, bytes, list[list[dict[str, Any]]]]:
     cfg = settings.effective()
     tz = ZoneInfo(cfg.get("timezone", "UTC"))
@@ -42,10 +39,10 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
     sims: dict[str, list[SimTrade]] = {}
     glitches = 0
     for a in alerts:
-        if a["net_result"] is None:
+        if a["exit_reason"] == "glitch":
+            glitches += 1
             continue
-        if a["net_result"] > GLITCH_NET:
-            glitches += 1      # сбой цены источника (пара к экзотическому токену) — в статистику не берём
+        if a["net_result"] is None:
             continue
         p = a["payload"] or {}
         sims.setdefault(a["mode"], []).append(SimTrade(
@@ -62,7 +59,7 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
     else:
         lines.append(f"Алертов {len(alerts)}, закрытых с итогом пока нет.")
     if glitches:
-        lines.append(f"⚠ Не учтено {glitches} сделок с результатом больше +{GLITCH_NET:.0%} — сбой цены источника")
+        lines.append(f"⚠ Не учтено {glitches} алертов: итог не подтвердил Jupiter (сбой цены источника)")
 
     # 2) упущенные возможности
     launches = await db.fetch(
@@ -160,11 +157,11 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
         lines.append("\n<b>Бумажная торговля</b> (за день)")
         for p in ports:
             r = await db.fetchrow(
-                """SELECT count(*) FILTER (WHERE pnl_pct <= $4) n, count(*) FILTER (WHERE pnl_sol > 0 AND pnl_pct <= $4) w,
-                          COALESCE(sum(pnl_sol) FILTER (WHERE pnl_pct <= $4), 0) pnl,
-                          count(*) FILTER (WHERE pnl_pct > $4) odd
+                """SELECT count(*) FILTER (WHERE NOT suspect) n, count(*) FILTER (WHERE pnl_sol > 0 AND NOT suspect) w,
+                          COALESCE(sum(pnl_sol) FILTER (WHERE NOT suspect), 0) pnl,
+                          count(*) FILTER (WHERE suspect) odd
                    FROM paper_positions WHERE portfolio=$1 AND closed_at >= $2 AND closed_at < $3
-                   AND exit_reason <> 'reset'""", p["name"], start, end, GLITCH_NET)
+                   AND exit_reason <> 'reset'""", p["name"], start, end)
             odd = f" · не учтено сбойных {r['odd']}" if r["odd"] else ""
             lines.append(f"  {p['name']}: сделок {r['n']}, удачных {r['w']}, итог {r['pnl']:+.4f} SOL "
                          f"(${r['pnl'] * price:+.2f}){odd}")

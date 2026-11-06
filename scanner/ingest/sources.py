@@ -457,6 +457,7 @@ class WatchSource(Source):
         # пул PumpSwap → монета через DexScreener (для покупок кошельков в уже мигрировавших монетах)
         self.resolve_pool: Callable[[str], Awaitable[str | None]] | None = None
         self.unresolved = 0
+        self.skip_pools: dict[str, float] = {}  # пул → до какого времени не спрашивать (не к SOL / неизвестен)
 
     def set_targets(self, wallets: list[str], coins: list[str]) -> None:
         """Кошельки важнее монет: при переполнении режем монеты."""
@@ -557,15 +558,12 @@ class WatchSource(Source):
                     if msg.get("method") != "logsNotification":
                         continue
                     self.notifications += 1
-                    addr = self.sid_addr.get((msg.get("params") or {}).get("subscription"))
                     unknown = self.unknown_pools(msg)
-                    if unknown:
-                        if self.want.get(addr) == "coin" and len(unknown) == 1:
-                            # подписка на монету: единственный незнакомый пул PumpSwap — пул этой монеты
-                            self.pool_to_mint[unknown[0]] = addr
-                        elif self.resolve_pool is not None:
-                            asyncio.create_task(self._resolve_and_emit(msg, unknown, sink))
-                            continue
+                    if unknown and self.resolve_pool is not None:
+                        # пул не угадываем (в сделке через роутер бывает несколько пулов разных монет):
+                        # монету и котировку (только SOL) определяет приёмник по базе и DexScreener
+                        asyncio.create_task(self._resolve_and_emit(msg, unknown, sink))
+                        continue
                     await self._emit(msg, sink)
             finally:
                 sync.cancel()
@@ -586,6 +584,7 @@ class WatchSource(Source):
                 self.pool_to_mint[pool] = mint
             else:
                 self.unresolved += 1
+                self.skip_pools[pool] = time.monotonic() + 600   # не к SOL или неизвестен — 10 мин не спрашиваем
         await self._emit(msg, sink)
 
     def unknown_pools(self, msg: dict[str, Any]) -> list[str]:
@@ -597,6 +596,6 @@ class WatchSource(Source):
         for data in pump_log_events(value.get("logs") or []):
             if data[:8] in (D_AMM_BUY, D_AMM_SELL) and len(data) >= 152:
                 pool = base58.b58encode(data[120:152]).decode()
-                if pool not in self.pool_to_mint and pool not in out:
+                if pool not in self.pool_to_mint and pool not in out and self.skip_pools.get(pool, 0) < time.monotonic():
                     out.append(pool)
         return out
