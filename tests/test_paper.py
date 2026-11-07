@@ -547,8 +547,13 @@ def test_route_signals_to_portfolios():
     targets, why = tr.route({"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}, "strong")
     assert not targets and "сильная копия" in why
     assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == main
-    assert tr.route({"modes": ["dev"]}, "watch")[0] == lottery
-    assert tr.route({"modes": ["dev", "copy"], "traders": [{"address": "W"}]}, "strong")[0] == main | lottery
+    one_sol = {"cluster": 0.0342}                                 # дев купил ~1 SOL при запуске
+    assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == lottery
+    assert tr.route({"modes": ["dev"], "metrics": {"cluster": 0.12}}, "watch")[0] == {"E"}   # D — только ~1 SOL
+    assert "дев купил не ~1 SOL" in tr.skipped["D"]
+    assert tr.route({"modes": ["dev"]}, "watch")[0] == {"E"}                                 # нет замера — только E
+    assert tr.route({"modes": ["dev", "copy"], "traders": [{"address": "W"}], "metrics": one_sol},
+                    "strong")[0] == main | lottery
     assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
     assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
     assert tr.route({}, "normal")[0] == set(pp.SCHEMES)          # старые вызовы без modes — во все

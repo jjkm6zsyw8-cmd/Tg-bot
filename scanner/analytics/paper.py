@@ -43,6 +43,10 @@ LOTTERY_SHARE = 0.10          # билет лотереи — 10% баланса
 LOTTERY_MIN_SOL = 0.02        # …но не меньше 0.02 SOL (~$1.8; 90CENT 6.11 куплена за 0.024)
 LOTTERY_MAX_OPEN = 8
 LOTTERY_DAY_STOP_USD = 10.0   # лотерея потеряла за день $10 — до 00:00 (Батуми) новых билетов нет
+# Проверка фильтра: D берёт только запуски, где дев купил ~1 SOL (3–3.5% монет у кластера дева в момент алерта),
+# E — все. По 9008 алертам «Наблюдения»: у таких ракет ×3+ 4.2% против 2.1% у остальных (оба дня одинаково)
+LOTTERY_FILTERED = "D"
+LOTTERY_DEV_SHARE = (0.030, 0.035)
 ENTRY_DELAY_S = 5.0
 EXIT_DELAY_S = 2.0
 MAX_HOLD_S = 2 * 3600          # страховка: позиция по «мёртвой» монете закрывается через 2 часа
@@ -64,8 +68,8 @@ SCHEMES: dict[str, dict[str, Any]] = {
           "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
 }
 LEGEND = ("A, B, C, F, G — одиночные копии и smart: A стоп−6% · B база · C только цель · F трейл после +15% · "
-          "G скальп +25% · D, E — лотерея «Наблюдение»: D тейк+20% · E тейк+50%, билет 10% (от $1.8), до 8 мест, "
-          "дневной стоп −$10")
+          "G скальп +25% · D, E — лотерея «Наблюдение»: D тейк+20%, только если дев купил ~1 SOL · E тейк+50%, все · "
+          "билет 10% (от $1.8), до 8 мест, дневной стоп −$10")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -684,7 +688,16 @@ class PaperTrader:
         if "smart" in modes:
             out |= main
         if "dev" in modes:
-            out |= lottery
+            lot = set(lottery)
+            share = (data.get("metrics") or {}).get("cluster")
+            lo = float(self.cfg.get("paper_lottery_dev_share_min", LOTTERY_DEV_SHARE[0]))
+            hi = float(self.cfg.get("paper_lottery_dev_share_max", LOTTERY_DEV_SHARE[1]))
+            if share is None or not lo <= float(share) < hi:
+                for n in lot & set(str(self.cfg.get("paper_lottery_filtered", LOTTERY_FILTERED))):
+                    lot.discard(n)
+                    self.skipped[n] = (f"{n}: дев купил не ~1 SOL при запуске (доля {float(share or 0):.1%}, "
+                                       f"нужно {lo:.1%}–{hi:.1%})")
+            out |= lot
         if not out and not why:
             if "mydev" in modes:
                 why = "«Мой дев» — в бумагу не берём: за 2 дня −$8"
