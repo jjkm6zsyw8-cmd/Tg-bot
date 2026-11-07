@@ -224,22 +224,35 @@ async def trader_view(db: Database, settings: Settings, address: str, ext: Any =
 
 
 async def stats_view(db: Database) -> str:
-    lines = ["📊 <b>Итог серии</b> (вход с задержкой реакции, выход по цели/экстренному сигналу)"]
+    """Итог алертов по режимам. Простое среднее раздувают единичные «иксы» и сбои цены (одна монета ×27000 давала
+    «+36691% на сделку»), поэтому: типичная сделка — медиана, среднее — без 1% самых больших; сбои не учитываем."""
+    lines = [("📊 <b>Итог серии</b> (вход +5 с, выход по цели, сигналу или через 60 мин)\n"
+              "<i>типичная — медиана сделки; среднее — без 1% самых больших (выбросы и сбои цены)</i>")]
     for days in (7, 30):
         rows = await db.fetch(
-            """SELECT a.mode, count(*) n, count(*) FILTER (WHERE o.net_result > 0) wins,
-                      avg(o.net_result) FILTER (WHERE o.net_result > 0) aw,
-                      avg(o.net_result) FILTER (WHERE o.net_result <= 0) al
-               FROM alerts a JOIN alert_outcomes o ON o.alert_id = a.id
-               WHERE a.created_at > now() - make_interval(days => $1) GROUP BY a.mode""", days)
+            """WITH x AS (
+                   SELECT a.mode, o.net_result r,
+                          percent_rank() OVER (PARTITION BY a.mode ORDER BY o.net_result) pr
+                   FROM alerts a JOIN alert_outcomes o ON o.alert_id = a.id
+                   WHERE a.created_at > now() - make_interval(days => $1) AND o.net_result IS NOT NULL
+                     AND COALESCE(o.exit_reason, '') <> 'glitch')
+               SELECT mode, count(*) n, count(*) FILTER (WHERE r > 0) wins,
+                      percentile_cont(0.5) WITHIN GROUP (ORDER BY r) med,
+                      avg(r) FILTER (WHERE pr < 0.99) trimmed
+               FROM x GROUP BY mode ORDER BY n DESC""", days)
+        glitches = await db.fetchval(
+            """SELECT count(*) FROM alerts a JOIN alert_outcomes o ON o.alert_id = a.id
+               WHERE a.created_at > now() - make_interval(days => $1) AND o.exit_reason = 'glitch'""", days)
         lines.append(f"\n<b>{days} дней</b>")
         if not rows:
             lines.append("  нет закрытых алертов")
         for r in rows:
             wr = r["wins"] / r["n"] if r["n"] else 0
-            aw, al = r["aw"] or 0.0, -(r["al"] or 0.0)
-            lines.append(f"  · {r['mode']}: {r['n']} алертов, удачных {wr:.0%}, +{aw:.0%}/−{al:.0%}, "
-                         f"итог серии <b>{pct(wr * aw - (1 - wr) * al)}</b>")
+            mark = "🟢" if (r["trimmed"] or 0) > 0 and (r["med"] or 0) > 0 else "🔴" if (r["trimmed"] or 0) <= 0 else "🟡"
+            lines.append(f"  {mark} {r['mode']}: {r['n']} алертов, удачных {wr:.0%}, типичная {pct(r['med'] or 0)}, "
+                         f"среднее <b>{pct(r['trimmed'] or 0)}</b>")
+        if glitches:
+            lines.append(f"  ⚠ не учтено сбоев цены: {glitches}")
     return "\n".join(lines)
 
 
