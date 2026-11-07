@@ -74,20 +74,11 @@ async def test_price_delta_blocks_wallet():
     assert g2.delta_reason("W") is None
 
 
-def test_entry_delta_skips_late_copy():
-    g = guard()
+def test_entry_delta_skip_is_off_by_default():
+    assert guard().entry_reason(5.0) is None                                  # по умолчанию выкл. (как 6.11)
+    g = guard({"copy_entry_max_delta": 0.15})                                 # включено в /settings
     assert g.entry_reason(None) is None and g.entry_reason(0.10) is None      # +10% — входим
-    assert "цена уже +30% от его покупки" in g.entry_reason(0.30)             # +30% — поздно, на вершине
-    assert guard({"copy_entry_max_delta": 0.5}).entry_reason(0.30) is None    # порог из настроек
-    assert guard({"copy_entry_max_delta": 1.0}).entry_reason(5.0) is None     # 100% — проверка выключена
-
-
-def test_own_wallets_consensus_is_not_strong():
-    from scanner.analytics.engine import consensus_level
-    traders = {"T1": {"manual": True}, "T2": {"manual": True}, "S": {"manual": False}}
-    assert consensus_level({"T1", "T2"}, traders) == "normal"       # два своих (твинки) — не подтверждение
-    assert consensus_level({"T1", "S"}, traders) == "strong"        # свой + независимый смарт-мани
-    assert consensus_level({"S", "X"}, traders) == "strong"         # смарт-мани как раньше
+    assert "цена уже +30% от его покупки" in g.entry_reason(0.30)             # +30% — поздно
 
 
 def test_dev_conveyor_gap():
@@ -111,7 +102,8 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
         settings = Settings(YamlConfig("config/config.yaml"))
         st = SimpleNamespace(mc=40.0, mint="M1", trades=[SimpleNamespace(ts=time.time())])
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg={**settings.effective(), "copy_ratio": 0.1}, states={"M1": st}, ext=None,
+                              cfg={**settings.effective(), "copy_ratio": 0.1, "copy_entry_max_delta": 0.15},
+                              states={"M1": st}, ext=None,
                               traders={"W": {"label": "лимфорк"}}, my_devs={})
         eng.copyguard = CopyGuard(eng)
         await eng.copyguard.log("W", "M1", "PEPE", "buy", 0.5, 38.0, "copied", None, ref_mc=38.0)

@@ -440,10 +440,32 @@ async def test_copy_skips_when_dexscreener_is_at_start_price(monkeypatch):
     assert opened and opened[0][0] == pytest.approx(58.0) and opened[0][1] == "jup"
 
 
+async def test_rugged_coin_and_its_dev_are_banned():
+    """Раг (−50% и хуже): ни в эту монету, ни в новые монеты её дева больше не входим — во всех портфелях."""
+    tr = bare_trader({"NEW": SimpleNamespace(deployer="DEV", mc=30.0, trades=[])})
+    tr.balance = {"A": 0.33, "B": 0.33}
+    tr.loss_exits = {}
+    tr.rugged = {"NK": -0.99}
+    tr.rug_devs = {"DEV"}
+    tr.priority = lambda: 0.0005
+    for name in "AB":
+        assert await tr._open(name, "NK", "normal", None, {}, None, 30.0) is None
+        assert "уже рагнула (-99%)" in tr.skipped[name]
+    assert await tr._open("A", "NEW", "normal", None, {}, None, 30.0) is None
+    assert "дев этой монеты уже рагал" in tr.skipped["A"]
+    tr.e.my_devs = {"DEV": {}}                       # свой дев из списка — его монеты не запрещаем
+    tr.e.states["NEW"].deployer = "DEV"
+    tr.rugged, tr.rug_devs = {}, {"DEV"}
+    tr.loss_exits = {("A", "NEW"): time.time()}      # дальше упрёмся в паузу после убытка — значит, бан не сработал
+    assert await tr._open("A", "NEW", "normal", None, {}, None, 30.0) is None
+    assert "повторно не входим" in tr.skipped["A"]
+
+
 async def test_no_reentry_after_loss_and_day_cap():
     from datetime import datetime, timezone
     tr = bare_trader({})
     tr.balance = {"A": 0.33}
+    tr.rugged, tr.rug_devs = {}, set()
     tr.loss_exits = {("A", "RUG"): time.time() - 300}
     tr.priority = lambda: 0.0005
     assert await tr._open("A", "RUG", "normal", None, {}, None, 30.0) is None

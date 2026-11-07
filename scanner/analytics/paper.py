@@ -62,6 +62,7 @@ LEGEND = ("A стоп−6% · B база · C только цель · D тей�
 # портфели ушли в −0.15…−0.22 SOL.
 START_MC_SOL = 32.0   # MC до ~32 SOL — стартовая цена кривой: источник ещё не видел сделок по монете
 REENTRY_COOLDOWN_MIN = 60   # после убыточного выхода в ту же монету этот портфель час не входит
+RUG_PCT = 0.5         # монета дала −50% и хуже — раг: больше не входим ни в неё, ни в монеты её дева (7 дней)
 TICK_S = 2.0          # проверка открытых позиций (стоп/тейк/трейлинг) раз в 2 с
 FRESH_S = 120.0       # цена из своего потока сделок годится, только если по монете были сделки за 2 минуты
 JUMP_X = 5.0          # скачок цены больше чем в 5 раз за одну проверку — ждём подтверждения
@@ -184,6 +185,8 @@ class PaperTrader:
         self.false_exits = 0                        # ценовых выходов, не подтвердившихся через 2 с
         self._last_flush = 0.0
         self.loss_exits: dict[tuple[str, str], float] = {}   # (портфель, монета) → время убыточного выхода
+        self.rugged: dict[str, float] = {}         # монета → худший результат (−0.5 и хуже): больше не входим
+        self.rug_devs: set[str] = set()            # девы этих монет: в их новые монеты тоже не входим
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -290,6 +293,14 @@ class PaperTrader:
                 """SELECT portfolio, mint, max(closed_at) t FROM paper_positions WHERE pnl_sol < 0
                    AND exit_reason <> 'reset' AND closed_at > now() - interval '2 hours' GROUP BY 1, 2"""):
             self.loss_exits[(r["portfolio"], r["mint"])] = r["t"].timestamp()
+        for r in await self.db.fetch(
+                """SELECT p.mint, min(p.pnl_pct) pct, max(t.deployer) dev FROM paper_positions p
+                   LEFT JOIN tokens t ON t.mint = p.mint
+                   WHERE p.pnl_pct <= $1 AND p.exit_reason <> 'reset' AND NOT p.suspect
+                     AND p.closed_at > now() - interval '7 days' GROUP BY p.mint""", -RUG_PCT):
+            self.rugged[r["mint"]] = r["pct"]
+            if r["dev"]:
+                self.rug_devs.add(r["dev"])
 
     async def reset(self) -> None:
         async with self.lock:
@@ -377,6 +388,14 @@ class PaperTrader:
             return None
         if len(open_here) >= MAX_OPEN:
             self.skipped[name] = f"лимит {MAX_OPEN} открытых позиций"
+            return None
+        if mint in self.rugged:
+            # регрессия 6.11: D семь раз за 20 минут входил в раг NORTHKOREA (−56…−99% каждый раз)
+            self.skipped[name] = f"монета уже рагнула ({self.rugged[mint]:+.0%}) — больше не входим"
+            return None
+        dev = getattr(self.e.states.get(mint), "deployer", None) if getattr(self.e, "states", None) else None
+        if dev and dev in self.rug_devs and dev not in (getattr(self.e, "my_devs", None) or {}):
+            self.skipped[name] = "дев этой монеты уже рагал — не входим"
             return None
         lost = self.loss_exits.get((name, mint))
         cool = float(self.cfg.get("paper_reentry_cooldown_min", REENTRY_COOLDOWN_MIN))
@@ -599,6 +618,11 @@ class PaperTrader:
         self.positions.pop(p.id, None)
         if pnl < 0:
             self.loss_exits[(p.portfolio, p.mint)] = time.time()
+        if pct <= -RUG_PCT and not suspect:
+            self.rugged[p.mint] = min(pct, self.rugged.get(p.mint, 0.0))
+            dev = getattr(self.e.states.get(p.mint), "deployer", None) if getattr(self.e, "states", None) else None
+            if dev:
+                self.rug_devs.add(dev)
         min_pos = max(float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
         if self.paused.get(p.portfolio) and self.balance[p.portfolio] >= 2 * min_pos:
             self.paused[p.portfolio] = False
