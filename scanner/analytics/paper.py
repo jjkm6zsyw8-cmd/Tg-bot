@@ -34,6 +34,15 @@ log = logging.getLogger(__name__)
 START_USD = 30.0
 POSITION_SHARE = 0.20                 # по умолчанию; меняется в /settings (paper_position_share)
 MAX_OPEN = 3
+# Какие сигналы в какие портфели (разбор 6–7.11, без сбоев цены, на портфель): одиночные копии +$29, smart +$9,
+# «Наблюдение» +$12 только за счёт 90CENT ×55 (без неё −$39), сильные копии −$32, «Мой дев» −$8, тренды −$7,
+# новые −$5. Основные портфели — одиночные копии и smart; лотерея «Наблюдения» — отдельно в D и E: маленький
+# билет, много мест и дневной стоп, чтобы плохой день стоил −$10, а не −$22, а ракета ×5…×55 давала плюс.
+LOTTERY = "DE"
+LOTTERY_SHARE = 0.10          # билет лотереи — 10% баланса…
+LOTTERY_MIN_SOL = 0.02        # …но не меньше 0.02 SOL (~$1.8; 90CENT 6.11 куплена за 0.024)
+LOTTERY_MAX_OPEN = 8
+LOTTERY_DAY_STOP_USD = 10.0   # лотерея потеряла за день $10 — до 00:00 (Батуми) новых билетов нет
 ENTRY_DELAY_S = 5.0
 EXIT_DELAY_S = 2.0
 MAX_HOLD_S = 2 * 3600          # страховка: позиция по «мёртвой» монете закрывается через 2 часа
@@ -54,8 +63,9 @@ SCHEMES: dict[str, dict[str, Any]] = {
     "G": {"name": "G: скальп — всё на +25%, стоп −8%, 5 мин", "stop": 0.08, "tp_net": 0.25, "tp_share": 1.0,
           "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
 }
-LEGEND = ("A стоп−6% · B база · C только цель · D тейк+20% · E тейк+50% · F трейл после +15% · G скальп +25% · "
-          "копии — по правилу своего портфеля · днём — лимит суммы в позициях (/settings)")
+LEGEND = ("A, B, C, F, G — одиночные копии и smart: A стоп−6% · B база · C только цель · F трейл после +15% · "
+          "G скальп +25% · D, E — лотерея «Наблюдение»: D тейк+20% · E тейк+50%, билет 10% (от $1.8), до 8 мест, "
+          "дневной стоп −$10")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -187,6 +197,8 @@ class PaperTrader:
         self.loss_exits: dict[tuple[str, str], float] = {}   # (портфель, монета) → время убыточного выхода
         self.rugged: dict[str, float] = {}         # монета → худший результат (−0.5 и хуже): больше не входим
         self.rug_devs: set[str] = set()            # девы этих монет: в их новые монеты тоже не входим
+        self.day_pnl: dict[str, float] = {}        # итог закрытых сделок портфеля за сегодня (Батуми), SOL
+        self._day_key = ""
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -301,6 +313,12 @@ class PaperTrader:
             self.rugged[r["mint"]] = r["pct"]
             if r["dev"]:
                 self.rug_devs.add(r["dev"])
+        self._day_key = self.day_key()
+        start = datetime.now(self.reset_tz()).replace(hour=0, minute=0, second=0, microsecond=0)
+        for r in await self.db.fetch(
+                """SELECT portfolio, sum(pnl_sol) s FROM paper_positions WHERE closed_at >= $1
+                   AND exit_reason <> 'reset' AND NOT suspect GROUP BY portfolio""", start):
+            self.day_pnl[r["portfolio"]] = float(r["s"] or 0)
 
     async def reset(self) -> None:
         async with self.lock:
@@ -322,6 +340,10 @@ class PaperTrader:
             return
         if data.get("trend") and not self.cfg.get("paper_trends", False):
             self.skipped.setdefault("*", "«Тренды» не входят в бумажную торговлю (настройка)")
+            return
+        targets, why = self.route(data, level)
+        if not targets:
+            self.skipped["*"] = why
             return
         await asyncio.sleep(ENTRY_DELAY_S)          # реакция пользователя
         # «Тренды» — только по DexScreener (по нему дан алерт); остальное — свой свежий поток, сверка с DexScreener
@@ -373,7 +395,7 @@ class PaperTrader:
         async with self.lock:
             sizes = []
             for name in SCHEMES:
-                size = await self._open(name, mint, level, alert_id, data, trader, mc, src)
+                size = await self._open(name, mint, level, alert_id, data, trader, mc, src) if name in targets else None
                 sizes.append(f"{name} {size:.3f}" if size else f"{name} —")
         if any(not x.endswith("—") for x in sizes):
             sol_usd = self.e.price.value or 150
@@ -386,8 +408,14 @@ class PaperTrader:
         if any(p.mint == mint for p in open_here):
             self.skipped[name] = "уже есть позиция по этой монете"
             return None
-        if len(open_here) >= MAX_OPEN:
-            self.skipped[name] = f"лимит {MAX_OPEN} открытых позиций"
+        lottery = self.is_lottery(name)
+        max_open = LOTTERY_MAX_OPEN if lottery else MAX_OPEN
+        if len(open_here) >= max_open:
+            self.skipped[name] = f"лимит {max_open} открытых позиций"
+            return None
+        if lottery and self.lottery_stopped(name):
+            self.skipped[name] = (f"лотерея: за сегодня −${float(self.cfg.get('paper_lottery_day_stop_usd', LOTTERY_DAY_STOP_USD)):g}"
+                                  " — дневной стоп до 00:00")
             return None
         if mint in self.rugged:
             # регрессия 6.11: D семь раз за 20 минут входил в раг NORTHKOREA (−56…−99% каждый раз)
@@ -403,16 +431,19 @@ class PaperTrader:
             # регрессия 6.11: D семь раз за 20 минут входил в один и тот же раг NORTHKOREA (−1.1 SOL за час)
             self.skipped[name] = f"монета уже дала убыток {fmt.ago(time.time() - lost)} назад — повторно не входим"
             return None
-        size = self.balance[name] * self.share_for(level)
-        # минимальная позиция: на ~$2 фиксированные комиссии (приоритет 2×0.0005 SOL + pump.fun) съедали ~7% сделки
-        min_size = max(float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
+        size = self.balance[name] * (float(self.cfg.get("paper_lottery_share", LOTTERY_SHARE)) if lottery
+                                     else self.share_for(level))
+        # минимальная позиция: на ~$2 фиксированные комиссии (приоритет 2×0.0005 SOL + pump.fun) съедали ~7% сделки;
+        # билет лотереи меньше — выигрыши там ×3…×55, а на дорогих билетах портфель вставал на паузу к вечеру
+        min_size = max(float(self.cfg.get("paper_lottery_min_sol", LOTTERY_MIN_SOL)) if lottery
+                       else float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
         if data.get("copy_sol"):
             # Ratio: копия — доля от суммы покупки цели (её уверенность), потолок — обычная доля портфеля
             ratio = float(self.cfg.get("copy_ratio", 0.10))
             size = min(size, ratio * float(data["copy_sol"]))
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * 0.5)    # …но и не больше половины баланса
-        cap = self.day_cap_sol()
+        cap = self.day_cap_sol() if lottery else None     # дневной лимит суммы — только на лотерею
         if cap is not None and size >= min_size:
             # днём торговля в минусе (6.11: копии 08–18 −0.03…−0.44 SOL во всех портфелях) — днём в позициях
             # не больше лимита, ночью и вечером — как обычно
@@ -618,6 +649,10 @@ class PaperTrader:
         self.positions.pop(p.id, None)
         if pnl < 0:
             self.loss_exits[(p.portfolio, p.mint)] = time.time()
+        if not suspect:
+            if self._day_key != self.day_key():
+                self._day_key, self.day_pnl = self.day_key(), {}
+            self.day_pnl[p.portfolio] = self.day_pnl.get(p.portfolio, 0.0) + pnl
         if pct <= -RUG_PCT and not suspect:
             self.rugged[p.mint] = min(pct, self.rugged.get(p.mint, 0.0))
             dev = getattr(self.e.states.get(p.mint), "deployer", None) if getattr(self.e, "states", None) else None
@@ -628,6 +663,54 @@ class PaperTrader:
             self.paused[p.portfolio] = False
             await self.db.execute("UPDATE paper_portfolios SET paused=false WHERE name=$1", p.portfolio)
         self._exits.setdefault(p.symbol or "?", []).append((p.portfolio, pct, EXIT_SHORT.get(reason, reason)))
+
+    def is_lottery(self, name: str) -> bool:
+        return name in str(self.cfg.get("paper_lottery_portfolios", LOTTERY))
+
+    def route(self, data: dict[str, Any], level: str) -> tuple[set[str], str]:
+        """В какие портфели идёт сигнал и почему никуда, если пусто. Без modes (старые вызовы) — во все."""
+        modes = set(data.get("modes") or [])
+        if not modes:
+            return set(SCHEMES), ""
+        lottery = {n for n in SCHEMES if self.is_lottery(n)}
+        main = set(SCHEMES) - lottery
+        out: set[str] = set()
+        why = ""
+        if "copy" in modes:
+            if len(data.get("traders") or []) >= 2 and not self.cfg.get("paper_strong_copies", False):
+                why = "сильная копия (2+ кошелька) — в бумагу не берём: за 2 дня −$32"
+            else:
+                out |= main
+        if "smart" in modes:
+            out |= main
+        if "dev" in modes:
+            out |= lottery
+        if not out and not why:
+            if "mydev" in modes:
+                why = "«Мой дев» — в бумагу не берём: за 2 дня −$8"
+            elif modes & {"new", "new_dev_wallet"}:
+                why = "новые монеты — в бумагу не берём: за 2 дня −$5"
+            else:
+                why = "этот сигнал в бумагу не берём"
+        return out, why
+
+    def reset_tz(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(str(self.cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
+        except Exception:  # noqa: BLE001
+            return ZoneInfo("Asia/Tbilisi")
+
+    def day_key(self) -> str:
+        return datetime.now(self.reset_tz()).date().isoformat()
+
+    def lottery_stopped(self, name: str) -> bool:
+        """Лотерея портфеля за сегодня в минусе больше дневного стопа (по закрытым сделкам)."""
+        stop_usd = float(self.cfg.get("paper_lottery_day_stop_usd", LOTTERY_DAY_STOP_USD) or 0)
+        if stop_usd <= 0:
+            return False
+        if self._day_key != self.day_key():
+            self._day_key, self.day_pnl = self.day_key(), {}
+        return self.day_pnl.get(name, 0.0) * (self.e.price.value or 150) <= -stop_usd
 
     def day_cap_sol(self, now: datetime | None = None) -> float | None:
         """Лимит суммы в открытых позициях днём (SOL) или None — вне дневных часов или лимит выключен (0)."""

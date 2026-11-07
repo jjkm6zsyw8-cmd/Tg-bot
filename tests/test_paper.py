@@ -478,11 +478,13 @@ async def test_no_reentry_after_loss_and_day_cap():
     tr.e.cfg = {"paper_day_cap_usd": 0}
     assert REAL_DAY_CAP(tr, noon) is None                             # 0 — без лимита
     tr.e.cfg = {}
-    tr.day_cap_sol = lambda now=None: 0.1
-    tr.positions = {1: Position(id=1, portfolio="A", mint="X", opened_ts=0, entry_mc=1, cost_sol=0.06, tokens=1,
+    tr.day_cap_sol = lambda now=None: 0.1                             # дневной лимит — только у лотереи (D, E)
+    tr.balance["D"] = 0.33
+    tr.day_pnl, tr._day_key = {}, tr.day_key()
+    tr.positions = {1: Position(id=1, portfolio="D", mint="X", opened_ts=0, entry_mc=1, cost_sol=0.09, tokens=1,
                                 tokens_initial=1, target_mc=None)}
-    assert await tr._open("A", "NEW", "normal", None, {}, None, 30.0) is None   # занято 0.06 из 0.1 — нет места
-    assert "лимит занят" in tr.skipped["A"]
+    assert await tr._open("D", "NEW", "watch", None, {}, None, 30.0) is None    # занято 0.09 из 0.1 — нет места
+    assert "лимит занят" in tr.skipped["D"]
 
 
 async def test_trends_not_in_paper_by_default(monkeypatch):
@@ -534,3 +536,54 @@ async def test_daily_reset_with_summary(monkeypatch):
         assert "Новый день" in (await db.fetchval("SELECT payload->>'text' FROM outbox ORDER BY id DESC LIMIT 1"))
     finally:
         await db.close()
+
+
+def test_route_signals_to_portfolios():
+    """Одиночные копии и smart — в A, B, C, F, G; «Наблюдение» (режим «Девы») — лотерея D и E;
+    сильные копии, «Мой дев» и новые монеты — в бумагу не идут."""
+    tr = bare_trader({})
+    main, lottery = set("ABCFG"), set("DE")
+    assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main
+    targets, why = tr.route({"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}, "strong")
+    assert not targets and "сильная копия" in why
+    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == main
+    assert tr.route({"modes": ["dev"]}, "watch")[0] == lottery
+    assert tr.route({"modes": ["dev", "copy"], "traders": [{"address": "W"}]}, "strong")[0] == main | lottery
+    assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
+    assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
+    assert tr.route({}, "normal")[0] == set(pp.SCHEMES)          # старые вызовы без modes — во все
+    tr.e.cfg = {"paper_strong_copies": True}
+    assert tr.route({"modes": ["copy"], "traders": [{}, {}]}, "strong")[0] == main
+
+
+async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
+    tr = bare_trader({})
+    tr.balance = {"D": 0.30, "A": 0.30}
+    tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
+    tr.priority = lambda: 0.0005
+    tr.fee_bps = lambda: 125
+    tr.day_pnl, tr._day_key = {}, tr.day_key()
+    opened = []
+
+    class DB:
+        async def fetchval(self, *a):
+            opened.append(a)
+            return len(opened)
+
+        async def execute(self, *a):
+            return None
+    tr.db = DB()
+    size = await tr._open("D", "M1", "watch", None, {}, None, 30.0)
+    assert size == pytest.approx(0.03)                          # 10% баланса
+    tr.balance["D"] = 0.10
+    assert await tr._open("D", "M2", "watch", None, {}, None, 30.0) == pytest.approx(0.02)   # не меньше 0.02
+    for i in range(3, 9):                                       # 8 мест в лотерее
+        tr.balance["D"] = 0.30
+        assert await tr._open("D", f"M{i}", "watch", None, {}, None, 30.0)
+    assert await tr._open("D", "M9", "watch", None, {}, None, 30.0) is None and "лимит 8" in tr.skipped["D"]
+    tr.positions.clear()
+    tr.day_pnl["D"] = -0.11                                      # −$11 при SOL $100
+    assert await tr._open("D", "M10", "watch", None, {}, None, 30.0) is None
+    assert "дневной стоп" in tr.skipped["D"]
+    tr.day_pnl["A"] = -0.5                                       # основной портфель: стопа лотереи нет
+    assert await tr._open("A", "M11", "normal", None, {}, None, 30.0) == pytest.approx(0.05)
