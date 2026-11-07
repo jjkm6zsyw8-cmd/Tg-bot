@@ -445,3 +445,4 @@ ALTER TABLE my_devs ADD COLUMN IF NOT EXISTS once_done boolean NOT NULL DEFAULT 
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS last_mc double precision;   -- последняя цена (для отчёта из бота)
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS suspect boolean NOT NULL DEFAULT false;   -- цена выхода не подтверждена
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS rule text;   -- copy — выход копии по своему правилу
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS source_wallet text;   -- чья копия / чей запуск (кошелёк из своего списка)

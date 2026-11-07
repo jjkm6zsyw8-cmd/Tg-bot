@@ -78,6 +78,14 @@ class AlertEntry:
         return lvl
 
 
+def consensus_level(distinct: set[str], traders: dict[str, Any]) -> str:
+    """Монету купили 2+ отслеживаемых кошелька. Свои (импорт, /addwallet) — часто твинки одного человека:
+    их общая покупка не независимое подтверждение, а скорее сговор. «Сильный» — только если среди купивших
+    есть кошелёк не из своего списка (смарт-мани)."""
+    independent = [a for a in distinct if not (traders.get(a) or {}).get("manual")]
+    return "strong" if independent else "normal"
+
+
 class Engine:
     def __init__(self, env: Env, settings: Settings, db: Database):
         self.env = env
@@ -616,7 +624,7 @@ class Engine:
             "symbol": st.symbol, "mc": st.mc, "age_s": time.time() - st.created_ts, "entry_mc": st.mc,
             "entry_max_mc": entry_max, "target_mc": target, "dump_mc": med, "note": note,
             "signal": "мой дев", "metrics": {}, "violations": [], "cluster_id": st.cluster_id,
-            "exit_rule": "Выход при первой продаже дева", "stage": "на кривой",
+            "exit_rule": "Выход при первой продаже дева", "stage": "на кривой", "source_wallet": dev_addr,
         }
         await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev")
 
@@ -744,7 +752,7 @@ class Engine:
         distinct = {b[1] for b in buys}
         signal, level = "single", "normal"
         if len(distinct) >= 2:
-            signal, level = "consensus", "strong"
+            signal, level = "consensus", consensus_level(distinct, self.traders)
         if entry and "dev" in entry.modes:
             signal, level = "dev_match", "strong"
         costs = self.costs()

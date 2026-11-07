@@ -224,6 +224,7 @@ EDITABLE: dict[str, tuple[str, float, float, float, str]] = {
     "copy_min_buy_sol": ("Копия: мин. покупка цели, SOL", 0.05, 0.01, 10, "num"),
     "antipvp_hold_s": ("Анти-PVP: продал быстрее, с", 5, 5, 300, "num"),
     "copy_max_delta": ("Копия: макс. дельта входа", 0.05, 0.05, 1.0, "pct"),
+    "copy_entry_max_delta": ("Копия: не входить, если дороже его покупки на", 0.05, 0.05, 1.0, "pct"),
     "copy_dev_min_gap_min": ("Мой дев: пауза между запусками, мин", 1, 0, 60, "num"),
 }
 

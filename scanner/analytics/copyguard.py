@@ -6,6 +6,8 @@
   последним 20 копиям больше порога (15%) при 5+ замерах → кошелёк не копируем: между нами влезают боты.
 * Журнал copy_log: каждая покупка/продажа своих кошельков — «скопировал» или «пропустил» с причиной (/copylog).
 * Конвейер: дев из своего списка запустил следующую монету быстрее N минут после прошлой → пропуск.
+* Вход дороже цели: наша цена входа выше MC сразу после его покупки больше чем на 15% → эту копию пропускаем
+  (бумага не входит): мы покупаем после ботов, на вершине его же закупа.
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ DEFAULTS: dict[str, float] = {
     "antipvp_pause_min": 120,      # длительность паузы
     "copy_max_delta": 0.15,        # средняя дельта входа больше 15% — не копируем
     "copy_delta_min_n": 5,         # замеров для решения
+    "copy_entry_max_delta": 0.15,  # эта копия: цена уже выше его покупки больше чем на 15% — не входим
     "copy_dev_min_gap_min": 3,     # дев из списка запускает чаще — конвейер, пропуск
 }
 
@@ -128,6 +131,19 @@ class CopyGuard:
             """UPDATE copy_log SET entry_mc=$3, delta=$4 WHERE id = (SELECT id FROM copy_log WHERE wallet=$1 AND mint=$2
                AND action='copied' ORDER BY id DESC LIMIT 1)""", wallet, mint, entry_mc, delta)
         return delta
+
+    def entry_reason(self, delta: float | None) -> str | None:
+        """Эта копия: цена входа уже выше его покупки больше порога — пропуск (0 или 100% — без проверки)."""
+        limit = q(self.cfg, "copy_entry_max_delta")
+        if delta is None or limit <= 0 or limit >= 1 or delta <= limit:
+            return None
+        return f"цена уже {delta:+.0%} от его покупки (порог +{limit:.0%})"
+
+    async def mark_skipped(self, wallet: str, mint: str, reason: str) -> None:
+        """Алерт ушёл, но бумага не вошла — в журнале копия становится «пропущено» с причиной."""
+        await self.db.execute(
+            """UPDATE copy_log SET action='skipped', reason=$3 WHERE id = (SELECT id FROM copy_log WHERE wallet=$1
+               AND mint=$2 AND action='copied' ORDER BY id DESC LIMIT 1)""", wallet, mint, reason)
 
     # ------------------------------------------------------------------ конвейер девов
     def dev_gap_reason(self, dev: str, now: float | None = None) -> str | None:

@@ -352,8 +352,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await reply(m, "\n".join(lines)[:4000])
 
     @router.message(Command("copylog"))
-    async def cmd_copylog(m: Message) -> None:
-        """Журнал копитрейда: по каждому своему кошельку — скопировано/пропущено, дельта входа, анти-PVP."""
+    async def cmd_copylog(m: Message, command: CommandObject) -> None:
+        """Журнал копитрейда: по каждому своему кошельку — скопировано/пропущено, дельта входа, анти-PVP
+        и итог бумаги по его копиям (/copylog 72 — за 72 часа)."""
         from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
 
@@ -368,19 +369,40 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         name = lambda w: esc(labels.get(w) or f"{w[:4]}…{w[-4:]}")  # noqa: E731
         paused = await db.kv_get("copy:paused", {}) or {}
         now = datetime.now(timezone.utc).timestamp()
-        stats = await db.fetch(
+        arg = (command.args or "").strip().lower().rstrip("чh")
+        hours = min(24 * 30, max(1, int(arg))) if arg.isdigit() else 24
+        stats = {r["wallet"]: r for r in await db.fetch(
             """SELECT wallet, count(*) FILTER (WHERE action='copied') c, count(*) FILTER (WHERE action='skipped') s,
                       avg(delta) d, count(delta) dn
-               FROM copy_log WHERE ts > now() - interval '24 hours' GROUP BY wallet ORDER BY c DESC, s DESC""")
+               FROM copy_log WHERE ts > now() - $1::float8 * interval '1 hour' GROUP BY wallet""", float(hours))}
+        # итог бумаги по кошельку: одна копия = одна монета, результат — средний по портфелям (позиция одна и та же)
+        paper = {r["w"]: r for r in await db.fetch(
+            """WITH x AS (SELECT source_wallet w, COALESCE(alert_id::text, mint) k, avg(pnl_sol) s, avg(pnl_pct) p
+                          FROM paper_positions WHERE source_wallet IS NOT NULL AND closed_at IS NOT NULL
+                            AND exit_reason <> 'reset' AND NOT suspect
+                            AND closed_at > now() - $1::float8 * interval '1 hour' GROUP BY 1, 2)
+               SELECT w, count(*) n, count(*) FILTER (WHERE s > 0) wins, sum(s) sol, min(p) worst FROM x GROUP BY w""",
+            float(hours))}
         sol = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
-        lines = ["📒 <b>Копитрейд за 24 ч</b>"]
-        for r in stats:
-            p_until = float(paused.get(r["wallet"], 0) or 0)
-            lines.append(f"• {name(r['wallet'])}: скопировано {r['c']}, пропущено {r['s']}"
-                         + (f" · дельта входа {r['d']:+.0%} ({r['dn']})" if r["dn"] else "")
-                         + (f" · ⏸ анти-PVP ещё {fmt.ago(p_until - now)}" if p_until > now else ""))
+        lines = [f"📒 <b>Копитрейд за {hours} ч</b> · по итогу бумаги, сначала худшие"]
+        for w in sorted(set(stats) | set(paper), key=lambda w: (paper[w]["sol"] if w in paper else 0.0,
+                                                                -(stats[w]["c"] if w in stats else 0))):
+            r, pr = stats.get(w), paper.get(w)
+            p_until = float(paused.get(w, 0) or 0)
+            res = ""
+            if pr:
+                mark = "✅" if pr["sol"] > 0 else "❌"
+                res = (f" · {mark} бумага {pr['n']} сд., в плюсе {pr['wins']}, {pr['sol']:+.3f} SOL "
+                       f"(${pr['sol'] * sol:+.2f}), худшая {pr['worst']:+.0%}")
+            lines.append(f"• {name(w)}: скопировано {r['c'] if r else 0}, пропущено {r['s'] if r else 0}"
+                         + (f" · дельта входа {r['d']:+.0%} ({r['dn']})" if r and r["dn"] else "")
+                         + res
+                         + (f" · ⏸ анти-PVP ещё {fmt.ago(p_until - now)}" if p_until > now else "")
+                         + (f"\n   <code>{w}</code>" if pr and pr["sol"] < 0 else ""))   # нажать — скопировать
         if len(lines) == 1:
             lines.append("Сделок своих кошельков пока не было.")
+        else:
+            lines.append("<i>бумага: SOL на один портфель; убрать кошелёк — /removewallet адрес</i>")
         rows = await db.fetch("SELECT * FROM copy_log ORDER BY id DESC LIMIT 15")
         if rows:
             lines.append("\n<b>Последние</b>")
@@ -392,7 +414,13 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             lines.append(f"{icon} {r['ts'].astimezone(tz):%H:%M} {name(r['wallet'])} {verb}{sol_part} "
                          f"${esc(r['symbol'] or '?')} · MC {fmt.mc_usd(r['mc'], sol)}{delta}"
                          + (f" — {esc(r['reason'])}" if r["reason"] else ""))
-        await reply(m, "\n".join(lines)[:4000])
+        chunk = ""
+        for line in lines:                     # по строкам: длинный список не рвёт HTML-теги посередине
+            if chunk and len(chunk) + len(line) + 1 > 3900:
+                await reply(m, chunk)
+                chunk = ""
+            chunk = f"{chunk}\n{line}" if chunk else line
+        await reply(m, chunk)
 
     @router.message(Command("devonce"))
     async def cmd_devonce(m: Message, command: CommandObject) -> None:

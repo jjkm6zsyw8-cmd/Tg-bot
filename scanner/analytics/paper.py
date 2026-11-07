@@ -75,7 +75,14 @@ PERIOD_KEYBOARD = [
     [{"text": "Последние 20", "callback": "pp:hist"}, {"text": "Все сделки за 24 ч", "callback": "pp:day"}],
     [{"text": "📄 Файл всех сделок (Excel)", "callback": "pp:csv"}],
 ]
-MODE_SHORT = {"trend": "тренд", "dev": "дев", "smart": "смарт", "new": "новая", "new_dev_wallet": "дев"}
+MODE_SHORT = {"trend": "тренд", "dev": "дев", "smart": "смарт", "new": "новая", "new_dev_wallet": "дев",
+              "copy": "копия", "mydev": "мой дев"}
+
+
+def wallet_name(r: Any) -> str:
+    """Чья это сделка: подпись кошелька из своего списка или короткий адрес."""
+    w = r.get("source_wallet") or ""
+    return r.get("source_label") or (f"{w[:4]}…{w[-4:]}" if w else "")
 EXIT_SHORT = {"emergency": "дев продал", "trader_sell": "трейдер продал", "stop": "стоп", "take_profit": "тейк",
               "target": "цель", "trailing": "трейлинг", "time_stop": "нет роста", "max_hold": "2ч без выхода"}
 EXIT_NAMES = {"emergency": "экстренный выход (продажа кластера дева)", "trader_sell": "трейдер-источник продал",
@@ -306,7 +313,12 @@ class PaperTrader:
         guard = getattr(self.e, "copyguard", None)
         if guard is not None and data.get("copy_wallet") and data.get("copy_ref_mc"):
             # Price Delta: насколько дороже цели мы входим (+5 с реакции) — копить по кошельку
-            await guard.record_delta(data["copy_wallet"], mint, float(data["copy_ref_mc"]), float(mc))
+            delta = await guard.record_delta(data["copy_wallet"], mint, float(data["copy_ref_mc"]), float(mc))
+            why = guard.entry_reason(delta)
+            if why:                                  # эта копия: уже поздно — покупали бы на вершине его закупа
+                self.skipped["*"] = "копия: " + why
+                await guard.mark_skipped(data["copy_wallet"], mint, why)
+                return
         async with self.lock:
             sizes = []
             for name in SCHEMES:
@@ -352,9 +364,10 @@ class PaperTrader:
         now = datetime.now(timezone.utc)
         pid = await self.db.fetchval(
             """INSERT INTO paper_positions(portfolio, mint, alert_id, level, symbol, opened_at, entry_mc, cost_sol,
-                   tokens, tokens_initial, max_mc, target_mc, rule)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$7,$10,$11) RETURNING id""",
-            name, mint, alert_id, level, data.get("symbol"), now, mc, size, fill.tokens, target, rule)
+                   tokens, tokens_initial, max_mc, target_mc, rule, source_wallet)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$7,$10,$11,$12) RETURNING id""",
+            name, mint, alert_id, level, data.get("symbol"), now, mc, size, fill.tokens, target, rule,
+            data.get("copy_wallet") or data.get("source_wallet"))
         await self.db.execute(
             "INSERT INTO paper_trades(position_id, portfolio, side, ts, mc, sol, tokens, fee_sol, reason) "
             "VALUES ($1,$2,'buy',$3,$4,$5,$6,$7,'алерт')", pid, name, now, mc, size, fill.tokens, fill.fee_sol)
@@ -663,7 +676,9 @@ class PaperTrader:
     async def _closed(self, since: datetime | None) -> list[Any]:
         return await self.db.fetch(
             """SELECT p.*, a.mode, (SELECT t.mc FROM paper_trades t WHERE t.position_id = p.id AND t.side = 'sell'
-                                    ORDER BY t.ts DESC LIMIT 1) AS exit_mc
+                                    ORDER BY t.ts DESC LIMIT 1) AS exit_mc,
+                      (SELECT w.label FROM watchlist w WHERE w.address = p.source_wallet AND w.label IS NOT NULL
+                       LIMIT 1) AS source_label
                FROM paper_positions p LEFT JOIN alerts a ON a.id = p.alert_id
                WHERE p.closed_at IS NOT NULL AND p.exit_reason <> 'reset'
                  AND ($1::timestamptz IS NULL OR p.closed_at >= $1) ORDER BY p.opened_at, p.portfolio""", since)
@@ -688,6 +703,7 @@ class PaperTrader:
                              for r in sorted(rs, key=lambda x: x["portfolio"]))
             head_parts = [mark, f"{first['opened_at'].astimezone(self.tz()):%H:%M}",
                           f"${fmt.esc(first['symbol'] or '?')}", MODE_SHORT.get(first["mode"] or "", ""),
+                          fmt.esc(f"({wallet_name(first)})") if first.get("source_wallet") else "",
                           fmt.mc_usd(first["entry_mc"], sol_usd)]
             lines.append(" ".join(x for x in head_parts if x) + f" · {res}")
         wins = sum(1 for r in rows if (r["pnl_sol"] or 0) > 0)
@@ -711,18 +727,19 @@ class PaperTrader:
         out = io.StringIO()
         w = csv.writer(out, delimiter=";")
         tz = self.tz()
-        w.writerow(["портфель", "монета", "адрес", "режим", "уровень", "вход", "выход", "MC вход $",
+        w.writerow(["портфель", "монета", "адрес", "режим", "уровень", "кошелёк", "вход", "выход", "MC вход $",
                     "MC выход $", "MC максимум $", "вложено SOL", "получено SOL", "результат SOL", "результат %",
-                    "причина выхода"])
+                    "причина выхода", "адрес кошелька"])
         for r in await self._closed(since):
             w.writerow([
                 r["portfolio"], r["symbol"] or "", r["mint"], MODE_SHORT.get(r["mode"] or "", r["mode"] or ""),
-                r["level"] or "", f"{r['opened_at'].astimezone(tz):%Y-%m-%d %H:%M:%S}",
+                r["level"] or "", wallet_name(r) if r.get("source_wallet") else "",
+                f"{r['opened_at'].astimezone(tz):%Y-%m-%d %H:%M:%S}",
                 f"{r['closed_at'].astimezone(tz):%Y-%m-%d %H:%M:%S}",
                 round((r["entry_mc"] or 0) * sol_usd), round((r["exit_mc"] or 0) * sol_usd),
                 round((r["max_mc"] or 0) * sol_usd), round(r["cost_sol"] or 0, 5), round(r["proceeds_sol"] or 0, 5),
                 round(r["pnl_sol"] or 0, 5), round((r["pnl_pct"] or 0) * 100, 1),
-                EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""),
+                EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""), r.get("source_wallet") or "",
             ])
         return out.getvalue()
 

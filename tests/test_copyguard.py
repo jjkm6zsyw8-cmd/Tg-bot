@@ -74,6 +74,22 @@ async def test_price_delta_blocks_wallet():
     assert g2.delta_reason("W") is None
 
 
+def test_entry_delta_skips_late_copy():
+    g = guard()
+    assert g.entry_reason(None) is None and g.entry_reason(0.10) is None      # +10% — входим
+    assert "цена уже +30% от его покупки" in g.entry_reason(0.30)             # +30% — поздно, на вершине
+    assert guard({"copy_entry_max_delta": 0.5}).entry_reason(0.30) is None    # порог из настроек
+    assert guard({"copy_entry_max_delta": 1.0}).entry_reason(5.0) is None     # 100% — проверка выключена
+
+
+def test_own_wallets_consensus_is_not_strong():
+    from scanner.analytics.engine import consensus_level
+    traders = {"T1": {"manual": True}, "T2": {"manual": True}, "S": {"manual": False}}
+    assert consensus_level({"T1", "T2"}, traders) == "normal"       # два своих (твинки) — не подтверждение
+    assert consensus_level({"T1", "S"}, traders) == "strong"        # свой + независимый смарт-мани
+    assert consensus_level({"S", "X"}, traders) == "strong"         # смарт-мани как раньше
+
+
 def test_dev_conveyor_gap():
     g = guard()
     assert g.dev_gap_reason("D", 1000.0) is None
@@ -119,10 +135,28 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
                                                   "copy_ref_mc": 40.0}, "W")
         tiny = await db.fetchval("SELECT cost_sol FROM paper_positions WHERE portfolio='B' AND mint='M3'")
         assert tiny == pytest.approx(0.05)                                 # 10% от 0.1 = 0.01 → минимум 0.05 SOL
-        row = await db.fetchrow("SELECT entry_mc, delta FROM copy_log WHERE wallet='W'")
+        row = await db.fetchrow("SELECT entry_mc, delta FROM copy_log WHERE wallet='W' AND mint='M1'")
         assert row["entry_mc"] == 40.0 and row["delta"] == pytest.approx(40 / 38 - 1)
+        # чья копия — в позиции, в CSV (подпись из своего списка) и в /trades
+        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE source_wallet='W'") == 7 * 3
+        # цена уже на 33% выше его покупки — бумага не входит, в журнале «пропущено» с причиной
+        eng.states["M4"] = SimpleNamespace(mc=40.0, mint="M4", trades=[SimpleNamespace(ts=time.time())])
+        await eng.copyguard.log("W", "M4", "LATE", "buy", 1.0, 30.0, "copied", None, ref_mc=30.0)
+        await tr.on_alert("M4", "normal", None, {"symbol": "LATE", "mc": 40.0, "copy_wallet": "W", "copy_sol": 1.0,
+                                                  "copy_ref_mc": 30.0}, "W")
+        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE mint='M4'") == 0
+        late = await db.fetchrow("SELECT action, reason FROM copy_log WHERE mint='M4'")
+        assert late["action"] == "skipped" and "+33% от его покупки" in late["reason"]
+        assert "+33%" in tr.skipped["*"]
+        await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', 'W', 'лимфорк')")
+        for pid in list(tr.positions):
+            await tr._sell(tr.positions[pid], "trader_sell", 1.0, 40.0)
+        table = await tr.trades_csv(None)
+        assert ";кошелёк;" in table.splitlines()[0] and ";лимфорк;" in table and table.count(";W\r\n") == 21
+        day = await tr.trades_text(24)
+        assert "(лимфорк)" in day[0]
         await eng.copyguard.load()
-        assert list(eng.copyguard.deltas["W"]) == [pytest.approx(40 / 38 - 1)]
+        assert list(eng.copyguard.deltas["W"]) == [pytest.approx(40 / 38 - 1), pytest.approx(40 / 30 - 1)]
     finally:
         await db.close()
 
