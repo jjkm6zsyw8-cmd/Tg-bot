@@ -179,3 +179,16 @@ def test_dex_pair_prefers_sol_quote_over_exotic():
     assert p["market_cap_usd"] == 20_000 and p["good_quote"]
     only_exotic = parse_dex_pairs(data[:1], "M")
     assert only_exotic["market_cap_usd"] == 306e6 and not only_exotic["good_quote"]
+
+
+def test_dex_pairs_ignore_fake_pumpswap_pool_older_than_curve():
+    """Piper: кривая pump.fun $37k (у DexScreener без ликвидности) и левый пул PumpSwap $1.7k, созданный раньше."""
+    data = [
+        {"baseToken": {"address": "M"}, "quoteToken": {"symbol": "SOL", "address": "So11111111111111111111111111111111111111112"},
+         "dexId": "pumpswap", "pairCreatedAt": 1000, "liquidity": {"usd": 300}, "marketCap": 1725, "priceUsd": "0.0000017"},
+        {"baseToken": {"address": "M"}, "quoteToken": {"symbol": "SOL", "address": "So11111111111111111111111111111111111111112"},
+         "dexId": "pumpfun", "pairCreatedAt": 5000, "marketCap": 37061, "priceUsd": "0.000037"},
+    ]
+    assert parse_dex_pairs(data, "M")["market_cap_usd"] == 37061
+    data[0]["pairCreatedAt"] = 9000                       # пул после кривой — миграция, берём его
+    assert parse_dex_pairs(data, "M")["market_cap_usd"] == 1725

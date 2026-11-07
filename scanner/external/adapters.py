@@ -84,8 +84,17 @@ class DexScreener(ExternalSource):
 def parse_dex_pairs(data: Any, mint: str) -> dict[str, Any] | None:
     best = None
     rank: tuple[bool, float] = (False, -1.0)
+    # пара pump.fun (кривая) у DexScreener без ликвидности, и любой левый пул PumpSwap с $100 «ликвидности»
+    # её перебивал: Piper — кривая $37k, левый пул $1.7k → бумага «входила» по $1.7k. Пул миграции создаётся
+    # после кривой; пул PumpSwap старше пары кривой — не настоящий, его не берём
+    curve_at = min((int(d.get("pairCreatedAt") or 0) for d in data or []
+                    if d.get("dexId") == "pumpfun" and ((d.get("baseToken") or {}).get("address")) == mint
+                    and d.get("pairCreatedAt")), default=0)
     for d in data or []:
         if ((d.get("baseToken") or {}).get("address")) != mint:
+            continue
+        if (curve_at and d.get("dexId") == "pumpswap" and d.get("pairCreatedAt")
+                and int(d["pairCreatedAt"]) < curve_at):
             continue
         liq = float((d.get("liquidity") or {}).get("usd") or 0)
         r = (good_quote(d), liq)            # сначала пары к SOL/USDC/USDT, потом — по ликвидности

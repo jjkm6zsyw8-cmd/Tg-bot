@@ -15,6 +15,7 @@ import asyncio
 import csv
 import io
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -54,13 +55,13 @@ SCHEMES: dict[str, dict[str, Any]] = {
           "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
 }
 LEGEND = ("A стоп−6% · B база · C только цель · D тейк+20% · E тейк+50% · F трейл после +15% · G скальп +25% · "
-          "копии во всех: ½ на +30%, трейл 15%, стоп −20%")
-# Копии своих кошельков выходят по своему правилу во всех портфелях: по данным, весь плюс копий давали выходы
-# по цели (в среднем +82%), а ожидание продажи трейдера — в среднем −20%. Половина на +30% чистыми, остаток —
-# трейлинг 15% от пика, стоп −20% (тесные −6…−10% выбивали на обычных колебаниях); продал трейдер — продаём остаток
-COPY_SCHEME: dict[str, Any] = {"name": "копия: ½ на +30%, трейлинг 15%, стоп −20%", "stop": 0.20, "tp_net": 0.30,
-                               "tp_share": 0.5, "trail": 0.15, "target": False, "time_stop_s": None,
-                               "time_stop_gain": None}
+          "копии — по правилу своего портфеля · днём — лимит суммы в позициях (/settings)")
+# Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
+# выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
+# +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
+# портфели ушли в −0.15…−0.22 SOL.
+START_MC_SOL = 32.0   # MC до ~32 SOL — стартовая цена кривой: источник ещё не видел сделок по монете
+REENTRY_COOLDOWN_MIN = 60   # после убыточного выхода в ту же монету этот портфель час не входит
 TICK_S = 2.0          # проверка открытых позиций (стоп/тейк/трейлинг) раз в 2 с
 FRESH_S = 120.0       # цена из своего потока сделок годится, только если по монете были сделки за 2 минуты
 JUMP_X = 5.0          # скачок цены больше чем в 5 раз за одну проверку — ждём подтверждения
@@ -135,7 +136,7 @@ class Position:
     level: str = "normal"
     alert_id: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
-    rule: str | None = None          # "copy" — копия своего кошелька, выход по COPY_SCHEME
+    rule: str | None = None          # "copy" — копия своего кошелька (выход — по схеме портфеля)
 
     def net_if_sold(self, mc: float, fee_bps: float, priority_sol: float) -> float:
         value = sell_fill(mc, self.tokens, fee_bps, priority_sol).sol if self.tokens > 0 else 0.0
@@ -182,6 +183,7 @@ class PaperTrader:
         self.bad_prices = 0                         # отброшенных сбойных цен DexScreener
         self.false_exits = 0                        # ценовых выходов, не подтвердившихся через 2 с
         self._last_flush = 0.0
+        self.loss_exits: dict[tuple[str, str], float] = {}   # (портфель, монета) → время убыточного выхода
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -203,6 +205,26 @@ class PaperTrader:
         if not trades or time.time() - trades[-1].ts > FRESH_S:
             return None
         return float(st.mc)
+
+    async def jupiter_mc(self, mint: str) -> float | None:
+        """MC по цене Jupiter, SOL (pump.fun: 1 млрд токенов) или None."""
+        ext = getattr(self.e, "ext", None)
+        jp = await ext.jup_price(mint) if ext is not None else None
+        if not jp:
+            return None
+        return jp * 1e9 / (self.e.price.value or 150)
+
+    async def arbitrate(self, mint: str, own: float, dex: float) -> str:
+        """Свой поток и DexScreener расходятся больше чем вдвое — чья цена верна ("own" или "dex").
+        Решает Jupiter (чья ближе). Без Jupiter: стартовая цена кривой (~28 SOL) — признак источника, который ещё
+        не видел сделок: у своего потока — DexScreener прав, у DexScreener (свежая монета, у него 0–5 сделок) —
+        прав свой поток. Иначе — DexScreener, как раньше."""
+        jm = await self.jupiter_mc(mint)
+        if jm:
+            return "own" if abs(math.log(jm / own)) <= abs(math.log(jm / dex)) else "dex"
+        if dex <= START_MC_SOL < own:
+            return "own"
+        return "dex"
 
     async def jupiter_check(self, mint: str, price_usd: float) -> bool | None:
         """True — Jupiter подтверждает цену (±2×), False — расходится, None — у Jupiter нет цены."""
@@ -264,6 +286,10 @@ class PaperTrader:
                 max_mc=r["max_mc"] or r["entry_mc"], tp_done=r["tp_done"], level=r["level"] or "normal",
                 alert_id=r["alert_id"], extra={"last_mc": r["last_mc"]} if r.get("last_mc") else {},
                 rule=r.get("rule"))
+        for r in await self.db.fetch(
+                """SELECT portfolio, mint, max(closed_at) t FROM paper_positions WHERE pnl_sol < 0
+                   AND exit_reason <> 'reset' AND closed_at > now() - interval '2 hours' GROUP BY 1, 2"""):
+            self.loss_exits[(r["portfolio"], r["mint"])] = r["t"].timestamp()
 
     async def reset(self) -> None:
         async with self.lock:
@@ -297,13 +323,27 @@ class PaperTrader:
             jp = await ext.jup_price(mint)
             pu = (pair or {}).get("price_usd")
             if jp and pu and not 0.5 <= pu / jp <= 2.0:
-                log.warning("paper %s: DexScreener %.3g $ и Jupiter %.3g $ расходятся — не входим", mint, pu, jp)
-                self.skipped.setdefault("*", "цена DexScreener не сходится с Jupiter")
-                return
+                if dex <= START_MC_SOL and src != "dex":
+                    # DexScreener на стартовой цене кривой — он ещё не видел сделок; у Jupiter цена свежая
+                    dex, src = jp * 1e9 / (self.e.price.value or 150), "jup"
+                else:
+                    log.warning("paper %s: DexScreener %.3g $ и Jupiter %.3g $ расходятся — не входим", mint, pu, jp)
+                    self.skipped.setdefault("*", "цена DexScreener не сходится с Jupiter")
+                    return
         if own and dex and max(own, dex) / min(own, dex) > MISMATCH_X:
-            log.warning("paper %s: свой поток %.1f и DexScreener %.1f SOL расходятся — берём DexScreener",
-                        mint, own, dex)
-            own, src = None, "dex"
+            pick = await self.arbitrate(mint, own, dex)
+            log.warning("paper %s: свой поток %.1f и DexScreener %.1f SOL расходятся — берём %s", mint, own, dex, pick)
+            if pick == "dex":
+                own, src = None, "dex"
+        ref = data.get("copy_ref_mc")
+        if not own and dex and dex <= START_MC_SOL and ref and ref > 1.5 * dex:
+            # DexScreener ещё показывает стартовую цену кривой, а трейдер только что купил вдвое дороже —
+            # DexScreener не видел сделок. Решает Jupiter; без него надёжной цены нет — не входим
+            jm = await self.jupiter_mc(mint)
+            if jm is None:
+                self.skipped["*"] = "копия: DexScreener ещё на стартовой цене, Jupiter цену не знает"
+                return
+            dex, src = jm, "jup"
         mc = own or dex
         if mc is None and src == "dex":
             mc = data.get("mc")                     # цена алерта «Трендов» (тоже DexScreener)
@@ -338,6 +378,12 @@ class PaperTrader:
         if len(open_here) >= MAX_OPEN:
             self.skipped[name] = f"лимит {MAX_OPEN} открытых позиций"
             return None
+        lost = self.loss_exits.get((name, mint))
+        cool = float(self.cfg.get("paper_reentry_cooldown_min", REENTRY_COOLDOWN_MIN))
+        if lost and cool > 0 and time.time() - lost < 60 * cool:
+            # регрессия 6.11: D семь раз за 20 минут входил в один и тот же раг NORTHKOREA (−1.1 SOL за час)
+            self.skipped[name] = f"монета уже дала убыток {fmt.ago(time.time() - lost)} назад — повторно не входим"
+            return None
         size = self.balance[name] * self.share_for(level)
         # минимальная позиция: на ~$2 фиксированные комиссии (приоритет 2×0.0005 SOL + pump.fun) съедали ~7% сделки
         min_size = max(float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
@@ -347,6 +393,16 @@ class PaperTrader:
             size = min(size, ratio * float(data["copy_sol"]))
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * 0.5)    # …но и не больше половины баланса
+        cap = self.day_cap_sol()
+        if cap is not None and size >= min_size:
+            # днём торговля в минусе (6.11: копии 08–18 −0.03…−0.44 SOL во всех портфелях) — днём в позициях
+            # не больше лимита, ночью и вечером — как обычно
+            room = cap - sum(p.cost_sol for p in open_here)
+            if room < min_size:
+                self.skipped[name] = (f"днём не больше ${float(self.cfg.get('paper_day_cap_usd', 10)):g} "
+                                      "в позициях — лимит занят")
+                return None
+            size = min(size, room)
         if size < min_size:
             if not self.paused.get(name):
                 self.paused[name] = True
@@ -485,7 +541,7 @@ class PaperTrader:
 
     @staticmethod
     def scheme_for(p: Position) -> dict[str, Any]:
-        return COPY_SCHEME if p.rule == "copy" else SCHEMES[p.portfolio]
+        return SCHEMES[p.portfolio]
 
     def still_valid(self, p: Position, reason: str, mc: float) -> bool:
         scheme = self.scheme_for(p)
@@ -541,11 +597,28 @@ class PaperTrader:
                    pnl_pct=$6, max_mc=$7, suspect=$8 WHERE id=$1""", p.id, p.proceeds_sol, now, reason, pnl, pct,
             p.max_mc, suspect)
         self.positions.pop(p.id, None)
+        if pnl < 0:
+            self.loss_exits[(p.portfolio, p.mint)] = time.time()
         min_pos = max(float(self.cfg.get("paper_min_position_sol", 0.05)), 10 * self.priority())
         if self.paused.get(p.portfolio) and self.balance[p.portfolio] >= 2 * min_pos:
             self.paused[p.portfolio] = False
             await self.db.execute("UPDATE paper_portfolios SET paused=false WHERE name=$1", p.portfolio)
         self._exits.setdefault(p.symbol or "?", []).append((p.portfolio, pct, EXIT_SHORT.get(reason, reason)))
+
+    def day_cap_sol(self, now: datetime | None = None) -> float | None:
+        """Лимит суммы в открытых позициях днём (SOL) или None — вне дневных часов или лимит выключен (0)."""
+        cap_usd = float(self.cfg.get("paper_day_cap_usd", 10) or 0)
+        if cap_usd <= 0:
+            return None
+        try:
+            tz = ZoneInfo(str(self.cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
+        except Exception:  # noqa: BLE001
+            tz = ZoneInfo("Asia/Tbilisi")
+        hour = (now or datetime.now(timezone.utc)).astimezone(tz).hour
+        start, end = int(self.cfg.get("paper_day_from_h", 8)), int(self.cfg.get("paper_day_to_h", 18))
+        if not (start <= hour < end):
+            return None
+        return cap_usd / (self.e.price.value or 150)
 
     async def _msg(self, text: str) -> None:
         self._buf.append(text)

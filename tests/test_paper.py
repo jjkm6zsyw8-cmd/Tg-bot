@@ -399,22 +399,68 @@ async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
         await db.close()
 
 
-def test_copy_exit_rule():
-    """Копия: половина на +30% чистыми, остаток — трейлинг 15%, стоп −20%; без «нет роста» и без выхода по цели."""
-    s = pp.COPY_SCHEME
-    p = pos(entry=40.0, target=50.0)
-    assert decide_exit(p, 34.0, 10, s, 125, 0.0005) is None                       # −15% — держим
-    assert decide_exit(p, 31.0, 10, s, 125, 0.0005) == ("stop", 1.0)             # −22.5% — стоп
-    p2 = pos(entry=40.0, target=50.0)
-    assert decide_exit(p2, 51.0, 10, s, 125, 0.0005) is None                     # цель алерта не продаёт всё
-    assert decide_exit(p2, 56.0, 10, s, 125, 0.0005) == ("take_profit", 0.5)     # +30% чистыми — половина
-    p2.tp_done = True
-    assert decide_exit(p2, 90.0, 20, s, 125, 0.0005) is None                     # остаток летит дальше
-    assert decide_exit(p2, 76.0, 30, s, 125, 0.0005) == ("trailing", 1.0)        # −15% от пика 90
-    assert decide_exit(pos(entry=40.0), 41.0, 900, s, 125, 0.0005) is None       # без стопа по времени
+def test_copy_follows_portfolio_scheme():
+    """Копии выходят по правилу своего портфеля (C — только цель, F — трейл после +15%): единое правило
+    «½ на +30%» срезало иксы, которые и давали плюс (6.11 вечером C/F +1 SOL на копиях)."""
     tr = pp.PaperTrader.__new__(pp.PaperTrader)
-    assert tr.scheme_for(Position(id=1, portfolio="A", mint="M", opened_ts=0, entry_mc=1, cost_sol=1, tokens=1,
-                                  tokens_initial=1, target_mc=None, rule="copy")) is s
+    for name in "ACF":
+        p = Position(id=1, portfolio=name, mint="M", opened_ts=0, entry_mc=1, cost_sol=1, tokens=1,
+                     tokens_initial=1, target_mc=None, rule="copy")
+        assert tr.scheme_for(p) is pp.SCHEMES[name]
+    c = pp.SCHEMES["C"]
+    assert decide_exit(pos(entry=5.0, target=7.0), 36.0, 60, c, 125, 0.0005)[0] == "target"   # ×7 — по цели
+
+
+async def test_price_arbitration_without_and_with_jupiter():
+    tr = bare_trader({})
+    tr.e.ext = FakeExt(2_800)                                    # DexScreener: стартовые 28 SOL
+    assert await tr.arbitrate("M", 50.0, 28.0) == "own"         # KREO: DexScreener ещё не видел сделок
+    assert await tr.arbitrate("M", 28.0, 3000.0) == "dex"       # свой поток застрял на старте
+    assert await tr.arbitrate("M", 400.0, 100.0) == "dex"       # как раньше — DexScreener
+    tr.e.ext = FakeExt(2_800, jup=50 / 1e9 * 100)                # Jupiter: 50 SOL
+    assert await tr.arbitrate("M", 50.0, 28.0) == "own"
+    tr.e.ext = FakeExt(2_800, jup=3000 / 1e9 * 100)
+    assert await tr.arbitrate("M", 28.0, 3000.0) == "dex"
+
+
+async def test_copy_skips_when_dexscreener_is_at_start_price(monkeypatch):
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    opened = []
+
+    async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((mc, src))
+    tr = bare_trader({"M": fresh_state(60.0, age_s=600)}, FakeExt(2_800))   # свой поток устарел, DexScreener 28
+    tr._open = fake_open
+    tr.lock = __import__("asyncio").Lock()
+    data = {"mc": 60.0, "copy_ref_mc": 60.0}
+    await tr.on_alert("M", "normal", None, data, None)
+    assert not opened and "стартовой цене" in tr.skipped["*"]
+    tr.e.ext = FakeExt(2_800, jup=58 / 1e9 * 100)                         # Jupiter знает: 58 SOL
+    await tr.on_alert("M", "normal", None, data, None)
+    assert opened and opened[0][0] == pytest.approx(58.0) and opened[0][1] == "jup"
+
+
+async def test_no_reentry_after_loss_and_day_cap():
+    from datetime import datetime, timezone
+    tr = bare_trader({})
+    tr.balance = {"A": 0.33}
+    tr.loss_exits = {("A", "RUG"): time.time() - 300}
+    tr.priority = lambda: 0.0005
+    assert await tr._open("A", "RUG", "normal", None, {}, None, 30.0) is None
+    assert "уже дала убыток" in tr.skipped["A"]
+    # днём (12:00 Батуми = 08:00 UTC) — не больше $10 в позициях: при SOL $100 это 0.1 SOL
+    noon = datetime(2026, 11, 7, 8, 0, tzinfo=timezone.utc)
+    night = datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc)        # 02:00 Батуми
+    from tests.conftest import REAL_DAY_CAP
+    assert REAL_DAY_CAP(tr, noon) == pytest.approx(0.1) and REAL_DAY_CAP(tr, night) is None
+    tr.e.cfg = {"paper_day_cap_usd": 0}
+    assert REAL_DAY_CAP(tr, noon) is None                             # 0 — без лимита
+    tr.e.cfg = {}
+    tr.day_cap_sol = lambda now=None: 0.1
+    tr.positions = {1: Position(id=1, portfolio="A", mint="X", opened_ts=0, entry_mc=1, cost_sol=0.06, tokens=1,
+                                tokens_initial=1, target_mc=None)}
+    assert await tr._open("A", "NEW", "normal", None, {}, None, 30.0) is None   # занято 0.06 из 0.1 — нет места
+    assert "лимит занят" in tr.skipped["A"]
 
 
 async def test_trends_not_in_paper_by_default(monkeypatch):

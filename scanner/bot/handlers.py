@@ -15,7 +15,8 @@ from ..analytics.newcoins import DEFAULTS as _NEW_DEFAULTS
 
 from ..analytics.copyguard import DEFAULTS as _COPY_DEFAULTS  # noqa: E402
 
-NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005, "paper_min_position_sol": 0.05}
+NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005, "paper_min_position_sol": 0.05,
+                "paper_day_cap_usd": 10, "paper_day_from_h": 8, "paper_day_to_h": 18, "paper_reentry_cooldown_min": 60}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -389,6 +390,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                                                                 -(stats[w]["c"] if w in stats else 0))):
             r, pr = stats.get(w), paper.get(w)
             p_until = float(paused.get(w, 0) or 0)
+            late = bool(r and r["dn"] and r["dn"] >= float(cfg.get("copy_delta_min_n", 5))
+                        and (r["d"] or 0) > float(cfg.get("copy_max_delta", 0.15)))
             res = ""
             if pr:
                 mark = "✅" if pr["sol"] > 0 else "❌"
@@ -398,7 +401,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                          + (f" · дельта входа {r['d']:+.0%} ({r['dn']})" if r and r["dn"] else "")
                          + res
                          + (f" · ⏸ анти-PVP ещё {fmt.ago(p_until - now)}" if p_until > now else "")
-                         + (f"\n   <code>{w}</code>" if pr and pr["sol"] < 0 else ""))   # нажать — скопировать
+                         + (" · ⛔ не копируется: опаздываем" if late else "")
+                         + (f"\n   <code>{w}</code>" if (pr and pr["sol"] < 0) or late or p_until > now
+                            else ""))   # нажать — скопировать адрес для /removewallet
         if len(lines) == 1:
             lines.append("Сделок своих кошельков пока не было.")
         else:
