@@ -199,6 +199,7 @@ class PaperTrader:
         self.bad_prices = 0                         # отброшенных сбойных цен DexScreener
         self.false_exits = 0                        # ценовых выходов, не подтвердившихся через 2 с
         self.entry_fixed = 0                        # входов, где цену поправил Jupiter (свой поток отстал)
+        self.exit_fixed = 0                         # выходов, где цену поправил Jupiter (ложный стоп отменён и т. п.)
         self._last_flush = 0.0
         self.loss_exits: dict[tuple[str, str], float] = {}   # (портфель, монета) → время убыточного выхода
         self.rugged: dict[str, float] = {}         # монета → худший результат (−0.5 и хуже): больше не входим
@@ -600,6 +601,17 @@ class PaperTrader:
     async def _exit_later(self, p: Position, reason: str, share: float) -> None:
         await asyncio.sleep(EXIT_DELAY_S)            # реакция на сигнал выхода
         mc = await self.current_mc(p)                # ТЕКУЩАЯ цена через 2 с, а не максимум за позицию
+        # Цена выхода — тоже по рынку. 9.11 стопы срабатывали через 2–3 с после входа по цене, которой на рынке
+        # не было (BIFT: «стоп» на $5.9k, а монета в те минуты шла $10.8k → $15k; Chews, AI, NIGOOR так же):
+        # свой поток / DexScreener отдавали устаревшую низкую цену. Jupiter — текущее состояние пула: им
+        # проверяем ценовой выход и по нему продаём (×5 и дальше — скорее сбой самого Jupiter, не верим)
+        jm = await self.jupiter_mc(p.mint) if mc else None
+        if jm and 0.2 <= jm / mc <= 5:
+            if abs(jm / mc - 1) > 0.10:
+                self.exit_fixed += 1
+                log.info("paper %s %s: выход по Jupiter %.1f SOL вместо %.1f", p.portfolio, p.symbol, jm, mc)
+            mc = jm
+            p.extra["last_mc"] = jm
         if not self.still_valid(p, reason, mc):
             # один «провальный» замер цены (смена пары у DexScreener, сбой) выбивал стоп во всех портфелях,
             # а продажа шла уже по нормальной цене: «−5% стоп» у схем со стопом −15%. Ценовой выход —

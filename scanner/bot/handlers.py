@@ -317,7 +317,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                  f"Приёмник: {age(ing.get('at'))} · Аналитика: {age(ana.get('at'))}",
                  f"Бумага: открыто {ana.get('paper_open', '—')}, ложных ценовых выходов отменено "
                  f"{ana.get('paper_false_exits', 0)}, сбойных цен отброшено {ana.get('paper_bad_prices', 0)}, "
-                 f"входов по цене Jupiter (свой поток отстал) {ana.get('paper_entry_fixed', 0)}"]
+                 f"входов по цене Jupiter (свой поток отстал) {ana.get('paper_entry_fixed', 0)}, "
+                 f"выходов по цене Jupiter {ana.get('paper_exit_fixed', 0)}"]
         pend = await db.fetchrow("SELECT count(*) n, min(created_at) oldest FROM jobs WHERE done_at IS NULL")
         lines.append(f"\n<b>Задачи</b> (команды бота → аналитика): в очереди {pend['n']}"
                      + (f", самая старая {fmt.ago((now - pend['oldest']).total_seconds())} назад ⚠️"

@@ -644,3 +644,28 @@ async def test_entry_price_follows_jupiter_when_own_stream_lags(monkeypatch):
     tr.e.ext = FakeExt(3_000, jup=31 / 1e9 * 100)                           # разница 3% — оставляем свою цену
     await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)
     assert opened[-1] == pytest.approx(30.0)
+
+
+async def test_exit_is_checked_against_jupiter(monkeypatch):
+    """Регрессия 9.11: «стоп» через 2–3 с после входа по устаревшей низкой цене своего потока / DexScreener
+    (BIFT: стоп на $5.9k, рынок $10.8k → $15k). Jupiter не подтверждает — позиция остаётся; подтверждает —
+    продаём по цене Jupiter."""
+    monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
+    p = pos(entry=40.0, target=80.0)                                   # схема B: стоп −15%
+    tr = bare_trader({"M": fresh_state(30.0)}, FakeExt(0, jup=41 / 1e9 * 100))   # свой поток 30, Jupiter 41
+    tr.exit_fixed, tr.false_exits = 0, 0
+    tr.positions = {1: p}
+    sold = []
+
+    async def fake_sell(pp_, reason, share, mc):
+        sold.append((reason, mc))
+    tr._sell = fake_sell
+    tr.lock = __import__("asyncio").Lock()
+    p.closing = True
+    await tr._exit_later(p, "stop", 1.0)
+    assert not sold and not p.closing and tr.false_exits == 1 and tr.exit_fixed == 1   # ложный стоп отменён
+    assert p.extra["last_mc"] == pytest.approx(41.0)
+    tr.e.ext = FakeExt(0, jup=31 / 1e9 * 100)                                   # Jupiter: правда упала до 31
+    p.closing = True
+    await tr._exit_later(p, "stop", 1.0)
+    assert sold == [("stop", pytest.approx(31.0))]

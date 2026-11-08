@@ -1172,7 +1172,7 @@ class Engine:
                     "sol_usd": self.price.value, "fee_bps": self.fee_bps,
                     "latency_median_s": _median(self.latencies), "latency_p95_s": _pct(self.latencies, 0.95),
                     "paper_false_exits": self.paper.false_exits, "paper_bad_prices": self.paper.bad_prices,
-                    "paper_entry_fixed": self.paper.entry_fixed,
+                    "paper_entry_fixed": self.paper.entry_fixed, "paper_exit_fixed": self.paper.exit_fixed,
                     "paper_open": len(self.paper.positions),
                 })
             except Exception:  # noqa: BLE001
