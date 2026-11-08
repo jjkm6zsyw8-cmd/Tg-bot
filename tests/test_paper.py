@@ -70,10 +70,10 @@ async def test_paper_trader_full_cycle(monkeypatch):
         st = SimpleNamespace(mc=40.0, mint="MINT1", trades=[SimpleNamespace(ts=__import__("time").time())])
         settings = Settings(YamlConfig("config/config.yaml"))
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg=settings.effective(), states={"MINT1": st}, ext=None)
+                              cfg={**settings.effective(), "paper_start_usd": 30}, states={"MINT1": st}, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
-        assert tr.balance["B"] == pytest.approx(0.3)                    # $30 при SOL = $100
+        assert tr.balance["B"] == pytest.approx(0.3)                    # старт $30 (настройка) при SOL = $100
         n = len(pp.SCHEMES)
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0, "target_mc": 90.0}, None)
         assert len(tr.positions) == n and tr.balance["B"] == pytest.approx(0.21)   # «Сильный»: 20% × 1.5 = 30%
@@ -115,7 +115,7 @@ async def test_paper_trader_full_cycle(monkeypatch):
         table = await tr.trades_csv(None)
         assert table.count("\n") == 8 and "портфель;монета" in table and "экстренный выход" in table
         await tr.reset()
-        assert tr.balance["A"] == pytest.approx(0.3)
+        assert tr.balance["A"] == pytest.approx(0.3)   # сброс — до старта из настройки ($30)
     finally:
         await db.close()
 
@@ -470,11 +470,11 @@ async def test_no_reentry_after_loss_and_day_cap():
     tr.priority = lambda: 0.0005
     assert await tr._open("A", "RUG", "normal", None, {}, None, 30.0) is None
     assert "уже дала убыток" in tr.skipped["A"]
-    # днём (12:00 Батуми = 08:00 UTC) — не больше $10 в позициях: при SOL $100 это 0.1 SOL
+    # днём (12:00 Батуми = 08:00 UTC) — не больше $35 в позициях лотереи: при SOL $100 это 0.35 SOL
     noon = datetime(2026, 11, 7, 8, 0, tzinfo=timezone.utc)
     night = datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc)        # 02:00 Батуми
     from tests.conftest import REAL_DAY_CAP
-    assert REAL_DAY_CAP(tr, noon) == pytest.approx(0.1) and REAL_DAY_CAP(tr, night) is None
+    assert REAL_DAY_CAP(tr, noon) == pytest.approx(0.35) and REAL_DAY_CAP(tr, night) is None   # $35 при SOL $100
     tr.e.cfg = {"paper_day_cap_usd": 0}
     assert REAL_DAY_CAP(tr, noon) is None                             # 0 — без лимита
     tr.e.cfg = {}
@@ -531,7 +531,7 @@ async def test_daily_reset_with_summary(monkeypatch):
         await tr.maybe_daily_reset()
         texts = [r["payload"]["text"] for r in await db.fetch("SELECT payload FROM outbox ORDER BY id")]
         assert any("Итог дня бумаги" in t and "По времени суток" in t for t in texts)
-        assert not tr.positions and tr.balance["A"] == pytest.approx(0.3)
+        assert not tr.positions and tr.balance["A"] == pytest.approx(1.0)
         await tr.flush_messages()
         assert "Новый день" in (await db.fetchval("SELECT payload->>'text' FROM outbox ORDER BY id DESC LIMIT 1"))
     finally:
@@ -587,7 +587,7 @@ async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
         assert await tr._open("D", f"M{i}", "watch", None, {}, None, 30.0)
     assert await tr._open("D", "M9", "watch", None, {}, None, 30.0) is None and "лимит 8" in tr.skipped["D"]
     tr.positions.clear()
-    tr.day_pnl["D"] = -0.11                                      # −$11 при SOL $100
+    tr.day_pnl["D"] = -0.36                                      # −$36 при SOL $100 (стоп $35)
     assert await tr._open("D", "M10", "watch", None, {}, None, 30.0) is None
     assert "дневной стоп" in tr.skipped["D"]
     tr.day_pnl["A"] = -0.5                                       # основной портфель: стопа лотереи нет
@@ -612,10 +612,10 @@ async def test_manual_reset_clears_lottery_day_stop():
         await tr.start()
         await db.execute("""INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol,
                                tokens, tokens_initial, exit_reason, pnl_sol, pnl_pct)
-                            VALUES ('D', 'M', now(), now(), 30, 0.05, 1, 1, 'stop', -0.2, -0.5)""")
+                            VALUES ('D', 'M', now(), now(), 30, 0.05, 1, 1, 'stop', -0.4, -0.5)""")
         tr2 = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr2.start()
-        assert tr2.lottery_stopped("D")                              # −$20 за сегодня — стоп
+        assert tr2.lottery_stopped("D")                              # −$40 за сегодня — стоп ($35)
         await tr2.reset()
         assert not tr2.lottery_stopped("D")                          # сброс снимает стоп сразу…
         tr3 = pp.PaperTrader(eng)  # type: ignore[arg-type]

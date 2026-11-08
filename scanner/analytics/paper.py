@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-START_USD = 30.0
+START_USD = 100.0                     # старт портфеля (paper_start_usd): $100 — доллары в масштабе реального банка
 POSITION_SHARE = 0.20                 # по умолчанию; меняется в /settings (paper_position_share)
 MAX_OPEN = 3
 # Какие сигналы в какие портфели (разбор 6–7.11, без сбоев цены, на портфель): одиночные копии +$29, smart +$9,
@@ -42,9 +42,10 @@ LOTTERY = "DE"
 LOTTERY_SHARE = 0.10          # билет лотереи — 10% баланса…
 LOTTERY_MIN_SOL = 0.02        # …но не меньше 0.02 SOL (~$1.8; 90CENT 6.11 куплена за 0.024)
 LOTTERY_MAX_OPEN = 8
-LOTTERY_DAY_STOP_USD = 10.0   # лотерея потеряла за день $10 — до 00:00 (Батуми) новых билетов нет
+LOTTERY_DAY_STOP_USD = 35.0   # лотерея потеряла за день $35 (треть стартовых $100) — до 00:00/сброса новых билетов нет
 # Проверка фильтра: D берёт только запуски, где дев купил ~1 SOL (3–3.5% монет у кластера дева в момент алерта),
 # E — все. По 9008 алертам «Наблюдения»: у таких ракет ×3+ 4.2% против 2.1% у остальных (оба дня одинаково)
+DAY_CAP_USD = 35.0            # днём в позициях лотереи не больше $35 (треть старта)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
 ENTRY_DELAY_S = 5.0
@@ -69,7 +70,7 @@ SCHEMES: dict[str, dict[str, Any]] = {
 }
 LEGEND = ("A, B, C, F, G — одиночные копии и smart: A стоп−6% · B база · C только цель · F трейл после +15% · "
           "G скальп +25% · D, E — лотерея «Наблюдение»: D тейк+20%, только если дев купил ~1 SOL · E тейк+50%, все · "
-          "билет 10% (от $1.8), до 8 мест, дневной стоп −$10")
+          "билет 10% (от $1.8), до 8 мест, дневной стоп −$35 · старт $100")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -293,7 +294,7 @@ class PaperTrader:
             await self.db.execute(
                 """INSERT INTO paper_portfolios(name, scheme, start_usd, start_sol, balance_sol)
                    VALUES ($1, $2, $3, $4, $4) ON CONFLICT (name) DO NOTHING""",
-                name, scheme, START_USD, START_USD / sol)
+                name, scheme, self.start_usd(), self.start_usd() / sol)
         for r in await self.db.fetch("SELECT * FROM paper_portfolios"):
             self.balance[r["name"]] = r["balance_sol"]
             self.paused[r["name"]] = r["paused"]
@@ -334,11 +335,11 @@ class PaperTrader:
             sol = self.e.price.value or 150
             await self.db.execute("UPDATE paper_positions SET closed_at=now(), exit_reason='reset' WHERE closed_at IS NULL")
             await self.db.execute("UPDATE paper_portfolios SET start_usd=$1, start_sol=$2, balance_sol=$2, paused=false, "
-                                  "reset_at=now()", START_USD, START_USD / sol)
+                                  "reset_at=now()", self.start_usd(), self.start_usd() / sol)
             self.positions.clear()
             self.day_pnl = {}                      # сброс — новый счёт и для дневного стопа лотереи
             for n in SCHEMES:
-                self.balance[n] = START_USD / sol
+                self.balance[n] = self.start_usd() / sol
                 self.paused[n] = False
             await self.db.kv_set("paper:compared", None)
 
@@ -459,7 +460,7 @@ class PaperTrader:
             # не больше лимита, ночью и вечером — как обычно
             room = cap - sum(p.cost_sol for p in open_here)
             if room < min_size:
-                self.skipped[name] = (f"днём не больше ${float(self.cfg.get('paper_day_cap_usd', 10)):g} "
+                self.skipped[name] = (f"днём не больше ${float(self.cfg.get('paper_day_cap_usd', DAY_CAP_USD)):g} "
                                       "в позициях — лимит занят")
                 return None
             size = min(size, room)
@@ -675,6 +676,9 @@ class PaperTrader:
             await self.db.execute("UPDATE paper_portfolios SET paused=false WHERE name=$1", p.portfolio)
         self._exits.setdefault(p.symbol or "?", []).append((p.portfolio, pct, EXIT_SHORT.get(reason, reason)))
 
+    def start_usd(self) -> float:
+        return float(self.cfg.get("paper_start_usd") or START_USD)
+
     def is_lottery(self, name: str) -> bool:
         return name in str(self.cfg.get("paper_lottery_portfolios", LOTTERY))
 
@@ -734,7 +738,7 @@ class PaperTrader:
 
     def day_cap_sol(self, now: datetime | None = None) -> float | None:
         """Лимит суммы в открытых позициях днём (SOL) или None — вне дневных часов или лимит выключен (0)."""
-        cap_usd = float(self.cfg.get("paper_day_cap_usd", 10) or 0)
+        cap_usd = float(self.cfg.get("paper_day_cap_usd", DAY_CAP_USD) or 0)
         if cap_usd <= 0:
             return None
         try:
@@ -963,7 +967,7 @@ class PaperTrader:
         await self.flush_messages()
         await self.db.enqueue("text", {"topic": "paper", "text": text}, priority=4)
         await self.reset()
-        await self._msg(f"🔄 Новый день ({today}): все портфели снова по ${START_USD:.0f}")
+        await self._msg(f"🔄 Новый день ({today}): все портфели снова по ${self.start_usd():.0f}")
 
     async def day_summary(self, tz: ZoneInfo) -> str:
         """Итог дня: схемы (с открытыми позициями по последней цене) и закрытые сделки по 6-часовым отрезкам."""

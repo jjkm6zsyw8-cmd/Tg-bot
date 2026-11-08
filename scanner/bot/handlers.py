@@ -16,7 +16,8 @@ from ..analytics.newcoins import DEFAULTS as _NEW_DEFAULTS
 from ..analytics.copyguard import DEFAULTS as _COPY_DEFAULTS  # noqa: E402
 
 NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005, "paper_min_position_sol": 0.05,
-                "paper_day_cap_usd": 10, "paper_day_from_h": 8, "paper_day_to_h": 18, "paper_reentry_cooldown_min": 60}
+                "paper_day_cap_usd": 35, "paper_day_from_h": 8, "paper_day_to_h": 18, "paper_reentry_cooldown_min": 60,
+                "paper_start_usd": 100, "paper_lottery_day_stop_usd": 35}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
