@@ -592,3 +592,34 @@ async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
     assert "дневной стоп" in tr.skipped["D"]
     tr.day_pnl["A"] = -0.5                                       # основной портфель: стопа лотереи нет
     assert await tr._open("A", "M11", "normal", None, {}, None, 30.0) == pytest.approx(0.05)
+
+
+async def test_manual_reset_clears_lottery_day_stop():
+    """Регрессия 8.11: после ручного /paper reset лотерея всё равно стояла на дневном стопе до 00:00."""
+    from scanner.config import Settings, YamlConfig
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        settings = Settings(YamlConfig("config/config.yaml"))
+        eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
+                              cfg=settings.effective(), states={}, ext=None)
+        tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
+        await tr.start()
+        await db.execute("""INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol,
+                               tokens, tokens_initial, exit_reason, pnl_sol, pnl_pct)
+                            VALUES ('D', 'M', now(), now(), 30, 0.05, 1, 1, 'stop', -0.2, -0.5)""")
+        tr2 = pp.PaperTrader(eng)  # type: ignore[arg-type]
+        await tr2.start()
+        assert tr2.lottery_stopped("D")                              # −$20 за сегодня — стоп
+        await tr2.reset()
+        assert not tr2.lottery_stopped("D")                          # сброс снимает стоп сразу…
+        tr3 = pp.PaperTrader(eng)  # type: ignore[arg-type]
+        await tr3.start()
+        assert not tr3.lottery_stopped("D")                          # …и после перезапуска (считаем от сброса)
+    finally:
+        await db.close()

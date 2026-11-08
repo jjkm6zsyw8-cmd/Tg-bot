@@ -318,7 +318,12 @@ class PaperTrader:
             if r["dev"]:
                 self.rug_devs.add(r["dev"])
         self._day_key = self.day_key()
+        # дневной стоп лотереи считает итог с 00:00 (Батуми) или с последнего сброса — что позже:
+        # ручной /paper reset должен снимать стоп (регрессия 8.11: лотерея простояла всю ночь после сброса)
         start = datetime.now(self.reset_tz()).replace(hour=0, minute=0, second=0, microsecond=0)
+        last_reset = await self.db.fetchval("SELECT max(reset_at) FROM paper_portfolios")
+        if last_reset and last_reset > start:
+            start = last_reset
         for r in await self.db.fetch(
                 """SELECT portfolio, sum(pnl_sol) s FROM paper_positions WHERE closed_at >= $1
                    AND exit_reason <> 'reset' AND NOT suspect GROUP BY portfolio""", start):
@@ -331,6 +336,7 @@ class PaperTrader:
             await self.db.execute("UPDATE paper_portfolios SET start_usd=$1, start_sol=$2, balance_sol=$2, paused=false, "
                                   "reset_at=now()", START_USD, START_USD / sol)
             self.positions.clear()
+            self.day_pnl = {}                      # сброс — новый счёт и для дневного стопа лотереи
             for n in SCHEMES:
                 self.balance[n] = START_USD / sol
                 self.paused[n] = False
@@ -640,6 +646,7 @@ class PaperTrader:
                                   "WHERE id=$1", p.id, p.tokens, p.proceeds_sol, p.max_mc)
             await self._msg(f"💰 {p.portfolio} ${fmt.esc(p.symbol or '?')} тейк {share:.0%} · MC {fmt.mc_usd(mc, sol_usd)}")
             return
+        p.max_mc = max(p.max_mc or 0.0, mc)           # максимум не ниже цены выхода (gris 8.11: выход 6.3k, «макс» 5.3k)
         pnl = p.proceeds_sol - p.cost_sol
         pct = pnl / p.cost_sol if p.cost_sol else 0.0
         suspect = False
