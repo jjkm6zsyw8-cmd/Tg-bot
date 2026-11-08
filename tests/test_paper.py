@@ -669,3 +669,18 @@ async def test_exit_is_checked_against_jupiter(monkeypatch):
     p.closing = True
     await tr._exit_later(p, "stop", 1.0)
     assert sold == [("stop", pytest.approx(31.0))]
+
+
+async def test_target_moves_with_jupiter_entry(monkeypatch):
+    """Регрессия 9.11: вход поправлен на Jupiter, а цель алерта осталась от старой цены — ниже входа."""
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    got = []
+
+    async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        got.append((mc, data.get("target_mc")))
+    tr = bare_trader({"M": fresh_state(30.0)}, FakeExt(3_000, jup=45 / 1e9 * 100))
+    tr._open = fake_open
+    tr.lock = __import__("asyncio").Lock()
+    tr.entry_fixed = 0
+    await tr.on_alert("M", "normal", None, {"mc": 30.0, "target_mc": 39.0}, None)
+    assert got[-1] == (pytest.approx(45.0), pytest.approx(58.5))          # цель +30% от нового входа

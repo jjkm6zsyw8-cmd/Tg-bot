@@ -404,6 +404,10 @@ class PaperTrader:
             jm = await self.jupiter_mc(mint)
             if jm and 1 / 3 <= jm / mc <= 3 and abs(jm / mc - 1) > 0.10:
                 log.info("paper %s: вход по Jupiter %.1f SOL вместо %.1f (свой поток отстал)", mint, jm, mc)
+                if data.get("target_mc"):
+                    # цель алерта считалась от старой цены: без поправки она оказывалась ниже входа, и позиция
+                    # сразу закрывалась «по цели» в минус (DAISY 9.11: вход 7.5k, «цель» 6.9k, −12%)
+                    data = {**data, "target_mc": float(data["target_mc"]) * jm / mc}
                 mc = jm
                 self.entry_fixed += 1
         guard = getattr(self.e, "copyguard", None)
