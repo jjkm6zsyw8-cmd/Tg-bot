@@ -623,3 +623,24 @@ async def test_manual_reset_clears_lottery_day_stop():
         assert not tr3.lottery_stopped("D")                          # …и после перезапуска (считаем от сброса)
     finally:
         await db.close()
+
+
+async def test_entry_price_follows_jupiter_when_own_stream_lags(monkeypatch):
+    """Регрессия 8.11: вход записывался ниже всей минутной свечи (свой поток видел старую сделку)."""
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    opened = []
+
+    async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append(mc)
+    tr = bare_trader({"M": fresh_state(30.0)}, FakeExt(3_000, jup=45 / 1e9 * 100))   # Jupiter: 45 SOL
+    tr._open = fake_open
+    tr.lock = __import__("asyncio").Lock()
+    tr.entry_fixed = 0
+    await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)
+    assert opened[-1] == pytest.approx(45.0) and tr.entry_fixed == 1        # покупаем по рынку, не по старой сделке
+    tr.e.ext = FakeExt(3_000, jup=300 / 1e9 * 100)                          # ×10 — сбой Jupiter, не верим
+    await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)
+    assert opened[-1] == pytest.approx(30.0)
+    tr.e.ext = FakeExt(3_000, jup=31 / 1e9 * 100)                           # разница 3% — оставляем свою цену
+    await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)
+    assert opened[-1] == pytest.approx(30.0)

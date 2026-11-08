@@ -198,6 +198,7 @@ class PaperTrader:
         self._exits: dict[str, list[tuple[str, float, str]]] = {}
         self.bad_prices = 0                         # отброшенных сбойных цен DexScreener
         self.false_exits = 0                        # ценовых выходов, не подтвердившихся через 2 с
+        self.entry_fixed = 0                        # входов, где цену поправил Jupiter (свой поток отстал)
         self._last_flush = 0.0
         self.loss_exits: dict[tuple[str, str], float] = {}   # (портфель, монета) → время убыточного выхода
         self.rugged: dict[str, float] = {}         # монета → худший результат (−0.5 и хуже): больше не входим
@@ -394,6 +395,16 @@ class PaperTrader:
         if not mc or mc <= 0:
             self.skipped.setdefault("*", "нет свежей цены монеты")
             return
+        if src != "dex":
+            # Цена входа — то, по чему можно купить сейчас. Свой поток видит не все сделки монеты: 8.11 у 15 из 22
+            # прибыльных сделок вход был записан ниже всей минутной свечи (×1.1–1.7), плюс бумаги завышался
+            # (+$182 против +$106 по рынку). Jupiter считает цену по текущему состоянию пула — ей и верим,
+            # если она в разумных пределах (×3: дальше скорее сбой самого Jupiter)
+            jm = await self.jupiter_mc(mint)
+            if jm and 1 / 3 <= jm / mc <= 3 and abs(jm / mc - 1) > 0.10:
+                log.info("paper %s: вход по Jupiter %.1f SOL вместо %.1f (свой поток отстал)", mint, jm, mc)
+                mc = jm
+                self.entry_fixed += 1
         guard = getattr(self.e, "copyguard", None)
         if guard is not None and data.get("copy_wallet") and data.get("copy_ref_mc"):
             # Price Delta: насколько дороже цели мы входим (+5 с реакции) — копить по кошельку
