@@ -930,6 +930,10 @@ class Engine:
         if prev_mode_level is None and not e.manual:
             # бумажная торговля входит по каждому алерту выбранных уровней (одна позиция на монету)
             asyncio.create_task(self.paper.on_alert(mint, e.level, aid, dict(e.data), trader or e.data.get("trader")))
+        if e.level == "watch" and not e.has_message and not cfg.get("send_watch_alerts", False):
+            # «Наблюдение» — ~4000 в сутки: Telegram их не пропускал, очередь сообщений росла до 900+ и копии
+            # приходили с опозданием. Бумага (лотерея D/E) их покупает и так; в чат — только отчёт бумаги
+            return
         text = fmt.render_alert(e.data, self.price.value, bool(cfg.get("compact")))
         profile_kind, profile_ref = ("d", str(e.data.get("cluster_id"))) if e.data.get("cluster_id") else \
             ("t", trader or e.data.get("trader") or "")
@@ -1014,6 +1018,8 @@ class Engine:
 
     async def _follow_msg(self, e: AlertEntry, kind: str, st: TokenState, emergency: bool = False,
                           extra: str = "") -> None:
+        if not e.has_message and not e.manual:
+            return                   # алерта в чате не было («Наблюдение», сводка) — продолжение ни к чему
         text = fmt.render_follow(kind, {"mint": e.mint, "symbol": st.symbol, "mc": st.mc}, self.price.value, extra)
         kb = fmt.exit_keyboard(e.mint, self.settings.links(), self.env.redirect_base) if emergency else None
         await self.db.enqueue("follow", {"mint": e.mint, "text": text, "keyboard": kb, "emergency": emergency,
@@ -1081,8 +1087,9 @@ class Engine:
             await self.db.enqueue("follow", {"mint": e.mint, "text": text, "keyboard": None, "emergency": False,
                                              "kind": "final"}, priority=5)
             return
-        if seen == 0:
-            # после алерта не было ни одной сделки (нет данных) — итог записан, но в чат не шлём
+        if seen == 0 or not e.has_message:
+            # после алерта не было ни одной сделки (нет данных) или самого алерта не было в чате
+            # («Наблюдение») — итог записан, но в чат не шлём
             return
         main_id = e.alert_ids.get("dev") or next(iter(e.alert_ids.values()), None)
         text = fmt.render_final({**e.data, "symbol": st.symbol}, outcome, self.price.value)
