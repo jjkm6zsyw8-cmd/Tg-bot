@@ -1,6 +1,7 @@
 """Блок E: исполнение бумажных сделок и правила выхода."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from types import SimpleNamespace
@@ -857,3 +858,29 @@ async def test_main_portfolio_m():
     tr.start_usd = lambda: 100.0
     tr.day_pnl, tr._day_key = {"M": -0.30}, tr.day_key()                                  # −$30 при SOL $100
     assert tr.day_stopped("M") and tr.day_stop_usd("M") == 25.0
+
+
+async def test_m_enters_faster(monkeypatch):
+    """M входит раньше остальных (1 с против 5 с) — на тех же сигналах видно, что даёт скорость входа."""
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0.05)
+    tr = bare_trader({})
+    tr.e.cfg = {"paper_m_entry_delay_s": 0.01}
+    prices = iter([30.0, 36.0])
+    entered = []
+
+    async def fake_market(mint):
+        return next(prices), "jupiter"
+
+    async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        entered.append((name, mc))
+        return 0.1
+    tr.market_mc, tr._open = fake_market, fake_open
+    tr.state_price = lambda mint: None
+    tr.lock = asyncio.Lock()
+
+    async def no_msg(text):
+        return None
+    tr._msg = no_msg
+    strong = {"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}], "copy_wallet": "W"}
+    await tr.on_alert("M1", "strong", None, strong, "W")
+    assert ("M", 30.0) in entered and ("G", 36.0) in entered     # M — по цене через 1 с, G — через 5 с

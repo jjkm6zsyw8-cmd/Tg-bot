@@ -59,8 +59,9 @@ SCOUT_USD = 10.0
 #   одиночная копия своего кошелька                          −4.5% на сделку, в минусе каждый день  → в M не берём
 #   smart-money, 2+ кошелька разом                            −4.0% на сделку                         → в M не берём
 #   лотерея (дев ~1 SOL)                                     −15…−18% на билет                       → в M не берём
-# Вместе (позиция 20% ×1.5 у сильных, потолок 30%, дневной стоп −25%): $100 → $191 за 4 дня, ни одного дня в минусе.
-# Это подбор на тех же данных — вживую будет меньше; M на бумаге и покажет, сколько.
+# Главное: результат почти целиком решает цена входа внутри минуты. M по всем дням: вход сразу за трейдером (30% высоты
+# минутной свечи) — $100 → $388; 40% — $146; как бумага с задержкой 5 с по Jupiter (≈60%, измерено) — $100 → $54.
+# Поэтому M входит через 1 с; что это даёт на реальных ценах, покажет сравнение M с остальными (5 с) на тех же сигналах.
 MAIN = "M"
 M_KINDS: dict[str, dict[str, Any]] = {
     # 85% на +25%, 15% — «раннер» с трейлингом 30%, не продаётся за трейдером (шанс на ракету стоит ~1% на сделку)
@@ -78,6 +79,7 @@ M_COPY_MIN_AGE_S = 0.0
 M_COPY_MIN_MC_USD = 0.0
 M_LOTTERY_SHARE = 0.05
 M_DAY_STOP_PCT = 0.25
+M_ENTRY_DELAY_S = 1.0          # M входит через 1 с (как бот на реальных деньгах), остальные — через ENTRY_DELAY_S
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
@@ -455,7 +457,20 @@ class PaperTrader:
         if not targets:
             self.skipped["*"] = why
             return
-        await asyncio.sleep(ENTRY_DELAY_S)          # реакция пользователя
+        # M входит быстрее остальных — как бот на реальных деньгах (бэктест 6–9.11: результат почти целиком решает
+        # цена входа внутри минуты; на тех же сигналах M через 1 с против остальных через 5 с покажет, что даёт скорость)
+        m_delay = float(self.cfg.get("paper_m_entry_delay_s", M_ENTRY_DELAY_S))
+        fast = targets & {MAIN} if not data.get("trend") and m_delay < ENTRY_DELAY_S else set()
+        plan = [(m_delay, fast), (ENTRY_DELAY_S - m_delay, targets - fast)] if fast else [(ENTRY_DELAY_S, targets)]
+        for delay, names in plan:
+            await asyncio.sleep(max(0.0, delay))
+            if names:
+                await self._enter(mint, level, alert_id, data, trader, names, guard_delta=MAIN not in names or
+                                  names == targets)
+
+    async def _enter(self, mint: str, level: str, alert_id: int | None, data: dict[str, Any], trader: str | None,
+                     targets: set[str], guard_delta: bool = True) -> None:
+        """Цена входа по рынку и открытие позиций в портфелях targets."""
         if data.get("trend"):
             mc, src = await self._trend_entry_price(mint, data)
             if not mc:
@@ -477,7 +492,7 @@ class PaperTrader:
                 # входа и позиция сразу закрывалась «по цели» в минус (DAISY 9.11: вход 7.5k, «цель» 6.9k)
                 data = {**data, "target_mc": float(data["target_mc"]) * mc / ref}
         guard = getattr(self.e, "copyguard", None)
-        if guard is not None and data.get("copy_wallet") and data.get("copy_ref_mc"):
+        if guard is not None and guard_delta and data.get("copy_wallet") and data.get("copy_ref_mc"):
             # Price Delta: насколько дороже цели мы входим (+5 с реакции) — копить по кошельку
             delta = await guard.record_delta(data["copy_wallet"], mint, float(data["copy_ref_mc"]), float(mc))
             why = guard.entry_reason(delta)
