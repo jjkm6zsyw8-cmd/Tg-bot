@@ -626,6 +626,33 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
         await paper_answer(m, cmd, 24 if cmd == "trades" else None)
 
+    @router.message(Command("rating"))
+    async def cmd_rating(m: Message, command: CommandObject) -> None:
+        """Рейтинг кошельков по итогу их копий; /rating адрес топ|норм|слабый|пауза|авто — ручная правка."""
+        from ..analytics.rating import MANUAL, TIERS, rating_report
+        cfg = await reload()
+        parts = (command.args or "").split()
+        if parts and is_valid_address(parts[0]):
+            what = parts[1].lower() if len(parts) > 1 else ""
+            if what in ("авто", "auto"):
+                await db.execute("UPDATE wallet_rating SET manual_tier=NULL WHERE address=$1", parts[0])
+                return await reply(m, "✅ Кошелёк снова оценивается автоматически (применится в течение 5 минут).")
+            tier = MANUAL.get(what)
+            if not tier:
+                return await reply(m, "Формат: /rating адрес топ|норм|слабый|пауза|авто")
+            await db.execute(
+                """INSERT INTO wallet_rating(address, tier, manual_tier) VALUES ($1, $2, $2)
+                   ON CONFLICT (address) DO UPDATE SET manual_tier=EXCLUDED.manual_tier""", parts[0], tier)
+            return await reply(m, f"✅ Вручную: {TIERS[tier]} (применится в течение 5 минут). Вернуть — /rating {parts[0]} авто")
+        text, chunk = await rating_report(db, cfg), ""
+        for line in text.split("\n"):
+            if len(chunk) + len(line) > 3900:
+                await reply(m, chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            await reply(m, chunk)
+
     @router.message(Command("scout"))
     async def cmd_scout(m: Message) -> None:
         """Разведка кошельков: кто на испытании, кого добавили и отсеяли."""

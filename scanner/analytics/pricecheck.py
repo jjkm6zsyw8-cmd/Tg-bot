@@ -85,7 +85,13 @@ class PriceCheck:
             return hit[1]
         d = await self._get(http, f"{GECKO}/tokens/{mint}/pools?page=1")
         out: list[list[float]] = []
-        for pool in ((d or {}).get("data") or [])[:2]:
+        pools = []
+        for pool in ((d or {}).get("data") or []):
+            base = (((pool.get("relationships") or {}).get("base_token") or {}).get("data") or {}).get("id")
+            if base and base != f"solana_{mint}":
+                continue          # чужой пул: наша монета там вторая сторона пары (pump.fun разрешает такие пары)
+            pools.append(pool)
+        for pool in pools[:2]:
             addr = (pool.get("attributes") or {}).get("address")
             if not addr:
                 continue

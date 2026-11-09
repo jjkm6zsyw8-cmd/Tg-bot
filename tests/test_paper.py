@@ -108,15 +108,18 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         assert not any(p.tp_done for p in tr.positions.values() if p.portfolio == "C")
         assert not next(p for p in tr.positions.values() if p.portfolio == "D").tp_done   # лотерея ждёт ×2
         assert not any(p.portfolio in "EG" for p in tr.positions.values())            # E и G: всё на +25%
+        m = next(p for p in tr.positions.values() if p.portfolio == "M")
+        assert m.tp_done and m.rule == "copy"                            # M: схема копий — 70% на +25%, остаток едет
         st.mc = 45.0
         for p in list(tr.positions.values()):
             await tr._check(p, 45.0, "emergency")
         await __import__("asyncio").sleep(0.05)
         assert not tr.positions
         rows = await db.fetch("SELECT portfolio, pnl_sol, exit_reason FROM paper_positions ORDER BY portfolio")
-        assert [r["exit_reason"] for r in rows] == ["emergency"] * 4 + ["take_profit", "emergency", "take_profit"]
-        # 7 входов + 2 частичных тейка (A, B; лотерея D ждёт ×2) + 7 полных выходов
-        assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 16
+        assert [r["exit_reason"] for r in rows] == ["emergency"] * 4 + ["take_profit", "emergency", "take_profit",
+                                                                        "emergency"]
+        # 8 входов + 3 частичных тейка (A, B, M; лотерея D ждёт ×2) + 8 полных выходов
+        assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 19
         await tr.flush_messages()
         exits = await db.fetchval("SELECT payload->>'text' FROM outbox WHERE kind='text' ORDER BY id DESC LIMIT 1")
         closed = [x for x in exits.split("\n") if x[:1] in "✅❌"]
@@ -130,9 +133,9 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         hist = await tr.history()
         assert "дев продал" in hist
         day = await tr.trades_text(24)
-        assert len(day) == 1 and day[0].count("$T") == 1 and "G +" in day[0] and "сделок 7" in day[0]
+        assert len(day) == 1 and day[0].count("$T") == 1 and "G +" in day[0] and "сделок 8" in day[0]
         table = await tr.trades_csv(None)
-        assert table.count("\n") == 8 and "портфель;монета" in table and "экстренный выход" in table
+        assert table.count("\n") == 9 and "портфель;монета" in table and "экстренный выход" in table
         assert "проверка по рынку" in table and ";ещё нет;" in table
         await tr.reset()
         assert tr.balance["A"] == pytest.approx(0.3)   # сброс — до старта из настройки ($30)
@@ -563,7 +566,7 @@ async def test_daily_reset_with_summary(monkeypatch):
         assert await db.kv_get("paper:daily_reset") and not await db.fetchval("SELECT count(*) FROM outbox")
         await tr.on_alert("M1", "strong", None, {"symbol": "T", "mc": 40.0, "copy_wallet": "W", "copy_sol": 1.0}, "W")
         assert {p.rule for p in tr.positions.values()} == {"copy"}
-        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE rule='copy'") == 7
+        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE rule='copy'") == len(pp.SCHEMES) - 1
         p = next(iter(tr.positions.values()))
         await tr._sell(p, "take_profit", 1.0, 60.0)
         await db.kv_set("paper:daily_reset", "2000-01-01")           # наступил новый день
@@ -581,7 +584,7 @@ def test_route_signals_to_portfolios():
     """Одиночные копии и smart-money — во все основные A, B, C, E, F, G (как 8.11); «Наблюдение» (режим «Девы») —
     лотерея D; сильные копии, «Мой дев» и новые монеты — в бумагу не идут."""
     tr = bare_trader({})
-    main, lottery = set("ABCEFG"), set("D")
+    main, lottery = set("ABCEFGM"), {"D", "M"}                     # M — боевая версия: и копии, и билеты лотереи
     smart = main
     assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main
     targets, why = tr.route({"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}, "strong")
@@ -603,7 +606,7 @@ def test_route_signals_to_portfolios():
     assert tr.route({"modes": ["copy"], "traders": [{}, {}]}, "strong")[0] == main
     tr.e.cfg = {"paper_smart_portfolios": "F"}                      # можно снова мерить smart отдельно
     assert tr.route({"modes": ["smart"]}, "normal")[0] == {"F"}
-    assert tr.route({"modes": ["copy"], "traders": [{}]}, "normal")[0] == set("ABCEG")
+    assert tr.route({"modes": ["copy"], "traders": [{}]}, "normal")[0] == set("ABCEGM")
 
 
 async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
@@ -783,3 +786,60 @@ async def test_schemes_of_nov_8_restored():
     st = SimpleNamespace(mint="M", mc=40.0)
     await tr.on_trade(st, None, "W", False)                                        # трейдер продал
     assert checked == [("C", "trader_sell"), ("G", "trader_sell")]
+
+
+async def test_main_portfolio_m():
+    """M — боевая версия: схема и лимит по типу сигнала, билеты лотереи 5%, фильтр свежих дешёвых монет для копий,
+    раннер не продаёт вслед за трейдером, дневной стоп."""
+    tr = bare_trader({})
+    tr.balance = {"M": 1.0}
+    tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
+    tr.priority = lambda: 0.0005
+    tr.fee_bps = lambda: 125
+    tr.e.cfg = {"paper_position_share": 0.2, "paper_size_by_level": False}
+    ids = []
+
+    class DB:
+        async def fetchval(self, *a):
+            ids.append(a)
+            return len(ids)
+
+        async def execute(self, *a):
+            return None
+    tr.db = DB()
+    tr.e.rating = {"W": {"tier": "ok", "mult": 1.0}}
+    copy = {"modes": ["copy"], "copy_wallet": "W", "traders": [{"address": "W"}]}
+    lot = {"modes": ["dev"], "metrics": {"cluster": 0.034}}
+    assert await tr._open("M", "C1", "normal", None, copy, "W", 30.0) == pytest.approx(0.2)
+    assert await tr._open("M", "L1", "watch", None, lot, None, 30.0) == pytest.approx(0.04)   # 5% от 0.8
+    kinds = {p.mint: p.rule for p in tr.positions.values()}
+    assert kinds == {"C1": "copy", "L1": "lottery"}
+    assert tr.scheme_for(next(p for p in tr.positions.values() if p.mint == "L1")) is pp.M_KINDS["lottery"]
+    for i in range(2, 5):
+        assert await tr._open("M", f"L{i}", "watch", None, lot, None, 30.0)
+    assert await tr._open("M", "L5", "watch", None, lot, None, 30.0) is None                 # 4 билета лотереи
+    assert await tr._open("M", "C2", "normal", None, copy, "W", 30.0)                        # копии — свой лимит
+    # фильтр копий M: свежая монета — только в остальные портфели
+    tr.e.cfg = {"paper_m_copy_min_age_s": 120, "paper_m_copy_min_mc_usd": 10000}
+    assert "M" not in tr.route({**copy, "age_s": 30, "mc": 200.0}, "normal")[0]
+    assert "M" not in tr.route({**copy, "age_s": 600, "mc": 50.0}, "normal")[0]             # $5k при SOL $100
+    assert "M" in tr.route({**copy, "age_s": 600, "mc": 200.0}, "normal")[0]
+    assert "M" in tr.route({"modes": ["dev"], "metrics": {"cluster": 0.034}}, "watch")[0]
+    # раннер: после частичного тейка остаток не продаётся за трейдером
+    checked = []
+
+    async def fake_check(p, mc, reason, price_usd=None):
+        checked.append((p.mint, reason))
+    tr._check = fake_check
+    c1 = next(p for p in tr.positions.values() if p.mint == "C1")
+    c1.trader, c1.tp_done = "W", True
+    await tr.on_trade(SimpleNamespace(mint="C1", mc=40.0), None, "W", False)
+    assert checked == []
+    c1.tp_done = False
+    await tr.on_trade(SimpleNamespace(mint="C1", mc=40.0), None, "W", False)
+    assert checked == [("C1", "trader_sell")]
+    # дневной стоп M — 25% старта
+    tr.e.cfg = {}
+    tr.start_usd = lambda: 100.0
+    tr.day_pnl, tr._day_key = {"M": -0.30}, tr.day_key()                                  # −$30 при SOL $100
+    assert tr.day_stopped("M") and tr.day_stop_usd("M") == 25.0

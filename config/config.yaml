@@ -46,7 +46,7 @@ defaults:
 
   # --- разд. 5: разбор дня ---
   daily_report_time: "21:00"
-  timezone: "Europe/Moscow"
+  timezone: "Asia/Tbilisi"          # Батуми, UTC+4 (до 9.11 по умолчанию стояла Москва — CSV были в UTC+3)
   position_sol: 0.5               # размер позиции для расчёта проскальзывания
 
   # --- разд. 7: фильтры ---

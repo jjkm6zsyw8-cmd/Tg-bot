@@ -469,3 +469,16 @@ CREATE TABLE IF NOT EXISTS scout (
     cooldown_until timestamptz
 );
 CREATE INDEX IF NOT EXISTS scout_status_idx ON scout (status);
+
+-- Рейтинг кошельков (analytics/rating.py): по итогу их копий на бумаге; manual_tier — ручная правка (/rating)
+CREATE TABLE IF NOT EXISTS wallet_rating (
+    address     text PRIMARY KEY,
+    tier        text NOT NULL,              -- top | ok | new | weak | paused
+    auto_tier   text,
+    manual_tier text,
+    score       double precision,           -- средний результат копии, стянутый к нулю
+    copies      integer,
+    wins        integer,
+    sum_pct     double precision,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);

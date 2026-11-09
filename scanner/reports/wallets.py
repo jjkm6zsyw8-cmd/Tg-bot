@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 STATUS = {"queued": "в очереди на испытание", "probation": "на испытании", "promoted": "в своём списке (разведка)",
           "passed": "прошёл испытание, список полон", "rejected": "отсеян", "few": "мало сделок на испытании",
           "demoted": "убран: копии в минусе", "removed": "убран вручную"}
-HEAD = ["тип", "статус", "вердикт", "метка", "адрес", "откуда", "почему попал", "найден", "решение",
+HEAD = ["тип", "статус", "рейтинг", "оценка копии %", "вердикт", "метка", "адрес", "откуда", "почему попал", "найден", "решение",
         "копий в бумаге", "портфель", "в плюсе", "винрейт копий %", "итог копий SOL", "итог копий $",
         "средняя копия %", "лучшая %", "худшая %", "копий на испытании (H)", "итог испытания %",
         "GMGN винрейт 7д %", "GMGN прибыль 7д $", "GMGN монет 7д", "GMGN удержание, с", "GMGN сливов хуже −50%",
@@ -66,6 +66,8 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
             # добавленный вручную кошелёк остаётся «своим», даже если разведка его когда-то смотрела
             w.update({"kind": "разведка" if r["status"] == "promoted" else "кандидат",
                       "status": STATUS.get(r["status"], r["status"]), "found": r["found_at"]})
+    from ..analytics.rating import TIERS
+    rating = {r["address"]: r for r in await db.fetch("SELECT * FROM wallet_rating")}
     papers: dict[tuple[str, str], dict[str, Any]] = {}
     for r in await db.fetch(
             """SELECT source_wallet w, portfolio, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) wins,
@@ -86,8 +88,10 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
         t = w.get("traders") or {}
         g = w.get("gmgn") or {}
         kind = w.get("kind") or "кандидат"
+        rt = rating.get(addr) or {}
         rows.append((pnl, [
-            kind, w.get("status") or "", verdict_of(kind, n, wins, pnl) if kind != "кандидат" else "",
+            kind, w.get("status") or "", TIERS.get(rt.get("tier") or "", "") + (" ✋" if rt.get("manual_tier") else ""),
+            _pct(rt.get("score")), verdict_of(kind, n, wins, pnl) if kind != "кандидат" else "",
             w.get("label") or "", addr, w.get("source") or ("вручную" if kind.startswith("свой") else "автоотбор"),
             w.get("reason") or "", when(w.get("found")), w.get("decision") or "",
             n, p.get("portfolio") or "", wins, _pct(wins / n) if n else "", _num(pnl), round(pnl * sol_usd, 2),

@@ -52,6 +52,24 @@ SMART_ONLY = ""               # smart-money — во все основные п�
 SCOUT = "H"
 SCOUT_MAX_OPEN = 10
 SCOUT_USD = 10.0
+# M — боевая версия: один портфель, как будет торговать бот на реальные деньги. Свои схемы выхода для копий, smart-money
+# и лотереи (подбор — бэктест всех сигналов 6–9.11 по минутным свечам рынка), размер копий — по рейтингу кошелька,
+# лимиты позиций по типу сигнала и дневной стоп.
+MAIN = "M"
+M_KINDS: dict[str, dict[str, Any]] = {
+    "copy": {"stop": 0.15, "tp_net": 0.25, "tp_share": 0.7, "trail": 0.30, "time_stop_s": 300, "time_stop_gain": 0.10,
+             "follow_runner": False},
+    "smart": {"stop": 0.15, "tp_net": 0.25, "tp_share": 0.7, "trail": 0.30, "time_stop_s": 300,
+              "time_stop_gain": 0.10, "follow_runner": False},
+    "lottery": {"stop": 0.15, "tp_net": 1.0, "tp_share": 0.34, "trail": 0.30, "trail_after_net": 0.5, "target": False,
+                "time_stop_s": 600, "time_stop_gain": 0.10, "max_hold_s": 4 * 3600},
+}
+M_MAX_OPEN = {"copy": 4, "smart": 3, "lottery": 4}
+# Фильтр копий для M (бэктест 6–9.11): копии свежих дешёвых монет — снайпинг, где мы заведомо опаздываем
+M_COPY_MIN_AGE_S = 0.0
+M_COPY_MIN_MC_USD = 0.0
+M_LOTTERY_SHARE = 0.05
+M_DAY_STOP_PCT = 0.25
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
@@ -65,6 +83,7 @@ MAX_HOLD_S = 2 * 3600          # страховка: позиция по «мё�
 _G = {"stop": 0.08, "tp_net": 0.25, "tp_share": 1.0, "trail": None, "target": False, "time_stop_s": 300,
       "time_stop_gain": 0.10}
 SCHEMES: dict[str, dict[str, Any]] = {
+    MAIN: {**M_KINDS["copy"], "name": "M: боевая версия — свои схемы для копий, smart и лотереи, размер по рейтингу"},
     "A": {"name": "A: стоп −6%, половина на +30%, трейлинг 15%, цель", "stop": 0.06, "tp_net": 0.30,
           "tp_share": 0.5, "trail": 0.15, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
     "B": {"name": "B: база — стоп −15%, половина на +30%, трейлинг 15%, цель", "stop": 0.15, "tp_net": 0.30,
@@ -419,6 +438,9 @@ class PaperTrader:
         if data.get("trend") and not self.cfg.get("paper_trends", False):
             self.skipped.setdefault("*", "«Тренды» не входят в бумажную торговлю (настройка)")
             return
+        if (trader and not data.get("copy_wallet") and not data.get("source_wallet")
+                and set(data.get("modes") or []) & {"copy", "smart"}):
+            data = {**data, "source_wallet": trader}      # smart-money: рейтинг ведётся и по нему
         targets, why = self.route(data, level)
         if not targets:
             self.skipped["*"] = why
@@ -489,8 +511,13 @@ class PaperTrader:
             return None
         lottery = self.is_lottery(name)
         max_open = LOTTERY_MAX_OPEN if lottery else SCOUT_MAX_OPEN if name == SCOUT else MAX_OPEN
+        kind = self.kind_of(data) if name == MAIN else None
+        if kind:
+            lottery = kind == "lottery"
+            max_open = M_MAX_OPEN.get(kind, MAX_OPEN)
+            open_here = [p for p in open_here if (p.rule or "copy") == kind]
         if len(open_here) >= max_open:
-            self.skipped[name] = f"лимит {max_open} открытых позиций"
+            self.skipped[name] = f"лимит {max_open} открытых позиций" + (f" ({kind})" if kind else "")
             return None
         if self.day_stopped(name):
             self.skipped[name] = f"дневной стоп: за сегодня −${self.day_stop_usd(name):g} — новых входов нет до 00:00"
@@ -509,8 +536,9 @@ class PaperTrader:
             # регрессия 6.11: D семь раз за 20 минут входил в один и тот же раг NORTHKOREA (−1.1 SOL за час)
             self.skipped[name] = f"монета уже дала убыток {fmt.ago(time.time() - lost)} назад — повторно не входим"
             return None
-        size = self.balance[name] * (float(self.cfg.get("paper_lottery_share", LOTTERY_SHARE)) if lottery
-                                     else self.share_for(level))
+        lot_share = float(self.cfg.get("paper_m_lottery_share", M_LOTTERY_SHARE)) if kind else \
+            float(self.cfg.get("paper_lottery_share", LOTTERY_SHARE))
+        size = self.balance[name] * (lot_share if lottery else self.share_for(level))
         # минимальная позиция: на ~$2 фиксированные комиссии (приоритет 2×0.0005 SOL + pump.fun) съедали ~7% сделки;
         # билет лотереи меньше — выигрыши там ×3…×55, а на дорогих билетах портфель вставал на паузу к вечеру
         min_size = max(float(self.cfg.get("paper_lottery_min_sol", LOTTERY_MIN_SOL)) if lottery
@@ -519,6 +547,9 @@ class PaperTrader:
             # Ratio: копия — доля от суммы покупки цели (её уверенность), потолок — обычная доля портфеля
             ratio = float(self.cfg.get("copy_ratio", 0.10))
             size = min(size, ratio * float(data["copy_sol"]))
+        wallet = data.get("copy_wallet") or data.get("source_wallet")
+        if wallet and not lottery and name != SCOUT:
+            size *= float(self.wallet_rating(wallet).get("mult", 1.0))   # рейтинг кошелька: топ ×1.5 … слабый ×0.5
         if name == SCOUT:
             # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
             size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
@@ -547,7 +578,7 @@ class PaperTrader:
             return None
         self.balance[name] -= size
         target = data.get("target_mc")
-        rule = "copy" if data.get("copy_wallet") else None
+        rule = kind or ("copy" if data.get("copy_wallet") else None)
         now = datetime.now(timezone.utc)
         pid = await self.db.fetchval(
             """INSERT INTO paper_positions(portfolio, mint, alert_id, level, symbol, opened_at, entry_mc, cost_sol,
@@ -576,8 +607,10 @@ class PaperTrader:
             emergency = "emergency"
         for p in ps:
             reason = emergency
+            sc = self.scheme_for(p)
             if (reason is None and p.trader and trader == p.trader and not is_buy
-                    and not self.scheme_for(p).get("ignore_trader_sell")):
+                    and not sc.get("ignore_trader_sell")
+                    and not (p.tp_done and sc.get("follow_runner") is False)):   # остаток-«раннер» едет за иксом
                 reason = "trader_sell"
             if reason is None:
                 continue          # цены ведёт tick_loop по рыночной цене; из своего потока — только сигналы выхода
@@ -696,7 +729,15 @@ class PaperTrader:
 
     @staticmethod
     def scheme_for(p: Position) -> dict[str, Any]:
+        if p.portfolio == MAIN:
+            return M_KINDS.get(p.rule or "copy", M_KINDS["copy"])      # M: схема по типу сигнала позиции
         return SCHEMES[p.portfolio]
+
+    @staticmethod
+    def kind_of(data: dict[str, Any]) -> str:
+        modes = set(data.get("modes") or [])
+        return "copy" if "copy" in modes or data.get("copy_wallet") else "smart" if "smart" in modes else \
+            "lottery" if "dev" in modes else "copy"
 
     def fresh_trade(self, mint: str, max_age_s: float) -> bool:
         """По монете была сделка своего потока не позже max_age_s секунд назад."""
@@ -779,6 +820,14 @@ class PaperTrader:
     def start_usd(self) -> float:
         return float(self.cfg.get("paper_start_usd") or START_USD)
 
+    def wallet_rating(self, wallet: str) -> dict[str, Any]:
+        """Рейтинг кошелька (analytics/rating.py); нет копий — «новый», позиция ×0.75."""
+        r = (getattr(self.e, "rating", None) or {}).get(wallet)
+        if r:
+            return r
+        from .rating import cfg_get
+        return {"tier": "new", "mult": cfg_get(self.cfg, "rating_new_mult")}
+
     def is_lottery(self, name: str) -> bool:
         return name in str(self.cfg.get("paper_lottery_portfolios", LOTTERY))
 
@@ -789,6 +838,12 @@ class PaperTrader:
             return set(SCHEMES) - {SCOUT}, ""
         if "scout" in modes:
             return {SCOUT}, ""                       # кандидат разведки — только испытательный портфель
+        wallet = data.get("copy_wallet") or data.get("source_wallet")
+        if wallet and modes & {"copy", "smart"} and not modes & {"dev", "mydev"} \
+                and self.wallet_rating(wallet).get("tier") == "paused":
+            # рейтинг: копии кошелька в минусе — в боевые портфели не берём, только в теневой H; исправится — вернётся
+            self.skipped["*"] = "кошелёк на паузе по рейтингу — копия только в теневой H"
+            return {SCOUT}, ""
         lottery = {n for n in SCHEMES if self.is_lottery(n)}
         smart_only = set(str(self.cfg.get("paper_smart_portfolios", SMART_ONLY))) & set(SCHEMES) - lottery - {SCOUT}
         main = set(SCHEMES) - lottery - smart_only - {SCOUT}
@@ -812,8 +867,21 @@ class PaperTrader:
                     self.skipped[n] = (f"{n}: дев купил не ~1 SOL при запуске (доля {float(share or 0):.1%}, "
                                        f"нужно {lo:.1%}–{hi:.1%})")
             out |= lot
+            if lot and self.cfg.get("paper_m_lottery", True):
+                out.add(MAIN)                        # боевая версия берёт и билеты лотереи (маленькие)
             if not lot and not out:
                 why = "лотерея D: дев купил не ~1 SOL при запуске"
+        if MAIN in out and self.kind_of(data) == "copy":
+            age = data.get("age_s")
+            mc_usd = float(data.get("mc") or 0) * (self.e.price.value or 150)
+            min_age = float(self.cfg.get("paper_m_copy_min_age_s", M_COPY_MIN_AGE_S) or 0)
+            min_mc = float(self.cfg.get("paper_m_copy_min_mc_usd", M_COPY_MIN_MC_USD) or 0)
+            if age is not None and float(age) < min_age:
+                out.discard(MAIN)
+                self.skipped[MAIN] = f"M: монете {float(age):.0f} с — копии свежих монет в минусе (нужно {min_age:.0f}+ с)"
+            elif mc_usd and mc_usd < min_mc:
+                out.discard(MAIN)
+                self.skipped[MAIN] = f"M: капитализация ${mc_usd:,.0f} — копии дешёвых монет в минусе (нужно ${min_mc:,.0f}+)"
         if not out and not why:
             if "mydev" in modes:
                 why = "«Мой дев» — в бумагу не берём: за 2 дня −$8"
@@ -833,6 +901,8 @@ class PaperTrader:
         return datetime.now(self.reset_tz()).date().isoformat()
 
     def day_stop_usd(self, name: str) -> float:
+        if name == MAIN:
+            return round(self.start_usd() * float(self.cfg.get("paper_m_day_stop_pct", M_DAY_STOP_PCT) or 0), 2)
         if self.is_lottery(name):
             return float(self.cfg.get("paper_lottery_day_stop_usd", LOTTERY_DAY_STOP_USD) or 0)
         return round(self.start_usd() * float(self.cfg.get("paper_day_stop_pct", DAY_STOP_PCT) or 0), 2)
