@@ -510,6 +510,8 @@ async def test_no_reentry_after_loss_and_day_cap():
     noon = datetime(2026, 11, 7, 8, 0, tzinfo=timezone.utc)
     night = datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc)        # 02:00 Батуми
     from tests.conftest import REAL_DAY_CAP
+    assert REAL_DAY_CAP(tr, noon) is None                             # по умолчанию лимита нет (с 9.11)
+    tr.e.cfg = {"paper_day_cap_usd": 35}
     assert REAL_DAY_CAP(tr, noon) == pytest.approx(0.35) and REAL_DAY_CAP(tr, night) is None   # $35 при SOL $100
     tr.e.cfg = {"paper_day_cap_usd": 0}
     assert REAL_DAY_CAP(tr, noon) is None                             # 0 — без лимита
@@ -623,6 +625,11 @@ async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
         assert await tr._open("D", f"M{i}", "watch", None, {}, None, 30.0)
     assert await tr._open("D", "M9", "watch", None, {}, None, 30.0) is None and "лимит 8" in tr.skipped["D"]
     tr.positions.clear()
+    tr.day_pnl["D"] = tr.day_pnl["A"] = -0.6                     # по умолчанию дневных стопов нет (с 9.11)
+    assert await tr._open("D", "M10", "watch", None, {}, None, 30.0)
+    assert await tr._open("A", "M10", "normal", None, {}, None, 30.0)
+    tr.positions.clear()
+    tr.e.cfg = {"paper_lottery_day_stop_usd": 35, "paper_day_stop_pct": 0.25}   # включены в /settings
     tr.day_pnl["D"] = -0.36                                      # −$36 при SOL $100 (стоп $35)
     assert await tr._open("D", "M10", "watch", None, {}, None, 30.0) is None
     assert "дневной стоп" in tr.skipped["D"]
@@ -645,7 +652,7 @@ async def test_manual_reset_clears_lottery_day_stop():
         await db.migrate()
         settings = Settings(YamlConfig("config/config.yaml"))
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg=settings.effective(), states={}, ext=None)
+                              cfg={**settings.effective(), "paper_lottery_day_stop_usd": 35}, states={}, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         await db.execute("""INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol,
