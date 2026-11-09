@@ -7,11 +7,13 @@ score = сумма результатов / (копий + 4): средний р�
 
 Уровни и что они меняют (пороги — в /settings):
   🟢 топ    — score ≥ +4% на копию и 5+ копий: позиция ×1.5;
-  🟡 норм   — score ≥ −2%: обычная позиция;
-  ⚪ новый  — меньше 4 копий: позиция ×0.75, пока не наберётся история;
-  🟠 слабый — score от −6% до −2%: позиция ×0.5;
-  🔴 пауза  — score ниже −6% и 5+ копий: в боевые портфели не копируется, только в теневой H (по $10) —
+  🟡 норм   — score ≥ 0: обычная позиция;
+  ⚪ новый  — меньше 3 копий: позиция ×0.75, пока не наберётся история;
+  🟠 слабый — score от −3% до 0: позиция ×0.5;
+  🔴 пауза  — score ниже −3% и 3+ копии: в боевые портфели не копируется, только в теневой H (по $10) —
               если там исправится, вернётся сам.
+Пороги проверены «вперёд по времени» на 8–9.11 (решение — только по прошлым копиям): кошельки с оценкой ниже нуля
+дальше теряли −8.7% на копию (−$90 из −$108 всех одиночных копий), остальные — около нуля.
 Ручная правка: /rating адрес топ|норм|пауза|авто — «авто» возвращает автоматическую оценку.
 """
 from __future__ import annotations
@@ -32,10 +34,10 @@ WINDOW = 20
 SHRINK = 4
 EVERY_S = 300
 DEFAULTS: dict[str, Any] = {
-    "rating_top": 0.04,          # score для «топ»
-    "rating_ok": -0.02,          # ниже — «слабый»
-    "rating_pause": -0.06,       # ниже — пауза
-    "rating_min_copies": 5,      # копий для «топ» и паузы
+    "rating_top": 0.04,          # score для «топ» (и 5+ копий)
+    "rating_ok": 0.0,            # ниже — «слабый»
+    "rating_pause": -0.03,       # ниже — пауза
+    "rating_min_copies": 3,      # копий для паузы (до этого — «новый»)
     "rating_top_mult": 1.5,
     "rating_new_mult": 0.75,
     "rating_weak_mult": 0.5,
@@ -54,14 +56,17 @@ def score_of(pcts: list[float]) -> float:
     return sum(pcts) / (len(pcts) + SHRINK)
 
 
+TOP_MIN_COPIES = 5
+
+
 def tier_of(pcts: list[float], cfg: dict[str, Any]) -> str:
     n, s = len(pcts), score_of(pcts)
     need = int(cfg_get(cfg, "rating_min_copies"))
     if n >= need and s < cfg_get(cfg, "rating_pause"):
         return "paused"
-    if n < 4:
+    if n < need:
         return "new"
-    if n >= need and s >= cfg_get(cfg, "rating_top"):
+    if n >= TOP_MIN_COPIES and s >= cfg_get(cfg, "rating_top"):
         return "top"
     if s >= cfg_get(cfg, "rating_ok"):
         return "ok"

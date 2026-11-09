@@ -12,7 +12,8 @@ DSN = os.environ.get("TEST_DATABASE_URL", "postgresql://scanner:scanner@localhos
 
 
 def test_tiers():
-    assert tier_of([0.3, -0.1], {}) == "new"                           # мало копий
+    assert tier_of([0.3, -0.1], {}) == "new"                           # мало копий (меньше 3)
+    assert tier_of([-0.1, -0.1, -0.1], {}) == "paused"                 # три копии по −10% — уже пауза
     assert tier_of([0.25] * 6, {}) == "top"                           # +25% × 6 / (6 + 4) = +15%
     assert tier_of([0.25, -0.08, -0.08, 0.25, -0.08, 0.0], {}) == "ok"
     assert tier_of([-0.1, -0.1, 0.05, -0.1, 0.0], {}) == "weak"        # −25%/9 ≈ −2.8%
@@ -26,7 +27,7 @@ def test_paused_wallet_goes_to_shadow_and_size_follows_rating():
     tr.e.rating = {"BAD": {"tier": "paused", "mult": 0.0}, "TOP": {"tier": "top", "mult": 1.5}}
     data = {"modes": ["copy"], "traders": [{"address": "BAD"}], "copy_wallet": "BAD"}
     assert tr.route(data, "normal")[0] == {"H"} and "пауз" in tr.skipped["*"]
-    assert tr.route({**data, "copy_wallet": "TOP"}, "normal")[0] == set("ABCEFGM")
+    assert tr.route({**data, "copy_wallet": "TOP"}, "normal")[0] == set("ABCEFG")
     smart = {"modes": ["smart"], "traders": [{"address": "BAD"}], "source_wallet": "BAD"}
     assert tr.route(smart, "normal")[0] == {"H"}                       # smart-money тоже по рейтингу
     assert tr.wallet_rating("NEW")["tier"] == "new"

@@ -52,20 +52,28 @@ SMART_ONLY = ""               # smart-money — во все основные п�
 SCOUT = "H"
 SCOUT_MAX_OPEN = 10
 SCOUT_USD = 10.0
-# M — боевая версия: один портфель, как будет торговать бот на реальные деньги. Свои схемы выхода для копий, smart-money
-# и лотереи (подбор — бэктест всех сигналов 6–9.11 по минутным свечам рынка), размер копий — по рейтингу кошелька,
-# лимиты позиций по типу сигнала и дневной стоп.
+# M — боевая версия: один портфель, как бот торговал бы на реальные деньги. Подбор — бэктест всех сигналов 6–9.11
+# по минутным свечам рынка (модель сверена с бумагой на ценах Jupiter: −11.8% против −10.9% на сделку), со схемой G:
+#   сильная копия (твой кошелёк + ещё один отслеживаемый)   +11.8% на сделку, в плюсе 3 дня из 4, четвёртый ≈ 0
+#   smart-money, один кошелёк                                 +4.0% на сделку, в плюсе все дни
+#   одиночная копия своего кошелька                          −4.5% на сделку, в минусе каждый день  → в M не берём
+#   smart-money, 2+ кошелька разом                            −4.0% на сделку                         → в M не берём
+#   лотерея (дев ~1 SOL)                                     −15…−18% на билет                       → в M не берём
+# Вместе (позиция 20% ×1.5 у сильных, потолок 30%, дневной стоп −25%): $100 → $191 за 4 дня, ни одного дня в минусе.
+# Это подбор на тех же данных — вживую будет меньше; M на бумаге и покажет, сколько.
 MAIN = "M"
 M_KINDS: dict[str, dict[str, Any]] = {
-    "copy": {"stop": 0.15, "tp_net": 0.25, "tp_share": 0.7, "trail": 0.30, "time_stop_s": 300, "time_stop_gain": 0.10,
-             "follow_runner": False},
-    "smart": {"stop": 0.15, "tp_net": 0.25, "tp_share": 0.7, "trail": 0.30, "time_stop_s": 300,
-              "time_stop_gain": 0.10, "follow_runner": False},
+    # 85% на +25%, 15% — «раннер» с трейлингом 30%, не продаётся за трейдером (шанс на ракету стоит ~1% на сделку)
+    "copy": {"stop": 0.08, "tp_net": 0.25, "tp_share": 0.85, "trail": 0.30, "time_stop_s": 300,
+             "time_stop_gain": 0.10, "follow_runner": False},
+    "smart": {"stop": 0.08, "tp_net": 0.25, "tp_share": 1.0, "trail": None, "time_stop_s": 300, "time_stop_gain": 0.10},
     "lottery": {"stop": 0.15, "tp_net": 1.0, "tp_share": 0.34, "trail": 0.30, "trail_after_net": 0.5, "target": False,
                 "time_stop_s": 600, "time_stop_gain": 0.10, "max_hold_s": 4 * 3600},
 }
 M_MAX_OPEN = {"copy": 4, "smart": 3, "lottery": 4}
-# Фильтр копий для M (бэктест 6–9.11): копии свежих дешёвых монет — снайпинг, где мы заведомо опаздываем
+M_SINGLE_TIERS = ""            # одиночные копии в M — только у кошельков с этими уровнями рейтинга ("top"); пусто — нет
+M_SIZE_CAP = 0.30              # одна позиция M — не больше 30% баланса
+# Фильтр копий для M: свежие дешёвые монеты (по умолчанию выключен — сильные копии и так отбирают)
 M_COPY_MIN_AGE_S = 0.0
 M_COPY_MIN_MC_USD = 0.0
 M_LOTTERY_SHARE = 0.05
@@ -103,10 +111,12 @@ SCHEMES: dict[str, dict[str, Any]] = {
     "G": {**_G, "name": "G: всё на +25%, стоп −8%, 5 мин"},
     SCOUT: {**_G, "name": "H: испытательный срок — кандидаты разведки, как G, по $10"},
 }
-LEGEND = ("копии и smart (схемы 8.11): G всё на +25%, стоп −8% · A стоп −6%, ½ на +30%, трейл 15% · "
+LEGEND = ("M — боевая: сильные копии (2+ кошелька; 85% на +25%, 15% раннер) и одиночный smart (всё на +25%), стоп −8%, "
+          "позиция ≤30%, дневной стоп −25% · "
+          "копии и smart (схемы 8.11): G всё на +25%, стоп −8% · A стоп −6%, ½ на +30%, трейл 15% · "
           "B стоп −15%, ½ на +30%, трейл 15% · C только цель · F трейл 15% после +15% · E как G, стоп −15% · "
           "D — лотерея (дев купил ~1 SOL): треть на ×2, остаток трейл 30%, до 4 ч · H — испытание кандидатов "
-          "разведки (как G, по $10) · вход через 5 с · без дневных стопов · цены по рынку · старт $100")
+          "разведки (как G, по $10) · вход через 5 с · A–H без дневных стопов · цены по рынку · старт $100")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -554,7 +564,8 @@ class PaperTrader:
             # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
             size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
         size = max(size, min_size)                    # не мельче минимума…
-        size = min(size, self.balance[name] * 0.5)    # …но и не больше половины баланса
+        size = min(size, self.balance[name] * (float(self.cfg.get("paper_m_size_cap", M_SIZE_CAP)) if name == MAIN
+                                               else 0.5))    # …но и не больше половины баланса (M — 30%)
         cap = self.day_cap_sol() if lottery else None     # дневной лимит суммы — только на лотерею
         if cap is not None and size >= min_size:
             # днём торговля в минусе (6.11: копии 08–18 −0.03…−0.44 SOL во всех портфелях) — днём в позициях
@@ -850,8 +861,8 @@ class PaperTrader:
         out: set[str] = set()
         why = ""
         if "copy" in modes:
-            if len(data.get("traders") or []) >= 2 and not self.cfg.get("paper_strong_copies", False):
-                why = "сильная копия (2+ кошелька) — в бумагу не берём: за 2 дня −$32"
+            if len(data.get("traders") or []) >= 2 and not self.cfg.get("paper_strong_copies", True):
+                why = "сильные копии выключены (paper_strong_copies)"
             else:
                 out |= main
         if "smart" in modes:
@@ -867,10 +878,22 @@ class PaperTrader:
                     self.skipped[n] = (f"{n}: дев купил не ~1 SOL при запуске (доля {float(share or 0):.1%}, "
                                        f"нужно {lo:.1%}–{hi:.1%})")
             out |= lot
-            if lot and self.cfg.get("paper_m_lottery", True):
+            if lot and self.cfg.get("paper_m_lottery", False):
                 out.add(MAIN)                        # боевая версия берёт и билеты лотереи (маленькие)
             if not lot and not out:
                 why = "лотерея D: дев купил не ~1 SOL при запуске"
+        if MAIN in out:
+            kind = self.kind_of(data)
+            strong = level == "strong" or len(data.get("traders") or []) >= 2
+            tiers = {t.strip() for t in str(self.cfg.get("paper_m_single_tiers", M_SINGLE_TIERS) or "").split(",")
+                     if t.strip()}
+            wallet = data.get("copy_wallet") or data.get("source_wallet")
+            if kind == "copy" and not strong and not (wallet and self.wallet_rating(wallet).get("tier") in tiers):
+                out.discard(MAIN)
+                self.skipped[MAIN] = "M: одиночные копии по рынку в минусе (−4.5% на сделку) — берём сильные (2+ кошелька)"
+            elif kind == "smart" and strong and not self.cfg.get("paper_m_smart_strong", False):
+                out.discard(MAIN)
+                self.skipped[MAIN] = "M: smart 2+ кошелька разом по рынку в минусе — берём одиночный smart"
         if MAIN in out and self.kind_of(data) == "copy":
             age = data.get("age_s")
             mc_usd = float(data.get("mc") or 0) * (self.e.price.value or 150)

@@ -18,7 +18,9 @@ from ..analytics.copyguard import DEFAULTS as _COPY_DEFAULTS  # noqa: E402
 NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005, "paper_min_position_sol": 0.05,
                 "paper_day_cap_usd": 0, "paper_day_from_h": 8, "paper_day_to_h": 18, "paper_reentry_cooldown_min": 60,
                 "paper_start_usd": 100, "paper_lottery_day_stop_usd": 0, "paper_day_stop_pct": 0,
-                "paper_scout_usd": 10, "scout_slots": 20, "scout_max_auto": 15, "scout_min_copies": 6}
+                "paper_scout_usd": 10, "scout_slots": 20, "scout_max_auto": 15, "scout_min_copies": 6,
+                "paper_m_day_stop_pct": 0.25, "paper_m_size_cap": 0.30, "rating_top": 0.04, "rating_pause": -0.03,
+                "rating_top_mult": 1.5}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database

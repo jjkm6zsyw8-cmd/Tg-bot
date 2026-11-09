@@ -581,32 +581,38 @@ async def test_daily_reset_with_summary(monkeypatch):
 
 
 def test_route_signals_to_portfolios():
-    """Одиночные копии и smart-money — во все основные A, B, C, E, F, G (как 8.11); «Наблюдение» (режим «Девы») —
-    лотерея D; сильные копии, «Мой дев» и новые монеты — в бумагу не идут."""
+    """Копии и smart-money — во все основные A, B, C, E, F, G (как 8.11); боевой M — только сильные копии (2+
+    кошелька) и одиночный smart (по рынку одиночные копии и smart 2+ в минусе); «Наблюдение» — лотерея D;
+    «Мой дев» и новые монеты — в бумагу не идут."""
     tr = bare_trader({})
-    main, lottery = set("ABCEFGM"), {"D", "M"}                     # M — боевая версия: и копии, и билеты лотереи
-    smart = main
-    assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main
-    targets, why = tr.route({"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}, "strong")
-    assert not targets and "сильная копия" in why
-    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == smart
+    main, lottery = set("ABCEFG"), {"D"}
+    assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main     # одиночная — без M
+    assert "сильные" in tr.skipped["M"]
+    strong = {"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}
+    assert tr.route(strong, "strong")[0] == main | {"M"}                                          # сильная — и в M
+    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == main | {"M"}
+    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}, {"address": "T"}]}, "strong")[0] == main
+    smart = main | {"M"}
     one_sol = {"cluster": 0.0342}                                 # дев купил ~1 SOL при запуске
     assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == lottery
     targets, why = tr.route({"modes": ["dev"], "metrics": {"cluster": 0.12}}, "watch")      # D — только ~1 SOL
     assert not targets and "дев купил не ~1 SOL" in why and "дев купил не ~1 SOL" in tr.skipped["D"]
     assert not tr.route({"modes": ["dev"]}, "watch")[0]                                     # нет замера — не берём
     assert tr.route({"modes": ["dev", "copy"], "traders": [{"address": "W"}], "metrics": one_sol},
-                    "strong")[0] == main | lottery
+                    "strong")[0] == main | lottery | {"M"}
     assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
     assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
     assert tr.route({}, "normal")[0] == set(pp.SCHEMES) - {"H"}   # старые вызовы без modes — во все, кроме H
     assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H"}  # кандидат разведки — только испытательный H
     assert "H" not in main | smart | lottery
-    tr.e.cfg = {"paper_strong_copies": True}
-    assert tr.route({"modes": ["copy"], "traders": [{}, {}]}, "strong")[0] == main
+    tr.e.cfg = {"paper_strong_copies": False}
+    targets, why = tr.route({"modes": ["copy"], "traders": [{}, {}]}, "strong")
+    assert not targets and "сильные копии выключены" in why
     tr.e.cfg = {"paper_smart_portfolios": "F"}                      # можно снова мерить smart отдельно
     assert tr.route({"modes": ["smart"]}, "normal")[0] == {"F"}
-    assert tr.route({"modes": ["copy"], "traders": [{}]}, "normal")[0] == set("ABCEGM")
+    assert tr.route({"modes": ["copy"], "traders": [{}]}, "normal")[0] == set("ABCEG")
+    tr.e.cfg = {"paper_m_lottery": True}                            # лотерею в M можно включить
+    assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == {"D", "M"}
 
 
 async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
@@ -821,10 +827,18 @@ async def test_main_portfolio_m():
     assert await tr._open("M", "C2", "normal", None, copy, "W", 30.0)                        # копии — свой лимит
     # фильтр копий M: свежая монета — только в остальные портфели
     tr.e.cfg = {"paper_m_copy_min_age_s": 120, "paper_m_copy_min_mc_usd": 10000}
-    assert "M" not in tr.route({**copy, "age_s": 30, "mc": 200.0}, "normal")[0]
-    assert "M" not in tr.route({**copy, "age_s": 600, "mc": 50.0}, "normal")[0]             # $5k при SOL $100
-    assert "M" in tr.route({**copy, "age_s": 600, "mc": 200.0}, "normal")[0]
+    strong = {**copy, "traders": [{"address": "W"}, {"address": "X"}]}
+    assert "M" not in tr.route({**strong, "age_s": 30, "mc": 200.0}, "strong")[0]
+    assert "M" not in tr.route({**strong, "age_s": 600, "mc": 50.0}, "strong")[0]           # $5k при SOL $100
+    assert "M" in tr.route({**strong, "age_s": 600, "mc": 200.0}, "strong")[0]
+    assert "M" not in tr.route({**copy, "age_s": 600, "mc": 200.0}, "normal")[0]            # одиночная — не в M
+    tr.e.cfg = {"paper_m_single_tiers": "top"}
+    tr.e.rating = {"W": {"tier": "top", "mult": 1.5}}
+    assert "M" in tr.route({**copy, "age_s": 600, "mc": 200.0}, "normal")[0]                # …кроме «топа», если включено
+    assert "M" not in tr.route({"modes": ["dev"], "metrics": {"cluster": 0.034}}, "watch")[0]
+    tr.e.cfg = {"paper_m_lottery": True}
     assert "M" in tr.route({"modes": ["dev"], "metrics": {"cluster": 0.034}}, "watch")[0]
+    tr.e.rating = {"W": {"tier": "ok", "mult": 1.0}}
     # раннер: после частичного тейка остаток не продаётся за трейдером
     checked = []
 
