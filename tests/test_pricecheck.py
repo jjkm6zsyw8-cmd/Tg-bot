@@ -45,7 +45,7 @@ async def test_run_once_marks_bad_positions():
     try:
         await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
         await db.migrate()
-        now = time.time() - 600
+        now = time.time() - 2400                     # путь цены пишется, когда со входа прошло 31 мин
         t = now - now % 60
         pid = {}
         for name, exit_mc in (("OK", 70.0), ("BAD", 33.0)):
@@ -57,7 +57,8 @@ async def test_run_once_marks_bad_positions():
             await db.execute("""INSERT INTO paper_trades(position_id, portfolio, side, ts, mc, sol, tokens, fee_sol)
                                 VALUES ($1, 'A', 'sell', to_timestamp($2), $3, 0.04, 1, 0)""", pid[name], t + 70, exit_mc)
         pc = PriceCheck(SimpleNamespace(db=db, price=SimpleNamespace(value=100.0)))
-        cs = [candle(t, 6.9e-6, 7.2e-6), candle(t + 60, 6.9e-6, 7.2e-6)]
+        cs = [candle(t, 6.9e-6, 7.2e-6), candle(t + 60, 6.9e-6, 7.2e-6), candle(t + 120, 6.0e-6, 14e-6),
+              candle(t + 600, 9e-6, 10e-6)]
 
         async def fake_candles(http, mint):
             return cs
@@ -67,6 +68,11 @@ async def test_run_once_marks_bad_positions():
         assert rows["OK"]["price_check"] == "ok" and not rows["OK"]["suspect"]
         assert rows["BAD"]["price_check"] == "exit" and rows["BAD"]["suspect"]
         assert pc.stats["checked"] == 2 and pc.stats["bad"] == 1
+        path = await db.fetchrow("SELECT path_mfe, path_mae, path_dip, path_peak_s, path_p30 FROM paper_positions "
+                                 "WHERE mint='OK'")
+        assert path["path_mfe"] == pytest.approx(1.0)                          # пик 14e-6 при входе 7e-6 — ×2
+        assert path["path_dip"] == pytest.approx(6.0 / 7.0 - 1)                # до пика проседала до 6e-6
+        assert path["path_peak_s"] == pytest.approx(110) and path["path_p30"] == pytest.approx(10 / 7 - 1)
         assert await pc.run_once(None) == 0                                     # уже проверены
     finally:
         await db.close()

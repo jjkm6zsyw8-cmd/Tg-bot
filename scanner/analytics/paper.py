@@ -46,37 +46,38 @@ LOTTERY_DAY_STOP_USD = 35.0   # лотерея потеряла за день $3
 # Проверка фильтра: D берёт только запуски, где дев купил ~1 SOL (3–3.5% монет у кластера дева в момент алерта),
 # E — все. По 9008 алертам «Наблюдения»: у таких ракет ×3+ 4.2% против 2.1% у остальных (оба дня одинаково)
 DAY_CAP_USD = 35.0            # днём в позициях лотереи не больше $35 (треть старта)
+SMART_ONLY = "F"              # smart-money — отдельный портфель: меряем его без примеси копий
+DAY_STOP_PCT = 0.25           # портфель копий за день потерял 25% старта — до 00:00/сброса новых входов нет
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
-ENTRY_DELAY_S = 5.0
+ENTRY_DELAY_S = 2.0          # бот входит за 1–2 с (было 5 с «на реакцию человека»)
 EXIT_DELAY_S = 2.0
 MAX_HOLD_S = 2 * 3600          # страховка: позиция по «мёртвой» монете закрывается через 2 часа
 
+# Портфели-эксперименты (с 10.11): копии торгуют A, B, C, E, G — у каждого одно отличие от эталона G; F — только
+# smart-money (мерить отдельно), D — лотерея. Минутные свечи 8–9.11 (181 сигнал): ширина стопа почти не влияет
+# (−8%: −7.5% на сделку, −15%: −8.9%, без стопа −10.1%), вход на просадке хуже (−14…−18% против −6%), а у копий
+# решают секунды входа — поэтому сравниваем вживую, а вход ускорен до 2 с
+_G = {"stop": 0.08, "tp_net": 0.25, "tp_share": 1.0, "trail": None, "target": False, "time_stop_s": 300,
+      "time_stop_gain": 0.10}
 SCHEMES: dict[str, dict[str, Any]] = {
-    "A": {"name": "A: стоп −6%", "stop": 0.06, "tp_net": 0.30, "tp_share": 0.5, "trail": 0.15, "target": True,
-          "time_stop_s": 600, "time_stop_gain": 0.10},
-    "B": {"name": "B: базовая", "stop": 0.15, "tp_net": 0.30, "tp_share": 0.5, "trail": 0.15, "target": True,
-          "time_stop_s": 600, "time_stop_gain": 0.10},
-    "C": {"name": "C: только экстренный выход и цель", "stop": None, "tp_net": None, "tp_share": 0.0, "trail": None,
-          "target": True, "time_stop_s": None, "time_stop_gain": None},
+    "A": {**_G, "name": "A: как G, но стоп −15%", "stop": 0.15},
+    "B": {**_G, "name": "B: 70% на +25%, остаток трейлинг 30%", "tp_share": 0.70, "trail": 0.30},
+    "C": {**_G, "name": "C: как G, но не продаёт вслед за трейдером", "ignore_trader_sell": True},
     # D — лотерея, ловит иксы: 9.11 ALICE дошла до ×20, BUIDL до ×19.7, а «половина на +20%, трейл 10%» забрали
     # ×8.5 и ×8. Теперь: треть на ×2 (отбить билет), остаток — трейлинг 30% от пика, включается после +50%;
     # держим до 4 часов (90CENT 6.11 росла ×55 за 2 часа)
     "D": {"name": "D: лотерея — треть на ×2, остаток трейлинг 30% после +50%, стоп −15%", "stop": 0.15,
           "tp_net": 1.0, "tp_share": 0.34, "trail": 0.30, "trail_after_net": 0.5, "target": False,
           "time_stop_s": 600, "time_stop_gain": 0.10, "max_hold_s": 4 * 3600},
-    # E — копии и smart, как G, но вся позиция на +40%: сравнить, где фиксировать лучше (+25% или +40%)
-    "E": {"name": "E: всё на +40%, стоп −8%, 5 мин", "stop": 0.08, "tp_net": 0.40, "tp_share": 1.0,
-          "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
-    "F": {"name": "F: без тейка, трейл 15% после +15%, стоп −10%", "stop": 0.10, "tp_net": None, "tp_share": 0.0,
-          "trail": 0.15, "trail_after_net": 0.15, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
-    "G": {"name": "G: скальп — всё на +25%, стоп −8%, 5 мин", "stop": 0.08, "tp_net": 0.25, "tp_share": 1.0,
-          "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
+    "E": {**_G, "name": "E: всё на +40%", "tp_net": 0.40},
+    "F": {**_G, "name": "F: только smart-money, как G"},
+    "G": {**_G, "name": "G: эталон — всё на +25%, стоп −8%, 5 мин"},
 }
-LEGEND = ("A, B, C, E, F, G — одиночные копии и smart: A стоп−6% · B база · C только цель · E всё на +40% · "
-          "F трейл после +15% · G всё на +25% · D — лотерея «Наблюдение» (дев купил ~1 SOL): треть на ×2, остаток "
-          "трейл 30%, держит до 4 ч · билет 10% (от $1.8), до 8 мест, дневной стоп −$35 · цены — по рынку (Jupiter) "
-          "· старт $100")
+LEGEND = ("копии: G эталон (всё на +25%, стоп −8%) · A стоп −15% · B 70% на +25%, остаток трейл 30% · "
+          "C не продаёт за трейдером · E всё на +40% · F — только smart-money · D — лотерея (дев купил ~1 SOL): "
+          "треть на ×2, остаток трейл 30%, до 4 ч · дневной стоп: копии −25%, лотерея −$35 · цены по рынку · "
+          "старт $100")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -480,9 +481,8 @@ class PaperTrader:
         if len(open_here) >= max_open:
             self.skipped[name] = f"лимит {max_open} открытых позиций"
             return None
-        if lottery and self.lottery_stopped(name):
-            self.skipped[name] = (f"лотерея: за сегодня −${float(self.cfg.get('paper_lottery_day_stop_usd', LOTTERY_DAY_STOP_USD)):g}"
-                                  " — дневной стоп до 00:00")
+        if self.day_stopped(name):
+            self.skipped[name] = f"дневной стоп: за сегодня −${self.day_stop_usd(name):g} — новых входов нет до 00:00"
             return None
         if mint in self.rugged:
             # регрессия 6.11: D семь раз за 20 минут входил в раг NORTHKOREA (−56…−99% каждый раз)
@@ -562,7 +562,8 @@ class PaperTrader:
             emergency = "emergency"
         for p in ps:
             reason = emergency
-            if reason is None and p.trader and trader == p.trader and not is_buy:
+            if (reason is None and p.trader and trader == p.trader and not is_buy
+                    and not self.scheme_for(p).get("ignore_trader_sell")):
                 reason = "trader_sell"
             if reason is None:
                 continue          # цены ведёт tick_loop по рыночной цене; из своего потока — только сигналы выхода
@@ -773,7 +774,8 @@ class PaperTrader:
         if not modes:
             return set(SCHEMES), ""
         lottery = {n for n in SCHEMES if self.is_lottery(n)}
-        main = set(SCHEMES) - lottery
+        smart_only = set(str(self.cfg.get("paper_smart_portfolios", SMART_ONLY))) & set(SCHEMES) - lottery
+        main = set(SCHEMES) - lottery - smart_only
         out: set[str] = set()
         why = ""
         if "copy" in modes:
@@ -782,7 +784,7 @@ class PaperTrader:
             else:
                 out |= main
         if "smart" in modes:
-            out |= main
+            out |= smart_only or main
         if "dev" in modes:
             lot = set(lottery)
             share = (data.get("metrics") or {}).get("cluster")
@@ -813,6 +815,20 @@ class PaperTrader:
 
     def day_key(self) -> str:
         return datetime.now(self.reset_tz()).date().isoformat()
+
+    def day_stop_usd(self, name: str) -> float:
+        if self.is_lottery(name):
+            return float(self.cfg.get("paper_lottery_day_stop_usd", LOTTERY_DAY_STOP_USD) or 0)
+        return round(self.start_usd() * float(self.cfg.get("paper_day_stop_pct", DAY_STOP_PCT) or 0), 2)
+
+    def day_stopped(self, name: str) -> bool:
+        """Портфель за сегодня (с 00:00 по Батуми или с последнего сброса) в минусе больше дневного стопа."""
+        stop_usd = self.day_stop_usd(name)
+        if stop_usd <= 0:
+            return False
+        if self._day_key != self.day_key():
+            self._day_key, self.day_pnl = self.day_key(), {}
+        return self.day_pnl.get(name, 0.0) * (self.e.price.value or 150) <= -stop_usd
 
     def lottery_stopped(self, name: str) -> bool:
         """Лотерея портфеля за сегодня в минусе больше дневного стопа (по закрытым сделкам)."""

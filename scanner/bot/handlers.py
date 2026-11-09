@@ -17,7 +17,7 @@ from ..analytics.copyguard import DEFAULTS as _COPY_DEFAULTS  # noqa: E402
 
 NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005, "paper_min_position_sol": 0.05,
                 "paper_day_cap_usd": 35, "paper_day_from_h": 8, "paper_day_to_h": 18, "paper_reentry_cooldown_min": 60,
-                "paper_start_usd": 100, "paper_lottery_day_stop_usd": 35}
+                "paper_start_usd": 100, "paper_lottery_day_stop_usd": 35, "paper_day_stop_pct": 0.25}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -620,6 +620,21 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await db.job("paper", {"cmd": "reset"})
             return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
         await paper_answer(m, cmd, 24 if cmd == "trades" else None)
+
+    @router.message(Command("calib"))
+    async def cmd_calib(m: Message, command: CommandObject) -> None:
+        """Калибровка стопов и тейков по пути цены после входа (/calib 14 — за 14 дней)."""
+        from ..reports.calib import calib_report
+        arg = (command.args or "").strip().lower().rstrip("dд")
+        days = min(60.0, max(1.0, float(arg))) if arg.replace(".", "", 1).isdigit() else 7.0
+        text, chunk = await calib_report(db, days), ""
+        for line in text.split("\n"):                       # режем по строкам, чтобы не порвать HTML-теги
+            if len(chunk) + len(line) > 3900:
+                await reply(m, chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            await reply(m, chunk)
 
     @router.message(Command("tune"))
     async def cmd_tune(m: Message) -> None:

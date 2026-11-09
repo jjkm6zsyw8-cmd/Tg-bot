@@ -5,6 +5,10 @@
 Теперь бот сам ловит такие сделки: цена вне свечи своей минуты (с допуском 15%) — позиция помечается ⚠
 (suspect) и не идёт в итоги, в отчёте /paper видно, сколько сделок проверено и сколько отброшено.
 
+Заодно по тем же свечам записывается путь цены за 30 минут после входа (рост, просадка, просадка до пика,
+время до пика, цена через 30 мин) — на этом /calib подбирает стопы и тейки по реальной истории сигналов.
+Поэтому сделку проверяем, когда со входа прошло 31 минута.
+
 GeckoTerminal бесплатно — ~30 запросов в минуту на всех; «Тренды» берут до 12, самопроверка — до 10.
 На монету 2–3 запроса (пулы + минутные свечи двух пулов), свечи кешируются на 10 минут.
 """
@@ -28,6 +32,18 @@ GECKO = "https://api.geckoterminal.com/api/v2/networks/solana"
 TOLERANCE = 1.15          # цена может выйти за свечу своей минуты не больше чем на 15% (курс SOL, разные пулы)
 CHECK_EVERY_S = 60.0
 CANDLE_TTL_S = 600.0
+PATH_S = 1800.0           # путь цены — 30 минут после входа
+
+
+def path_stats(candles: list[list[float]], t0: float, entry_usd: float) -> dict[str, float] | None:
+    """Путь цены за 30 мин после входа: рост, просадка, просадка до пика, секунд до пика, цена через 30 мин."""
+    after = sorted((c for c in candles if t0 - 60 < c[0] <= t0 + PATH_S), key=lambda c: c[0])
+    if len(after) < 2 or entry_usd <= 0:
+        return None
+    k = max(range(len(after)), key=lambda i: after[i][2])
+    return {"mfe": after[k][2] / entry_usd - 1, "mae": min(c[3] for c in after) / entry_usd - 1,
+            "dip": min(0.0, min(c[3] for c in after[:k + 1]) / entry_usd - 1),
+            "peak_s": max(0.0, after[k][0] - t0), "p30": after[-1][4] / entry_usd - 1}
 
 
 def within(price: float, lo: float, hi: float, tol: float = TOLERANCE) -> bool:
@@ -105,7 +121,7 @@ class PriceCheck:
         rows = await self.db.fetch(
             """SELECT id, mint, opened_at, entry_mc FROM paper_positions
                WHERE closed_at IS NOT NULL AND exit_reason <> 'reset' AND price_check IS NULL
-                 AND closed_at < now() - interval '90 seconds' AND closed_at > now() - interval '12 hours'
+                 AND opened_at < now() - interval '31 minutes' AND closed_at > now() - interval '12 hours'
                ORDER BY closed_at LIMIT 60""")
         if not rows:
             return 0
@@ -124,8 +140,11 @@ class PriceCheck:
             v = self.verdict(candles, (r["opened_at"].timestamp(), float(r["entry_mc"] or 0)),
                              sells.get(r["id"], []), sol_usd)
             bad = v in ("entry", "exit")
+            ps = path_stats(candles, r["opened_at"].timestamp(), float(r["entry_mc"] or 0) * sol_usd / 1e9)
             await self.db.execute(
-                "UPDATE paper_positions SET price_check=$2, suspect = suspect OR $3 WHERE id=$1", r["id"], v, bad)
+                """UPDATE paper_positions SET price_check=$2, suspect = suspect OR $3, path_mfe=$4, path_mae=$5,
+                       path_dip=$6, path_peak_s=$7, path_p30=$8 WHERE id=$1""",
+                r["id"], v, bad, *(ps[k] if ps else None for k in ("mfe", "mae", "dip", "peak_s", "p30")))
             self.stats["checked"] += 1
             self.stats["bad"] += bad
             self.stats["nodata"] += v == "nodata"

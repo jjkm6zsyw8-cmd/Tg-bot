@@ -447,3 +447,9 @@ ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS suspect boolean NOT NULL DE
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS rule text;   -- copy — выход копии по своему правилу
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS source_wallet text;
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS price_check text;   -- самопроверка по свечам GeckoTerminal: ok | entry | exit | nodata   -- чья копия / чей запуск (кошелёк из своего списка)
+-- путь цены за 30 мин после входа (минутные свечи GeckoTerminal) — для самонастройки стопов и тейков (/calib)
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_mfe double precision;     -- лучший рост от входа
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_mae double precision;     -- худшая просадка от входа
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_dip double precision;     -- просадка ДО пика
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_peak_s double precision;  -- через сколько секунд пик
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_p30 double precision;     -- где цена через 30 мин

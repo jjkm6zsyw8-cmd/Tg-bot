@@ -27,6 +27,25 @@ def test_fees_and_slippage_are_realistic():
     assert big.tokens / 5.0 < small.tokens / 0.04
 
 
+# Схемы, на которых проверяется механика решений (портфели с 10.11 стали экспериментами вокруг G)
+OLD = {
+    "A": {"stop": 0.06, "tp_net": 0.30, "tp_share": 0.5, "trail": 0.15, "target": True, "time_stop_s": 600,
+          "time_stop_gain": 0.10},
+    "B": {"stop": 0.15, "tp_net": 0.30, "tp_share": 0.5, "trail": 0.15, "target": True, "time_stop_s": 600,
+          "time_stop_gain": 0.10},
+    "C": {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": None, "target": True, "time_stop_s": None,
+          "time_stop_gain": None},
+    "F": {"stop": 0.10, "tp_net": None, "tp_share": 0.0, "trail": 0.15, "trail_after_net": 0.15, "target": True,
+          "time_stop_s": 600, "time_stop_gain": 0.10},
+}
+
+
+@pytest.fixture
+def old_schemes(monkeypatch):
+    for k, v in OLD.items():
+        monkeypatch.setitem(pp.SCHEMES, k, v)
+
+
 def pos(entry=40.0, target=80.0) -> Position:
     f = buy_fill(entry, 0.2, 125, 0.0005)
     return Position(id=1, portfolio="B", mint="M", opened_ts=0, entry_mc=entry, cost_sol=0.2, tokens=f.tokens,
@@ -34,7 +53,7 @@ def pos(entry=40.0, target=80.0) -> Position:
 
 
 def test_exit_rules_scheme_b():
-    s = pp.SCHEMES["B"]
+    s = OLD["B"]
     assert decide_exit(pos(), 33.0, 10, s, 125, 0.0005) == ("stop", 1.0)           # −17.5% по цене
     p = pos()
     r = decide_exit(p, 56.0, 10, s, 125, 0.0005)
@@ -48,14 +67,14 @@ def test_exit_rules_scheme_b():
 
 
 def test_exit_rules_a_and_c():
-    assert decide_exit(pos(), 37.0, 10, pp.SCHEMES["A"], 125, 0.0005) == ("stop", 1.0)   # −6% хватает
-    c = pp.SCHEMES["C"]
+    assert decide_exit(pos(), 37.0, 10, OLD["A"], 125, 0.0005) == ("stop", 1.0)   # −6% хватает
+    c = OLD["C"]
     assert decide_exit(pos(), 20.0, 10, c, 125, 0.0005) is None                         # без ценового стопа
     assert decide_exit(pos(), 60.0, 10, c, 125, 0.0005) is None                         # без тейк-профита
     assert decide_exit(pos(), 80.0, 10, c, 125, 0.0005)[0] == "target"
 
 
-async def test_paper_trader_full_cycle(monkeypatch):
+async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
     from scanner.config import Settings, YamlConfig
     from scanner.db.pool import Database
     try:
@@ -135,9 +154,9 @@ async def test_exit_uses_current_price_not_peak(monkeypatch):
 def test_position_without_price_still_hits_time_rules():
     """Регрессия: позиция без источника цены висела часами и не закрывалась."""
     p = pos(entry=40.0)
-    assert decide_exit(p, 40.0, 601, pp.SCHEMES["A"], 125, 0.0005) == ("time_stop", 1.0)
+    assert decide_exit(p, 40.0, 601, OLD["A"], 125, 0.0005) == ("time_stop", 1.0)
     p2 = pos(entry=40.0)
-    assert decide_exit(p2, 40.0, pp.MAX_HOLD_S + 1, pp.SCHEMES["C"], 125, 0.0005) == ("max_hold", 1.0)
+    assert decide_exit(p2, 40.0, pp.MAX_HOLD_S + 1, OLD["C"], 125, 0.0005) == ("max_hold", 1.0)
 
 
 def test_new_schemes_d_to_g():
@@ -160,7 +179,7 @@ def test_new_schemes_d_to_g():
     assert decide_exit(pos(), 56.0, 10, e, 125, 0.0005) is None                         # +36% чистыми — мало
     assert decide_exit(pos(), 58.5, 10, e, 125, 0.0005) == ("take_profit", 1.0)
     assert decide_exit(pos(), 36.5, 10, e, 125, 0.0005) == ("stop", 1.0)               # −8.75%
-    f = pp.SCHEMES["F"]
+    f = OLD["F"]
     p = pos()
     assert decide_exit(p, 46.0, 10, f, 125, 0.0005) is None                             # +15% цены ≈ +10% чистыми
     assert decide_exit(p, 52.0, 20, f, 125, 0.0005) is None                             # трейлинг включился
@@ -208,6 +227,7 @@ def bare_trader(states, ext=None) -> pp.PaperTrader:
     tr.positions = {}
     tr.jup_cache = {}
     tr.entry_fixed = tr.exit_fixed = tr.false_exits = tr.no_price = tr.bad_prices = 0
+    tr.day_pnl, tr._day_key = {}, tr.day_key()
     return tr
 
 
@@ -252,7 +272,7 @@ async def test_entry_price_sources(monkeypatch):
     assert not opened and "нет подтверждённой цены" in tr.skipped["*"] and tr.no_price == 1
 
 
-async def test_price_jump_needs_confirmation(monkeypatch):
+async def test_price_jump_needs_confirmation(monkeypatch, old_schemes):
     monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
     tr = bare_trader({})
     sold = []
@@ -284,7 +304,7 @@ async def test_exit_price_capped_against_glitch():
     assert await tr.current_mc(p) == 50.0
 
 
-async def test_persistent_dexscreener_glitch_needs_jupiter(monkeypatch):
+async def test_persistent_dexscreener_glitch_needs_jupiter(monkeypatch, old_schemes):
     """Регрессия: DexScreener несколько проверок подряд показывал $306M вместо $20k (пара к экзотическому токену)."""
     tr = bare_trader({}, FakeExt(0, jup=None))
     tr.bad_prices = 0
@@ -357,7 +377,7 @@ async def test_price_exit_needs_confirmation_after_delay(monkeypatch):
     assert sold[-1][0] == "emergency"                   # экстренный выход — без проверки
 
 
-async def test_own_stream_jump_checked_with_jupiter(monkeypatch):
+async def test_own_stream_jump_checked_with_jupiter(monkeypatch, old_schemes):
     """Свой поток стабильно показывал ×17 (пул не к SOL) — подтверждение повтором не спасало. Теперь — Jupiter."""
     monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
     tr = bare_trader({}, FakeExt(0, jup=40 * 100 / 1e9))       # Jupiter: MC 40 SOL при SOL $100
@@ -423,7 +443,7 @@ def test_copy_follows_portfolio_scheme():
         p = Position(id=1, portfolio=name, mint="M", opened_ts=0, entry_mc=1, cost_sol=1, tokens=1,
                      tokens_initial=1, target_mc=None, rule="copy")
         assert tr.scheme_for(p) is pp.SCHEMES[name]
-    c = pp.SCHEMES["C"]
+    c = OLD["C"]
     assert decide_exit(pos(entry=5.0, target=7.0), 36.0, 60, c, 125, 0.0005)[0] == "target"   # ×7 — по цели
 
 
@@ -555,14 +575,14 @@ async def test_daily_reset_with_summary(monkeypatch):
 
 
 def test_route_signals_to_portfolios():
-    """Одиночные копии и smart — в A, B, C, E, F, G; «Наблюдение» (режим «Девы») — лотерея D;
+    """Одиночные копии — в A, B, C, E, G; smart-money — только в F; «Наблюдение» (режим «Девы») — лотерея D;
     сильные копии, «Мой дев» и новые монеты — в бумагу не идут."""
     tr = bare_trader({})
-    main, lottery = set("ABCEFG"), set("D")
+    main, lottery, smart = set("ABCEG"), set("D"), {"F"}
     assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main
     targets, why = tr.route({"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}, "strong")
     assert not targets and "сильная копия" in why
-    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == main
+    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == smart
     one_sol = {"cluster": 0.0342}                                 # дев купил ~1 SOL при запуске
     assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == lottery
     targets, why = tr.route({"modes": ["dev"], "metrics": {"cluster": 0.12}}, "watch")      # D — только ~1 SOL
@@ -606,8 +626,10 @@ async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
     tr.day_pnl["D"] = -0.36                                      # −$36 при SOL $100 (стоп $35)
     assert await tr._open("D", "M10", "watch", None, {}, None, 30.0) is None
     assert "дневной стоп" in tr.skipped["D"]
-    tr.day_pnl["A"] = -0.5                                       # основной портфель: стопа лотереи нет
+    tr.day_pnl["A"] = -0.2                                       # копии: −$20 из дневного стопа −$25 — ещё входим
     assert await tr._open("A", "M11", "normal", None, {}, None, 30.0) == pytest.approx(0.05)
+    tr.day_pnl["A"] = -0.3                                       # −$30 — дневной стоп копий (25% от $100)
+    assert await tr._open("A", "M12", "normal", None, {}, None, 30.0) is None and "дневной стоп" in tr.skipped["A"]
 
 
 async def test_manual_reset_clears_lottery_day_stop():
@@ -721,3 +743,31 @@ async def test_stop_needs_confirmed_price(monkeypatch):
     p.closing = True
     await tr._exit_later(p, "stop", 1.0)
     assert sold == [("stop", 30.0)]
+
+
+async def test_experiment_schemes():
+    """Эксперименты вокруг G: A — стоп −15%, B — 70% на +25% и остаток трейлингом, C — не продаёт за трейдером,
+    E — всё на +40%."""
+    g, a, b, e = (pp.SCHEMES[k] for k in "GABE")
+    assert decide_exit(pos(), 36.0, 10, g, 125, 0.0005) == ("stop", 1.0)          # −10% — стоп G
+    assert decide_exit(pos(), 36.0, 10, a, 125, 0.0005) is None                    # A держит до −15%
+    assert decide_exit(pos(), 33.5, 10, a, 125, 0.0005) == ("stop", 1.0)
+    pb = pos()
+    assert decide_exit(pb, 53.0, 10, b, 125, 0.0005) == ("take_profit", 0.70)     # 70% на +25%
+    pb.tp_done = True
+    assert decide_exit(pb, 120.0, 20, b, 125, 0.0005) is None                      # остаток едет за иксом
+    assert decide_exit(pb, 80.0, 30, b, 125, 0.0005) == ("trailing", 1.0)         # −33% от пика
+    assert decide_exit(pos(), 53.0, 10, e, 125, 0.0005) is None                    # E ждёт +40%
+    tr = bare_trader({})
+    checked = []
+
+    async def fake_check(p, mc, reason, price_usd=None):
+        checked.append((p.portfolio, reason))
+    tr._check = fake_check
+    for i, name in enumerate("CG"):
+        p = pos()
+        p.id, p.portfolio, p.trader = i + 1, name, "W"
+        tr.positions[p.id] = p
+    st = SimpleNamespace(mint="M", mc=40.0)
+    await tr.on_trade(st, None, "W", False)                                        # трейдер продал
+    assert checked == [("G", "trader_sell")]                                       # C не идёт за ним
