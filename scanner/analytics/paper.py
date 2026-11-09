@@ -610,12 +610,22 @@ class PaperTrader:
         # свой поток / DexScreener отдавали устаревшую низкую цену. Jupiter — текущее состояние пула: им
         # проверяем ценовой выход и по нему продаём (×5 и дальше — скорее сбой самого Jupiter, не верим)
         jm = await self.jupiter_mc(p.mint) if mc else None
+        confirmed = False
         if jm and 0.2 <= jm / mc <= 5:
             if abs(jm / mc - 1) > 0.10:
                 self.exit_fixed += 1
                 log.info("paper %s %s: выход по Jupiter %.1f SOL вместо %.1f", p.portfolio, p.symbol, jm, mc)
             mc = jm
             p.extra["last_mc"] = jm
+            confirmed = True
+        if reason in ("stop", "trailing") and not confirmed and not self.fresh_trade(p.mint, 10.0):
+            # Jupiter цену не знает (свежая монета), а свой поток без сделки за 10 с — значит, цена из DexScreener
+            # или старая сделка. 9.11: 12 из 37 стопов G были ниже всей минутной свечи (6.6k → «3.3k», −51%,
+            # рынок 6.9–7.2k). Стоп только по подтверждённой цене; позицию закроют время или следующий замер
+            p.closing = False
+            self.false_exits += 1
+            log.info("paper %s %s: %s по неподтверждённой цене %.1f — не продаю", p.portfolio, p.symbol, reason, mc)
+            return
         if not self.still_valid(p, reason, mc):
             # один «провальный» замер цены (смена пары у DexScreener, сбой) выбивал стоп во всех портфелях,
             # а продажа шла уже по нормальной цене: «−5% стоп» у схем со стопом −15%. Ценовой выход —
@@ -630,6 +640,12 @@ class PaperTrader:
     @staticmethod
     def scheme_for(p: Position) -> dict[str, Any]:
         return SCHEMES[p.portfolio]
+
+    def fresh_trade(self, mint: str, max_age_s: float) -> bool:
+        """По монете была сделка своего потока не позже max_age_s секунд назад."""
+        st = self.e.states.get(mint) if getattr(self.e, "states", None) else None
+        trades = getattr(st, "trades", None)
+        return bool(trades) and time.time() - trades[-1].ts <= max_age_s
 
     def still_valid(self, p: Position, reason: str, mc: float) -> bool:
         scheme = self.scheme_for(p)

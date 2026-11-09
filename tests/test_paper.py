@@ -684,3 +684,25 @@ async def test_target_moves_with_jupiter_entry(monkeypatch):
     tr.entry_fixed = 0
     await tr.on_alert("M", "normal", None, {"mc": 30.0, "target_mc": 39.0}, None)
     assert got[-1] == (pytest.approx(45.0), pytest.approx(58.5))          # цель +30% от нового входа
+
+
+async def test_stop_needs_confirmed_price(monkeypatch):
+    """Регрессия 9.11: стоп по цене DexScreener / старой сделке (Jupiter монету ещё не знает) — 12 ложных стопов."""
+    monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
+    p = pos(entry=40.0, target=80.0)
+    tr = bare_trader({"M": fresh_state(30.0, age_s=60)}, FakeExt(3_000))     # свой поток: сделка минуту назад
+    tr.exit_fixed, tr.false_exits = 0, 0
+    sold = []
+
+    async def fake_sell(pp_, reason, share, mc):
+        sold.append((reason, mc))
+    tr._sell = fake_sell
+    tr.lock = __import__("asyncio").Lock()
+    tr.current_mc = lambda p_: __import__("asyncio").sleep(0, result=30.0)
+    p.closing = True
+    await tr._exit_later(p, "stop", 1.0)
+    assert not sold and tr.false_exits == 1                                 # цена не подтверждена — не продаём
+    tr.e.states = {"M": fresh_state(30.0, age_s=2)}                         # свежая сделка своего потока
+    p.closing = True
+    await tr._exit_later(p, "stop", 1.0)
+    assert sold == [("stop", 30.0)]
