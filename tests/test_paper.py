@@ -107,14 +107,14 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         assert next(p for p in tr.positions.values() if p.portfolio == "A").tp_done
         assert not any(p.tp_done for p in tr.positions.values() if p.portfolio == "C")
         assert not next(p for p in tr.positions.values() if p.portfolio == "D").tp_done   # лотерея ждёт ×2
-        assert not any(p.portfolio == "G" for p in tr.positions.values())             # скальп: всё на +25%
+        assert not any(p.portfolio in "EG" for p in tr.positions.values())            # E и G: всё на +25%
         st.mc = 45.0
         for p in list(tr.positions.values()):
             await tr._check(p, 45.0, "emergency")
         await __import__("asyncio").sleep(0.05)
         assert not tr.positions
         rows = await db.fetch("SELECT portfolio, pnl_sol, exit_reason FROM paper_positions ORDER BY portfolio")
-        assert [r["exit_reason"] for r in rows] == ["emergency"] * 6 + ["take_profit"]
+        assert [r["exit_reason"] for r in rows] == ["emergency"] * 4 + ["take_profit", "emergency", "take_profit"]
         # 7 входов + 2 частичных тейка (A, B; лотерея D ждёт ×2) + 7 полных выходов
         assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 16
         await tr.flush_messages()
@@ -176,10 +176,10 @@ def test_new_schemes_d_to_g():
     held.max_net = 0.6
     assert decide_exit(held, 60.0, 3 * 3600, d, 125, 0.0005) is None                    # держит до 4 часов
     assert decide_exit(held, 60.0, 4 * 3600 + 1, d, 125, 0.0005) == ("max_hold", 1.0)
-    e = pp.SCHEMES["E"]                                                                 # копии: всё на +40%
-    assert decide_exit(pos(), 56.0, 10, e, 125, 0.0005) is None                         # +36% чистыми — мало
-    assert decide_exit(pos(), 58.5, 10, e, 125, 0.0005) == ("take_profit", 1.0)
-    assert decide_exit(pos(), 36.5, 10, e, 125, 0.0005) == ("stop", 1.0)               # −8.75%
+    e = pp.SCHEMES["E"]                                                                 # как G, стоп −15%
+    assert decide_exit(pos(), 53.0, 10, e, 125, 0.0005) == ("take_profit", 1.0)        # всё на +25%
+    assert decide_exit(pos(), 36.5, 10, e, 125, 0.0005) is None                         # −8.75% — держим
+    assert decide_exit(pos(), 33.5, 10, e, 125, 0.0005) == ("stop", 1.0)               # −16%
     f = OLD["F"]
     p = pos()
     assert decide_exit(p, 46.0, 10, f, 125, 0.0005) is None                             # +15% цены ≈ +10% чистыми
@@ -578,10 +578,11 @@ async def test_daily_reset_with_summary(monkeypatch):
 
 
 def test_route_signals_to_portfolios():
-    """Одиночные копии — в A, B, C, E, G; smart-money — только в F; «Наблюдение» (режим «Девы») — лотерея D;
-    сильные копии, «Мой дев» и новые монеты — в бумагу не идут."""
+    """Одиночные копии и smart-money — во все основные A, B, C, E, F, G (как 8.11); «Наблюдение» (режим «Девы») —
+    лотерея D; сильные копии, «Мой дев» и новые монеты — в бумагу не идут."""
     tr = bare_trader({})
-    main, lottery, smart = set("ABCEG"), set("D"), {"F"}
+    main, lottery = set("ABCEFG"), set("D")
+    smart = main
     assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main
     targets, why = tr.route({"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}, "strong")
     assert not targets and "сильная копия" in why
@@ -600,6 +601,9 @@ def test_route_signals_to_portfolios():
     assert "H" not in main | smart | lottery
     tr.e.cfg = {"paper_strong_copies": True}
     assert tr.route({"modes": ["copy"], "traders": [{}, {}]}, "strong")[0] == main
+    tr.e.cfg = {"paper_smart_portfolios": "F"}                      # можно снова мерить smart отдельно
+    assert tr.route({"modes": ["smart"]}, "normal")[0] == {"F"}
+    assert tr.route({"modes": ["copy"], "traders": [{}]}, "normal")[0] == set("ABCEG")
 
 
 async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
@@ -755,19 +759,17 @@ async def test_stop_needs_confirmed_price(monkeypatch):
     assert sold == [("stop", 30.0)]
 
 
-async def test_experiment_schemes():
-    """Эксперименты вокруг G: A — стоп −15%, B — 70% на +25% и остаток трейлингом, C — не продаёт за трейдером,
-    E — всё на +40%."""
-    g, a, b, e = (pp.SCHEMES[k] for k in "GABE")
+async def test_schemes_of_nov_8_restored():
+    """Схемы 8.11 вернулись: A, B, C, F — как тогда (с выходом по цели), G — всё на +25%, E — G со стопом −15%;
+    все портфели продают вслед за трейдером."""
+    for k, v in OLD.items():
+        assert {kk: vv for kk, vv in pp.SCHEMES[k].items() if kk != "name"} == v
+    g, e = pp.SCHEMES["G"], pp.SCHEMES["E"]
     assert decide_exit(pos(), 36.0, 10, g, 125, 0.0005) == ("stop", 1.0)          # −10% — стоп G
-    assert decide_exit(pos(), 36.0, 10, a, 125, 0.0005) is None                    # A держит до −15%
-    assert decide_exit(pos(), 33.5, 10, a, 125, 0.0005) == ("stop", 1.0)
-    pb = pos()
-    assert decide_exit(pb, 53.0, 10, b, 125, 0.0005) == ("take_profit", 0.70)     # 70% на +25%
-    pb.tp_done = True
-    assert decide_exit(pb, 120.0, 20, b, 125, 0.0005) is None                      # остаток едет за иксом
-    assert decide_exit(pb, 80.0, 30, b, 125, 0.0005) == ("trailing", 1.0)         # −33% от пика
-    assert decide_exit(pos(), 53.0, 10, e, 125, 0.0005) is None                    # E ждёт +40%
+    assert decide_exit(pos(), 36.0, 10, e, 125, 0.0005) is None                    # E держит до −15%
+    assert decide_exit(pos(), 33.5, 10, e, 125, 0.0005) == ("stop", 1.0)
+    assert decide_exit(pos(), 81.0, 10, pp.SCHEMES["C"], 125, 0.0005) == ("target", 1.0)
+    assert pp.ENTRY_DELAY_S == 5.0
     tr = bare_trader({})
     checked = []
 
@@ -780,4 +782,4 @@ async def test_experiment_schemes():
         tr.positions[p.id] = p
     st = SimpleNamespace(mint="M", mc=40.0)
     await tr.on_trade(st, None, "W", False)                                        # трейдер продал
-    assert checked == [("G", "trader_sell")]                                       # C не идёт за ним
+    assert checked == [("C", "trader_sell"), ("G", "trader_sell")]
