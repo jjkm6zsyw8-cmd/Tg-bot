@@ -279,13 +279,14 @@ class Jupiter(ExternalSource):
     def base(self) -> str:
         return "https://api.jup.ag/price/v3" if self.key else "https://lite-api.jup.ag/price/v3"
 
-    async def prices(self, mints: list[str]) -> dict[str, float]:
+    async def prices(self, mints: list[str], ttl: float = TTL_PRICE) -> dict[str, float]:
+        """ttl — сколько секунд годится кеш (бумага для решений берёт 1–4 с, сверка — 15 с)."""
         key = ",".join(sorted(mints))[:500]
 
         async def fetch() -> dict[str, float]:
             d = await self.request("GET", self.base, path_key="price", params={"ids": ",".join(mints[:50])})
             return {m: float(v["usdPrice"]) for m, v in (d or {}).items() if isinstance(v, dict) and v.get("usdPrice")}
-        return await self.cached("prices", key, TTL_PRICE, fetch)
+        return await self.cached(f"prices{int(ttl)}", key, ttl, fetch)
 
     async def sol_usd(self) -> float | None:
         return (await self.prices([SOL_MINT])).get(SOL_MINT)

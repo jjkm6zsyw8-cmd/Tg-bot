@@ -318,7 +318,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                  f"Бумага: открыто {ana.get('paper_open', '—')}, ложных ценовых выходов отменено "
                  f"{ana.get('paper_false_exits', 0)}, сбойных цен отброшено {ana.get('paper_bad_prices', 0)}, "
                  f"входов по цене Jupiter (свой поток отстал) {ana.get('paper_entry_fixed', 0)}, "
-                 f"выходов по цене Jupiter {ana.get('paper_exit_fixed', 0)}"]
+                 f"выходов по цене Jupiter {ana.get('paper_exit_fixed', 0)}, без подтверждённой цены не вошли "
+                 f"{ana.get('paper_no_price', 0)}",
+                 "Самопроверка по свечам GeckoTerminal: проверено {checked}, неверная цена {bad}, нет свечей {nodata}"
+                 .format(**{"checked": 0, "bad": 0, "nodata": 0, **(ana.get('paper_pricecheck') or {})})]
         pend = await db.fetchrow("SELECT count(*) n, min(created_at) oldest FROM jobs WHERE done_at IS NULL")
         lines.append(f"\n<b>Задачи</b> (команды бота → аналитика): в очереди {pend['n']}"
                      + (f", самая старая {fmt.ago((now - pend['oldest']).total_seconds())} назад ⚠️"

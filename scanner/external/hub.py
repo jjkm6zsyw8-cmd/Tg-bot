@@ -287,10 +287,18 @@ class ExternalHub:
         _ok, v = await self._call(self.dex, self.dex.pairs_many(mints, ttl), timeout)
         return v or {}
 
-    async def jup_price(self, mint: str) -> float | None:
-        """Независимая цена Jupiter (USD за токен) — сверка, когда DexScreener показывает скачок."""
-        _ok, v = await self._call(self.jupiter, self.jupiter.prices([mint]), 3.0)
+    async def jup_price(self, mint: str, ttl: float | None = None) -> float | None:
+        """Цена Jupiter (USD за токен) по текущему состоянию пула — рыночная цена для решений бумаги."""
+        coro = self.jupiter.prices([mint]) if ttl is None else self.jupiter.prices([mint], ttl)
+        _ok, v = await self._call(self.jupiter, coro, 3.0)
         return (v or {}).get(mint)
+
+    async def jup_prices(self, mints: list[str], ttl: float = 3.0) -> dict[str, float]:
+        """Цены Jupiter пачкой (до 50 монет одним запросом) — сопровождение открытых позиций бумаги."""
+        if not mints:
+            return {}
+        _ok, v = await self._call(self.jupiter, self.jupiter.prices(list(dict.fromkeys(mints))[:50], ttl), 3.0)
+        return v or {}
 
     async def sol_usd(self) -> float | None:
         _ok, v = await self._call(self.jupiter, self.jupiter.sol_usd(), 3.0)

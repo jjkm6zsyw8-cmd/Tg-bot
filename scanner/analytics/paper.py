@@ -38,7 +38,7 @@ MAX_OPEN = 3
 # «Наблюдение» +$12 только за счёт 90CENT ×55 (без неё −$39), сильные копии −$32, «Мой дев» −$8, тренды −$7,
 # новые −$5. Основные портфели — одиночные копии и smart; лотерея «Наблюдения» — отдельно в D и E: маленький
 # билет, много мест и дневной стоп, чтобы плохой день стоил −$10, а не −$22, а ракета ×5…×55 давала плюс.
-LOTTERY = "DE"
+LOTTERY = "D"                 # E с 9.11 — копии и smart (лотерея без фильтра 4 сессии из 4 в минусе)
 LOTTERY_SHARE = 0.10          # билет лотереи — 10% баланса…
 LOTTERY_MIN_SOL = 0.02        # …но не меньше 0.02 SOL (~$1.8; 90CENT 6.11 куплена за 0.024)
 LOTTERY_MAX_OPEN = 8
@@ -59,18 +59,24 @@ SCHEMES: dict[str, dict[str, Any]] = {
           "time_stop_s": 600, "time_stop_gain": 0.10},
     "C": {"name": "C: только экстренный выход и цель", "stop": None, "tp_net": None, "tp_share": 0.0, "trail": None,
           "target": True, "time_stop_s": None, "time_stop_gain": None},
-    "D": {"name": "D: тейк 50% на +20%, трейл 10%, стоп −10%", "stop": 0.10, "tp_net": 0.20, "tp_share": 0.5,
-          "trail": 0.10, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
-    "E": {"name": "E: тейк 50% на +50%, трейл 20%, стоп −15%", "stop": 0.15, "tp_net": 0.50, "tp_share": 0.5,
-          "trail": 0.20, "target": True, "time_stop_s": 900, "time_stop_gain": 0.10},
+    # D — лотерея, ловит иксы: 9.11 ALICE дошла до ×20, BUIDL до ×19.7, а «половина на +20%, трейл 10%» забрали
+    # ×8.5 и ×8. Теперь: треть на ×2 (отбить билет), остаток — трейлинг 30% от пика, включается после +50%;
+    # держим до 4 часов (90CENT 6.11 росла ×55 за 2 часа)
+    "D": {"name": "D: лотерея — треть на ×2, остаток трейлинг 30% после +50%, стоп −15%", "stop": 0.15,
+          "tp_net": 1.0, "tp_share": 0.34, "trail": 0.30, "trail_after_net": 0.5, "target": False,
+          "time_stop_s": 600, "time_stop_gain": 0.10, "max_hold_s": 4 * 3600},
+    # E — копии и smart, как G, но вся позиция на +40%: сравнить, где фиксировать лучше (+25% или +40%)
+    "E": {"name": "E: всё на +40%, стоп −8%, 5 мин", "stop": 0.08, "tp_net": 0.40, "tp_share": 1.0,
+          "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
     "F": {"name": "F: без тейка, трейл 15% после +15%, стоп −10%", "stop": 0.10, "tp_net": None, "tp_share": 0.0,
           "trail": 0.15, "trail_after_net": 0.15, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
     "G": {"name": "G: скальп — всё на +25%, стоп −8%, 5 мин", "stop": 0.08, "tp_net": 0.25, "tp_share": 1.0,
           "trail": None, "target": False, "time_stop_s": 300, "time_stop_gain": 0.10},
 }
-LEGEND = ("A, B, C, F, G — одиночные копии и smart: A стоп−6% · B база · C только цель · F трейл после +15% · "
-          "G скальп +25% · D, E — лотерея «Наблюдение»: D тейк+20%, только если дев купил ~1 SOL · E тейк+50%, все · "
-          "билет 10% (от $1.8), до 8 мест, дневной стоп −$35 · старт $100")
+LEGEND = ("A, B, C, E, F, G — одиночные копии и smart: A стоп−6% · B база · C только цель · E всё на +40% · "
+          "F трейл после +15% · G всё на +25% · D — лотерея «Наблюдение» (дев купил ~1 SOL): треть на ×2, остаток "
+          "трейл 30%, держит до 4 ч · билет 10% (от $1.8), до 8 мест, дневной стоп −$35 · цены — по рынку (Jupiter) "
+          "· старт $100")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -79,6 +85,14 @@ START_MC_SOL = 32.0   # MC до ~32 SOL — стартовая цена крив
 REENTRY_COOLDOWN_MIN = 60   # после убыточного выхода в ту же монету этот портфель час не входит
 RUG_PCT = 0.5         # монета дала −50% и хуже — раг: больше не входим ни в неё, ни в монеты её дева (7 дней)
 TICK_S = 2.0          # проверка открытых позиций (стоп/тейк/трейлинг) раз в 2 с
+# Рыночная цена для ВСЕХ решений бумаги (вход, стоп, цель, трейлинг, выход): Jupiter (текущее состояние пула) →
+# сделка своего потока не старше OWN_MAX_AGE_S → цена неизвестна, по ней ничего не решаем. DexScreener и старые
+# сделки своего потока для решений не используются: 8–9.11 они давали входы ниже рынка и стопы по цене, которой
+# на рынке не было (сверка с минутными свечами GeckoTerminal)
+PRICE_EXITS = ("stop", "trailing", "target", "take_profit")
+JUP_REFRESH_S = 4.0   # цены Jupiter открытых позиций — одним запросом раз в 4 с
+JUP_MAX_AGE_S = 8.0   # цена Jupiter годится для решения, если ей не больше 8 с
+OWN_MAX_AGE_S = 10.0  # сделка своего потока годится, если ей не больше 10 с
 FRESH_S = 120.0       # цена из своего потока сделок годится, только если по монете были сделки за 2 минуты
 JUMP_X = 5.0          # скачок цены больше чем в 5 раз за одну проверку — ждём подтверждения
 MISMATCH_X = 2.0      # свой поток и DexScreener расходятся больше чем в 2 раза — верим DexScreener
@@ -179,7 +193,7 @@ def decide_exit(pos: Position, mc: float, now: float, scheme: dict[str, Any], fe
     if (scheme.get("time_stop_s") and now - pos.opened_ts >= scheme["time_stop_s"]
             and pos.max_net < scheme["time_stop_gain"] and not pos.tp_done):
         return "time_stop", 1.0
-    if now - pos.opened_ts >= MAX_HOLD_S:
+    if now - pos.opened_ts >= float(scheme.get("max_hold_s") or MAX_HOLD_S):
         return "max_hold", 1.0
     return None
 
@@ -200,6 +214,9 @@ class PaperTrader:
         self.false_exits = 0                        # ценовых выходов, не подтвердившихся через 2 с
         self.entry_fixed = 0                        # входов, где цену поправил Jupiter (свой поток отстал)
         self.exit_fixed = 0                         # выходов, где цену поправил Jupiter (ложный стоп отменён и т. п.)
+        self.no_price = 0                           # входов, пропущенных без подтверждённой цены
+        self.jup_cache: dict[str, tuple[float, float]] = {}   # монета → (когда, MC по Jupiter, SOL)
+        self._jup_refresh = 0.0
         self._last_flush = 0.0
         self.loss_exits: dict[tuple[str, str], float] = {}   # (портфель, монета) → время убыточного выхода
         self.rugged: dict[str, float] = {}         # монета → худший результат (−0.5 и хуже): больше не входим
@@ -228,13 +245,49 @@ class PaperTrader:
             return None
         return float(st.mc)
 
-    async def jupiter_mc(self, mint: str) -> float | None:
+    async def jupiter_mc(self, mint: str, ttl: float | None = None) -> float | None:
         """MC по цене Jupiter, SOL (pump.fun: 1 млрд токенов) или None."""
         ext = getattr(self.e, "ext", None)
-        jp = await ext.jup_price(mint) if ext is not None else None
+        if ext is None:
+            return None
+        jp = await (ext.jup_price(mint) if ttl is None else ext.jup_price(mint, ttl))
         if not jp:
             return None
-        return jp * 1e9 / (self.e.price.value or 150)
+        mc = jp * 1e9 / (self.e.price.value or 150)
+        self.jup_cache[mint] = (time.time(), mc)
+        return mc
+
+    async def refresh_jupiter(self, mints: list[str]) -> None:
+        """Цены Jupiter всех открытых позиций одним запросом (до 50 монет)."""
+        ext = getattr(self.e, "ext", None)
+        if ext is None or not mints or not hasattr(ext, "jup_prices"):
+            return
+        prices = await ext.jup_prices(mints, ttl=JUP_REFRESH_S - 1)
+        now, sol = time.time(), (self.e.price.value or 150)
+        for m, usd in prices.items():
+            if usd:
+                self.jup_cache[m] = (now, usd * 1e9 / sol)
+
+    def market_cached(self, mint: str) -> tuple[float | None, str]:
+        """Рыночная цена без запросов: свежая цена Jupiter из кеша → свежая сделка своего потока → неизвестна."""
+        c = self.jup_cache.get(mint)
+        if c and time.time() - c[0] <= JUP_MAX_AGE_S:
+            return c[1], "jup"
+        if self.fresh_trade(mint, OWN_MAX_AGE_S):
+            return float(self.e.states[mint].mc), "own"
+        return None, ""
+
+    async def market_mc(self, mint: str) -> tuple[float | None, str]:
+        """Рыночная цена прямо сейчас (для входа и выхода): Jupiter не старше 2 с → свежая сделка своего потока."""
+        c = self.jup_cache.get(mint)
+        if c and time.time() - c[0] <= 2.0:
+            return c[1], "jup"
+        jm = await self.jupiter_mc(mint, ttl=1.0)
+        if jm:
+            return jm, "jup"
+        if self.fresh_trade(mint, OWN_MAX_AGE_S):
+            return float(self.e.states[mint].mc), "own"
+        return None, ""
 
     async def arbitrate(self, mint: str, own: float, dex: float) -> str:
         """Свой поток и DexScreener расходятся больше чем вдвое — чья цена верна ("own" или "dex").
@@ -359,57 +412,26 @@ class PaperTrader:
             self.skipped["*"] = why
             return
         await asyncio.sleep(ENTRY_DELAY_S)          # реакция пользователя
-        # «Тренды» — только по DexScreener (по нему дан алерт); остальное — свой свежий поток, сверка с DexScreener
-        src = "dex" if data.get("trend") else "auto"
-        own = None if src == "dex" else self.state_price(mint)
-        dex = await self.dex_price(mint)            # цена через 5 с после алерта
-        ext = getattr(self.e, "ext", None)
-        if dex and ext is not None and not own:
-            pair = await ext.dex_pair(mint, timeout=2.0, ttl=1.0)
-            jp = await ext.jup_price(mint)
-            pu = (pair or {}).get("price_usd")
-            if jp and pu and not 0.5 <= pu / jp <= 2.0:
-                if dex <= START_MC_SOL and src != "dex":
-                    # DexScreener на стартовой цене кривой — он ещё не видел сделок; у Jupiter цена свежая
-                    dex, src = jp * 1e9 / (self.e.price.value or 150), "jup"
-                else:
-                    log.warning("paper %s: DexScreener %.3g $ и Jupiter %.3g $ расходятся — не входим", mint, pu, jp)
-                    self.skipped.setdefault("*", "цена DexScreener не сходится с Jupiter")
-                    return
-        if own and dex and max(own, dex) / min(own, dex) > MISMATCH_X:
-            pick = await self.arbitrate(mint, own, dex)
-            log.warning("paper %s: свой поток %.1f и DexScreener %.1f SOL расходятся — берём %s", mint, own, dex, pick)
-            if pick == "dex":
-                own, src = None, "dex"
-        ref = data.get("copy_ref_mc")
-        if not own and dex and dex <= START_MC_SOL and ref and ref > 1.5 * dex:
-            # DexScreener ещё показывает стартовую цену кривой, а трейдер только что купил вдвое дороже —
-            # DexScreener не видел сделок. Решает Jupiter; без него надёжной цены нет — не входим
-            jm = await self.jupiter_mc(mint)
-            if jm is None:
-                self.skipped["*"] = "копия: DexScreener ещё на стартовой цене, Jupiter цену не знает"
+        if data.get("trend"):
+            mc, src = await self._trend_entry_price(mint, data)
+            if not mc:
                 return
-            dex, src = jm, "jup"
-        mc = own or dex
-        if mc is None and src == "dex":
-            mc = data.get("mc")                     # цена алерта «Трендов» (тоже DexScreener)
-        if not mc or mc <= 0:
-            self.skipped.setdefault("*", "нет свежей цены монеты")
-            return
-        if src != "dex":
-            # Цена входа — то, по чему можно купить сейчас. Свой поток видит не все сделки монеты: 8.11 у 15 из 22
-            # прибыльных сделок вход был записан ниже всей минутной свечи (×1.1–1.7), плюс бумаги завышался
-            # (+$182 против +$106 по рынку). Jupiter считает цену по текущему состоянию пула — ей и верим,
-            # если она в разумных пределах (×3: дальше скорее сбой самого Jupiter)
-            jm = await self.jupiter_mc(mint)
-            if jm and 1 / 3 <= jm / mc <= 3 and abs(jm / mc - 1) > 0.10:
-                log.info("paper %s: вход по Jupiter %.1f SOL вместо %.1f (свой поток отстал)", mint, jm, mc)
-                if data.get("target_mc"):
-                    # цель алерта считалась от старой цены: без поправки она оказывалась ниже входа, и позиция
-                    # сразу закрывалась «по цели» в минус (DAISY 9.11: вход 7.5k, «цель» 6.9k, −12%)
-                    data = {**data, "target_mc": float(data["target_mc"]) * jm / mc}
-                mc = jm
-                self.entry_fixed += 1
+        else:
+            mc, src = await self.market_mc(mint)
+            if mc is None:
+                # нет ни цены Jupiter, ни свежей сделки своего потока: входить по устаревшей цене — значит
+                # записать вход, которого на рынке не было
+                self.no_price += 1
+                self.skipped["*"] = "нет подтверждённой цены (Jupiter монету не знает, свежих сделок нет) — не входим"
+                return
+            own = self.state_price(mint)
+            if own and abs(own / mc - 1) > 0.10:
+                self.entry_fixed += 1                # свой поток отстал от рынка — вход по рынку
+            ref = float(data.get("entry_mc") or data.get("mc") or 0)
+            if data.get("target_mc") and ref > 0 and 1 / 3 <= mc / ref <= 3 and abs(mc / ref - 1) > 0.10:
+                # цель алерта считалась от цены алерта: сдвигаем вместе с рыночным входом, иначе она бывала ниже
+                # входа и позиция сразу закрывалась «по цели» в минус (DAISY 9.11: вход 7.5k, «цель» 6.9k)
+                data = {**data, "target_mc": float(data["target_mc"]) * mc / ref}
         guard = getattr(self.e, "copyguard", None)
         if guard is not None and data.get("copy_wallet") and data.get("copy_ref_mc"):
             # Price Delta: насколько дороже цели мы входим (+5 с реакции) — копить по кошельку
@@ -428,6 +450,24 @@ class PaperTrader:
             sol_usd = self.e.price.value or 150
             await self._msg(f"📥 ${fmt.esc(data.get('symbol') or '?')} · MC {fmt.mc_usd(mc, sol_usd)} · "
                             + " · ".join(sizes) + " SOL")
+
+    async def _trend_entry_price(self, mint: str, data: dict[str, Any]) -> tuple[float | None, str]:
+        """«Тренды» — по DexScreener (по нему дан алерт), со сверкой с Jupiter."""
+        dex = await self.dex_price(mint)
+        ext = getattr(self.e, "ext", None)
+        if dex and ext is not None:
+            pair = await ext.dex_pair(mint, timeout=2.0, ttl=1.0)
+            jp = await ext.jup_price(mint)
+            pu = (pair or {}).get("price_usd")
+            if jp and pu and not 0.5 <= pu / jp <= 2.0:
+                log.warning("paper %s: DexScreener %.3g $ и Jupiter %.3g $ расходятся — не входим", mint, pu, jp)
+                self.skipped.setdefault("*", "цена DexScreener не сходится с Jupiter")
+                return None, "dex"
+        mc = dex or data.get("mc")
+        if not mc or mc <= 0:
+            self.skipped.setdefault("*", "нет свежей цены монеты")
+            return None, "dex"
+        return float(mc), "dex"
 
     async def _open(self, name: str, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
                     trader: str | None, mc: float, src: str = "auto") -> float | None:
@@ -524,9 +564,9 @@ class PaperTrader:
             reason = emergency
             if reason is None and p.trader and trader == p.trader and not is_buy:
                 reason = "trader_sell"
-            if reason is None and p.extra.get("src") == "dex":
-                continue          # цену «Трендов» ведём по DexScreener, из своего потока — только экстренные сигналы
-            await self._check(p, st.mc, reason)
+            if reason is None:
+                continue          # цены ведёт tick_loop по рыночной цене; из своего потока — только сигналы выхода
+            await self._check(p, float(p.extra.get("last_mc") or p.entry_mc), reason)
 
     async def tick_loop(self) -> None:
         last_report = time.time()
@@ -534,23 +574,28 @@ class PaperTrader:
             await asyncio.sleep(TICK_S)
             try:
                 ps = list(self.positions.values())
-                own = {p.id: (None if p.extra.get("src") == "dex" else self.state_price(p.mint)) for p in ps}
-                # без свежего своего потока — одной пачкой в DexScreener (до 30 монет за запрос)
-                need = [p.mint for p in ps if own[p.id] is None]
+                market = [p.mint for p in ps if p.extra.get("src") != "dex"]
+                if market and time.time() - self._jup_refresh >= JUP_REFRESH_S:
+                    self._jup_refresh = time.time()
+                    await self.refresh_jupiter(market)
+                # «Тренды» — по DexScreener (одной пачкой до 30 монет), остальное — по рыночной цене
+                need = [p.mint for p in ps if p.extra.get("src") == "dex"]
                 ext = getattr(self.e, "ext", None)
                 pairs = await ext.dex_pairs(need, timeout=3.0, ttl=TICK_S) if need and ext is not None else {}
                 sol_usd = self.e.price.value or 150
                 for p in ps:
-                    mc = own[p.id]
                     price_usd = None
-                    if mc is None:
+                    if p.extra.get("src") == "dex":
+                        mc = None
                         pair = pairs.get(p.mint)
                         if pair and pair.get("market_cap_usd"):
                             mc = pair["market_cap_usd"] / sol_usd
                             price_usd = pair.get("price_usd")
+                    else:
+                        mc, _src = self.market_cached(p.mint)
                     if not mc:
-                        # цены нет (монета без сделок и без пары на DexScreener): правила по времени всё равно
-                        # должны срабатывать, иначе позиция зависает навсегда и занимает слот
+                        # цена неизвестна: решаем по последней подтверждённой — правила по времени должны срабатывать,
+                        # иначе позиция зависает и занимает слот; ценовые выходы без новой цены не подтвердятся
                         mc = float(p.extra.get("last_mc") or p.entry_mc)
                     await self._check(p, mc, None, price_usd)
                 if time.time() - self._last_flush >= 60:
@@ -604,27 +649,24 @@ class PaperTrader:
 
     async def _exit_later(self, p: Position, reason: str, share: float) -> None:
         await asyncio.sleep(EXIT_DELAY_S)            # реакция на сигнал выхода
-        mc = await self.current_mc(p)                # ТЕКУЩАЯ цена через 2 с, а не максимум за позицию
-        # Цена выхода — тоже по рынку. 9.11 стопы срабатывали через 2–3 с после входа по цене, которой на рынке
-        # не было (BIFT: «стоп» на $5.9k, а монета в те минуты шла $10.8k → $15k; Chews, AI, NIGOOR так же):
-        # свой поток / DexScreener отдавали устаревшую низкую цену. Jupiter — текущее состояние пула: им
-        # проверяем ценовой выход и по нему продаём (×5 и дальше — скорее сбой самого Jupiter, не верим)
-        jm = await self.jupiter_mc(p.mint) if mc else None
-        confirmed = False
-        if jm and 0.2 <= jm / mc <= 5:
-            if abs(jm / mc - 1) > 0.10:
-                self.exit_fixed += 1
-                log.info("paper %s %s: выход по Jupiter %.1f SOL вместо %.1f", p.portfolio, p.symbol, jm, mc)
-            mc = jm
-            p.extra["last_mc"] = jm
-            confirmed = True
-        if reason in ("stop", "trailing") and not confirmed and not self.fresh_trade(p.mint, 10.0):
-            # Jupiter цену не знает (свежая монета), а свой поток без сделки за 10 с — значит, цена из DexScreener
-            # или старая сделка. 9.11: 12 из 37 стопов G были ниже всей минутной свечи (6.6k → «3.3k», −51%,
-            # рынок 6.9–7.2k). Стоп только по подтверждённой цене; позицию закроют время или следующий замер
+        if p.extra.get("src") == "dex":
+            mc, confirmed = await self.current_mc(p), True   # «Тренды» — по DexScreener, как и вход
+        else:
+            mc, _src = await self.market_mc(p.mint)
+            confirmed = mc is not None
+            if mc is None:
+                mc = float(p.extra.get("last_mc") or p.entry_mc)
+            else:
+                own = self.state_price(p.mint)
+                if own and abs(own / mc - 1) > 0.10:
+                    self.exit_fixed += 1         # свой поток показывал другую цену — продаём по рынку
+                p.extra["last_mc"] = mc
+        if reason in PRICE_EXITS and not confirmed:
+            # цену подтвердить нечем (Jupiter не знает монету, свежих сделок нет) — ценовой выход не делаем:
+            # 9.11 такие «стопы» шли по цене ниже всей минутной свечи; позицию закроет время или новый замер
             p.closing = False
             self.false_exits += 1
-            log.info("paper %s %s: %s по неподтверждённой цене %.1f — не продаю", p.portfolio, p.symbol, reason, mc)
+            log.info("paper %s %s: %s без подтверждённой цены — не продаю", p.portfolio, p.symbol, reason)
             return
         if not self.still_valid(p, reason, mc):
             # один «провальный» замер цены (смена пары у DexScreener, сбой) выбивал стоп во всех портфелях,
@@ -752,6 +794,8 @@ class PaperTrader:
                     self.skipped[n] = (f"{n}: дев купил не ~1 SOL при запуске (доля {float(share or 0):.1%}, "
                                        f"нужно {lo:.1%}–{hi:.1%})")
             out |= lot
+            if not lot and not out:
+                why = "лотерея D: дев купил не ~1 SOL при запуске"
         if not out and not why:
             if "mydev" in modes:
                 why = "«Мой дев» — в бумагу не берём: за 2 дня −$8"
@@ -825,11 +869,16 @@ class PaperTrader:
             v = sell_fill(mc, p.tokens, self.fee_bps(), self.priority()).sol if p.tokens else 0.0
             open_value += v
             open_lines.append((p, (p.proceeds_sol + v) / p.cost_sol - 1 if p.cost_sol else 0.0))
-        equity = self.balance.get(name, port["balance_sol"]) + open_value
+        # сделки, которые самопроверка (свечи GeckoTerminal) или Jupiter пометили ⚠, в итог не идут
+        equity = self.balance.get(name, port["balance_sol"]) + open_value - sum(
+            r["pnl_sol"] or 0 for r in rows if r.get("suspect"))
         best = max(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
         worst = min(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
+        suspect_pnl = sum(r["pnl_sol"] or 0 for r in rows if r.get("suspect"))
         return {"port": port, "trades": len(rows), "wins": len(wins),
-                "anomalies": sum(1 for r in rows if r.get("suspect")), "pnl_sol": sum(r["pnl_sol"] or 0 for r in rows),
+                "anomalies": sum(1 for r in rows if r.get("suspect")), "suspect_pnl": suspect_pnl,
+                "checked": sum(1 for r in rows if r.get("price_check")),
+                "pnl_sol": sum(r["pnl_sol"] or 0 for r in rows) - suspect_pnl,
                 "avg_win": sum(wins) / len(wins) if wins else 0.0, "avg_loss": sum(losses) / len(losses) if losses else 0.0,
                 "equity": equity, "open": open_lines, "best": best, "worst": worst}
 
@@ -883,9 +932,12 @@ class PaperTrader:
         for sym, xs in by_mint.items():
             lines.append(f"🟢 ${fmt.esc(sym)} " + " ".join(xs))
         odd = sum(per[n]["anomalies"] for n in SCHEMES)
-        if odd:
-            lines.append(f"⚠ {odd} сделок с ценой, которую не подтвердил Jupiter (вероятный сбой) — "
-                         "см. «Последние 20 сделок»")
+        checked = sum(per[n]["checked"] for n in SCHEMES)
+        total = sum(per[n]["trades"] for n in SCHEMES)
+        if checked or odd:
+            odd_usd = sum(per[n]["suspect_pnl"] for n in SCHEMES) * sol_usd
+            lines.append(f"🔎 по рынку проверено {checked} из {total} сделок"
+                         + (f" · ⚠ {odd} с неверной ценой не входят в итог ({odd_usd:+.0f}$)" if odd else " · все сходятся"))
         if not hourly:
             lines.append(f"<i>{LEGEND}</i>")
         if hourly:

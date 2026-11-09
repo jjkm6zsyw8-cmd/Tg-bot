@@ -87,7 +87,7 @@ async def test_paper_trader_full_cycle(monkeypatch):
         assert b.tp_done                                                 # B продал 50% на +30%
         assert next(p for p in tr.positions.values() if p.portfolio == "A").tp_done
         assert not any(p.tp_done for p in tr.positions.values() if p.portfolio == "C")
-        assert next(p for p in tr.positions.values() if p.portfolio == "D").tp_done   # тейк 50% на +20%
+        assert not next(p for p in tr.positions.values() if p.portfolio == "D").tp_done   # лотерея ждёт ×2
         assert not any(p.portfolio == "G" for p in tr.positions.values())             # скальп: всё на +25%
         st.mc = 45.0
         for p in list(tr.positions.values()):
@@ -96,8 +96,8 @@ async def test_paper_trader_full_cycle(monkeypatch):
         assert not tr.positions
         rows = await db.fetch("SELECT portfolio, pnl_sol, exit_reason FROM paper_positions ORDER BY portfolio")
         assert [r["exit_reason"] for r in rows] == ["emergency"] * 6 + ["take_profit"]
-        # 7 входов + 3 частичных тейка (A, B, D) + 7 полных выходов
-        assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 17
+        # 7 входов + 2 частичных тейка (A, B; лотерея D ждёт ×2) + 7 полных выходов
+        assert (await db.fetchval("SELECT count(*) FROM paper_trades")) == 16
         await tr.flush_messages()
         exits = await db.fetchval("SELECT payload->>'text' FROM outbox WHERE kind='text' ORDER BY id DESC LIMIT 1")
         closed = [x for x in exits.split("\n") if x[:1] in "✅❌"]
@@ -105,7 +105,7 @@ async def test_paper_trader_full_cycle(monkeypatch):
         text = await tr.render(hourly=True)
         assert "Бумага · за 1 час" in text and "<pre>" in text and "G" in text and text.count("\n") <= 12
         period = await tr.render_period(1)
-        assert "за 1 час" in period and "★" in period and "скальп" in period
+        assert "за 1 час" in period and "★" in period and "всё на +25%" in period
         whole = await tr.render()                                 # /paper и кнопка «Всё» (hours=None)
         assert "за всё время" in whole and "период" not in whole
         hist = await tr.history()
@@ -141,12 +141,25 @@ def test_position_without_price_still_hits_time_rules():
 
 
 def test_new_schemes_d_to_g():
-    d = pp.SCHEMES["D"]
-    assert decide_exit(pos(), 51.0, 10, d, 125, 0.0005) == ("take_profit", 0.5)        # +20% чистыми
-    assert decide_exit(pos(), 35.5, 10, d, 125, 0.0005) == ("stop", 1.0)               # −11%
-    e = pp.SCHEMES["E"]
-    assert decide_exit(pos(), 56.0, 10, e, 125, 0.0005) is None                         # +30% ещё мало
-    assert decide_exit(pos(), 42.0, 700, e, 125, 0.0005) is None                        # стоп по времени — 15 мин
+    d = pp.SCHEMES["D"]                                                                 # лотерея — держит иксы
+    assert decide_exit(pos(), 51.0, 10, d, 125, 0.0005) is None                         # +20% — держим
+    assert decide_exit(pos(), 33.5, 10, d, 125, 0.0005) == ("stop", 1.0)               # −16%
+    assert decide_exit(pos(), 84.0, 10, d, 125, 0.0005) == ("take_profit", 0.34)       # ×2 чистыми — треть
+    pr = pos()
+    assert decide_exit(pr, 400.0, 20, d, 125, 0.0005) == ("take_profit", 0.34)
+    pr.tp_done = True
+    assert decide_exit(pr, 800.0, 30, d, 125, 0.0005) is None                           # ×20 — едем дальше
+    assert decide_exit(pr, 600.0, 40, d, 125, 0.0005) is None                           # −25% от пика — ещё держим
+    assert decide_exit(pr, 550.0, 50, d, 125, 0.0005) == ("trailing", 1.0)             # −31% от пика
+    assert decide_exit(pos(), 41.0, 3 * 3600, d, 125, 0.0005) == ("time_stop", 1.0)   # без роста — время
+    held = pos()
+    held.max_net = 0.6
+    assert decide_exit(held, 60.0, 3 * 3600, d, 125, 0.0005) is None                    # держит до 4 часов
+    assert decide_exit(held, 60.0, 4 * 3600 + 1, d, 125, 0.0005) == ("max_hold", 1.0)
+    e = pp.SCHEMES["E"]                                                                 # копии: всё на +40%
+    assert decide_exit(pos(), 56.0, 10, e, 125, 0.0005) is None                         # +36% чистыми — мало
+    assert decide_exit(pos(), 58.5, 10, e, 125, 0.0005) == ("take_profit", 1.0)
+    assert decide_exit(pos(), 36.5, 10, e, 125, 0.0005) == ("stop", 1.0)               # −8.75%
     f = pp.SCHEMES["F"]
     p = pos()
     assert decide_exit(p, 46.0, 10, f, 125, 0.0005) is None                             # +15% цены ≈ +10% чистыми
@@ -181,8 +194,11 @@ class FakeExt:
     async def dex_pair(self, mint, timeout=None, ttl=15.0):
         return {"market_cap_usd": self.mc_usd, "price_usd": self.mc_usd / 1e9} if self.mc_usd else None
 
-    async def jup_price(self, mint):
+    async def jup_price(self, mint, ttl=None):
         return self.jup
+
+    async def jup_prices(self, mints, ttl=None):
+        return {m: self.jup for m in mints} if self.jup else {}
 
 
 def bare_trader(states, ext=None) -> pp.PaperTrader:
@@ -190,6 +206,8 @@ def bare_trader(states, ext=None) -> pp.PaperTrader:
     tr.e = SimpleNamespace(states=states, ext=ext, price=SimpleNamespace(value=100.0), cfg={})
     tr.skipped = {}
     tr.positions = {}
+    tr.jup_cache = {}
+    tr.entry_fixed = tr.exit_fixed = tr.false_exits = tr.no_price = tr.bad_prices = 0
     return tr
 
 
@@ -206,34 +224,32 @@ async def test_stale_own_price_is_not_used():
 
 
 async def test_entry_price_sources(monkeypatch):
+    """Вход по рыночной цене: Jupiter → сделка своего потока не старше 10 с → не входим. «Тренды» — DexScreener."""
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
     opened = []
 
     async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
         opened.append((mc, src))
         return None
-    # «Тренды»: только DexScreener, даже если свой поток свежий
     tr = bare_trader({"M": fresh_state(28.0)}, FakeExt(300_000))     # $300k при SOL $100 = 3000 SOL
     tr.e.cfg = {"paper_trends": True}
     tr._open = fake_open
     tr.lock = __import__("asyncio").Lock()
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
-    assert opened and opened[0] == (3000.0, "dex")
-    # девы/новые: свой свежий поток, но при расхождении с DexScreener > 2× — DexScreener
+    assert opened and opened[0] == (3000.0, "dex")                   # «Тренды» — по DexScreener
     opened.clear()
-    tr.e.ext = FakeExt(4_000)                                       # 40 SOL
+    await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)       # Jupiter нет — свежая сделка своего потока
+    assert opened[0] == (28.0, "own")
+    opened.clear()
+    tr.e.ext = FakeExt(300_000, jup=45 / 1e9 * 100)                  # Jupiter есть — по Jupiter
     await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)
-    assert opened[0] == (40.0, "auto") or opened[0] == (28.0, "auto")
+    assert opened[0] == (pytest.approx(45.0), "jup")
     opened.clear()
+    tr.jup_cache.clear()
+    tr.e.states = {"M": fresh_state(28.0, age_s=60)}                 # сделке минута, Jupiter не знает монету
     tr.e.ext = FakeExt(300_000)
     await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)
-    assert opened[0] == (3000.0, "dex")
-    # свой поток устарел и DexScreener нет — не входим
-    opened.clear()
-    tr.e.states = {"M": fresh_state(28.0, age_s=600)}
-    tr.e.ext = None
-    await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)
-    assert not opened and "нет свежей цены" in tr.skipped["*"]
+    assert not opened and "нет подтверждённой цены" in tr.skipped["*"] and tr.no_price == 1
 
 
 async def test_price_jump_needs_confirmation(monkeypatch):
@@ -394,7 +410,7 @@ async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
             "SELECT mint, suspect FROM paper_positions WHERE portfolio='F' AND closed_at IS NOT NULL")}
         assert rows == {"REAL": False, "FAKE": True}
         text = await tr.render_period(None)
-        assert "1 сделок с ценой, которую не подтвердил Jupiter" in text
+        assert "⚠ 1 с неверной ценой не входят в итог" in text
     finally:
         await db.close()
 
@@ -434,7 +450,7 @@ async def test_copy_skips_when_dexscreener_is_at_start_price(monkeypatch):
     tr.lock = __import__("asyncio").Lock()
     data = {"mc": 60.0, "copy_ref_mc": 60.0}
     await tr.on_alert("M", "normal", None, data, None)
-    assert not opened and "стартовой цене" in tr.skipped["*"]
+    assert not opened and "нет подтверждённой цены" in tr.skipped["*"]
     tr.e.ext = FakeExt(2_800, jup=58 / 1e9 * 100)                         # Jupiter знает: 58 SOL
     await tr.on_alert("M", "normal", None, data, None)
     assert opened and opened[0][0] == pytest.approx(58.0) and opened[0][1] == "jup"
@@ -539,19 +555,19 @@ async def test_daily_reset_with_summary(monkeypatch):
 
 
 def test_route_signals_to_portfolios():
-    """Одиночные копии и smart — в A, B, C, F, G; «Наблюдение» (режим «Девы») — лотерея D и E;
+    """Одиночные копии и smart — в A, B, C, E, F, G; «Наблюдение» (режим «Девы») — лотерея D;
     сильные копии, «Мой дев» и новые монеты — в бумагу не идут."""
     tr = bare_trader({})
-    main, lottery = set("ABCFG"), set("DE")
+    main, lottery = set("ABCEFG"), set("D")
     assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main
     targets, why = tr.route({"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}, "strong")
     assert not targets and "сильная копия" in why
     assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == main
     one_sol = {"cluster": 0.0342}                                 # дев купил ~1 SOL при запуске
     assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == lottery
-    assert tr.route({"modes": ["dev"], "metrics": {"cluster": 0.12}}, "watch")[0] == {"E"}   # D — только ~1 SOL
-    assert "дев купил не ~1 SOL" in tr.skipped["D"]
-    assert tr.route({"modes": ["dev"]}, "watch")[0] == {"E"}                                 # нет замера — только E
+    targets, why = tr.route({"modes": ["dev"], "metrics": {"cluster": 0.12}}, "watch")      # D — только ~1 SOL
+    assert not targets and "дев купил не ~1 SOL" in why and "дев купил не ~1 SOL" in tr.skipped["D"]
+    assert not tr.route({"modes": ["dev"]}, "watch")[0]                                     # нет замера — не берём
     assert tr.route({"modes": ["dev", "copy"], "traders": [{"address": "W"}], "metrics": one_sol},
                     "strong")[0] == main | lottery
     assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
@@ -638,12 +654,10 @@ async def test_entry_price_follows_jupiter_when_own_stream_lags(monkeypatch):
     tr.entry_fixed = 0
     await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)
     assert opened[-1] == pytest.approx(45.0) and tr.entry_fixed == 1        # покупаем по рынку, не по старой сделке
-    tr.e.ext = FakeExt(3_000, jup=300 / 1e9 * 100)                          # ×10 — сбой Jupiter, не верим
-    await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)
-    assert opened[-1] == pytest.approx(30.0)
-    tr.e.ext = FakeExt(3_000, jup=31 / 1e9 * 100)                           # разница 3% — оставляем свою цену
-    await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)
-    assert opened[-1] == pytest.approx(30.0)
+    tr.jup_cache.clear()
+    tr.e.ext = FakeExt(3_000, jup=31 / 1e9 * 100)                           # разница 3% — тоже по рынку,
+    await tr.on_alert("M", "normal", None, {"mc": 30.0}, None)              # но «поправленным» не считаем
+    assert opened[-1] == pytest.approx(31.0) and tr.entry_fixed == 1
 
 
 async def test_exit_is_checked_against_jupiter(monkeypatch):
@@ -666,6 +680,7 @@ async def test_exit_is_checked_against_jupiter(monkeypatch):
     assert not sold and not p.closing and tr.false_exits == 1 and tr.exit_fixed == 1   # ложный стоп отменён
     assert p.extra["last_mc"] == pytest.approx(41.0)
     tr.e.ext = FakeExt(0, jup=31 / 1e9 * 100)                                   # Jupiter: правда упала до 31
+    tr.jup_cache.clear()
     p.closing = True
     await tr._exit_later(p, "stop", 1.0)
     assert sold == [("stop", pytest.approx(31.0))]

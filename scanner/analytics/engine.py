@@ -111,6 +111,8 @@ class Engine:
         self.new_eval_at: dict[str, float] = {}
         self.trends = Trends(self)
         self.paper = PaperTrader(self)
+        from .pricecheck import PriceCheck
+        self.pricecheck = PriceCheck(self)
         self._ls_cache: set[str] = set()
         self._ls_loaded = 0.0
         self._cl_day: dict[int, tuple[Any, int]] = {}
@@ -209,7 +211,8 @@ class Engine:
         await self.start()
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
-                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.paper.tick_loop()]
+                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.paper.tick_loop(),
+                 self.pricecheck.loop()]
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий
@@ -1173,6 +1176,7 @@ class Engine:
                     "latency_median_s": _median(self.latencies), "latency_p95_s": _pct(self.latencies, 0.95),
                     "paper_false_exits": self.paper.false_exits, "paper_bad_prices": self.paper.bad_prices,
                     "paper_entry_fixed": self.paper.entry_fixed, "paper_exit_fixed": self.paper.exit_fixed,
+                    "paper_no_price": self.paper.no_price, "paper_pricecheck": self.pricecheck.stats,
                     "paper_open": len(self.paper.positions),
                 })
             except Exception:  # noqa: BLE001
