@@ -17,7 +17,8 @@ from ..analytics.copyguard import DEFAULTS as _COPY_DEFAULTS  # noqa: E402
 
 NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005, "paper_min_position_sol": 0.05,
                 "paper_day_cap_usd": 0, "paper_day_from_h": 8, "paper_day_to_h": 18, "paper_reentry_cooldown_min": 60,
-                "paper_start_usd": 100, "paper_lottery_day_stop_usd": 0, "paper_day_stop_pct": 0}
+                "paper_start_usd": 100, "paper_lottery_day_stop_usd": 0, "paper_day_stop_pct": 0,
+                "paper_scout_usd": 10, "scout_slots": 20, "scout_max_auto": 15, "scout_min_copies": 6}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -321,7 +322,11 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                  f"выходов по цене Jupiter {ana.get('paper_exit_fixed', 0)}, без подтверждённой цены не вошли "
                  f"{ana.get('paper_no_price', 0)}",
                  "Самопроверка по свечам GeckoTerminal: проверено {checked}, неверная цена {bad}, нет свечей {nodata}"
-                 .format(**{"checked": 0, "bad": 0, "nodata": 0, **(ana.get('paper_pricecheck') or {})})]
+                 .format(**{"checked": 0, "bad": 0, "nodata": 0, **(ana.get('paper_pricecheck') or {})}),
+                 "Разведка: на испытании {probation}, найдено {found}, начато {started}, добавлено {promoted}, "
+                 "отсеяно {rejected}, убрано {demoted}, ошибок GMGN {gmgn_errors} (с запуска)"
+                 .format(**{"probation": 0, "found": 0, "started": 0, "promoted": 0, "rejected": 0, "demoted": 0,
+                            "gmgn_errors": 0, **(ana.get('scout') or {})})]
         pend = await db.fetchrow("SELECT count(*) n, min(created_at) oldest FROM jobs WHERE done_at IS NULL")
         lines.append(f"\n<b>Задачи</b> (команды бота → аналитика): в очереди {pend['n']}"
                      + (f", самая старая {fmt.ago((now - pend['oldest']).total_seconds())} назад ⚠️"
@@ -620,6 +625,31 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await db.job("paper", {"cmd": "reset"})
             return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
         await paper_answer(m, cmd, 24 if cmd == "trades" else None)
+
+    @router.message(Command("scout"))
+    async def cmd_scout(m: Message) -> None:
+        """Разведка кошельков: кто на испытании, кого добавили и отсеяли."""
+        from ..analytics.scout import scout_report
+        await reply(m, (await scout_report(db))[:4000])
+
+    @router.message(Command("wallets"))
+    async def cmd_wallets(m: Message) -> None:
+        """Файл по всем кошелькам: свои, разведка, кандидаты, smart-money — с итогом копий и вердиктом."""
+        from ..reports.wallets import wallets_csv
+        cfg = await reload()
+        sol = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+        data, n = await wallets_csv(db, sol, str(cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
+        await m.answer_document(BufferedInputFile(data.encode("utf-8-sig"), filename="wallets.csv"),
+                                caption=f"👛 Кошельков: {n}, сначала худшие. Вердикт — по итогу копий в бумаге.")
+
+    @router.message(Command("export"))
+    async def cmd_export(m: Message) -> None:
+        """Всё для разбора одним архивом: сделки за сутки и 30 дней, кошельки, журнал копитрейда."""
+        from ..reports.export import build_export
+        tr = await paper_view()
+        data, caption = await build_export(db, tr)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await m.answer_document(BufferedInputFile(data, filename=f"scanner_{stamp}.zip"), caption="📦 " + caption)
 
     @router.message(Command("calib"))
     async def cmd_calib(m: Message, command: CommandObject) -> None:

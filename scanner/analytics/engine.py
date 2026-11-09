@@ -96,6 +96,7 @@ class Engine:
         self.info: dict[str, TokenInfo] = {}
         self.alerts: dict[str, AlertEntry] = {}
         self.traders: dict[str, Any] = {}
+        self.scouts: set[str] = set()               # кандидаты разведки на испытании — копии только в H
         self.smart_buys: dict[str, list[tuple[float, str, float]]] = {}
         self.references: list[dict[str, Any]] = []
         self.cur_token = 0
@@ -113,6 +114,8 @@ class Engine:
         self.paper = PaperTrader(self)
         from .pricecheck import PriceCheck
         self.pricecheck = PriceCheck(self)
+        from .scout import Scout
+        self.scout = Scout(self)
         self._ls_cache: set[str] = set()
         self._ls_loaded = 0.0
         self._cl_day: dict[int, tuple[Any, int]] = {}
@@ -212,7 +215,7 @@ class Engine:
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
                  self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.paper.tick_loop(),
-                 self.pricecheck.loop()]
+                 self.pricecheck.loop(), self.scout.loop()]
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий
@@ -409,9 +412,10 @@ class Engine:
             self._feed_ts.append(time.monotonic())
         trader = r["trader"]
         tracked = trader in self.traders
-        if st is None and (tracked or mint in self.alerts or mint in self.watch_tokens):
+        scout = not tracked and trader in self.scouts
+        if st is None and (tracked or scout or mint in self.alerts or mint in self.watch_tokens):
             st = await load_state(self.db, mint, self.cfg)
-            if st is None and tracked:
+            if st is None and (tracked or scout):
                 # монета появилась до запуска бота (или во время обрыва): заводим заглушку по сделке трейдера,
                 # иначе покупку отслеживаемого кошелька пропустим
                 await self._stub_token(mint, r)
@@ -434,6 +438,8 @@ class Engine:
             st.migrated = True
         if tracked:
             await self._on_smart_trade(st, r)
+        elif scout and r["is_buy"]:
+            self._on_scout_buy(st, r)
         info = self.info.get(mint)
         if info is not None and info.needs_rpc and not info.rpc_started and r["is_buy"]:
             n = len({t.trader for t in st.trades if t.is_buy and t.trader != st.deployer})
@@ -657,6 +663,8 @@ class Engine:
         for r in await self.db.fetch("SELECT address, label FROM watchlist WHERE kind='trader'"):
             self.traders.setdefault(r["address"], {"address": r["address"], "label": r["label"], "tier": None,
                                                    "copy_30d": None, "win_rate": None, "manual": True})
+        self.scouts = {r["address"] for r in await self.db.fetch(
+            "SELECT address FROM scout WHERE status='probation'")}
         self.watch_tokens = {r["address"] for r in await self.db.fetch(
             "SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())")}
         # девы из своего списка: алерт в момент запуска, цели — по их почерку (analytics/walletcheck.py)
@@ -674,6 +682,15 @@ class Engine:
         rows = await self.db.fetch(
             "SELECT * FROM launches WHERE is_reference ORDER BY created_at DESC LIMIT 200")
         self.references = [dict(r) for r in rows]
+
+    def _on_scout_buy(self, st: TokenState, r: Any) -> None:
+        """Кандидат разведки купил — копия в испытательный портфель H (без алерта в чат)."""
+        if r["trader"] == st.deployer or float(r["sol_amount"] or 0) < float(self.cfg.get("scout_min_buy_sol", 0.1)):
+            return
+        if sum(1 for t in st.trades if t.trader == r["trader"] and t.is_buy) > 1:
+            return                                   # докупка — копируем только первый вход
+        data = {"modes": ["scout"], "symbol": st.symbol, "mc": st.mc, "source_wallet": r["trader"]}
+        asyncio.create_task(self.paper.on_alert(st.mint, "normal", None, data, r["trader"]))
 
     async def _on_smart_trade(self, st: TokenState, r: Any) -> None:
         cfg = self.cfg
@@ -1177,6 +1194,7 @@ class Engine:
                     "paper_false_exits": self.paper.false_exits, "paper_bad_prices": self.paper.bad_prices,
                     "paper_entry_fixed": self.paper.entry_fixed, "paper_exit_fixed": self.paper.exit_fixed,
                     "paper_no_price": self.paper.no_price, "paper_pricecheck": self.pricecheck.stats,
+                    "scout": {**self.scout.stats, "probation": len(self.scouts)},
                     "paper_open": len(self.paper.positions),
                 })
             except Exception:  # noqa: BLE001
@@ -1305,6 +1323,12 @@ class Engine:
                     await send_daily(self.db, self.settings, now.date())
                 except Exception:  # noqa: BLE001
                     log.exception("daily")
+                if cfg.get("daily_export", True):
+                    try:                             # архив для разбора: сделки за день и за 30 дней, кошельки, копитрейд
+                        from ..reports.export import enqueue_export
+                        await enqueue_export(self.db, self.paper, "📦 Ежедневная выгрузка")
+                    except Exception:  # noqa: BLE001
+                        log.exception("daily export")
             utc = datetime.now(timezone.utc)
             if utc.hour == 3 and last_nightly != utc.date():
                 last_nightly = utc.date()

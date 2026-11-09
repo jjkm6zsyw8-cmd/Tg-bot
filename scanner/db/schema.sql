@@ -453,3 +453,19 @@ ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_mae double precision; 
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_dip double precision;     -- просадка ДО пика
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_peak_s double precision;  -- через сколько секунд пик
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_p30 double precision;     -- где цена через 30 мин
+
+-- Разведка кошельков (analytics/scout.py): кандидаты, испытательный срок в портфеле H, решения
+CREATE TABLE IF NOT EXISTS scout (
+    address        text PRIMARY KEY,
+    status         text NOT NULL DEFAULT 'queued',  -- queued | probation | promoted | passed | rejected | few | demoted | removed
+    source         text,                            -- свои данные | GMGN
+    reason         text,                            -- почему попал в кандидаты
+    score          double precision,
+    stats          jsonb,                           -- GMGN за 7 дней: винрейт, прибыль, монет, удержание
+    found_at       timestamptz NOT NULL DEFAULT now(),
+    started_at     timestamptz,                     -- начало испытания
+    decided_at     timestamptz,
+    decision       text,
+    cooldown_until timestamptz
+);
+CREATE INDEX IF NOT EXISTS scout_status_idx ON scout (status);

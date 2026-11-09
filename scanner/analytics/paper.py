@@ -47,6 +47,11 @@ LOTTERY_DAY_STOP_USD = 0.0    # дневной стоп лотереи, $ (0 —
 # E — все. По 9008 алертам «Наблюдения»: у таких ракет ×3+ 4.2% против 2.1% у остальных (оба дня одинаково)
 DAY_CAP_USD = 0.0             # днём в позициях лотереи не больше $X (0 — без лимита; с 9.11 выключен)
 SMART_ONLY = "F"              # smart-money — отдельный портфель: меряем его без примеси копий
+# H — испытательный срок: кандидаты «Разведки» (analytics/scout.py) копируются только сюда, как G, фиксированной
+# суммой; по итогу их копий разведка решает — в свой список или в отсев. На остальные портфели не влияет.
+SCOUT = "H"
+SCOUT_MAX_OPEN = 10
+SCOUT_USD = 10.0
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
@@ -73,11 +78,12 @@ SCHEMES: dict[str, dict[str, Any]] = {
     "E": {**_G, "name": "E: всё на +40%", "tp_net": 0.40},
     "F": {**_G, "name": "F: только smart-money, как G"},
     "G": {**_G, "name": "G: эталон — всё на +25%, стоп −8%, 5 мин"},
+    SCOUT: {**_G, "name": "H: испытательный срок — кандидаты разведки, как G, по $10"},
 }
 LEGEND = ("копии: G эталон (всё на +25%, стоп −8%) · A стоп −15% · B 70% на +25%, остаток трейл 30% · "
           "C не продаёт за трейдером · E всё на +40% · F — только smart-money · D — лотерея (дев купил ~1 SOL): "
-          "треть на ×2, остаток трейл 30%, до 4 ч · без дневных стопов (сбор данных) · цены по рынку · "
-          "старт $100")
+          "треть на ×2, остаток трейл 30%, до 4 ч · H — испытательный срок кандидатов разведки (как G, по $10) · "
+          "без дневных стопов (сбор данных) · цены по рынку · старт $100")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -478,7 +484,7 @@ class PaperTrader:
             self.skipped[name] = "уже есть позиция по этой монете"
             return None
         lottery = self.is_lottery(name)
-        max_open = LOTTERY_MAX_OPEN if lottery else MAX_OPEN
+        max_open = LOTTERY_MAX_OPEN if lottery else SCOUT_MAX_OPEN if name == SCOUT else MAX_OPEN
         if len(open_here) >= max_open:
             self.skipped[name] = f"лимит {max_open} открытых позиций"
             return None
@@ -509,6 +515,9 @@ class PaperTrader:
             # Ratio: копия — доля от суммы покупки цели (её уверенность), потолок — обычная доля портфеля
             ratio = float(self.cfg.get("copy_ratio", 0.10))
             size = min(size, ratio * float(data["copy_sol"]))
+        if name == SCOUT:
+            # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
+            size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * 0.5)    # …но и не больше половины баланса
         cap = self.day_cap_sol() if lottery else None     # дневной лимит суммы — только на лотерею
@@ -773,10 +782,12 @@ class PaperTrader:
         """В какие портфели идёт сигнал и почему никуда, если пусто. Без modes (старые вызовы) — во все."""
         modes = set(data.get("modes") or [])
         if not modes:
-            return set(SCHEMES), ""
+            return set(SCHEMES) - {SCOUT}, ""
+        if "scout" in modes:
+            return {SCOUT}, ""                       # кандидат разведки — только испытательный портфель
         lottery = {n for n in SCHEMES if self.is_lottery(n)}
-        smart_only = set(str(self.cfg.get("paper_smart_portfolios", SMART_ONLY))) & set(SCHEMES) - lottery
-        main = set(SCHEMES) - lottery - smart_only
+        smart_only = set(str(self.cfg.get("paper_smart_portfolios", SMART_ONLY))) & set(SCHEMES) - lottery - {SCOUT}
+        main = set(SCHEMES) - lottery - smart_only - {SCOUT}
         out: set[str] = set()
         why = ""
         if "copy" in modes:
@@ -927,7 +938,7 @@ class PaperTrader:
                    or saved.get("*") or next((v for v in saved.values()), ""))
             lines.append(f"⏸ сделок нет · алертов за период: {parts or '0'}" + (f" · бумага не вошла: {why}" if why else ""))
         # таблица: портфель · за период · всего · баланс · сделки (доля прибыльных); ★ — лидер по «всего»
-        leader = max(SCHEMES, key=lambda n: tot[n]["equity"] / tot[n]["port"]["start_sol"])
+        leader = max((n for n in SCHEMES if n != SCOUT), key=lambda n: tot[n]["equity"] / tot[n]["port"]["start_sol"])
         head = ("    " + (f"{'период':>7}" if hours is not None else "") + f"{'всего':>7}{'баланс':>8}  сделки")
         rows = [head]
         for n in SCHEMES:

@@ -196,6 +196,25 @@ class Gmgn(ExternalSource):
             return parse_gmgn_wallet(data)
         return await self.cached(f"wallet_{period}", wallet, TTL_LABELS, fetch)
 
+    async def trending(self, interval: str = "1h", limit: int = 20) -> list[dict[str, Any]]:
+        """Монеты в тренде (GMGN rank, вес 3): адрес, символ, MC — источник кандидатов разведки."""
+        async def fetch() -> list[dict[str, Any]]:
+            data = await self._get("/v1/market/rank", {"chain": "sol", "interval": interval, "limit": limit}, 3)
+            rows = (data or {}).get("rank") if isinstance(data, dict) else data
+            return [{"mint": r.get("address"), "symbol": r.get("symbol") or "", "mc": _f(r.get("market_cap"))}
+                    for r in rows or [] if isinstance(r, dict) and r.get("address")]
+        return await self.cached("rank", interval, 300, fetch) or []
+
+    async def top_traders(self, mint: str, limit: int = 30) -> list[dict[str, Any]]:
+        """Лучшие трейдеры монеты по реализованной прибыли (GMGN token_top_traders, вес 5)."""
+        async def fetch() -> list[dict[str, Any]]:
+            data = await self._get("/v1/market/token_top_traders",
+                                   {"chain": "sol", "address": mint, "limit": limit, "order_by": "profit",
+                                    "direction": "desc"}, 5)
+            rows = (data or {}).get("list") if isinstance(data, dict) else data
+            return [parse_gmgn_trader(r) for r in rows or [] if isinstance(r, dict) and r.get("address")]
+        return await self.cached("top_traders", mint, 1800, fetch) or []
+
     async def created_tokens(self, wallet: str) -> Any:
         async def fetch() -> Any:
             return await self._get("/v1/user/created_tokens", {"chain": "sol", "wallet_address": wallet}, 1)
@@ -215,6 +234,17 @@ def parse_gmgn_security(d: Any) -> dict[str, Any] | None:
     }
 
 
+def parse_gmgn_trader(r: dict[str, Any]) -> dict[str, Any]:
+    """Строка топ-трейдеров монеты: прибыль в $, доля проданного, сделки, метки."""
+    tags = [str(t) for t in (r.get("tags") or []) + (r.get("maker_token_tags") or []) if t]
+    bought, sold = _f(r.get("history_bought_cost")) or 0.0, _f(r.get("history_sold_income")) or 0.0
+    profit = _f(r.get("realized_profit"))
+    return {"address": r.get("address"), "profit_usd": profit if profit is not None else sold - bought,
+            "bought_usd": bought, "sold_share": _f(r.get("sell_amount_percentage")) or 0.0,
+            "buys": int(_f(r.get("buy_tx_count_cur")) or 0), "sells": int(_f(r.get("sell_tx_count_cur")) or 0),
+            "exchange": str(r.get("addr_type")) == "2", "suspicious": bool(r.get("is_suspicious")), "tags": tags}
+
+
 def parse_gmgn_wallet(d: Any) -> dict[str, Any] | None:
     if isinstance(d, list):
         d = d[0] if d else None
@@ -224,11 +254,18 @@ def parse_gmgn_wallet(d: Any) -> dict[str, Any] | None:
     tags = list(common.get("tags") or [])
     if common.get("tag") and common["tag"] not in tags:
         tags.append(common["tag"])
+    pnl = d.get("pnl_stat") or {}
+    winrate = _f(pnl.get("winrate"))
     return {
         "tags": tags, "name": common.get("name"), "twitter": common.get("twitter_username"),
         "followers": common.get("followers_count"), "fund_from": common.get("fund_from"),
-        "pnl": _f(d.get("pnl")), "realized_profit": _f(d.get("realized_profit")),
-        "winrate": _f(d.get("winrate")), "buy_count": d.get("buy_count"), "sell_count": d.get("sell_count"),
+        "pnl": _f(d.get("realized_profit_pnl", d.get("pnl"))), "realized_profit": _f(d.get("realized_profit")),
+        "winrate": winrate if winrate is not None else _f(d.get("winrate")),
+        "buy_count": d.get("buy_count", d.get("buy")), "sell_count": d.get("sell_count", d.get("sell")),
+        # для разведки: сколько монет торговал, среднее удержание, распределение итогов по монетам
+        "token_num": int(_f(pnl.get("token_num")) or 0), "avg_hold_s": _f(pnl.get("avg_holding_period")),
+        "big_losses": int(_f(pnl.get("pnl_lt_nd5_num")) or 0), "x5": int(_f(pnl.get("pnl_gt_5x_num")) or 0),
+        "created_tokens": int(_f(common.get("created_token_count")) or 0),
         "is_smart": any(t in ("smart_degen", "smart_money") for t in tags),
         "is_kol": any(t in ("kol", "renowned") for t in tags),
         "is_exchange": any(w in " ".join(map(str, tags + [common.get("fund_from") or ""])).lower()

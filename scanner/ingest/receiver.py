@@ -93,6 +93,7 @@ class Receiver:
         self.store_hours = float(rel.get("trade_store_hours", 24))
         self.known_mints: dict[str, float] = {}   # mint → unix-время создания
         self.tracked_wallets: set[str] = set()
+        self.scout_wallets: set[str] = set()       # кандидаты разведки: храним их сделки, монеты не подписываем
         self.tracked_mints: set[str] = set()      # алерты, бумажные позиции, наблюдение
         self.extended: dict[str, float] = {}      # mint → до какого unix-времени собирать сделки
         self.mc_track: dict[str, list[float]] = {}  # mint → [начальный MC, последний, MC 10 мин назад, отметка]
@@ -204,7 +205,7 @@ class Receiver:
                 if isinstance(s, PumpPortalSource):
                     await s.subscribe_tokens([ev.mint])
         elif isinstance(ev, Trade):
-            if ev.trader in self.tracked_wallets and ev.is_buy:
+            if ev.trader in self.tracked_wallets and ev.is_buy and ev.trader not in self.scout_wallets:
                 # отслеживаемый трейдер купил — сделки монеты нужны для цены и выхода (30 минут)
                 self.extended[ev.mint] = max(self.extended.get(ev.mint, 0), time.time() + 1800)
                 if self.watch is not None:
@@ -266,7 +267,8 @@ class Receiver:
         if self.watch is None:
             return
         rows = await self.db.fetch(
-            """SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')""")
+            """SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')
+               UNION SELECT address FROM scout WHERE status = 'probation'""")
         wallets = [r["address"] for r in rows]
         self.watch_devs = {r["wallet"] for r in await self.db.fetch(
             """SELECT l.wallet FROM cluster_links l JOIN clusters c ON c.id = l.cluster_id
@@ -611,8 +613,13 @@ class Receiver:
             try:
                 rows = await self.db.fetch(
                     "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist "
-                    "WHERE kind IN ('trader', 'dev')")
+                    "WHERE kind IN ('trader', 'dev') UNION SELECT address FROM scout WHERE status = 'probation'")
                 wallets = {r["address"] for r in rows}
+                # испытание разведки: цену и выход по ним бумага берёт из Jupiter — подписка на все сделки их
+                # монет (трафик Helius) не нужна, только на сделки самих кошельков
+                self.scout_wallets = {r["address"] for r in await self.db.fetch(
+                    "SELECT address FROM scout WHERE status = 'probation'")} - {r["address"] for r in await self.db.fetch(
+                    "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist")}
                 self.tracked_wallets = wallets
                 self.tracked_mints = {r["mint"] for r in await self.db.fetch(
                     """SELECT mint FROM alerts WHERE created_at > now() - interval '1 day'

@@ -93,7 +93,7 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         assert tr.balance["B"] == pytest.approx(0.3)                    # старт $30 (настройка) при SOL = $100
-        n = len(pp.SCHEMES)
+        n = len(pp.SCHEMES) - 1                                          # H — только кандидаты разведки
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0, "target_mc": 90.0}, None)
         assert len(tr.positions) == n and tr.balance["B"] == pytest.approx(0.21)   # «Сильный»: 20% × 1.5 = 30%
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0}, None)
@@ -595,7 +595,9 @@ def test_route_signals_to_portfolios():
                     "strong")[0] == main | lottery
     assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
     assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
-    assert tr.route({}, "normal")[0] == set(pp.SCHEMES)          # старые вызовы без modes — во все
+    assert tr.route({}, "normal")[0] == set(pp.SCHEMES) - {"H"}   # старые вызовы без modes — во все, кроме H
+    assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H"}  # кандидат разведки — только испытательный H
+    assert "H" not in main | smart | lottery
     tr.e.cfg = {"paper_strong_copies": True}
     assert tr.route({"modes": ["copy"], "traders": [{}, {}]}, "strong")[0] == main
 
