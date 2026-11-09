@@ -91,6 +91,7 @@ TICK_S = 2.0          # проверка открытых позиций (сто
 # сделки своего потока для решений не используются: 8–9.11 они давали входы ниже рынка и стопы по цене, которой
 # на рынке не было (сверка с минутными свечами GeckoTerminal)
 PRICE_EXITS = ("stop", "trailing", "target", "take_profit")
+CHECK_NAMES = {"ok": "ок", "nodata": "нет свечей", "entry": "⚠ вход", "exit": "⚠ выход"}
 JUP_REFRESH_S = 4.0   # цены Jupiter открытых позиций — одним запросом раз в 4 с
 JUP_MAX_AGE_S = 8.0   # цена Jupiter годится для решения, если ей не больше 8 с
 OWN_MAX_AGE_S = 10.0  # сделка своего потока годится, если ей не больше 10 с
@@ -1044,7 +1045,9 @@ class PaperTrader:
         tz = self.tz()
         w.writerow(["портфель", "монета", "адрес", "режим", "уровень", "кошелёк", "вход", "выход", "MC вход $",
                     "MC выход $", "MC максимум $", "вложено SOL", "получено SOL", "результат SOL", "результат %",
-                    "причина выхода", "адрес кошелька"])
+                    "причина выхода", "адрес кошелька", "проверка по рынку", "рост за 30 мин %",
+                    "просадка до пика %", "цена через 30 мин %"])
+        pct = lambda v: "" if v is None else round(v * 100, 1)
         for r in await self._closed(since):
             w.writerow([
                 r["portfolio"], r["symbol"] or "", r["mint"], MODE_SHORT.get(r["mode"] or "", r["mode"] or ""),
@@ -1055,6 +1058,8 @@ class PaperTrader:
                 round((r["max_mc"] or 0) * sol_usd), round(r["cost_sol"] or 0, 5), round(r["proceeds_sol"] or 0, 5),
                 round(r["pnl_sol"] or 0, 5), round((r["pnl_pct"] or 0) * 100, 1),
                 EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""), r.get("source_wallet") or "",
+                "⚠ не в итоге" if r.get("suspect") else CHECK_NAMES.get(r.get("price_check") or "", "ещё нет"),
+                pct(r.get("path_mfe")), pct(r.get("path_dip")), pct(r.get("path_p30")),
             ])
         return out.getvalue()
 

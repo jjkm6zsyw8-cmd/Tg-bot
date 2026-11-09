@@ -144,7 +144,7 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
         for pid in list(tr.positions):
             await tr._sell(tr.positions[pid], "trader_sell", 1.0, 40.0)
         table = await tr.trades_csv(None)
-        assert ";кошелёк;" in table.splitlines()[0] and ";лимфорк;" in table and table.count(";W\r\n") == 21
+        assert ";кошелёк;" in table.splitlines()[0] and ";лимфорк;" in table and table.count(";W;ещё нет;;;\r\n") == 21
         day = await tr.trades_text(24)
         assert "(лимфорк)" in day[0]
         await eng.copyguard.load()

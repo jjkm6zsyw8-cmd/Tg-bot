@@ -133,6 +133,7 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         assert len(day) == 1 and day[0].count("$T") == 1 and "G +" in day[0] and "сделок 7" in day[0]
         table = await tr.trades_csv(None)
         assert table.count("\n") == 8 and "портфель;монета" in table and "экстренный выход" in table
+        assert "проверка по рынку" in table and ";ещё нет;" in table
         await tr.reset()
         assert tr.balance["A"] == pytest.approx(0.3)   # сброс — до старта из настройки ($30)
     finally:
