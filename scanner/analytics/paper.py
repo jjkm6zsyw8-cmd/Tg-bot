@@ -459,6 +459,9 @@ class PaperTrader:
                 and set(data.get("modes") or []) & {"copy", "smart"}):
             data = {**data, "source_wallet": trader}      # smart-money: рейтинг ведётся и по нему
         targets, why = self.route(data, level)
+        if getattr(self, "last_filter", None):
+            log_ = (await self.db.kv_get("autofilter:log") or [])[-499:] + [self.last_filter]
+            await self.db.kv_set("autofilter:log", log_)
         if not targets:
             self.skipped["*"] = why
             return
@@ -919,6 +922,19 @@ class PaperTrader:
             elif kind == "smart" and strong and not self.cfg.get("paper_m_smart_strong", False):
                 out.discard(MAIN)
                 self.skipped[MAIN] = "M: smart 2+ кошелька разом по рынку в минусе — берём одиночный smart"
+        model = getattr(self.e, "autofilter", None) or {}
+        self.last_filter = None
+        if MAIN in out and model.get("active") and self.kind_of(data) in ("copy", "smart") \
+                and self.cfg.get("paper_m_autofilter", True):
+            from .autofilter import features, predict
+            x = features(data, level, "copy" if self.kind_of(data) == "copy" else "smart", datetime.now(timezone.utc))
+            pred = predict(model, x)
+            thr = float(self.cfg.get("paper_m_filter_threshold", 0.0))
+            self.last_filter = {"mint": data.get("mint") or "", "symbol": data.get("symbol") or "",
+                                "pred": round(pred, 4), "skip": pred < thr, "at": datetime.now(timezone.utc).isoformat()}
+            if pred < thr:
+                out.discard(MAIN)
+                self.skipped[MAIN] = f"M: автофильтр — по истории такие сигналы дают {pred:+.0%} на копию"
         if MAIN in out and self.kind_of(data) == "copy":
             age = data.get("age_s")
             mc_usd = float(data.get("mc") or 0) * (self.e.price.value or 150)

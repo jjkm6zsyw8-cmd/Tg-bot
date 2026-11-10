@@ -98,6 +98,7 @@ class Engine:
         self.traders: dict[str, Any] = {}
         self.scouts: set[str] = set()               # кандидаты разведки на испытании — копии только в H
         self.rating: dict[str, dict[str, Any]] = {}  # рейтинг кошельков по итогу их копий (analytics/rating.py)
+        self.autofilter: dict[str, Any] = {}         # модель автофильтра сигналов (analytics/autofilter.py)
         self.smart_buys: dict[str, list[tuple[float, str, float]]] = {}
         self.references: list[dict[str, Any]] = []
         self.cur_token = 0
@@ -115,10 +116,12 @@ class Engine:
         self.paper = PaperTrader(self)
         from .pricecheck import PriceCheck
         self.pricecheck = PriceCheck(self)
+        from .autofilter import AutoFilter
         from .rating import Rating
         from .scout import Scout
         self.scout = Scout(self)
         self.ratings = Rating(self)
+        self.filter = AutoFilter(self)
         self._ls_cache: set[str] = set()
         self._ls_loaded = 0.0
         self._cl_day: dict[int, tuple[Any, int]] = {}
@@ -218,7 +221,7 @@ class Engine:
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
                  self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.paper.tick_loop(),
-                 self.pricecheck.loop(), self.scout.loop(), self.ratings.loop()]
+                 self.pricecheck.loop(), self.scout.loop(), self.ratings.loop(), self.filter.loop()]
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий

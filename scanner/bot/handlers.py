@@ -629,6 +629,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
         await paper_answer(m, cmd, 24 if cmd == "trades" else None)
 
+    @router.message(Command("filter"))
+    async def cmd_filter(m: Message) -> None:
+        """Автофильтр сигналов: чему научился на сделках трейдеров, включён ли, что отсеивает."""
+        from ..analytics.autofilter import filter_report
+        await reply(m, (await filter_report(db))[:4000])
+
     @router.message(Command("rating"))
     async def cmd_rating(m: Message, command: CommandObject) -> None:
         """Рейтинг кошельков по итогу их копий; /rating адрес топ|норм|слабый|пауза|авто — ручная правка."""
