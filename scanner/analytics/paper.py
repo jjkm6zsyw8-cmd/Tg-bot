@@ -80,6 +80,11 @@ M_COPY_MIN_MC_USD = 0.0
 M_LOTTERY_SHARE = 0.05
 M_DAY_STOP_PCT = 0.25
 M_ENTRY_DELAY_S = 1.0          # M входит через 1 с (как бот на реальных деньгах), остальные — через ENTRY_DELAY_S
+# Поправка на реальную цену входа копий и smart (scripts/entry_check.py, 10.11, 1321 копия): цена Jupiter, по которой
+# входит бумага, отстаёт — через 5 с бумага записывала вход в среднем по цене трейдера (+0%), а по сделкам блокчейна
+# цена через 5 с уже +5% (через 1 с +0%, через 2 с +3%). Без поправки бумага была оптимистичнее реальности на ~5%.
+ENTRY_SLIP = 0.05              # портфели с входом через 5 с
+M_ENTRY_SLIP = 0.02            # M (вход через 1 с, у реального бота — 1–2 с)
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
@@ -500,6 +505,11 @@ class PaperTrader:
                 self.skipped["*"] = "копия: " + why
                 await guard.mark_skipped(data["copy_wallet"], mint, why)
                 return
+        if set(data.get("modes") or []) & {"copy", "smart"}:
+            # вход по реальной цене: поправка на отставание цены Jupiter (журнал копий — по сырой цене)
+            slip = float(self.cfg.get("paper_m_entry_slip", M_ENTRY_SLIP) if targets == {MAIN}
+                         else self.cfg.get("paper_entry_slip", ENTRY_SLIP))
+            mc = mc * (1 + slip)
         async with self.lock:
             sizes = []
             for name in SCHEMES:
