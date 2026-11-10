@@ -230,6 +230,14 @@ async def test_end_to_end(monkeypatch):
         assert await db.fetchval("SELECT message_id FROM token_messages WHERE mint=$1", live)
         emerg_msgs = [m for m in fake.sent if "ВЫХОД" in m["text"]]
         assert emerg_msgs and emerg_msgs[0]["disable_notification"] is False
+        # регрессия 10.11: старые строки полной ленты забивали окно очереди — алерты и отчёты ждали часами
+        for i in range(80):
+            await db.execute("""INSERT INTO outbox(kind, payload, priority, created_at)
+                                VALUES ('full', $1, 7, now() - interval '30 minutes')""", {"text": f"лента {i}"})
+        await db.enqueue("text", {"topic": "paper", "text": "отчёт после пробки"}, priority=5)
+        await sender.drain()
+        assert any("отчёт после пробки" in m["text"] for m in fake.sent)
+        assert await db.fetchval("SELECT count(*) FROM outbox WHERE kind='full' AND sent_at IS NULL") == 0
         # пауза глушит обычные алерты, но не экстренные
         await db.kv_set("mute_until", (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
         await db.enqueue("alert", {"mint": rand_addr(), "topic": "dev", "text": "x", "keyboard": None, "level": "normal"})

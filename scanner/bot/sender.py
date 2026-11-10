@@ -141,9 +141,16 @@ class Sender:
         # Telegram пускает в группу ~20 сообщений в минуту. Строго по приоритету правки алертов и сопровождение
         # съедали весь лимит, а отчёты, «Копитрейд», сводки ждали часами и потом приходили пачкой.
         # Старение: каждая минута ожидания повышает приоритет на 1 (до 6) — через ~5 мин сообщение наверху очереди
+        # строка полной ленты старше 2 минут бесполезна: такие ждали лимита, старели, поднимались наверх и забивали
+        # окно из 50 сообщений — за ними часами стояли алерты и отчёты (10.11: в очереди 483, самое старое 2ч38м)
+        await self.db.execute(
+            """UPDATE outbox SET sent_at = now(), error = 'stale' WHERE sent_at IS NULL AND kind = 'full'
+                 AND created_at < now() - interval '2 minutes'""")
         rows = await self.db.fetch(
             """SELECT * FROM outbox WHERE sent_at IS NULL AND attempts < 5
-               ORDER BY priority - LEAST(6, EXTRACT(EPOCH FROM (now() - created_at)) / 60.0), id LIMIT 50""")
+               ORDER BY priority - CASE WHEN kind = 'full' THEN 0
+                                        ELSE LEAST(6, EXTRACT(EPOCH FROM (now() - created_at)) / 60.0) END, id
+               LIMIT 50""")
         if not rows:
             return
         muted = await self.muted()
