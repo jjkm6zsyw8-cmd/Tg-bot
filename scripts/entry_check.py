@@ -444,6 +444,31 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     say(f"Размер ставки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема по прошлым дням; "
         f"учтено, что своя покупка и продажа двигают цену; SOL ${sol_usd:.0f}):")
     say("  " + " · ".join(sized))
+    # ракеты: как часто монета после входа делала ×2/×5/×10 (в пределах 30 мин) и что дают схемы «держать»
+    rockets = [
+        ("½ на +25%, остаток — трейлинг 30%", dict(tp=0.25, share=0.5, stop=0.15, time_s=None, gain=0, trail=0.30)),
+        ("держать: стоп −30%, трейлинг 40% от пика", dict(tp=0.0, share=1e-9, stop=0.30, time_s=None, gain=0,
+                                                         trail=0.40)),
+        ("тейк ×2, стоп −30%", dict(tp=1.0, share=1.0, stop=0.30, time_s=None, gain=0, trail=None)),
+        ("тейк ×3, стоп −50%", dict(tp=2.0, share=1.0, stop=0.50, time_s=None, gain=0, trail=None)),
+    ]
+    say("")
+    say(f"Ракеты (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл.; цена видна 30 мин после входа):")
+    for label, pick in (("smart", lambda g: g["kind"].startswith("smart")),
+                        ("копии", lambda g: not g["kind"].startswith("smart"))):
+        grp = [(g, entry_at(g["path"], g["s0"], d)) for g in good if pick(g)]
+        grp = [(g, e) for g, e in grp if e]
+        if not grp:
+            continue
+        peaks = []
+        for g, e in grp:
+            t0 = g["path"][e[0]][1]
+            peaks.append(max((p[2] for p in g["path"][e[0]:] if p[1] - t0 <= HORIZON_S), default=e[1]) / e[1])
+        hit = " · ".join(f"×{x}: {sum(pk >= x for pk in peaks) / len(peaks):.0%}" for x in (2, 5, 10))
+        g_usd = sum(simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd)[0] for g, e in grp) * 10
+        parts = [f"{name} {sum(simulate(g['path'], e[0], e[1], g['who'], sc, xd)[0] for g, e in grp) * 10:+.0f}$"
+                 for name, sc in rockets]
+        say(f"  {label} ({len(grp)}): дошли до {hit} · схема G {g_usd:+.0f}$ · " + " · ".join(parts))
     # отбор без подгонки: smart — все; копии — только кошельки, у которых по ПРОШЛЫМ дням 3+ сигнала и плюс
     say("")
     say(f"Отбор без подгонки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема G): smart — "
