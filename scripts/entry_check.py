@@ -26,6 +26,11 @@ PRIO = 0.0005 / 0.15                 # приоритет на одну тран
 SLOT_S = 0.4
 DELAYS = (0.4, 1.0, 2.0, 3.0, 5.0, 10.0)
 HORIZON_S = 1800
+# перебор выходов: тейк × стоп × таймер (выход через 10 мин, если не было +5%) — на сигналах с видимыми первыми секундами
+GRID_TP = (0.05, 0.07, 0.10, 0.15, 0.20, 0.25, 0.40, 0.60)
+GRID_STOP = (0.05, 0.08, 0.10, 0.15, 0.20, 0.30, None)
+GRID_TIME = (None, 600)
+GRID_DELAYS = (0.4, 1.0, 2.0, 3.0)
 SCHEMES = {
     # G — всё на +25% чистыми, стоп −8%, 5 минут на +10%, выход за трейдером
     "G": dict(tp=0.25, share=1.0, stop=0.08, time_s=300, gain=0.10, trail=None),
@@ -68,7 +73,7 @@ def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: floa
         if tr == trader and not is_buy and not tp_done:
             got += rem * mc
             return net(got / mc0), "трейдер продал"
-        if mc <= mc0 * (1 - sc["stop"]):
+        if sc["stop"] is not None and mc <= mc0 * (1 - sc["stop"]):
             got += rem * mc
             return net(got / mc0), "стоп"
         if tp_done and sc["trail"] and mc <= peak * (1 - sc["trail"]):
@@ -103,6 +108,7 @@ async def main(dsn: str | None = None) -> None:
     by_day: dict[str, dict[float, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
     wallets: dict[str, list[float]] = collections.defaultdict(list)
     seen_early, used, no_trigger, no_path = 0, 0, 0, 0
+    grid_paths: list[tuple[list[tuple[int, float, float, str, bool]], int, str]] = []
     for s in sigs:
         who = s["source_wallet"] or s["alert_trader"]
         trig = await conn.fetchrow(
@@ -134,6 +140,7 @@ async def main(dsn: str | None = None) -> None:
             continue
         kind = f"{'копия' if s['mode'] == 'copy' else 'smart'} {'сильная' if s['level'] == 'strong' else 'одна'}"
         day = s["opened_at"].strftime("%d.%m")
+        grid_paths.append((path, int(trig["slot"]), who))
         for d in DELAYS:
             e = entry_at(path, int(trig["slot"]), d)
             if not e:
@@ -174,6 +181,27 @@ async def main(dsn: str | None = None) -> None:
     print("\nПо дням, все сигналы G: через 1 с | через 5 с")
     for day in sorted(by_day):
         print(f"  {day}: {cell(by_day[day][1.0])} | {cell(by_day[day][5.0])}")
+    if grid_paths:
+        print(f"\nПеребор выходов ({len(grid_paths)} сигналов, $ при $10 на сделку, тейк/стоп/таймер 10 мин):")
+        for d in GRID_DELAYS:
+            entries = [(p, entry_at(p, s0, d), who) for p, s0, who in grid_paths]
+            entries = [(p, e, who) for p, e, who in entries if e]
+            rows_g = []
+            for tp in GRID_TP:
+                for stop in GRID_STOP:
+                    for tm in GRID_TIME:
+                        sc = dict(tp=tp, share=1.0, stop=stop, time_s=tm, gain=0.05, trail=None)
+                        rs = [simulate(p, e[0], e[1], who, sc)[0] for p, e, who in entries]
+                        rows_g.append((sum(rs) * 10, tp, stop, tm, sum(r > 0 for r in rs) / len(rs) if rs else 0))
+            rows_g.sort(key=lambda r: -r[0])
+            name = lambda r: (f"+{r[1]:.0%}/{('−%d%%' % round(r[2] * 100)) if r[2] else 'без стопа'}"
+                              f"{'/10м' if r[3] else ''}")
+            pos_n = sum(1 for r in rows_g if r[0] > 0)
+            pick = {(0.05, None, 600), (0.25, 0.08, None), (0.60, 0.20, None)}
+            print(f"  через {d:g} с: в плюсе {pos_n} из {len(rows_g)} · лучшие: "
+                  + "; ".join(f"{name(r)} {r[0]:+.0f}$ ({r[4]:.0%})" for r in rows_g[:4])
+                  + " · для сравнения: " + "; ".join(f"{name(r)} {r[0]:+.0f}$" for r in rows_g
+                                                      if (r[1], r[2], r[3]) in pick))
     ranked = sorted(((st.mean(v), w, len(v)) for w, v in wallets.items() if len(v) >= 3), reverse=True)
     if ranked:
         print("\nКошельки при входе через 1 с (3+ сигнала), лучшие и худшие:")
