@@ -338,6 +338,90 @@ def partial_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> st
             + f" · G {sum(g) * 10:+.0f}$ · медиана роста монет {st.median(peaks):+.0%}")
 
 
+# вход частями: первая покупка на сигнале, вторая — если цена откатилась на dip; выход от средней цены
+BUDGET_SOL = 0.12                    # $10 при SOL ≈ $84: приоритет 0.0005 SOL на транзакцию — доля от этого
+DCA_GRID = [dict(first=fs, dip=dp, tp=tp, stop=stp) for fs in (0.5, 0.33) for dp in (0.05, 0.08, 0.10, 0.15, 0.20, 0.30)
+            for tp in (0.10, 0.15, 0.25, 0.40) for stp in (0.10, 0.20, 0.30, None)]
+
+
+def simulate_dca(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: float, sc: dict[str, Any],
+                 exit_delay: float | None = None) -> float:
+    """Результат на весь бюджет ($10 = 1.0): доля first покупается на входе; если цена откатилась на dip от входа —
+    докупка остатка (через задержку, как продажа); выход всего — когда чистый результат от средней цены ≥ tp, или стоп
+    −stop от средней (только после докупки; до неё ждём отката), или конец окна 30 мин. Без докупки вложено first."""
+    prio = 0.0005 / BUDGET_SOL
+    t0 = path[i0][1]
+    tokens = sc["first"] * (1 - FEE) / mc0
+    spent = sc["first"] + prio
+    added = False
+    last = mc0
+    for j in range(i0 + 1, len(path)):
+        _slot, ts, mc, _tr, _b = path[j]
+        if ts - t0 > HORIZON_S:
+            break
+        last = mc
+        if not added and mc <= mc0 * (1 - sc["dip"]):
+            px = fill_after(path, j, exit_delay)
+            tokens += (1 - sc["first"]) * (1 - FEE) / px
+            spent += (1 - sc["first"]) + prio
+            added = True
+            continue
+        value = tokens * mc * (1 - FEE) - prio
+        if value / spent - 1 >= sc["tp"]:
+            return tokens * fill_after(path, j, exit_delay) * (1 - FEE) - prio - spent
+        if added and sc["stop"] is not None and value / spent - 1 <= -sc["stop"]:
+            return tokens * fill_after(path, j, exit_delay) * (1 - FEE) - prio - spent
+    return tokens * last * (1 - FEE) - prio - spent
+
+
+def dca_name(sc: dict[str, Any]) -> str:
+    first = 10 * sc["first"]
+    stop = "стоп −{:.0%}".format(sc["stop"]) if sc["stop"] else "без стопа"
+    return "${:.1f} сразу + ${:.1f} на −{:.0%}, выход +{:.0%}, {}".format(first, 10 - first, sc["dip"], sc["tp"], stop)
+
+
+def dca_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> list[str]:
+    if not paths:
+        return []
+    g = [simulate(p, i0, mc0, who, SCHEMES["G"], xd)[0] for p, i0, mc0, who, _d in paths]
+    res = [[simulate_dca(p, i0, mc0, sc, xd) for sc in DCA_GRID] for p, i0, mc0, _w, _d in paths]
+    days = [x[4] for x in paths]
+    wf, _ = pick_by_past(res, days, g)
+    # откат до пика: насколько монета проседает от входа, прежде чем дойти до максимума (за 30 мин)
+    dips = []
+    for p, i0, mc0, _w, _d in paths:
+        t0 = p[i0][1]
+        win = [q for q in p[i0:] if q[1] - t0 <= HORIZON_S]
+        k = max(range(len(win)), key=lambda k: win[k][2])
+        dips.append(min(q[2] for q in win[:k + 1]) / mc0 - 1)
+    # «откат = медиана откатов по прошлым дням», $5 + $5, выход и стоп — лучшие по прошлым дням
+    med_tot = 0.0
+    for dd in sorted(set(days)):
+        past = [i for i, x in enumerate(days) if x < dd]
+        idx = [i for i, x in enumerate(days) if x == dd]
+        if len(past) < 30:
+            med_tot += sum(g[i] for i in idx) * 10
+            continue
+        dip = max(0.03, -st.median(dips[i] for i in past))
+        best = None
+        for tp in (0.10, 0.15, 0.25, 0.40):
+            for stp in (0.10, 0.20, 0.30, None):
+                sc = dict(first=0.5, dip=dip, tp=tp, stop=stp)
+                v = sum(simulate_dca(paths[i][0], paths[i][1], paths[i][2], sc, xd) for i in past)
+                if best is None or v > best[0]:
+                    best = (v, sc)
+        med_tot += sum(simulate_dca(paths[i][0], paths[i][1], paths[i][2], best[1], xd) for i in idx) * 10
+    best_k = max(range(len(DCA_GRID)), key=lambda k: sum(r[k] for r in res))
+    top = sorted(range(len(DCA_GRID)), key=lambda k: -sum(r[k] for r in res))[:3]
+    hit = " · ".join(f"−{x:.0%}: {sum(dv <= -x for dv in dips) / len(dips):.0%}" for x in (0.05, 0.10, 0.20, 0.30))
+    return [f"откат до пика: медиана {st.median(dips):+.0%}; монет, проседавших до пика на {hit}",
+            f"откат = медиана по прошлым дням ($5+$5) {med_tot:+.0f}$ · вариант по прошлым дням {wf:+.0f}$ · "
+            f"вариантов в плюсе {sum(1 for k in range(len(DCA_GRID)) if sum(r[k] for r in res) > 0)} из "
+            f"{len(DCA_GRID)} · G {sum(g) * 10:+.0f}$",
+            "лучшие задним числом: " + " · ".join(f"{dca_name(DCA_GRID[k])} {sum(r[k] for r in res) * 10:+.0f}$"
+                                                for k in top)]
+
+
 OTHER_MODES = {"dev": "запуски девов (лотерея D)", "mydev": "мой дев", "new": "новые монеты",
                "new_dev_wallet": "новый кошелёк дева"}
 LOTTERY_D = dict(tp=1.0, share=0.34, stop=0.15, time_s=600, gain=0.10, trail=0.30)   # D: ⅓ на ×2, остаток трейл 30%
@@ -686,6 +770,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     say(f"Трейлинг всей позиции — без тейка, продажа только по откату от пика (покупка +{round(d / SLOT_S)} бл., "
         f"продажа +{round(xd / SLOT_S)} бл.; цена видна 30 мин, потом продажа по последней цене):")
     part_lines: list[str] = []
+    dca_paths: list[tuple[str, list[Any]]] = []
     for label, pick in (("smart", lambda g: g["kind"].startswith("smart")),
                         ("копии", lambda g: not g["kind"].startswith("smart"))):
         paths = []
@@ -697,10 +782,18 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         if paths:
             say(f"  {label} ({len(paths)}): " + trail_line(paths, xd))
             part_lines.append(f"  {label} ({len(paths)}): " + partial_line(paths, xd))
+            dca_paths.append((label, paths))
     say("")
     say("Часть на уровне обычного роста (65–70%), остаток — трейлинг 15/30% (тейк +10…+40%, стопы −8/−15/−30%/без):")
     for ln in part_lines:
         say(ln)
+    say("")
+    say("Вход частями: часть сразу, остаток — на откате (−5…−30% от входа); выход всего от средней цены (+10…+40%), "
+        "стоп после докупки −10/−20/−30%/без; $10 на сигнал, до отката вложено только первая часть:")
+    for label, paths in dca_paths:
+        for i, ln in enumerate(dca_line(paths, xd)):
+            say(f"  {label + ' (' + str(len(paths)) + ')' if i == 0 else ' ' * (len(label) + 3 + len(str(len(paths))))}"
+                f": {ln}")
     # отбор без подгонки: smart — все; копии — только кошельки, у которых по ПРОШЛЫМ дням 3+ сигнала и плюс
     say("")
     say(f"Отбор без подгонки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема G): smart — "

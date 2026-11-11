@@ -35,6 +35,15 @@ def test_exit_delay_parameter_overrides_default(monkeypatch):
     assert why == "стоп" and r == pytest.approx(ec.net(25 / 30))
 
 
+def test_dca_buys_on_dip_and_exits_from_average():
+    sc = dict(first=0.5, dip=0.10, tp=0.10, stop=None)
+    p = path(30, 29, 26, 26, 26, 31, 33)                 # откат −13% → докупка по 26, потом рост: выход от средней
+    r = ec.simulate_dca(p, 0, 30, sc, 0.0)
+    assert r > 0.03                                       # одна покупка по 30 дала бы ~+3%, с докупкой больше
+    no_dip = ec.simulate_dca(path(30, 31, 33, 36), 0, 30, dict(first=0.5, dip=0.10, tp=0.10, stop=None), 0.0)
+    assert 0.02 < no_dip < 0.09                           # без отката вложено только $5: результат — от половины бюджета
+
+
 def test_bigger_size_moves_price_against_us():
     # без влияния (крошечная ставка) — почти как net; чем больше ставка, тем хуже результат той же сделки
     assert ec.net_sized(1.3, 60, 1e-6) == pytest.approx(ec.net(1.3) + 2 * ec.PRIO - 2 * 0.0005 / 1e-6, abs=1e-3)
@@ -127,6 +136,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Ракеты" in out and "копии (2): дошли до ×2" in out
     assert "Копии через фильтры smart" in out and "прошли бы все:" in out
     assert "ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА" in out and "• запуски девов (лотерея D): 1 сигн." in out
+    assert "Вход частями" in out and "откат = медиана по прошлым дням" in out
     assert "Часть на уровне обычного роста" in out and "уровень = медиана роста" in out
     assert "Трейлинг всей позиции" in out and "копии (2): по прошлым дням" in out and "трейлинг всей позиции: по прошлым дням" in out
     # второй запуск — из кеша, без запросов
