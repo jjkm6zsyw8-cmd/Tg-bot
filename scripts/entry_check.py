@@ -340,8 +340,9 @@ def partial_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> st
 
 # вход частями: первая покупка на сигнале, вторая — если цена откатилась на dip; выход от средней цены
 BUDGET_SOL = 0.12                    # $10 при SOL ≈ $84: приоритет 0.0005 SOL на транзакцию — доля от этого
-DCA_GRID = [dict(first=fs, dip=dp, tp=tp, stop=stp) for fs in (0.5, 0.33) for dp in (0.05, 0.08, 0.10, 0.15, 0.20, 0.30)
-            for tp in (0.10, 0.15, 0.25, 0.40) for stp in (0.10, 0.20, 0.30, None)]
+DCA_GRID = [dict(first=fs, dip=dp, tp=tp, stop=stp) for fs in (0.5, 0.33, 0.0)
+            for dp in (0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40)
+            for tp in (0.10, 0.15, 0.25, 0.40, 0.60) for stp in (0.10, 0.20, 0.30, None)]
 
 
 def simulate_dca(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: float, sc: dict[str, Any],
@@ -352,7 +353,7 @@ def simulate_dca(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: 
     prio = 0.0005 / BUDGET_SOL
     t0 = path[i0][1]
     tokens = sc["first"] * (1 - FEE) / mc0
-    spent = sc["first"] + prio
+    spent = sc["first"] + prio if sc["first"] > 0 else 0.0      # first = 0 — ждём отката и заходим на всё
     added = False
     last = mc0
     for j in range(i0 + 1, len(path)):
@@ -366,15 +367,22 @@ def simulate_dca(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: 
             spent += (1 - sc["first"]) + prio
             added = True
             continue
+        if spent <= 0:
+            continue
         value = tokens * mc * (1 - FEE) - prio
         if value / spent - 1 >= sc["tp"]:
             return tokens * fill_after(path, j, exit_delay) * (1 - FEE) - prio - spent
         if added and sc["stop"] is not None and value / spent - 1 <= -sc["stop"]:
             return tokens * fill_after(path, j, exit_delay) * (1 - FEE) - prio - spent
+    if spent <= 0:
+        return 0.0                                  # отката не было — сделки нет
     return tokens * last * (1 - FEE) - prio - spent
 
 
 def dca_name(sc: dict[str, Any]) -> str:
+    if not sc["first"]:
+        stop = "стоп −{:.0%}".format(sc["stop"]) if sc["stop"] else "без стопа"
+        return "ждать −{:.0%}, весь $10, выход +{:.0%}, {}".format(sc["dip"], sc["tp"], stop)
     first = 10 * sc["first"]
     stop = "стоп −{:.0%}".format(sc["stop"]) if sc["stop"] else "без стопа"
     return "${:.1f} сразу + ${:.1f} на −{:.0%}, выход +{:.0%}, {}".format(first, 10 - first, sc["dip"], sc["tp"], stop)
@@ -411,15 +419,21 @@ def dca_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> list[s
                 if best is None or v > best[0]:
                     best = (v, sc)
         med_tot += sum(simulate_dca(paths[i][0], paths[i][1], paths[i][2], best[1], xd) for i in idx) * 10
-    best_k = max(range(len(DCA_GRID)), key=lambda k: sum(r[k] for r in res))
     top = sorted(range(len(DCA_GRID)), key=lambda k: -sum(r[k] for r in res))[:3]
+    wait_k = [k for k, sc in enumerate(DCA_GRID) if not sc["first"]]
+    wait_top = sorted(wait_k, key=lambda k: -sum(r[k] for r in res))[:3]
     hit = " · ".join(f"−{x:.0%}: {sum(dv <= -x for dv in dips) / len(dips):.0%}" for x in (0.05, 0.10, 0.20, 0.30))
     return [f"откат до пика: медиана {st.median(dips):+.0%}; монет, проседавших до пика на {hit}",
             f"откат = медиана по прошлым дням ($5+$5) {med_tot:+.0f}$ · вариант по прошлым дням {wf:+.0f}$ · "
             f"вариантов в плюсе {sum(1 for k in range(len(DCA_GRID)) if sum(r[k] for r in res) > 0)} из "
             f"{len(DCA_GRID)} · G {sum(g) * 10:+.0f}$",
             "лучшие задним числом: " + " · ".join(f"{dca_name(DCA_GRID[k])} {sum(r[k] for r in res) * 10:+.0f}$"
-                                                for k in top)]
+                                                for k in top),
+            "только «ждать отката, весь $10» по прошлым дням: " + "{:+.0f}$".format(
+                pick_by_past([[r[k] for k in wait_k] for r in res], days, g)[0])
+            + " · лучшие задним числом: " + " · ".join(
+                f"{dca_name(DCA_GRID[k])} {sum(r[k] for r in res) * 10:+.0f}$ "
+                f"({sum(1 for r in res if r[k] != 0)} сд.)" for k in wait_top)]
 
 
 OTHER_MODES = {"dev": "запуски девов (лотерея D)", "mydev": "мой дев", "new": "новые монеты",

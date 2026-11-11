@@ -44,6 +44,15 @@ def test_dca_buys_on_dip_and_exits_from_average():
     assert 0.02 < no_dip < 0.09                           # без отката вложено только $5: результат — от половины бюджета
 
 
+def test_wait_for_dip_then_full_buy():
+    sc = dict(first=0.0, dip=0.20, tp=0.25, stop=None)
+    assert ec.simulate_dca(path(30, 31, 33, 36), 0, 30, sc, 0.0) == 0.0          # отката не было — сделки нет
+    r = ec.simulate_dca(path(30, 28, 23, 24, 30, 31), 0, 30, sc, 0.0)            # −23% → покупка по 23, потом +30%
+    assert r > 0.2
+    lost = ec.simulate_dca(path(30, 50, 23, 20, 15), 0, 30, sc, 0.0)            # сначала пик, потом слив — минус
+    assert lost < -0.3
+
+
 def test_bigger_size_moves_price_against_us():
     # без влияния (крошечная ставка) — почти как net; чем больше ставка, тем хуже результат той же сделки
     assert ec.net_sized(1.3, 60, 1e-6) == pytest.approx(ec.net(1.3) + 2 * ec.PRIO - 2 * 0.0005 / 1e-6, abs=1e-3)
