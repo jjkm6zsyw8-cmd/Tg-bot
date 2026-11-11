@@ -453,10 +453,16 @@ FACT_TACTICS: list[tuple[str, str, dict[str, Any] | None]] = [
 ]
 
 
+FACT_CSV: list[list[Any]] = []          # та же таблица для файла
+
+
 def fact_table(groups: list[tuple[str, list[tuple[Any, int, float, str, str]]]], xd: float) -> list[str]:
     """Одна таблица: тактика → $ по дням (копии | smart), всего, сделок, в плюсе."""
     out = []
     days = sorted({p[4] for _l, ps in groups for p in ps})
+    FACT_CSV.clear()
+    FACT_CSV.append(["тактика", "сигналы"] + [f"{d[3:]}.{d[:2]}, $" for d in days]
+                    + ["всего, $", "сделок", "в плюсе, %", "на сделку, $"])
     out.append("ФАКТ ПО ТАКТИКАМ — сделки из базы в порядке блоков, $10 на сигнал, покупка через 2 блока, продажа "
                "через 1; по дням " + " / ".join(f"{d[3:]}.{d[:2]}" for d in days))
     for name, kind, sc in FACT_TACTICS:
@@ -475,6 +481,9 @@ def fact_table(groups: list[tuple[str, list[tuple[Any, int, float, str, str]]]],
             n = len(vals)
             parts.append(f"{label} {sum(byd):+.0f}$ [" + " / ".join(f"{b:+.0f}" for b in byd) + f"] {n} сд., "
                          f"в плюсе {sum(v > 0 for _d, v in vals) / n if n else 0:.0%}")
+            FACT_CSV.append([name, label] + [round(b, 2) for b in byd]
+                            + [round(sum(byd), 2), n, round(100 * sum(v > 0 for _d, v in vals) / n, 1) if n else "",
+                               round(sum(byd) / n, 2) if n else ""])
         out.append(f"• {name}: " + " | ".join(parts))
     return out
 
@@ -582,6 +591,23 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
             + f" · по прошлым дням {wf:+.0f}$ · лучшая задним числом {sname(GRID[best])} "
               f"{sum(r['grid'][best] for r in rs) * 10:+.0f}$")
         say("    трейлинг всей позиции: " + trail_line([r["trail_path"] for r in rs], xd))
+
+
+async def send_files(conn: Any, text: str) -> None:
+    """Файлы в Telegram (топик отчётов): таблица тактик CSV (открывается в Excel/Numbers) и полный отчёт TXT."""
+    import csv as _csv
+    import io as _io
+    stamp = __import__("datetime").datetime.now().strftime("%Y-%m-%d_%H%M")
+    files = []
+    if FACT_CSV:
+        buf = _io.StringIO()
+        _csv.writer(buf, delimiter=";").writerows(FACT_CSV)
+        files.append((f"tactics_{stamp}.csv", buf.getvalue(), "📊 Факт по тактикам: $ по дням, копии и smart"))
+    files.append((f"check_{stamp}.txt", text, "🔬 Полный отчёт проверки"))
+    for name, body, caption in files:
+        oid = await conn.fetchval("INSERT INTO outbox(kind, payload, priority) VALUES ('file', $1, 4) RETURNING id",
+                                  json.dumps({"csv": body, "filename": name, "caption": caption, "topic": "daily"}))
+        await conn.execute("SELECT pg_notify('outbox', $1)", str(oid))
 
 
 async def notify(conn: Any, text: str) -> None:
@@ -966,6 +992,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     text = "\n".join(out)
     if os.environ.get("EC_TG", "1") != "0":
         await notify(conn, text)
+        await send_files(conn, text)
     if gapper:
         await gapper.close()
     await conn.close()

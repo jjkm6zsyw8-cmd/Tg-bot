@@ -155,6 +155,9 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert len(calls) == 1 and "из кеша 1" in out
     db = await Database(DSN).connect(min_size=1, max_size=2)
     try:
+        files = await db.fetch("SELECT payload FROM outbox WHERE kind = 'file' ORDER BY id")
+        assert [f["payload"]["filename"][:8] for f in files][:2] == ["tactics_", "check_20"]
+        assert "тактика;сигналы;" in files[0]["payload"]["csv"] and "$5+$5: докупка −30%" in files[0]["payload"]["csv"]
         sent = await db.fetch("SELECT payload FROM outbox WHERE kind = 'text'")
         assert sent and "Проверка «быстрый бот»" in sent[0]["payload"]["text"] and "<pre>" in sent[0]["payload"]["text"]
     finally:
