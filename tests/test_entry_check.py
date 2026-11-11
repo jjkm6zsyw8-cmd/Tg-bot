@@ -94,6 +94,14 @@ async def test_main_runs_on_db(capsys, monkeypatch):
                              sig, tr, mc, slot, now + timedelta(seconds=0.4 * (slot - 200)))
         await db.execute("""INSERT INTO copy_log(wallet, mint, side, action, ref_mc, entry_mc, delta)
                             VALUES ('W', 'M1', 'buy', 'copied', 30, 33, 0.1)""")
+        # запуск дева: вход через 2 блока после создания монеты
+        await db.execute("""INSERT INTO tokens(mint, signature, deployer, current_owner, created_at, created_slot,
+                               initial_mc_sol) VALUES ('D1', 'CREATE1', 'DEV', 'DEV', $1, 300, 28.0)""", now)
+        for i, mc in enumerate([28.0, 29.0, 31.0, 36.0, 45.0, 60.0, 58.0]):
+            await db.execute("""INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol,
+                                   slot, ts) VALUES ($1, 'D1', 'B', true, 0.1, 1, $2, $3, $4)""",
+                             f"d{i}", mc, 300 + i, now + timedelta(seconds=0.4 * i))
+        await db.execute("INSERT INTO alerts(mint, mode, level) VALUES ('D1', 'dev', 'normal')")
     finally:
         await db.close()
     calls = []
@@ -118,6 +126,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Отбор без подгонки" in out and "Всего: smart 0 сд." in out
     assert "Ракеты" in out and "копии (2): дошли до ×2" in out
     assert "Копии через фильтры smart" in out and "прошли бы все:" in out
+    assert "ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА" in out and "• запуски девов (лотерея D): 1 сигн." in out
     # второй запуск — из кеша, без запросов
     await ec.main(DSN, rpc=NoRpc())
     out = capsys.readouterr().out

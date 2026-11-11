@@ -240,6 +240,109 @@ class Gapper:
         return status, rows
 
 
+OTHER_MODES = {"dev": "запуски девов (лотерея D)", "mydev": "мой дев", "new": "новые монеты",
+               "new_dev_wallet": "новый кошелёк дева"}
+LOTTERY_D = dict(tp=1.0, share=0.34, stop=0.15, time_s=600, gain=0.10, trail=0.30)   # D: ⅓ на ×2, остаток трейл 30%
+ROCKETS = [
+    ("½ на +25%, остаток трейл 30%", dict(tp=0.25, share=0.5, stop=0.15, time_s=None, gain=0, trail=0.30)),
+    ("держать: стоп −30%, трейл 40%", dict(tp=0.0, share=1e-9, stop=0.30, time_s=None, gain=0, trail=0.40)),
+    ("тейк ×2, стоп −30%", dict(tp=1.0, share=1.0, stop=0.30, time_s=None, gain=0, trail=None)),
+    ("тейк ×3, стоп −50%", dict(tp=2.0, share=1.0, stop=0.50, time_s=None, gain=0, trail=None)),
+]
+
+
+async def check_other(conn: Any, gapper: Any, say: Any) -> None:
+    """Сигналы, которые бумага не торгует (или только D): запуски девов, новые монеты, мой дев — на скорости бота.
+    Вход — через 2 блока после последней сделки монеты к моменту алерта (у запуска — после создания монеты),
+    выход — через 1 блок после сигнала, по сделкам. Первые секунды догружаются так же, как у копий."""
+    days = float(os.environ.get("EC_OTHER_DAYS", 3))
+    alerts = await conn.fetch(
+        """SELECT a.mint, a.mode, a.created_at, a.payload->'metrics'->>'cluster' AS share,
+                  t.deployer, t.created_slot, t.signature AS create_sig, t.initial_mc_sol
+           FROM alerts a JOIN tokens t ON t.mint = a.mint
+           WHERE a.mode = ANY($1::text[]) AND a.created_at > now() - make_interval(days => $2)
+           ORDER BY a.created_at""", list(OTHER_MODES), int(math.ceil(days)))
+    if not alerts:
+        return
+    d, xd = MAIN_REAL
+    groups: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    lost = collections.Counter()
+    for a in alerts:
+        trig = await conn.fetchrow(
+            """SELECT slot, ts, mc_sol, signature, pool FROM trades WHERE mint=$1 AND slot IS NOT NULL AND mc_sol > 0
+                 AND ts <= $2::timestamptz AND ts > $2::timestamptz - interval '30 seconds'
+               ORDER BY slot DESC, id DESC LIMIT 1""", a["mint"], a["created_at"])
+        if trig is None and a["mode"] == "dev" and a["created_slot"] and a["initial_mc_sol"]:
+            trig = {"slot": a["created_slot"], "ts": a["created_at"], "mc_sol": a["initial_mc_sol"],
+                    "signature": a["create_sig"], "pool": "pump"}
+        if trig is None:
+            lost["нет сделок до алерта"] += 1
+            continue
+        rows = await conn.fetch(
+            """SELECT slot, extract(epoch FROM ts) t, mc_sol, trader, is_buy, signature FROM trades
+               WHERE mint=$1 AND slot >= $2 AND ts <= $3::timestamptz + interval '31 minutes' AND mc_sol > 0
+               ORDER BY slot, id""", a["mint"], trig["slot"], trig["ts"])
+        s0 = int(trig["slot"])
+        full = [(int(r["slot"]), float(r["t"]), float(r["mc_sol"]), r["trader"], r["is_buy"], r["signature"])
+                for r in rows]
+        if len(full) < 2:
+            lost["нет цены после"] += 1
+            continue
+        if not any(s0 < q[0] <= s0 + EARLY_SLOTS for q in full):
+            if not gapper:
+                lost["без дозагрузки"] += 1
+                continue
+            after = next((q for q in full if q[0] > s0), None)
+            status, extra = await gapper.fill(a["mint"], trig, after[5] if after else None, after[0] if after else None)
+            if status not in ("full", "window"):
+                lost[status] += 1
+                continue
+            have = {q[5] for q in full}
+            full = sorted(full + [tuple(r) for r in extra if r[5] not in have], key=lambda q: q[0])
+        path = [q[:5] for q in full]
+        e = entry_at(path, s0, d)
+        if not e:
+            continue
+        name = OTHER_MODES[a["mode"]]
+        try:
+            share = float(a["share"]) if a["share"] is not None else None
+        except ValueError:
+            share = None
+        if a["mode"] == "dev" and share is not None and 0.030 <= share < 0.035:
+            name += ", дев купил ~1 SOL (как D)"
+        t0 = path[e[0]][1]
+        peak = max((q[2] for q in path[e[0]:] if q[1] - t0 <= HORIZON_S), default=e[1]) / e[1]
+        res = {"G": simulate(path, e[0], e[1], a["deployer"], SCHEMES["G"], xd)[0],
+               "D": simulate(path, e[0], e[1], a["deployer"], LOTTERY_D, xd)[0],
+               "peak": peak, "day": a["created_at"].strftime("%m.%d"),
+               "grid": [simulate(path, e[0], e[1], a["deployer"], sc, xd)[0] for sc in GRID]}
+        for label, sc in ROCKETS:
+            res[label] = simulate(path, e[0], e[1], a["deployer"], sc, xd)[0]
+        groups[name].append(res)
+    say("")
+    say(f"ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА ({days:g} дн., $10 на сделку; покупка через {round(d / SLOT_S)} бл. после "
+        f"последней сделки к алерту, у запуска — после создания; продажа через {round(xd / SLOT_S)} бл.; "
+        f"цена видна 30 мин). Сейчас в бумагу идут только запуски девов «~1 SOL» (D).")
+    if lost:
+        say("  не посчитано: " + ", ".join(f"{k} {v}" for k, v in lost.items()))
+    for name, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        n = len(rs)
+        hit = " · ".join(f"×{x}: {sum(r['peak'] >= x for r in rs) / n:.0%}" for x in (2, 5, 10))
+        best = max(range(len(GRID)), key=lambda k: sum(r["grid"][k] for r in rs))
+        # схема выхода по прошлым дням (честно)
+        days_l = sorted({r["day"] for r in rs})
+        wf = 0.0
+        for dd in days_l:
+            past = [r for r in rs if r["day"] < dd]
+            k = max(range(len(GRID)), key=lambda k: sum(r["grid"][k] for r in past)) if len(past) >= 30 else None
+            wf += sum((r["grid"][k] if k is not None else r["G"]) for r in rs if r["day"] == dd) * 10
+        say(f"• {name}: {n} сигн. · дошли до {hit}")
+        say(f"    G {sum(r['G'] for r in rs) * 10:+.0f}$ · D {sum(r['D'] for r in rs) * 10:+.0f}$ · "
+            + " · ".join(f"{lbl} {sum(r[lbl] for r in rs) * 10:+.0f}$" for lbl, _ in ROCKETS)
+            + f" · по прошлым дням {wf:+.0f}$ · лучшая задним числом {sname(GRID[best])} "
+              f"{sum(r['grid'][best] for r in rs) * 10:+.0f}$")
+
+
 async def notify(conn: Any, text: str) -> None:
     """Итог — в Telegram (топик отчётов) через очередь бота, кусками до 3500 знаков."""
     chunks, cur = [], ""
@@ -575,6 +678,8 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         show = ranked if len(ranked) <= 10 else ranked[:5] + ranked[-5:]
         for m, w, n in show:
             say(f"  {w[:6]}…{w[-4:]}: {m:+.1%} на сделку, {n} сигн.")
+    if os.environ.get("EC_OTHER", "1") != "0":
+        await check_other(conn, gapper, say)
     text = "\n".join(out)
     if os.environ.get("EC_TG", "1") != "0":
         await notify(conn, text)
