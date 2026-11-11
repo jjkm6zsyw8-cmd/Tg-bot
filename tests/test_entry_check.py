@@ -115,6 +115,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "БЫСТРЫЙ БОТ ПО ВСЕМ ДНЯМ" in out and "покупка +2 бл., продажа +1 бл." in out
     assert "бумага входит через ≈5.0 с" in out
     assert "Размер ставки" in out and "$200:" in out
+    assert "Отбор без подгонки" in out and "Всего: smart 0 сд." in out
     # второй запуск — из кеша, без запросов
     await ec.main(DSN, rpc=NoRpc())
     out = capsys.readouterr().out

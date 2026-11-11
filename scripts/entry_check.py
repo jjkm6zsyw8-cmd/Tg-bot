@@ -444,6 +444,29 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     say(f"Размер ставки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема по прошлым дням; "
         f"учтено, что своя покупка и продажа двигают цену; SOL ${sol_usd:.0f}):")
     say("  " + " · ".join(sized))
+    # отбор без подгонки: smart — все; копии — только кошельки, у которых по ПРОШЛЫМ дням 3+ сигнала и плюс
+    say("")
+    say(f"Отбор без подгонки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема G): smart — "
+        "все; копии — только кошельки, бывшие в плюсе по прошлым дням (3+ сигнала):")
+    rows_m = mat[MAIN_REAL]
+    cum, tot_s, tot_c, n_s, n_c = 0.0, 0.0, 0.0, 0, 0
+    for day in days_l:
+        past: dict[str, list[float]] = collections.defaultdict(list)
+        for i, g in enumerate(good):
+            if g["day"] < day and rows_m[i][gi] is not None:
+                past[g["who"]].append(rows_m[i][gi])  # type: ignore[arg-type]
+        ok = {w for w, v in past.items() if len(v) >= 3 and st.mean(v) > 0}
+        sm = [rows_m[i][gi] for i, g in enumerate(good) if g["day"] == day and g["kind"].startswith("smart")
+              and rows_m[i][gi] is not None]
+        cp = [rows_m[i][gi] for i, g in enumerate(good) if g["day"] == day and not g["kind"].startswith("smart")
+              and g["who"] in ok and rows_m[i][gi] is not None]
+        ds, dc = sum(sm) * 10, sum(cp) * 10        # type: ignore[arg-type]
+        cum += ds + dc
+        tot_s, tot_c, n_s, n_c = tot_s + ds, tot_c + dc, n_s + len(sm), n_c + len(cp)
+        say(f"  {day[3:]}.{day[:2]}: smart {len(sm)} · {ds:+.0f}$ | копии {len(cp)} (кошельков {len(ok)}) · "
+            f"{dc:+.0f}$ | итого {cum:+.0f}$")
+    say(f"  Всего: smart {n_s} сд. {tot_s:+.0f}$ ({tot_s / (10 * n_s) if n_s else 0:+.1%} на сделку) · копии "
+        f"{n_c} сд. {tot_c:+.0f}$ ({tot_c / (10 * n_c) if n_c else 0:+.1%} на сделку)")
     by_how = collections.defaultdict(list)
     for i, g in enumerate(good):
         by_how[g["how"]].append(i)
