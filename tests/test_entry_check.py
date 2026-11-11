@@ -21,6 +21,13 @@ def path(*mcs, trader_sell_at=None):
     return out
 
 
+def test_exit_fills_after_reaction_delay(monkeypatch):
+    monkeypatch.setattr(ec, "EXIT_DELAY_S", 1.0)                 # 3 слота
+    p = path(30, 30, 27, 25, 22, 20, 20)                          # стоп −8% пробит на слоте 2, продажа через 1 с
+    r, why = ec.simulate(p, 0, 30, "W", ec.SCHEMES["G"])
+    assert why == "стоп" and r == pytest.approx(ec.net(20 / 30))
+
+
 def test_entry_after_delay_takes_price_of_that_moment():
     p = path(30, 33, 36, 40, 40, 40)
     assert ec.entry_at(p, 100, 0.4) == (1, 33)            # следующий слот
@@ -28,7 +35,8 @@ def test_entry_after_delay_takes_price_of_that_moment():
     assert ec.entry_at(p, 100, 10) == (5, 40)
 
 
-def test_exits_take_profit_stop_trader():
+def test_exits_take_profit_stop_trader(monkeypatch):
+    monkeypatch.setattr(ec, "EXIT_DELAY_S", 0.0)
     g = ec.SCHEMES["G"]
     r, why = ec.simulate(path(30, 30, 35, 40), 0, 30, "W", g)
     assert why == "тейк" and r > 0.25

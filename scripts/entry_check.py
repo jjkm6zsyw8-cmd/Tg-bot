@@ -24,6 +24,7 @@ from typing import Any
 FEE = 0.0125
 PRIO = 0.0005 / 0.15                 # приоритет на одну транзакцию, доля позиции 0.15 SOL
 SLOT_S = 0.4
+EXIT_DELAY_S = float(os.environ.get("EC_EXIT_DELAY", 1.0))   # бот видит сделку и продаёт не мгновенно
 DELAYS = (0.4, 1.0, 2.0, 3.0, 5.0, 10.0)
 HORIZON_S = 1800
 # перебор выходов: тейк × стоп × таймер (выход через 10 мин, если не было +5%) — на сигналах с видимыми первыми секундами
@@ -56,6 +57,17 @@ def entry_at(path: list[tuple[int, float, float, str, bool]], s0: int, delay: fl
     return (idx, path[idx][2]) if idx is not None else None
 
 
+def fill_after(path: list[tuple[int, float, float, str, bool]], j: int) -> float:
+    """Цена продажи: последняя сделка к слоту «сигнал выхода + EXIT_DELAY_S» (бот продаёт не мгновенно)."""
+    target = path[j][0] + math.ceil(EXIT_DELAY_S / SLOT_S)
+    mc = path[j][2]
+    for slot, _ts, m, _tr, _b in path[j + 1:]:
+        if slot > target:
+            break
+        mc = m
+    return mc
+
+
 def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: float, trader: str,
              sc: dict[str, Any]) -> tuple[float, str]:
     """Выход по сделкам после входа. path: (слот, время, MC, трейдер, покупка)."""
@@ -63,7 +75,8 @@ def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: floa
     rem, got, peak, tp_done, max_net = 1.0, 0.0, mc0, False, -1.0
     tp_level = mc0 * (1 + sc["tp"] + 2 * PRIO) / (1 - FEE) ** 2
     last_mc = mc0
-    for slot, ts, mc, tr, is_buy in path[i0 + 1:]:
+    for j in range(i0 + 1, len(path)):
+        slot, ts, mc, tr, is_buy = path[j]
         if ts - t0 > HORIZON_S:
             break
         if sc["time_s"] and ts - t0 >= sc["time_s"] and max_net < sc["gain"] and not tp_done:
@@ -71,17 +84,17 @@ def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: floa
             return net(got / mc0), "нет роста"
         last_mc = mc
         if tr == trader and not is_buy and not tp_done:
-            got += rem * mc
+            got += rem * fill_after(path, j)
             return net(got / mc0), "трейдер продал"
         if sc["stop"] is not None and mc <= mc0 * (1 - sc["stop"]):
-            got += rem * mc
+            got += rem * fill_after(path, j)
             return net(got / mc0), "стоп"
         if tp_done and sc["trail"] and mc <= peak * (1 - sc["trail"]):
-            got += rem * mc
+            got += rem * fill_after(path, j)
             return net(got / mc0), "трейлинг"
         if not tp_done and mc >= tp_level:
             sell = rem if sc["share"] >= 1 else sc["share"]
-            got += sell * mc
+            got += sell * fill_after(path, j)
             rem -= sell
             tp_done = True
             if rem <= 1e-9:
@@ -164,6 +177,7 @@ async def main(dsn: str | None = None) -> None:
 
     def cell(v: list[float]) -> str:
         return f"{st.mean(v):+5.1%} ({sum(x > 0 for x in v) / len(v):.0%} в плюсе, {len(v)})" if v else "—"
+    print(f"Продажа через {EXIT_DELAY_S:g} с после сигнала выхода (EC_EXIT_DELAY)")
     print(f"Точная проверка входа за {days:g} дн. · сигналов {len(sigs)}, посчитано {used} "
           f"(нет сделки трейдера {no_trigger}, нет пути цены {no_path}) · с видимыми сделками первых 3 с: {seen_early} "
           f"— таблица по ним")
