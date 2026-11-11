@@ -27,7 +27,8 @@ def test_paused_wallet_goes_to_shadow_and_size_follows_rating():
     tr.e.rating = {"BAD": {"tier": "paused", "mult": 0.0}, "TOP": {"tier": "top", "mult": 1.5}}
     data = {"modes": ["copy"], "traders": [{"address": "BAD"}], "copy_wallet": "BAD"}
     assert tr.route(data, "normal")[0] == {"H"} and "пауз" in tr.skipped["*"]
-    assert tr.route({**data, "copy_wallet": "TOP"}, "normal")[0] == set("ABCEFG")
+    assert tr.route({**data, "copy_wallet": "TOP"}, "normal")[0] == {"H"}            # копии с 12.11 — наблюдение
+    assert tr.route({"modes": ["smart"], "source_wallet": "TOP"}, "normal")[0] == set("ABG") | {"M"}
     smart = {"modes": ["smart"], "traders": [{"address": "BAD"}], "source_wallet": "BAD"}
     assert tr.route(smart, "normal")[0] == {"H"}                       # smart-money тоже по рейтингу
     assert tr.wallet_rating("NEW")["tier"] == "new"
@@ -83,3 +84,40 @@ async def test_compute_with_db_and_manual_override():
         assert r["L"]["tier"] == "ok" and r["L"]["auto"] == "paused" and r["L"]["manual"]
     finally:
         await db.close()
+
+
+async def test_cleanup_removes_losing_scalpers_but_keeps_smart_like():
+    from scanner.analytics.rating import cleanup
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=2)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        for addr, hold, copy in (("SCALP", 20.0, -0.06), ("HOLDER", 600.0, 0.10), ("FEW", 20.0, -0.1)):
+            await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $1)", addr)
+            await db.execute("""INSERT INTO traders(address, label, manual, active, median_hold_s, copy_30d)
+                                VALUES ($1, $1, true, true, $2, $3)""", addr, hold, copy)
+        await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('dev', 'DEV1', 'дев')")
+        paused = {"tier": "paused", "manual": False, "n": 12, "score": -0.08}
+        rating = {"SCALP": paused, "HOLDER": paused, "FEW": {**paused, "n": 4}, "DEV1": paused}
+        out = await cleanup(db, {}, rating)
+        assert len(out) == 1 and "SCALP" in out[0] and "держит монету 20 с" in out[0]
+        left = {r["address"] for r in await db.fetch("SELECT address FROM watchlist")}
+        assert left == {"HOLDER", "FEW", "DEV1"}                         # smart-like, мало копий и дев — остаются
+        assert not await db.fetchval("SELECT active FROM traders WHERE address='SCALP'")
+        assert await db.fetchval("SELECT reason FROM removed_wallets WHERE address='SCALP'")
+        assert await cleanup(db, {"wallet_autoclean": False}, rating) == []
+    finally:
+        await db.close()
+
+
+def test_smart_like():
+    from scanner.analytics.copytrade import smart_like
+    assert smart_like({"median_hold_s": 600, "copy_30d": 0.05})
+    assert not smart_like({"median_hold_s": 44, "copy_30d": 0.05})          # скальпер
+    assert not smart_like({"median_hold_s": 600, "copy_30d": -0.02})        # держит, но копии в минусе
+    assert not smart_like({"median_hold_s": 600, "copy_30d": 0.05, "linked_to_dev": True})
+    assert not smart_like({"label": "без статистики"})

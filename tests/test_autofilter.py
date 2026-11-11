@@ -54,7 +54,7 @@ def test_m_skips_bad_signal_when_active():
     model = {**af.fit([(x, y) for x, y, _ in rows]), "active": True}
     tr = bare_trader({})
     tr.e.autofilter = model
-    strong = {"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}], "copy_wallet": "W"}
+    strong = {"modes": ["smart"], "traders": [{"address": "W"}], "source_wallet": "W"}   # с 12.11 M — только smart
     assert "M" not in tr.route({**strong, "age_s": 10, "mc": 100.0}, "strong")[0]
     assert "автофильтр" in tr.skipped["M"] and tr.last_filter["skip"]
     assert "M" in tr.route({**strong, "age_s": 3000, "mc": 100.0}, "strong")[0]

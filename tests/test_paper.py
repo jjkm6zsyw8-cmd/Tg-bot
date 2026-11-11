@@ -90,7 +90,8 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         st = SimpleNamespace(mc=40.0, mint="MINT1", trades=[SimpleNamespace(ts=__import__("time").time())])
         settings = Settings(YamlConfig("config/config.yaml"))
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg={**settings.effective(), "paper_start_usd": 30}, states={"MINT1": st}, ext=None)
+                              cfg={**settings.effective(), "paper_start_usd": 30, "paper_off_set": ""},
+                              states={"MINT1": st}, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         assert tr.balance["B"] == pytest.approx(0.3)                    # старт $30 (настройка) при SOL = $100
@@ -353,7 +354,7 @@ async def test_entry_skipped_when_jupiter_disagrees(monkeypatch):
     assert opened
 
 
-async def test_price_exit_needs_confirmation_after_delay(monkeypatch):
+async def test_price_exit_needs_confirmation_after_delay(monkeypatch, old_schemes):
     """Регрессия: один низкий замер выбивал стоп −15%, а продажа шла по нормальной цене («−5% стоп»)."""
     monkeypatch.setattr(pp, "EXIT_DELAY_S", 0)
     st = SimpleNamespace(mc=40.0, mint="M", trades=[SimpleNamespace(ts=time.time())])
@@ -421,7 +422,7 @@ async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
         settings = Settings(YamlConfig("config/config.yaml"))
         sts = {m: SimpleNamespace(mc=28.0, mint=m, trades=[SimpleNamespace(ts=time.time())]) for m in ("REAL", "FAKE")}
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg=settings.effective(), states=sts, ext=None)
+                              cfg={**settings.effective(), "paper_off_set": ""}, states=sts, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         for m in ("REAL", "FAKE"):
@@ -560,7 +561,7 @@ async def test_daily_reset_with_summary(monkeypatch):
         settings = Settings(YamlConfig("config/config.yaml"))
         st = SimpleNamespace(mc=40.0, mint="M1", trades=[SimpleNamespace(ts=time.time())])
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg=settings.effective(), states={"M1": st}, ext=None)
+                              cfg={**settings.effective(), "paper_off_set": ""}, states={"M1": st}, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         await tr.maybe_daily_reset()                                 # первый запуск — только запомнить день
@@ -582,38 +583,27 @@ async def test_daily_reset_with_summary(monkeypatch):
 
 
 def test_route_signals_to_portfolios():
-    """Копии и smart-money — во все основные A, B, C, E, F, G (как 8.11); боевой M — только сильные копии (2+
-    кошелька) и одиночный smart (по рынку одиночные копии и smart 2+ в минусе); «Наблюдение» — лотерея D;
+    """С 12.11: smart — в A, B, G и боевой M; копии своего списка — только наблюдение в H (за неделю в минусе при
+    любой тактике); лотерея D выключена (включается paper_lottery_on); C, D, E, F новых сделок не открывают;
     «Мой дев» и новые монеты — в бумагу не идут."""
     tr = bare_trader({})
-    main, lottery = set("ABCEFG"), {"D"}
-    assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == main     # одиночная — без M
-    assert "сильные" in tr.skipped["M"]
+    smart = set("ABG") | {"M"}
+    assert tr.route({"modes": ["copy"], "traders": [{"address": "W"}]}, "normal")[0] == {"H"}
     strong = {"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}]}
-    assert tr.route(strong, "strong")[0] == main | {"M"}                                          # сильная — и в M
-    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == main | {"M"}
-    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}, {"address": "T"}]}, "strong")[0] == main
-    smart = main | {"M"}
-    one_sol = {"cluster": 0.0342}                                 # дев купил ~1 SOL при запуске
-    assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == lottery
-    targets, why = tr.route({"modes": ["dev"], "metrics": {"cluster": 0.12}}, "watch")      # D — только ~1 SOL
-    assert not targets and "дев купил не ~1 SOL" in why and "дев купил не ~1 SOL" in tr.skipped["D"]
-    assert not tr.route({"modes": ["dev"]}, "watch")[0]                                     # нет замера — не берём
-    assert tr.route({"modes": ["dev", "copy"], "traders": [{"address": "W"}], "metrics": one_sol},
-                    "strong")[0] == main | lottery | {"M"}
+    assert tr.route(strong, "strong")[0] == {"H"}                                            # сильная копия — тоже
+    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0] == smart
+    assert tr.route({"modes": ["smart"], "traders": [{"address": "S"}, {"address": "T"}]}, "strong")[0] == smart
+    one_sol = {"cluster": 0.0342}
+    targets, why = tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")
+    assert not targets and "лотерея D выключена" in why
     assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
     assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
-    assert tr.route({}, "normal")[0] == set(pp.SCHEMES) - {"H"}   # старые вызовы без modes — во все, кроме H
-    assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H"}  # кандидат разведки — только испытательный H
-    assert "H" not in main | smart | lottery
-    tr.e.cfg = {"paper_strong_copies": False}
-    targets, why = tr.route({"modes": ["copy"], "traders": [{}, {}]}, "strong")
-    assert not targets and "сильные копии выключены" in why
-    tr.e.cfg = {"paper_smart_portfolios": "F"}                      # можно снова мерить smart отдельно
-    assert tr.route({"modes": ["smart"]}, "normal")[0] == {"F"}
-    assert tr.route({"modes": ["copy"], "traders": [{}]}, "normal")[0] == set("ABCEG")
-    tr.e.cfg = {"paper_m_lottery": True}                            # лотерею в M можно включить
-    assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == {"D", "M"}
+    assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H"}
+    assert not tr.route({}, "normal")[0] & set("CDEF")                    # закрытые портфели новых сделок не берут
+    tr.e.cfg = {"paper_lottery_on": True, "paper_off_set": "CEF"}         # лотерею можно включить обратно
+    assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == {"D"}
+    tr.e.cfg = {"paper_smart_set": "G"}                                   # набор smart-портфелей настраивается
+    assert tr.route({"modes": ["smart"]}, "normal")[0] == {"G", "M"}
 
 
 async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
@@ -706,7 +696,7 @@ async def test_entry_price_follows_jupiter_when_own_stream_lags(monkeypatch):
     assert opened[-1] == pytest.approx(31.0) and tr.entry_fixed == 1
 
 
-async def test_exit_is_checked_against_jupiter(monkeypatch):
+async def test_exit_is_checked_against_jupiter(monkeypatch, old_schemes):
     """Регрессия 9.11: «стоп» через 2–3 с после входа по устаревшей низкой цене своего потока / DexScreener
     (BIFT: стоп на $5.9k, рынок $10.8k → $15k). Jupiter не подтверждает — позиция остаётся; подтверждает —
     продаём по цене Jupiter."""
@@ -769,30 +759,30 @@ async def test_stop_needs_confirmed_price(monkeypatch):
     assert sold == [("stop", 30.0)]
 
 
-async def test_schemes_of_nov_8_restored():
-    """Схемы 8.11 вернулись: A, B, C, F — как тогда (с выходом по цели), G — всё на +25%, E — G со стопом −15%;
-    все портфели продают вслед за трейдером."""
-    for k, v in OLD.items():
-        assert {kk: vv for kk, vv in pp.SCHEMES[k].items() if kk != "name"} == v
-    g, e = pp.SCHEMES["G"], pp.SCHEMES["E"]
-    assert decide_exit(pos(), 36.0, 10, g, 125, 0.0005) == ("stop", 1.0)          # −10% — стоп G
-    assert decide_exit(pos(), 36.0, 10, e, 125, 0.0005) is None                    # E держит до −15%
-    assert decide_exit(pos(), 33.5, 10, e, 125, 0.0005) == ("stop", 1.0)
-    assert decide_exit(pos(), 81.0, 10, pp.SCHEMES["C"], 125, 0.0005) == ("target", 1.0)
-    assert pp.ENTRY_DELAY_S == 5.0
+async def test_smart_schemes_of_nov_12():
+    """С 12.11: A — всё на +25% без стопа, B — 70% на +25% и трейлинг 15% остатка, G — +25%/−8%/5 мин; все держат
+    до 30 мин; C и F — как раньше (новых сделок не берут); все продают вслед за трейдером (B — до тейка)."""
+    for k in ("C", "F"):
+        assert {kk: vv for kk, vv in pp.SCHEMES[k].items() if kk != "name"} == OLD[k]
+    a, b, g = pp.SCHEMES["A"], pp.SCHEMES["B"], pp.SCHEMES["G"]
+    assert decide_exit(pos(), 20.0, 10, a, 125, 0.0005) is None                    # −50% — A без стопа держит
+    assert decide_exit(pos(), 56.0, 10, a, 125, 0.0005) == ("take_profit", 1.0)    # +25% чистыми
+    assert decide_exit(pos(), 56.0, 10, b, 125, 0.0005) == ("take_profit", 0.70)
+    assert decide_exit(pos(), 36.0, 10, g, 125, 0.0005) == ("stop", 1.0)
+    assert decide_exit(pos(), 41.0, 1801, a, 125, 0.0005) == ("max_hold", 1.0)     # 30 минут — продаём
     tr = bare_trader({})
     checked = []
 
     async def fake_check(p, mc, reason, price_usd=None):
         checked.append((p.portfolio, reason))
     tr._check = fake_check
-    for i, name in enumerate("CG"):
+    for i, name in enumerate("ABG"):
         p = pos()
         p.id, p.portfolio, p.trader = i + 1, name, "W"
         tr.positions[p.id] = p
     st = SimpleNamespace(mint="M", mc=40.0)
     await tr.on_trade(st, None, "W", False)                                        # трейдер продал
-    assert checked == [("C", "trader_sell"), ("G", "trader_sell")]
+    assert checked == [("A", "trader_sell"), ("B", "trader_sell"), ("G", "trader_sell")]
 
 
 async def test_main_portfolio_m():
@@ -826,19 +816,15 @@ async def test_main_portfolio_m():
         assert await tr._open("M", f"L{i}", "watch", None, lot, None, 30.0)
     assert await tr._open("M", "L5", "watch", None, lot, None, 30.0) is None                 # 4 билета лотереи
     assert await tr._open("M", "C2", "normal", None, copy, "W", 30.0)                        # копии — свой лимит
-    # фильтр копий M: свежая монета — только в остальные портфели
-    tr.e.cfg = {"paper_m_copy_min_age_s": 120, "paper_m_copy_min_mc_usd": 10000}
+    # с 12.11 M — только smart (одиночный и сильный); копии — в H; лотерея — только если включить
     strong = {**copy, "traders": [{"address": "W"}, {"address": "X"}]}
-    assert "M" not in tr.route({**strong, "age_s": 30, "mc": 200.0}, "strong")[0]
-    assert "M" not in tr.route({**strong, "age_s": 600, "mc": 50.0}, "strong")[0]           # $5k при SOL $100
-    assert "M" in tr.route({**strong, "age_s": 600, "mc": 200.0}, "strong")[0]
-    assert "M" not in tr.route({**copy, "age_s": 600, "mc": 200.0}, "normal")[0]            # одиночная — не в M
-    tr.e.cfg = {"paper_m_single_tiers": "top"}
-    tr.e.rating = {"W": {"tier": "top", "mult": 1.5}}
-    assert "M" in tr.route({**copy, "age_s": 600, "mc": 200.0}, "normal")[0]                # …кроме «топа», если включено
+    assert "M" not in tr.route({**strong, "age_s": 600, "mc": 200.0}, "strong")[0]
+    assert "M" in tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0]
+    assert "M" in tr.route({"modes": ["smart"], "traders": [{"address": "S"}, {"address": "T"}]}, "strong")[0]
     assert "M" not in tr.route({"modes": ["dev"], "metrics": {"cluster": 0.034}}, "watch")[0]
-    tr.e.cfg = {"paper_m_lottery": True}
+    tr.e.cfg = {"paper_lottery_on": True, "paper_m_lottery": True}
     assert "M" in tr.route({"modes": ["dev"], "metrics": {"cluster": 0.034}}, "watch")[0]
+    assert pp.SCHEMES["M"]["stop"] is None and pp.M_KINDS["smart"]["max_hold_s"] == 1800
     tr.e.rating = {"W": {"tier": "ok", "mult": 1.0}}
     # раннер: после частичного тейка остаток не продаётся за трейдером
     checked = []
@@ -887,7 +873,7 @@ async def test_m_enters_faster(monkeypatch):
     async def no_msg(text):
         return None
     tr._msg = no_msg
-    strong = {"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}], "copy_wallet": "W"}
+    strong = {"modes": ["smart"], "traders": [{"address": "W"}], "source_wallet": "W"}
     await tr.on_alert("M1", "strong", None, strong, "W")
     # без данных о покупке трейдера (запасной путь): M — через 1 с, G — через 5 с, поправка по замеру +2%
     assert ("M", pytest.approx(30.0 * 1.02)) in entered and ("G", pytest.approx(36.0 * 1.02)) in entered

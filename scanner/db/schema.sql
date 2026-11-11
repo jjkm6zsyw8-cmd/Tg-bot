@@ -495,3 +495,15 @@ ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_low_s double precision
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_hi_before_low double precision;
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_hi_after_low double precision;
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_src text;
+-- кошелёк, добавленный разведкой в smart: не снимается ночным пересчётом, только итогом своих копий (scout.demote)
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false;
+-- убранные автоматически из своего списка (скальперы в минусе): кто, почему, когда — вернуть /addwallet
+CREATE TABLE IF NOT EXISTS removed_wallets (
+    address    text PRIMARY KEY,
+    label      text,
+    reason     text,
+    removed_at timestamptz NOT NULL DEFAULT now()
+);
+-- 12.11: найденные разведкой (🔍) переходят из копий в smart — один раз, дальше их ведёт scout.demote
+UPDATE traders SET manual=false, pinned=true
+ WHERE manual AND label LIKE '🔍%' AND address IN (SELECT address FROM scout WHERE status='promoted');

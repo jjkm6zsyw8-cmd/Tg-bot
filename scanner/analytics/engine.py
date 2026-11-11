@@ -19,7 +19,7 @@ from ..config import Env, Settings
 from ..db.pool import Database
 from ..ingest.rpc import RpcError, SolanaRpc
 from . import clusters as cl
-from .copytrade import TIER_NAMES, refresh_traders_adaptive
+from .copytrade import TIER_NAMES, refresh_traders_adaptive, smart_like
 from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_profit
 from .features import launch_summary
 from .filters import check as check_filters
@@ -679,6 +679,16 @@ class Engine:
                                                    "copy_30d": None, "win_rate": None, "manual": True})
         self.scouts = {r["address"] for r in await self.db.fetch(
             "SELECT address FROM scout WHERE status='probation'")}
+        own_smart = sorted(a for a, t in self.traders.items() if t.get("manual") and smart_like(t, self.cfg))
+        prev = await self.db.kv_get("own_smart")
+        if prev is not None and set(prev) != set(own_smart):
+            added, gone = set(own_smart) - set(prev), set(prev) - set(own_smart)
+            name = lambda a: (self.traders.get(a) or {}).get("label") or f"{a[:4]}…{a[-4:]}"  # noqa: E731
+            await self.db.system(
+                "🧠 <b>Свои кошельки как smart</b> (держат монету от 3 мин и в плюсе по копируемости)"
+                + ("\nТеперь smart: " + ", ".join(fmt.esc(name(a)) for a in sorted(added)) if added else "")
+                + ("\nСнова копии (наблюдение): " + ", ".join(fmt.esc(name(a)) for a in sorted(gone)) if gone else ""))
+        await self.db.kv_set("own_smart", own_smart)
         self.watch_tokens = {r["address"] for r in await self.db.fetch(
             "SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())")}
         # девы из своего списка: алерт в момент запуска, цели — по их почерку (analytics/walletcheck.py)
@@ -710,7 +720,9 @@ class Engine:
     async def _on_smart_trade(self, st: TokenState, r: Any) -> None:
         cfg = self.cfg
         trader = self.traders[r["trader"]]
-        own = bool(trader.get("manual"))      # свой список → раздел «Копитрейд», включается отдельно
+        # свой список → раздел «Копитрейд» (наблюдение); кошелёк, который держит монету минутами и в плюсе по
+        # копируемости, бот ведёт как smart — с фильтрами smart и в smart-портфели (analytics/copytrade.smart_like)
+        own = bool(trader.get("manual")) and not smart_like(trader, cfg)
         if not cfg.get("modes", {}).get("copy" if own else "smart", True):
             return
         line = {"is_buy": r["is_buy"], "label": trader["label"], "trader": r["trader"], "sol": r["sol_amount"],

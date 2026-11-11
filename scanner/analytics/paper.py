@@ -58,8 +58,16 @@ SMART_ONLY = ""               # smart-money — во все основные п�
 # H — испытательный срок: кандидаты «Разведки» (analytics/scout.py) копируются только сюда, как G, фиксированной
 # суммой; по итогу их копий разведка решает — в свой список или в отсев. На остальные портфели не влияет.
 SCOUT = "H"
-SCOUT_MAX_OPEN = 10
+SCOUT_MAX_OPEN = 40            # с 12.11 сюда же идут копии своего списка (наблюдение, без денег) — поток больше
 SCOUT_USD = 10.0
+SCOUT_START_MULT = 10          # H — наблюдение: старт ×10 ($1000), чтобы $10-копии не упирались в баланс
+# С 12.11 (решение по факту недели 5–11.11, scripts/entry_check.py, сделки в порядке блоков, $10 на сигнал):
+#   smart:  тейк +25% без стопа +$87 · 70% на +25% + трейл 15% +$81 · G +$75 (110 сделок, в плюсе 4–5 дней из 6)
+#   копии своего списка: все 11 тактик в минусе (−$125…−$562) — кошельки-скальперы (медиана удержания 44 с)
+# Поэтому: A, B, G — три тактики только на smart; M — боевая версия лучшей; копии — только наблюдение в H;
+# C, D, E, F новых сделок не открывают (история остаётся).
+SMART_SET = "ABG"
+OFF_SET = "CDEF"
 # M — боевая версия: один портфель, как бот торговал бы на реальные деньги. Подбор — бэктест всех сигналов 6–9.11
 # по минутным свечам рынка (модель сверена с бумагой на ценах Jupiter: −11.8% против −10.9% на сделку), со схемой G:
 #   сильная копия (твой кошелёк + ещё один отслеживаемый)   +11.8% на сделку, в плюсе 3 дня из 4, четвёртый ≈ 0
@@ -75,7 +83,9 @@ M_KINDS: dict[str, dict[str, Any]] = {
     # 85% на +25%, 15% — «раннер» с трейлингом 30%, не продаётся за трейдером (шанс на ракету стоит ~1% на сделку)
     "copy": {"stop": 0.08, "tp_net": 0.25, "tp_share": 0.85, "trail": 0.30, "time_stop_s": 300,
              "time_stop_gain": 0.10, "follow_runner": False},
-    "smart": {"stop": 0.08, "tp_net": 0.25, "tp_share": 1.0, "trail": None, "time_stop_s": 300, "time_stop_gain": 0.10},
+    # smart: лучшая тактика недели — всё на +25% без стопа; держим не дольше 30 мин, выходим за трейдером
+    "smart": {"stop": None, "tp_net": 0.25, "tp_share": 1.0, "trail": None, "time_stop_s": None,
+              "time_stop_gain": None, "max_hold_s": 1800},
     "lottery": {"stop": 0.15, "tp_net": 1.0, "tp_share": 0.34, "trail": 0.30, "trail_after_net": 0.5, "target": False,
                 "time_stop_s": 600, "time_stop_gain": 0.10, "max_hold_s": 4 * 3600},
 }
@@ -110,11 +120,12 @@ MAX_HOLD_S = 2 * 3600          # страховка: позиция по «мё�
 _G = {"stop": 0.08, "tp_net": 0.25, "tp_share": 1.0, "trail": None, "target": False, "time_stop_s": 300,
       "time_stop_gain": 0.10}
 SCHEMES: dict[str, dict[str, Any]] = {
-    MAIN: {**M_KINDS["copy"], "name": "M: боевая версия — свои схемы для копий, smart и лотереи, размер по рейтингу"},
-    "A": {"name": "A: стоп −6%, половина на +30%, трейлинг 15%, цель", "stop": 0.06, "tp_net": 0.30,
-          "tp_share": 0.5, "trail": 0.15, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
-    "B": {"name": "B: база — стоп −15%, половина на +30%, трейлинг 15%, цель", "stop": 0.15, "tp_net": 0.30,
-          "tp_share": 0.5, "trail": 0.15, "target": True, "time_stop_s": 600, "time_stop_gain": 0.10},
+    MAIN: {**M_KINDS["smart"], "name": "M: боевая — smart, всё на +25% без стопа (до 30 мин), размер по рейтингу"},
+    "A": {"name": "A: smart — всё на +25%, без стопа, до 30 мин", "stop": None, "tp_net": 0.25, "tp_share": 1.0,
+          "trail": None, "target": False, "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 1800},
+    "B": {"name": "B: smart — 70% на +25%, 30% трейлинг 15%, без стопа, до 30 мин", "stop": None, "tp_net": 0.25,
+          "tp_share": 0.70, "trail": 0.15, "target": False, "time_stop_s": None, "time_stop_gain": None,
+          "max_hold_s": 1800, "follow_runner": False},
     "C": {"name": "C: только цель, выход за трейдером и экстренный", "stop": None, "tp_net": None, "tp_share": 0.0,
           "trail": None, "target": True, "time_stop_s": None, "time_stop_gain": None},
     # D — лотерея, ловит иксы: 9.11 ALICE дошла до ×20, BUIDL до ×19.7, а «половина на +20%, трейл 10%» забрали
@@ -127,16 +138,15 @@ SCHEMES: dict[str, dict[str, Any]] = {
     "F": {"name": "F: без тейка — трейлинг 15% после +15%, стоп −10%, цель", "stop": 0.10, "tp_net": None,
           "tp_share": 0.0, "trail": 0.15, "trail_after_net": 0.15, "target": True, "time_stop_s": 600,
           "time_stop_gain": 0.10},
-    "G": {**_G, "name": "G: всё на +25%, стоп −8%, 5 мин"},
-    SCOUT: {**_G, "name": "H: испытательный срок — кандидаты разведки, как G, по $10"},
+    "G": {**_G, "name": "G: smart — всё на +25%, стоп −8%, 5 мин на +10%, до 30 мин", "max_hold_s": 1800},
+    SCOUT: {**_G, "name": "H: наблюдение — кандидаты разведки и копии своего списка, как G, по $10"},
 }
-LEGEND = ("M — боевая: сильные копии (2+ кошелька; 85% на +25%, 15% раннер) и одиночный smart (всё на +25%), стоп −8%, "
-          "позиция ≤30%, дневной стоп −25% · "
-          "копии и smart (схемы 8.11): G всё на +25%, стоп −8% · A стоп −6%, ½ на +30%, трейл 15% · "
-          "B стоп −15%, ½ на +30%, трейл 15% · C только цель · F трейл 15% после +15% · E как G, стоп −15% · "
-          "D — лотерея (дев купил ~1 SOL): треть на ×2, остаток трейл 30%, до 4 ч · H — испытание кандидатов "
-          "разведки (как G, по $10) · исполнение как у быстрого бота: покупка через 2 блока после трейдера по цене из "
-          "блокчейна, стоп/тейк по каждой сделке, продажа через 2 блока · A–H без дневных стопов · старт $100")
+LEGEND = ("с 12.11 — только smart (по факту недели копии в минусе при любой тактике): "
+          "A всё на +25% без стопа · B 70% на +25%, 30% трейл 15%, без стопа · G всё на +25%, стоп −8% · "
+          "M — боевая (как A, позиция ≤30%, дневной стоп −25%) · H — наблюдение: кандидаты разведки и копии своего "
+          "списка, по $10 · C, D, E, F новых сделок не открывают · держим до 30 мин · исполнение как у быстрого бота: "
+          "покупка через 2 блока после трейдера по цене блокчейна, стоп/тейк по каждой сделке, продажа через 2 блока · "
+          "старт $100 (H — $1000)")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -412,7 +422,7 @@ class PaperTrader:
             await self.db.execute(
                 """INSERT INTO paper_portfolios(name, scheme, start_usd, start_sol, balance_sol)
                    VALUES ($1, $2, $3, $4, $4) ON CONFLICT (name) DO NOTHING""",
-                name, scheme, self.start_usd(), self.start_usd() / sol)
+                name, scheme, self.start_usd(name), self.start_usd(name) / sol)
         for r in await self.db.fetch("SELECT * FROM paper_portfolios"):
             self.balance[r["name"]] = r["balance_sol"]
             self.paused[r["name"]] = r["paused"]
@@ -452,12 +462,14 @@ class PaperTrader:
         async with self.lock:
             sol = self.e.price.value or 150
             await self.db.execute("UPDATE paper_positions SET closed_at=now(), exit_reason='reset' WHERE closed_at IS NULL")
-            await self.db.execute("UPDATE paper_portfolios SET start_usd=$1, start_sol=$2, balance_sol=$2, paused=false, "
-                                  "reset_at=now()", self.start_usd(), self.start_usd() / sol)
+            for n in SCHEMES:
+                await self.db.execute(
+                    "UPDATE paper_portfolios SET start_usd=$2, start_sol=$3, balance_sol=$3, paused=false, reset_at=now() "
+                    "WHERE name=$1", n, self.start_usd(n), self.start_usd(n) / sol)
             self.positions.clear()
             self.day_pnl = {}                      # сброс — новый счёт и для дневного стопа лотереи
             for n in SCHEMES:
-                self.balance[n] = self.start_usd() / sol
+                self.balance[n] = self.start_usd(n) / sol
                 self.paused[n] = False
             await self.db.kv_set("paper:compared", None)
 
@@ -1015,8 +1027,9 @@ class PaperTrader:
             await self.db.execute("UPDATE paper_portfolios SET paused=false WHERE name=$1", p.portfolio)
         self._exits.setdefault(p.symbol or "?", []).append((p.portfolio, pct, EXIT_SHORT.get(reason, reason)))
 
-    def start_usd(self) -> float:
-        return float(self.cfg.get("paper_start_usd") or START_USD)
+    def start_usd(self, name: str | None = None) -> float:
+        base = float(self.cfg.get("paper_start_usd") or START_USD)
+        return base * SCOUT_START_MULT if name == SCOUT else base
 
     def wallet_rating(self, wallet: str) -> dict[str, Any]:
         """Рейтинг кошелька (analytics/rating.py); нет копий — «новый», позиция ×0.75."""
@@ -1033,7 +1046,7 @@ class PaperTrader:
         """В какие портфели идёт сигнал и почему никуда, если пусто. Без modes (старые вызовы) — во все."""
         modes = set(data.get("modes") or [])
         if not modes:
-            return set(SCHEMES) - {SCOUT}, ""
+            return set(SCHEMES) - {SCOUT} - set(str(self.cfg.get("paper_off_set", OFF_SET))), ""
         if "scout" in modes:
             return {SCOUT}, ""                       # кандидат разведки — только испытательный портфель
         wallet = data.get("copy_wallet") or data.get("source_wallet")
@@ -1043,18 +1056,16 @@ class PaperTrader:
             self.skipped["*"] = "кошелёк на паузе по рейтингу — копия только в теневой H"
             return {SCOUT}, ""
         lottery = {n for n in SCHEMES if self.is_lottery(n)}
-        smart_only = set(str(self.cfg.get("paper_smart_portfolios", SMART_ONLY))) & set(SCHEMES) - lottery - {SCOUT}
-        main = set(SCHEMES) - lottery - smart_only - {SCOUT}
+        smart_set = set(str(self.cfg.get("paper_smart_set", SMART_SET))) & set(SCHEMES) - {SCOUT, MAIN}
         out: set[str] = set()
         why = ""
         if "copy" in modes:
-            if len(data.get("traders") or []) >= 2 and not self.cfg.get("paper_strong_copies", True):
-                why = "сильные копии выключены (paper_strong_copies)"
-            else:
-                out |= main
+            # копии своего списка (кошельки-скальперы) — только наблюдение в H: за неделю 5–11.11 в минусе при любой
+            # из 11 тактик; по ним считается рейтинг. Кошельки, которые держат монету минутами, бот ведёт как smart
+            out.add(SCOUT)
         if "smart" in modes:
-            out |= smart_only or main
-        if "dev" in modes:
+            out |= smart_set | {MAIN}
+        if "dev" in modes and self.cfg.get("paper_lottery_on", False):
             lot = set(lottery)
             share = (data.get("metrics") or {}).get("cluster")
             lo = float(self.cfg.get("paper_lottery_dev_share_min", LOTTERY_DEV_SHARE[0]))
@@ -1078,7 +1089,7 @@ class PaperTrader:
             if kind == "copy" and not strong and not (wallet and self.wallet_rating(wallet).get("tier") in tiers):
                 out.discard(MAIN)
                 self.skipped[MAIN] = "M: одиночные копии по рынку в минусе (−4.5% на сделку) — берём сильные (2+ кошелька)"
-            elif kind == "smart" and strong and not self.cfg.get("paper_m_smart_strong", False):
+            elif kind == "smart" and strong and not self.cfg.get("paper_m_smart_strong", True):
                 out.discard(MAIN)
                 self.skipped[MAIN] = "M: smart 2+ кошелька разом по рынку в минусе — берём одиночный smart"
         model = getattr(self.e, "autofilter", None) or {}
@@ -1105,8 +1116,12 @@ class PaperTrader:
             elif mc_usd and mc_usd < min_mc:
                 out.discard(MAIN)
                 self.skipped[MAIN] = f"M: капитализация ${mc_usd:,.0f} — копии дешёвых монет в минусе (нужно ${min_mc:,.0f}+)"
+        off = set(str(self.cfg.get("paper_off_set", OFF_SET))) & set(SCHEMES)
+        out -= off
         if not out and not why:
-            if "mydev" in modes:
+            if "dev" in modes:
+                why = "лотерея D выключена (12.11: −$589 за день при $10 на билет)"
+            elif "mydev" in modes:
                 why = "«Мой дев» — в бумагу не берём: за 2 дня −$8"
             elif modes & {"new", "new_dev_wallet"}:
                 why = "новые монеты — в бумагу не берём: за 2 дня −$5"

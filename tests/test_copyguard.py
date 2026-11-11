@@ -131,7 +131,8 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
         row = await db.fetchrow("SELECT entry_mc, delta FROM copy_log WHERE wallet='W' AND mint='M1'")
         assert row["entry_mc"] == 40.0 and row["delta"] == pytest.approx(40 / 38 - 1)
         # чья копия — в позиции, в CSV (подпись из своего списка) и в /trades
-        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE source_wallet='W'") == 8 * 3   # A, B, C, E, F, G и боевой M — по три монеты
+        n_port = len(pp.SCHEMES) - 1 - len(pp.OFF_SET)                    # с 12.11: A, B, G и M (C–F закрыты)
+        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE source_wallet='W'") == n_port * 3
         # цена уже на 33% выше его покупки — бумага не входит, в журнале «пропущено» с причиной
         eng.states["M4"] = SimpleNamespace(mc=40.0, mint="M4", trades=[SimpleNamespace(ts=time.time())])
         await eng.copyguard.log("W", "M4", "LATE", "buy", 1.0, 30.0, "copied", None, ref_mc=30.0)
@@ -145,7 +146,7 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
         for pid in list(tr.positions):
             await tr._sell(tr.positions[pid], "trader_sell", 1.0, 40.0)
         table = await tr.trades_csv(None)
-        assert ";кошелёк;" in table.splitlines()[0] and ";лимфорк;" in table and table.count(";W;ещё нет;;;;свой поток;;;;;\r\n") == 24
+        assert ";кошелёк;" in table.splitlines()[0] and ";лимфорк;" in table and table.count(";W;ещё нет;;;;свой поток;;;;;\r\n") == n_port * 3
         day = await tr.trades_text(24)
         assert "(лимфорк)" in day[0]
         await eng.copyguard.load()

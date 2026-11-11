@@ -173,7 +173,7 @@ class Scout:
     async def _known(self) -> set[str]:
         rows = await self.db.fetch(
             """SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')
-               UNION SELECT address FROM traders WHERE manual
+               UNION SELECT address FROM traders WHERE manual OR pinned
                UNION SELECT address FROM scout WHERE status IN ('probation', 'promoted', 'passed')
                   OR (cooldown_until IS NOT NULL AND cooldown_until > now())""")
         return {r["address"] for r in rows}
@@ -315,7 +315,7 @@ class Scout:
                 await self._close(addr, "promoted", why, 0)
                 auto += 1
                 self.stats["promoted"] += 1
-                out.append(f"✅ в свой список: <code>{addr}</code> — {esc(why)}")
+                out.append(f"✅ в smart: <code>{addr}</code> — {esc(why)}")
             elif v == "promote":
                 await self._close(addr, "passed", why + " — свой список разведки полон", 0)
                 out.append(f"☑️ прошёл, но список полон ({cap}): <code>{addr}</code> — {esc(why)}")
@@ -328,23 +328,26 @@ class Scout:
         return out
 
     async def _promote(self, addr: str) -> None:
+        # с 12.11 прошедший испытание — сразу в smart (с фильтрами smart и в smart-портфели), а не в копии:
+        # pinned — ночной пересчёт по своей базе его не снимает, снимает только итог его копий (demote)
         await self.db.execute(
-            """INSERT INTO traders(address, label, manual, active, qualified, updated_at)
-               VALUES ($1, $2, true, true, false, now())
-               ON CONFLICT (address) DO UPDATE SET manual=true, active=true, updated_at=now(),
-                   label = '🔍 ' || COALESCE(NULLIF(traders.label, ''), $3)""",
+            """INSERT INTO traders(address, label, manual, active, qualified, pinned, updated_at)
+               VALUES ($1, $2, false, true, true, true, now())
+               ON CONFLICT (address) DO UPDATE SET active=true, pinned=true, updated_at=now(),
+                   label = CASE WHEN traders.label LIKE '🔍%' THEN traders.label
+                                ELSE '🔍 ' || COALESCE(NULLIF(traders.label, ''), $3) END""",
             addr, f"🔍 {short(addr)}", short(addr))
         await self.e._load_traders()
 
     async def demote(self) -> list[str]:
         rows = await self.db.fetch(
-            """SELECT s.address, t.active, t.manual FROM scout s LEFT JOIN traders t ON t.address = s.address
+            """SELECT s.address, t.active, t.manual, t.pinned FROM scout s LEFT JOIN traders t ON t.address = s.address
                WHERE s.status = 'promoted'""")
         out: list[str] = []
         changed = False
         for r in rows:
             addr = r["address"]
-            if not (r["active"] and r["manual"]):
+            if not (r["active"] and (r["manual"] or r["pinned"])):
                 await self._close(addr, "removed", "убран вручную", REJECT_DAYS)
                 continue
             last = await self.db.fetch(
@@ -354,7 +357,8 @@ class Scout:
                    ORDER BY p.closed_at DESC LIMIT 10""", addr)
             pnl = sum(float(x["pnl_sol"] or 0) for x in last)
             if len(last) >= 8 and pnl < 0:
-                await self.db.execute("UPDATE traders SET active=false, manual=false WHERE address=$1", addr)
+                await self.db.execute("UPDATE traders SET active=false, manual=false, pinned=false WHERE address=$1",
+                                      addr)
                 await self._close(addr, "demoted", f"последние {len(last)} копий в G: {pnl:+.3f} SOL", REJECT_DAYS)
                 self.stats["demoted"] += 1
                 changed = True

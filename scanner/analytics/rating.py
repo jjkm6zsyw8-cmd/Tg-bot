@@ -113,6 +113,41 @@ async def save(db: Any, rating: dict[str, dict[str, Any]]) -> None:
         [(w, r["tier"], r["auto"], r["score"], r["n"], r["wins"], r["sum"]) for w, r in rating.items()])
 
 
+CLEAN_MIN_COPIES = 10
+
+
+async def cleanup(db: Any, cfg: dict[str, Any], rating: dict[str, dict[str, Any]]) -> list[str]:
+    """Автоочистка своего списка: убираем кошелёк, если он не тянет на smart (держит секунды или в минусе по
+    копируемости) и его копии в минусе — рейтинг «пауза» по 10+ копиям (не ручная правка). Девы не трогаются.
+    Убранные — в removed_wallets (вернуть: /addwallet адрес). Возвращает строки для сообщения."""
+    if not cfg.get("wallet_autoclean", True):
+        return []
+    from .copytrade import smart_like
+    need = int(cfg.get("wallet_autoclean_min_copies", CLEAN_MIN_COPIES))
+    rows = await db.fetch(
+        """SELECT x.address, COALESCE(t.label, w.label) label, t.median_hold_s, t.copy_30d, t.linked_to_dev
+           FROM (SELECT address FROM watchlist WHERE kind = 'trader' UNION SELECT address FROM traders WHERE manual) x
+           LEFT JOIN traders t ON t.address = x.address
+           LEFT JOIN watchlist w ON w.address = x.address AND w.kind = 'trader'""")
+    out = []
+    for r in rows:
+        rt = rating.get(r["address"])
+        if not rt or rt["tier"] != "paused" or rt.get("manual") or rt["n"] < need or smart_like(dict(r), cfg):
+            continue
+        hold = r["median_hold_s"]
+        why = (f"{rt['n']} копий, в среднем {rt['score']:+.0%}"
+               + (f", держит монету {hold:.0f} с" if hold is not None else ""))
+        await db.execute("DELETE FROM watchlist WHERE address=$1 AND kind='trader'", r["address"])
+        await db.execute("UPDATE traders SET active=false, manual=false, pinned=false WHERE address=$1", r["address"])
+        await db.execute(
+            """INSERT INTO removed_wallets(address, label, reason) VALUES ($1, $2, $3)
+               ON CONFLICT (address) DO UPDATE SET label=EXCLUDED.label, reason=EXCLUDED.reason, removed_at=now()""",
+            r["address"], r["label"], why)
+        out.append(f"🗑 {esc(r['label'] or r['address'][:4] + '…' + r['address'][-4:])} — {esc(why)}\n"
+                   f"   <code>{r['address']}</code>")
+    return out
+
+
 class Rating:
     def __init__(self, engine: "Engine"):
         self.e = engine
@@ -142,6 +177,16 @@ class Rating:
                 if changes and not first:
                     await self.db.system("📊 <b>Рейтинг кошельков</b>\n" + "\n".join(changes[:20]))
                 first = False
+                day = __import__("datetime").date.today().isoformat()
+                if await self.db.kv_get("wallet_cleanup_day") != day:
+                    await self.db.kv_set("wallet_cleanup_day", day)
+                    gone = await cleanup(self.db, self.e.cfg, getattr(self.e, "rating", {}) or {})
+                    if gone:
+                        if hasattr(self.e, "_load_traders"):
+                            await self.e._load_traders()
+                        await self.db.system(
+                            "🗑 <b>Убраны из своего списка</b> — копии в минусе, и кошелёк не тянет на smart (держит "
+                            "секунды или в минусе по копируемости). Вернуть: /addwallet адрес\n" + "\n".join(gone[:30]))
             except Exception:  # noqa: BLE001 — рейтинг не должен ронять аналитику
                 log.exception("рейтинг кошельков")
             await asyncio.sleep(EVERY_S)

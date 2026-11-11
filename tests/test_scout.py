@@ -55,7 +55,7 @@ def test_verdict():
 
 async def test_scout_portfolio_fixed_size_and_slots():
     tr = bare_trader({})
-    tr.balance = {"H": 1.0}
+    tr.balance = {"H": 10.0}
     tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
     tr.priority = lambda: 0.0005
     tr.fee_bps = lambda: 125
@@ -71,9 +71,10 @@ async def test_scout_portfolio_fixed_size_and_slots():
     tr.db = DB()
     data = {"modes": ["scout"], "source_wallet": "W"}
     assert await tr._open("H", "M0", "normal", None, data, "W", 30.0) == pytest.approx(0.1)   # $10 при SOL $100
-    for i in range(1, 10):
+    for i in range(1, pp.SCOUT_MAX_OPEN):
         assert await tr._open("H", f"M{i}", "normal", None, data, "W", 30.0)
-    assert await tr._open("H", "M10", "normal", None, data, "W", 30.0) is None and "лимит 10" in tr.skipped["H"]
+    assert await tr._open("H", "MX", "normal", None, data, "W", 30.0) is None and \
+        f"лимит {pp.SCOUT_MAX_OPEN}" in tr.skipped["H"]
 
 
 async def test_scout_cycle_with_db():
@@ -117,7 +118,7 @@ async def test_scout_cycle_with_db():
         st = {r["address"]: r for r in await db.fetch("SELECT * FROM scout")}
         assert st["W"]["status"] == "promoted" and st["X"]["status"] == "rejected" and st["X"]["cooldown_until"]
         t = await db.fetchrow("SELECT * FROM traders WHERE address='W'")
-        assert t["manual"] and t["active"] and t["label"].startswith("🔍") and loads
+        assert not t["manual"] and t["pinned"] and t["active"] and t["label"].startswith("🔍") and loads   # в smart
         assert any("✅" in e and "W" in e for e in events)
         # X отсеян — 14 дней в кандидаты не возвращается
         assert await sc.discover_own() == 0

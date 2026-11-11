@@ -174,6 +174,20 @@ def qualifies(s7: TraderStats, s30: TraderStats, linked: bool, cfg: dict[str, An
     return not fails, fails
 
 
+OWN_SMART_MIN_HOLD_S = 180.0
+
+
+def smart_like(t: Any, cfg: dict[str, Any] | None = None) -> bool:
+    """Свой кошелёк, которого бот ведёт как smart: держит монету минутами (медиана удержания ≥ 3 мин) и повтор его
+    сделок с задержкой и комиссиями за 30 дней в плюсе (копируемость > 0), не связан с девами. Скальперов (держат
+    секунды) с задержкой не повторить — за неделю 5–11.11 копии таких кошельков были в минусе при любой тактике."""
+    get = t.get if hasattr(t, "get") else (lambda k, d=None: d)
+    hold, copy = get("median_hold_s"), get("copy_30d")
+    need = float((cfg or {}).get("own_smart_min_hold_s", OWN_SMART_MIN_HOLD_S))
+    return hold is not None and float(hold) >= need and copy is not None and float(copy) > 0 \
+        and not get("linked_to_dev")
+
+
 def tier(s30: TraderStats) -> str:
     return "excellent" if s30.copyability >= 0.15 and s30.win_rate >= 0.55 else "good"
 
@@ -205,6 +219,7 @@ async def save_trader(db: Database, address: str, s7: TraderStats, s30: TraderSt
                tier = EXCLUDED.tier,
                manual = COALESCE($4, traders.manual),
                active = CASE WHEN COALESCE($4, traders.manual) THEN COALESCE($4, traders.active)
+                             WHEN traders.pinned THEN traders.active
                              ELSE EXCLUDED.qualified END,
                qualified = EXCLUDED.qualified,
                qualified_at = CASE WHEN EXCLUDED.qualified AND NOT traders.qualified THEN now()
