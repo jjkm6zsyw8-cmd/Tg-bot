@@ -240,6 +240,51 @@ class Gapper:
         return status, rows
 
 
+# трейлинг всей позиции без тейка: продажа только по откату от пика (включается сразу — от безубытка — или после +X%)
+TRAIL_GRID = [dict(tp=act, share=1e-9, stop=stop, time_s=None, gain=0, trail=tr)
+              for act in (0.0, 0.10, 0.25) for tr in (0.10, 0.15, 0.20, 0.30, 0.40, 0.50) for stop in (0.10, 0.20, None)]
+
+
+def tname(sc: dict[str, Any]) -> str:
+    start = "сразу" if not sc["tp"] else "после +{:.0%}".format(sc["tp"])
+    stop = ", стоп −{:.0%}".format(sc["stop"]) if sc["stop"] else ", без стопа"
+    return "трейл {:.0%} {}{}".format(sc["trail"], start, stop)
+
+
+def pick_by_past(res: list[list[float]], days: list[str], fallback: list[float]) -> tuple[float, str]:
+    """Вариант на день D — лучший по дням до D (30+ сигналов истории), иначе fallback. Итог в $ при $10, название
+    варианта последнего дня."""
+    tot, last = 0.0, "—"
+    for dd in sorted(set(days)):
+        past = [i for i, x in enumerate(days) if x < dd]
+        idx = [i for i, x in enumerate(days) if x == dd]
+        if len(past) >= 30:
+            k = max(range(len(res[0])), key=lambda k: sum(res[i][k] for i in past))
+            tot += sum(res[i][k] for i in idx) * 10
+            last = str(k)
+        else:
+            tot += sum(fallback[i] for i in idx) * 10
+    return tot, last
+
+
+def trail_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> str:
+    """paths: (путь, индекс входа, MC входа, чья продажа — выход, день). Трейлинг всей позиции: по прошлым дням,
+    лучший задним числом, три постоянных варианта."""
+    if not paths:
+        return "—"
+    res = [[simulate(p, i0, mc0, who, sc, xd)[0] for sc in TRAIL_GRID] for p, i0, mc0, who, _d in paths]
+    g = [simulate(p, i0, mc0, who, SCHEMES["G"], xd)[0] for p, i0, mc0, who, _d in paths]
+    wf, last = pick_by_past(res, [x[4] for x in paths], g)
+    best = max(range(len(TRAIL_GRID)), key=lambda k: sum(r[k] for r in res))
+    fixed = [TRAIL_GRID.index(dict(tp=a, share=1e-9, stop=st_, time_s=None, gain=0, trail=t))
+             for a, t, st_ in ((0.0, 0.20, 0.10), (0.10, 0.30, 0.20), (0.25, 0.40, None))]
+    return (f"по прошлым дням {wf:+.0f}$" + (f" (последний выбор: {tname(TRAIL_GRID[int(last)])})" if last != "—" else "")
+            + f" · лучший задним числом {tname(TRAIL_GRID[best])} {sum(r[best] for r in res) * 10:+.0f}$ · "
+            + " · ".join(f"{tname(TRAIL_GRID[k])} {sum(r[k] for r in res) * 10:+.0f}$" for k in fixed)
+            + f" · для сравнения G {sum(g) * 10:+.0f}$ · вариантов в плюсе "
+              f"{sum(1 for k in range(len(TRAIL_GRID)) if sum(r[k] for r in res) > 0)} из {len(TRAIL_GRID)}")
+
+
 OTHER_MODES = {"dev": "запуски девов (лотерея D)", "mydev": "мой дев", "new": "новые монеты",
                "new_dev_wallet": "новый кошелёк дева"}
 LOTTERY_D = dict(tp=1.0, share=0.34, stop=0.15, time_s=600, gain=0.10, trail=0.30)   # D: ⅓ на ×2, остаток трейл 30%
@@ -318,6 +363,7 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
                "grid": [simulate(path, e[0], e[1], a["deployer"], sc, xd)[0] for sc in GRID]}
         for label, sc in ROCKETS:
             res[label] = simulate(path, e[0], e[1], a["deployer"], sc, xd)[0]
+        res["trail_path"] = (path, e[0], e[1], a["deployer"], res["day"])
         groups[name].append(res)
     say("")
     say(f"ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА ({days:g} дн., $10 на сделку; покупка через {round(d / SLOT_S)} бл. после "
@@ -341,6 +387,7 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
             + " · ".join(f"{lbl} {sum(r[lbl] for r in rs) * 10:+.0f}$" for lbl, _ in ROCKETS)
             + f" · по прошлым дням {wf:+.0f}$ · лучшая задним числом {sname(GRID[best])} "
               f"{sum(r['grid'][best] for r in rs) * 10:+.0f}$")
+        say("    трейлинг всей позиции: " + trail_line([r["trail_path"] for r in rs], xd))
 
 
 async def notify(conn: Any, text: str) -> None:
@@ -582,6 +629,19 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         parts = [f"{name} {sum(simulate(g['path'], e[0], e[1], g['who'], sc, xd)[0] for g, e in grp) * 10:+.0f}$"
                  for name, sc in rockets]
         say(f"  {label} ({len(grp)}): дошли до {hit} · схема G {g_usd:+.0f}$ · " + " · ".join(parts))
+    say("")
+    say(f"Трейлинг всей позиции — без тейка, продажа только по откату от пика (покупка +{round(d / SLOT_S)} бл., "
+        f"продажа +{round(xd / SLOT_S)} бл.; цена видна 30 мин, потом продажа по последней цене):")
+    for label, pick in (("smart", lambda g: g["kind"].startswith("smart")),
+                        ("копии", lambda g: not g["kind"].startswith("smart"))):
+        paths = []
+        for g in good:
+            if pick(g):
+                e = entry_at(g["path"], g["s0"], d)
+                if e:
+                    paths.append((g["path"], e[0], e[1], g["who"], g["day"]))
+        if paths:
+            say(f"  {label} ({len(paths)}): " + trail_line(paths, xd))
     # отбор без подгонки: smart — все; копии — только кошельки, у которых по ПРОШЛЫМ дням 3+ сигнала и плюс
     say("")
     say(f"Отбор без подгонки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема G): smart — "
