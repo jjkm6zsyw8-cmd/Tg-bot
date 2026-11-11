@@ -285,6 +285,59 @@ def trail_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> str:
               f"{sum(1 for k in range(len(TRAIL_GRID)) if sum(r[k] for r in res) > 0)} из {len(TRAIL_GRID)}")
 
 
+# часть на уровне «обычного роста» монеты, остаток — трейлинг: тейк 65–70% на +10…+40%, остаток трейл 15/30%
+PART_GRID = [dict(tp=tp, share=sh, stop=stop, time_s=None, gain=0, trail=tr)
+             for tp in (0.10, 0.15, 0.20, 0.25, 0.30, 0.40) for sh in (0.65, 0.70) for tr in (0.15, 0.30)
+             for stop in (0.08, 0.15, 0.30, None)]
+
+
+def pname(sc: dict[str, Any]) -> str:
+    stop = "стоп −{:.0%}".format(sc["stop"]) if sc["stop"] else "без стопа"
+    return "{:.0%} на +{:.0%}, остаток трейл {:.0%}, {}".format(sc["share"], sc["tp"], sc["trail"], stop)
+
+
+def partial_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> str:
+    """Тейк части на уровне роста, остаток трейлинг. По прошлым дням: и сам вариант, и «уровень = медиана роста
+    монет по прошлым дням» (как ты предложил), лучший задним числом, разбивка по стопам."""
+    if not paths:
+        return "—"
+    res = [[simulate(p, i0, mc0, who, sc, xd)[0] for sc in PART_GRID] for p, i0, mc0, who, _d in paths]
+    g = [simulate(p, i0, mc0, who, SCHEMES["G"], xd)[0] for p, i0, mc0, who, _d in paths]
+    days = [x[4] for x in paths]
+    wf, _ = pick_by_past(res, days, g)
+    # уровень тейка = медиана роста монет (пик за 30 мин) по прошлым дням, 70%, остаток трейл 15%, стоп по прошлым
+    peaks = []
+    for p, i0, mc0, _w, _d in paths:
+        t0 = p[i0][1]
+        peaks.append(max((q[2] for q in p[i0:] if q[1] - t0 <= HORIZON_S), default=mc0) / mc0 - 1)
+    med_tot = 0.0
+    for dd in sorted(set(days)):
+        past = [i for i, x in enumerate(days) if x < dd]
+        idx = [i for i, x in enumerate(days) if x == dd]
+        if len(past) < 30:
+            med_tot += sum(g[i] for i in idx) * 10
+            continue
+        lvl = max(0.05, st.median(peaks[i] for i in past))
+        best = None
+        for stop in (0.08, 0.15, 0.30, None):
+            sc = dict(tp=lvl, share=0.70, stop=stop, time_s=None, gain=0, trail=0.15)
+            v = sum(simulate(paths[i][0], paths[i][1], paths[i][2], paths[i][3], sc, xd)[0] for i in past)
+            if best is None or v > best[0]:
+                best = (v, sc)
+        med_tot += sum(simulate(paths[i][0], paths[i][1], paths[i][2], paths[i][3], best[1], xd)[0]
+                       for i in idx) * 10
+    best_k = max(range(len(PART_GRID)), key=lambda k: sum(r[k] for r in res))
+    by_stop = {}
+    for stop in (0.08, 0.15, 0.30, None):
+        ks = [k for k, sc in enumerate(PART_GRID) if sc["stop"] == stop]
+        by_stop[stop] = max(sum(r[k] for r in res) for k in ks) * 10
+    return (f"уровень = медиана роста по прошлым дням (70%, трейл 15%) {med_tot:+.0f}$ · вариант по прошлым дням "
+            f"{wf:+.0f}$ · лучший задним числом {pname(PART_GRID[best_k])} {sum(r[best_k] for r in res) * 10:+.0f}$ · "
+            "лучший при стопе: " + ", ".join(f"{('−%d%%' % round(k * 100)) if k else 'без'} {v:+.0f}$"
+                                             for k, v in by_stop.items())
+            + f" · G {sum(g) * 10:+.0f}$ · медиана роста монет {st.median(peaks):+.0%}")
+
+
 OTHER_MODES = {"dev": "запуски девов (лотерея D)", "mydev": "мой дев", "new": "новые монеты",
                "new_dev_wallet": "новый кошелёк дева"}
 LOTTERY_D = dict(tp=1.0, share=0.34, stop=0.15, time_s=600, gain=0.10, trail=0.30)   # D: ⅓ на ×2, остаток трейл 30%
@@ -632,6 +685,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     say("")
     say(f"Трейлинг всей позиции — без тейка, продажа только по откату от пика (покупка +{round(d / SLOT_S)} бл., "
         f"продажа +{round(xd / SLOT_S)} бл.; цена видна 30 мин, потом продажа по последней цене):")
+    part_lines: list[str] = []
     for label, pick in (("smart", lambda g: g["kind"].startswith("smart")),
                         ("копии", lambda g: not g["kind"].startswith("smart"))):
         paths = []
@@ -642,6 +696,11 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
                     paths.append((g["path"], e[0], e[1], g["who"], g["day"]))
         if paths:
             say(f"  {label} ({len(paths)}): " + trail_line(paths, xd))
+            part_lines.append(f"  {label} ({len(paths)}): " + partial_line(paths, xd))
+    say("")
+    say("Часть на уровне обычного роста (65–70%), остаток — трейлинг 15/30% (тейк +10…+40%, стопы −8/−15/−30%/без):")
+    for ln in part_lines:
+        say(ln)
     # отбор без подгонки: smart — все; копии — только кошельки, у которых по ПРОШЛЫМ дням 3+ сигнала и плюс
     say("")
     say(f"Отбор без подгонки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема G): smart — "

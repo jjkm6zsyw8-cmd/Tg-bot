@@ -127,6 +127,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Ракеты" in out and "копии (2): дошли до ×2" in out
     assert "Копии через фильтры smart" in out and "прошли бы все:" in out
     assert "ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА" in out and "• запуски девов (лотерея D): 1 сигн." in out
+    assert "Часть на уровне обычного роста" in out and "уровень = медиана роста" in out
     assert "Трейлинг всей позиции" in out and "копии (2): по прошлым дням" in out and "трейлинг всей позиции: по прошлым дням" in out
     # второй запуск — из кеша, без запросов
     await ec.main(DSN, rpc=NoRpc())
