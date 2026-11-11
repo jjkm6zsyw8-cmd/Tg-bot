@@ -4,9 +4,17 @@
   выход и цель). Учёт в SOL, показ в SOL и USD.
 * Вход по каждому алерту выбранных уровней («Сильный», «Обычный» — меняется в /settings): позиция 20%
   текущего баланса, не больше 3 открытых позиций и одной позиции на монету.
-* Реалистичное исполнение: вход по цене через 5 с после алерта, выход через 2 с после сигнала;
-  проскальзывание — по состоянию bonding curve с учётом размера позиции; комиссия Pump.fun — фактическая
-  по сделкам (fee в TradeEvent), иначе из настроек; плюс приоритетная комиссия за каждую транзакцию.
+* Исполнение как у реального быстрого бота (копии, smart, разведка; с 11.11):
+  - покупка ложится через ENTRY_BLOCKS (2) блока после покупки трейдера; цена — из блокчейна: последняя сделка
+    монеты к этому блоку (RPC, подписи монеты после покупки трейдера + getTransaction). Не удалось — цена после
+    покупки трейдера + поправка paper_entry_slip (по замеру переплата через 1–5 с: +1…+2%);
+  - стоп, тейк, трейлинг и продажа трейдера проверяются по КАЖДОЙ сделке монеты из своего потока; продажа ложится
+    через EXIT_BLOCKS (2) блока после сделки, давшей сигнал, — по последней сделке к этому блоку;
+  - нет сделок своего потока по монете (подписки нет, тихо) — запасной путь: цена Jupiter раз в 4 с, продажа через 2 с.
+  До 11.11 бумага узнавала цену раз в 4 с и продавала через 2 с: стоп −8% исполнялся в среднем на −19% (11.11, G),
+  а вход был +5% к цене — хуже реального бота. «Тренды» и лотерея — по-прежнему (вход через 5 с по рынку).
+  Проскальзывание — по состоянию bonding curve с учётом размера позиции; комиссия Pump.fun и приоритетная — за
+  каждую транзакцию.
 Реальной торговли нет и не будет без отдельного решения пользователя.
 """
 from __future__ import annotations
@@ -81,10 +89,14 @@ M_LOTTERY_SHARE = 0.05
 M_DAY_STOP_PCT = 0.25
 M_ENTRY_DELAY_S = 1.0          # M входит через 1 с (как бот на реальных деньгах), остальные — через ENTRY_DELAY_S
 # Поправка на реальную цену входа копий и smart (scripts/entry_check.py, 10.11, 1321 копия): цена Jupiter, по которой
-# входит бумага, отстаёт — через 5 с бумага записывала вход в среднем по цене трейдера (+0%), а по сделкам блокчейна
-# цена через 5 с уже +5% (через 1 с +0%, через 2 с +3%). Без поправки бумага была оптимистичнее реальности на ~5%.
-ENTRY_SLIP = 0.05              # портфели с входом через 5 с
-M_ENTRY_SLIP = 0.02            # M (вход через 1 с, у реального бота — 1–2 с)
+# поправка входа — только если цену блока «+2» получить не удалось: по замеру 11.11 (887 сигналов, по сделкам
+# блокчейна) переплата к цене трейдера через 0.4 с +0%, 1–2 с +1%, 3–5 с +2% (медиана)
+ENTRY_SLIP = 0.02              # копии/smart, запасной путь входа
+M_ENTRY_SLIP = 0.02
+ENTRY_BLOCKS = 2               # реальный бот: покупка ложится через 2 блока (~0.8 с) после покупки трейдера
+EXIT_BLOCKS = 2                # …продажа — через 2 блока после сделки, пересёкшей стоп/тейк
+ENTRY_RPC_WAIT_S = 2.0         # блок «+2» должен подтвердиться, прежде чем спрашивать RPC о сделках до него
+EXIT_WAIT_S = 3.0              # ждём из своего потока сделки блоков после сигнала не дольше (поток отстаёт ~1 с)
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
@@ -123,7 +135,8 @@ LEGEND = ("M — боевая: сильные копии (2+ кошелька; 8
           "копии и smart (схемы 8.11): G всё на +25%, стоп −8% · A стоп −6%, ½ на +30%, трейл 15% · "
           "B стоп −15%, ½ на +30%, трейл 15% · C только цель · F трейл 15% после +15% · E как G, стоп −15% · "
           "D — лотерея (дев купил ~1 SOL): треть на ×2, остаток трейл 30%, до 4 ч · H — испытание кандидатов "
-          "разведки (как G, по $10) · вход через 5 с · A–H без дневных стопов · цены по рынку · старт $100")
+          "разведки (как G, по $10) · исполнение как у быстрого бота: покупка через 2 блока после трейдера по цене из "
+          "блокчейна, стоп/тейк по каждой сделке, продажа через 2 блока · A–H без дневных стопов · старт $100")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -138,6 +151,8 @@ TICK_S = 2.0          # проверка открытых позиций (сто
 # на рынке не было (сверка с минутными свечами GeckoTerminal)
 PRICE_EXITS = ("stop", "trailing", "target", "take_profit")
 CHECK_NAMES = {"ok": "ок", "nodata": "нет свечей", "entry": "⚠ вход", "exit": "⚠ выход"}
+ENTRY_SRC = {"блок": "блок +2 (блокчейн)", "оценка": "оценка: цена трейдера +2%", "jup": "рынок (Jupiter)",
+             "jupiter": "рынок (Jupiter)", "own": "свой поток", "dex": "DexScreener"}
 JUP_REFRESH_S = 4.0   # цены Jupiter открытых позиций — одним запросом раз в 4 с
 JUP_MAX_AGE_S = 8.0   # цена Jupiter годится для решения, если ей не больше 8 с
 OWN_MAX_AGE_S = 10.0  # сделка своего потока годится, если ей не больше 10 с
@@ -465,6 +480,9 @@ class PaperTrader:
         if not targets:
             self.skipped["*"] = why
             return
+        if self.realtime(data):
+            await self._enter_realtime(mint, level, alert_id, data, trader, targets)
+            return
         # M входит быстрее остальных — как бот на реальных деньгах (бэктест 6–9.11: результат почти целиком решает
         # цена входа внутри минуты; на тех же сигналах M через 1 с против остальных через 5 с покажет, что даёт скорость)
         m_delay = float(self.cfg.get("paper_m_entry_delay_s", M_ENTRY_DELAY_S))
@@ -522,6 +540,125 @@ class PaperTrader:
             sol_usd = self.e.price.value or 150
             await self._msg(f"📥 ${fmt.esc(data.get('symbol') or '?')} · MC {fmt.mc_usd(mc, sol_usd)} · "
                             + " · ".join(sizes) + " SOL")
+
+    def realtime(self, data: dict[str, Any]) -> bool:
+        """Сигнал с покупкой трейдера (блок, подпись, цена) — исполняем как реальный бот."""
+        return (bool(self.cfg.get("paper_realtime", True)) and not data.get("trend")
+                and bool(data.get("trigger_slot")) and bool(data.get("trigger_sig")) and bool(data.get("trigger_mc"))
+                and time.time() - float(data.get("trigger_at") or 0) <= 15)     # покупка трейдера свежая
+
+    async def block_mc(self, mint: str, trig_sig: str, s0: int, target: int, trig_mc: float) -> float | None:
+        """MC монеты на блок target: последняя сделка монеты в блоках s0…target после покупки трейдера (RPC).
+        Сделок не было — цена после покупки трейдера. None — узнать не удалось."""
+        rpc = getattr(self.e, "rpc", None)
+        over = getattr(self.e, "rpc_over_budget", None)
+        if rpc is None or (callable(over) and over()):
+            return None
+        from ..ingest.pump_parser import ParseStats, parse_transaction
+        from ..ingest.rpc import RpcError
+        from ..models import Trade
+        from .curve import mc_sol
+        try:
+            sigs = await rpc.signatures_for(mint, limit=1000, until=trig_sig)
+        except (RpcError, Exception):  # noqa: BLE001
+            return None
+        # ответ — от новых к старым; сортировка устойчивая: внутри блока порядок сохраняется
+        cand = sorted((x for x in sigs or [] if not x.get("err") and x.get("slot") is not None
+                       and s0 <= int(x["slot"]) <= target), key=lambda x: -int(x["slot"]))
+        if not cand:
+            return trig_mc                       # между покупкой трейдера и нашим блоком сделок не было
+        pool_map: dict[str, str] = {}
+        try:
+            amm = await self.db.fetchval("SELECT amm_pool FROM tokens WHERE mint=$1", mint)
+            if amm:
+                pool_map[amm] = mint
+        except Exception:  # noqa: BLE001
+            pass
+        for x in cand[:4]:
+            try:
+                tx = await rpc.transaction(x["signature"])
+            except (RpcError, Exception):  # noqa: BLE001
+                return None
+            if not tx:
+                continue
+            evs = [ev for ev in parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pool_map)
+                   if isinstance(ev, Trade) and ev.mint == mint]
+            if evs:
+                mc = mc_sol(evs[-1].v_sol, evs[-1].v_tokens)
+                if mc > 0:
+                    return mc
+        return None
+
+    async def _enter_realtime(self, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
+                              trader: str | None, targets: set[str]) -> None:
+        """Вход как у реального бота: покупка через ENTRY_BLOCKS блока после покупки трейдера по цене блокчейна."""
+        await asyncio.sleep(ENTRY_RPC_WAIT_S)
+        s0 = int(data["trigger_slot"])
+        target = s0 + ENTRY_BLOCKS
+        trig_mc = float(data["trigger_mc"])
+        mc = await self.block_mc(mint, str(data["trigger_sig"]), s0, target, trig_mc)
+        src = "блок"
+        if mc is not None and not (1 / 3 <= mc / trig_mc <= 3):
+            mc = None                            # в 3+ раза от цены трейдера за 2 блока — сбой разбора, не верим
+        if mc is None:
+            mc = trig_mc * (1 + float(self.cfg.get("paper_entry_slip", ENTRY_SLIP)))
+            src = "оценка"
+        ref = float(data.get("entry_mc") or data.get("mc") or 0)
+        if data.get("target_mc") and ref > 0 and 1 / 3 <= mc / ref <= 3 and abs(mc / ref - 1) > 0.10:
+            data = {**data, "target_mc": float(data["target_mc"]) * mc / ref}
+        guard = getattr(self.e, "copyguard", None)
+        if guard is not None and data.get("copy_wallet") and data.get("copy_ref_mc"):
+            delta = await guard.record_delta(data["copy_wallet"], mint, float(data["copy_ref_mc"]), float(mc))
+            why = guard.entry_reason(delta)
+            if why:
+                self.skipped["*"] = "копия: " + why
+                await guard.mark_skipped(data["copy_wallet"], mint, why)
+                return
+        async with self.lock:
+            before = set(self.positions)
+            sizes = []
+            for name in SCHEMES:
+                size = await self._open(name, mint, level, alert_id, data, trader, mc, src) if name in targets else None
+                sizes.append(f"{name} {size:.3f}" if size else f"{name} —")
+            new = [self.positions[i] for i in self.positions if i not in before]
+        for p in new:
+            p.extra["entry_slot"] = target
+        if any(not x.endswith("—") for x in sizes):
+            sol_usd = self.e.price.value or 150
+            await self._msg(f"📥 ${fmt.esc(data.get('symbol') or '?')} · MC {fmt.mc_usd(mc, sol_usd)} "
+                            f"({'блок +2' if src == 'блок' else 'оценка'}) · " + " · ".join(sizes) + " SOL")
+        # сделки монеты после нашего блока, пришедшие, пока ждали подтверждения, — проверяем выходы по ним
+        st = self.e.states.get(mint) if getattr(self.e, "states", None) else None
+        for t in sorted((t for t in getattr(st, "trades", None) or [] if t.slot and t.slot > target),
+                        key=lambda t: t.slot):
+            for p in new:
+                if p.id in self.positions and not p.closing:
+                    await self._check(p, float(t.mc), None, trade_slot=int(t.slot), now=t.ts)
+
+    def mc_at_slot(self, mint: str, slot: int) -> float | None:
+        """Последняя сделка своего потока по монете не позже блока slot."""
+        st = self.e.states.get(mint) if getattr(self.e, "states", None) else None
+        for t in reversed(getattr(st, "trades", None) or []):
+            if t.slot is not None and t.slot <= slot and t.mc and t.mc > 0:
+                return float(t.mc)
+        return None
+
+    async def _exit_blocks(self, p: Position, reason: str, share: float, slot0: int) -> None:
+        """Продажа как у реального бота: ложится через EXIT_BLOCKS блока после сделки, давшей сигнал."""
+        target = slot0 + EXIT_BLOCKS
+        st = self.e.states.get(p.mint) if getattr(self.e, "states", None) else None
+        deadline = time.time() + EXIT_WAIT_S
+        while time.time() < deadline:
+            trades = getattr(st, "trades", None) or []
+            if any((t.slot or 0) > target for t in trades[-30:]):
+                break
+            await asyncio.sleep(0.2)
+        mc = self.mc_at_slot(p.mint, target) or float(p.extra.get("last_mc") or p.entry_mc)
+        p.extra["last_mc"] = mc
+        async with self.lock:
+            if p.id not in self.positions or p.tokens <= 0:
+                return
+            await self._sell(p, reason, share, mc)
 
     async def _trend_entry_price(self, mint: str, data: dict[str, Any]) -> tuple[float | None, str]:
         """«Тренды» — по DexScreener (по нему дан алерт), со сверкой с Jupiter."""
@@ -624,10 +761,10 @@ class PaperTrader:
         now = datetime.now(timezone.utc)
         pid = await self.db.fetchval(
             """INSERT INTO paper_positions(portfolio, mint, alert_id, level, symbol, opened_at, entry_mc, cost_sol,
-                   tokens, tokens_initial, max_mc, target_mc, rule, source_wallet)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$7,$10,$11,$12) RETURNING id""",
+                   tokens, tokens_initial, max_mc, target_mc, rule, source_wallet, entry_src)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$7,$10,$11,$12,$13) RETURNING id""",
             name, mint, alert_id, level, data.get("symbol"), now, mc, size, fill.tokens, target, rule,
-            data.get("copy_wallet") or data.get("source_wallet"))
+            data.get("copy_wallet") or data.get("source_wallet"), ENTRY_SRC.get(src, src))
         await self.db.execute(
             "INSERT INTO paper_trades(position_id, portfolio, side, ts, mc, sol, tokens, fee_sol, reason) "
             "VALUES ($1,$2,'buy',$3,$4,$5,$6,$7,'алерт')", pid, name, now, mc, size, fill.tokens, fill.fee_sol)
@@ -640,7 +777,7 @@ class PaperTrader:
         return size
 
     # ------------------------------------------------------------------ сопровождение
-    async def on_trade(self, st: "TokenState", eff: Any, trader: str, is_buy: bool) -> None:
+    async def on_trade(self, st: "TokenState", eff: Any, trader: str, is_buy: bool, slot: int | None = None) -> None:
         ps = [p for p in self.positions.values() if p.mint == st.mint and not p.closing]
         if not ps:
             return
@@ -654,6 +791,12 @@ class PaperTrader:
                     and not sc.get("ignore_trader_sell")
                     and not (p.tp_done and sc.get("follow_runner") is False)):   # остаток-«раннер» едет за иксом
                 reason = "trader_sell"
+            entry_slot = p.extra.get("entry_slot")
+            if entry_slot is not None and slot is not None and st.mc and st.mc > 0:
+                # как реальный бот: каждая сделка монеты после нашей покупки — проверка стопа/тейка/трейлинга
+                if slot > entry_slot:
+                    await self._check(p, float(st.mc), reason, trade_slot=int(slot))
+                continue
             if reason is None:
                 continue          # цены ведёт tick_loop по рыночной цене; из своего потока — только сигналы выхода
             await self._check(p, float(p.extra.get("last_mc") or p.entry_mc), reason)
@@ -681,6 +824,13 @@ class PaperTrader:
                         if pair and pair.get("market_cap_usd"):
                             mc = pair["market_cap_usd"] / sol_usd
                             price_usd = pair.get("price_usd")
+                    elif p.extra.get("entry_slot") is not None and self.fresh_trade(p.mint, OWN_MAX_AGE_S):
+                        # реальный бот: цена — последняя сделка монеты; выходы по времени тоже продаются по блокам
+                        last = self.e.states[p.mint].trades[-1]
+                        if last.slot:
+                            await self._check(p, float(self.e.states[p.mint].mc), None, trade_slot=int(last.slot))
+                            continue
+                        mc, _src = self.market_cached(p.mint)
                     else:
                         mc, _src = self.market_cached(p.mint)
                     if not mc:
@@ -704,8 +854,10 @@ class PaperTrader:
             except Exception:  # noqa: BLE001
                 log.exception("paper tick")
 
-    async def _check(self, p: Position, mc: float, emergency: str | None, price_usd: float | None = None) -> None:
-        """price_usd — цена DexScreener для этой проверки (None — цена из своего потока сделок)."""
+    async def _check(self, p: Position, mc: float, emergency: str | None, price_usd: float | None = None,
+                     trade_slot: int | None = None, now: float | None = None) -> None:
+        """price_usd — цена DexScreener для этой проверки (None — цена из своего потока сделок).
+        trade_slot — проверка по сделке своего потока: продажа ложится через EXIT_BLOCKS блока (как реальный бот)."""
         scheme = self.scheme_for(p)
         last = p.extra.get("last_mc")
         if emergency is None and last and (mc > JUMP_X * last or mc < last / JUMP_X):
@@ -730,12 +882,16 @@ class PaperTrader:
                         return
         p.extra.pop("jump", None)
         p.extra["last_mc"] = mc
-        decision = decide_exit(p, mc, time.time(), scheme, self.fee_bps(), self.priority(), emergency)
+        decision = decide_exit(p, mc, now if now is not None else time.time(), scheme, self.fee_bps(), self.priority(),
+                               emergency)
         if decision is None or p.closing:
             return
         reason, share = decision
         p.closing = True
-        asyncio.create_task(self._exit_later(p, reason, share))
+        if trade_slot is not None and p.extra.get("src") != "dex":
+            asyncio.create_task(self._exit_blocks(p, reason, share, trade_slot))
+        else:
+            asyncio.create_task(self._exit_later(p, reason, share))
 
     async def _exit_later(self, p: Position, reason: str, share: float) -> None:
         await asyncio.sleep(EXIT_DELAY_S)            # реакция на сигнал выхода
@@ -1198,7 +1354,7 @@ class PaperTrader:
         w.writerow(["портфель", "монета", "адрес", "режим", "уровень", "кошелёк", "вход", "выход", "MC вход $",
                     "MC выход $", "MC максимум $", "вложено SOL", "получено SOL", "результат SOL", "результат %",
                     "причина выхода", "адрес кошелька", "проверка по рынку", "рост за 30 мин %",
-                    "просадка до пика %", "цена через 30 мин %"])
+                    "просадка до пика %", "цена через 30 мин %", "вход по"])
         pct = lambda v: "" if v is None else round(v * 100, 1)
         for r in await self._closed(since):
             w.writerow([
@@ -1211,7 +1367,7 @@ class PaperTrader:
                 round(r["pnl_sol"] or 0, 5), round((r["pnl_pct"] or 0) * 100, 1),
                 EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""), r.get("source_wallet") or "",
                 "⚠ не в итоге" if r.get("suspect") else CHECK_NAMES.get(r.get("price_check") or "", "ещё нет"),
-                pct(r.get("path_mfe")), pct(r.get("path_dip")), pct(r.get("path_p30")),
+                pct(r.get("path_mfe")), pct(r.get("path_dip")), pct(r.get("path_p30")), r.get("entry_src") or "",
             ])
         return out.getvalue()
 

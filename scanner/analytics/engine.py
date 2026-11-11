@@ -36,6 +36,14 @@ from .state import TokenState, TradeRow
 log = logging.getLogger(__name__)
 
 
+def trigger_of(r: Any) -> dict[str, Any]:
+    """Покупка трейдера, по которой входит бумага (блок, подпись, MC после неё, когда увидели)."""
+    if not r["slot"] or not r["signature"] or not r["mc_sol"]:
+        return {}
+    return {"trigger_slot": int(r["slot"]), "trigger_sig": r["signature"], "trigger_mc": float(r["mc_sol"]),
+            "trigger_at": time.time()}
+
+
 @dataclass
 class TokenInfo:
     resolution: cl.Resolution | None = None
@@ -453,7 +461,7 @@ class Engine:
                 asyncio.create_task(self._resolve_rpc(st))
         await self._maybe_new_coin(st)
         if eff is not None and self.paper.positions:
-            await self.paper.on_trade(st, eff, trader, r["is_buy"])
+            await self.paper.on_trade(st, eff, trader, r["is_buy"], r["slot"])
         entry = self.alerts.get(mint)
         if entry and eff is not None and time.monotonic() < entry.follow_until:
             await self._follow(st, entry, eff, r)
@@ -695,7 +703,8 @@ class Engine:
             return
         if sum(1 for t in st.trades if t.trader == r["trader"] and t.is_buy) > 1:
             return                                   # докупка — копируем только первый вход
-        data = {"modes": ["scout"], "symbol": st.symbol, "mc": st.mc, "source_wallet": r["trader"]}
+        data = {"modes": ["scout"], "symbol": st.symbol, "mc": st.mc, "source_wallet": r["trader"],
+                **trigger_of(r)}
         asyncio.create_task(self.paper.on_alert(st.mint, "normal", None, data, r["trader"]))
 
     async def _on_smart_trade(self, st: TokenState, r: Any) -> None:
@@ -793,6 +802,7 @@ class Engine:
             "smart_in_coin": sum(1 for a in self.traders if st.balances.get(a, 0) > 0),
             "exit_rule": "Выход при продаже трейдера или кластера", "trader": r["trader"],
             "cluster_id": st.cluster_id, "stage": self._stage(st),
+            **trigger_of(r),            # бумага входит как реальный бот: через 2 блока после этой покупки
         }
         if own:
             # для бумаги: размер копии от суммы цели (Ratio) и дельта входа относительно её покупки

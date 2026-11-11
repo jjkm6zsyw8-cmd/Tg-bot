@@ -488,3 +488,5 @@ CREATE TABLE IF NOT EXISTS wallet_origin (
     origin     text NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+-- как посчитан вход бумаги: блок +2 (блокчейн) | оценка | рынок (Jupiter) | DexScreener
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS entry_src text;

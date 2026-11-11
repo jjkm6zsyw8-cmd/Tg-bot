@@ -889,5 +889,5 @@ async def test_m_enters_faster(monkeypatch):
     tr._msg = no_msg
     strong = {"modes": ["copy"], "traders": [{"address": "W"}, {"address": "X"}], "copy_wallet": "W"}
     await tr.on_alert("M1", "strong", None, strong, "W")
-    # M — по цене через 1 с (+2% поправки на реальную цену), G — через 5 с (+5%)
-    assert ("M", pytest.approx(30.0 * 1.02)) in entered and ("G", pytest.approx(36.0 * 1.05)) in entered
+    # без данных о покупке трейдера (запасной путь): M — через 1 с, G — через 5 с, поправка по замеру +2%
+    assert ("M", pytest.approx(30.0 * 1.02)) in entered and ("G", pytest.approx(36.0 * 1.02)) in entered
