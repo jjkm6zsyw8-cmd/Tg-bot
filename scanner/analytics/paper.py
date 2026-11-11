@@ -570,6 +570,9 @@ class PaperTrader:
             return None
         lost = self.loss_exits.get((name, mint))
         cool = float(self.cfg.get("paper_reentry_cooldown_min", REENTRY_COOLDOWN_MIN))
+        if name == MAIN:
+            # M после убытка в монету сутки не возвращается (11.11 mihao: 4 входа за 8 часов — все в минус)
+            cool = max(cool, float(self.cfg.get("paper_m_reentry_cooldown_min", 24 * 60)))
         if lost and cool > 0 and time.time() - lost < 60 * cool:
             # регрессия 6.11: D семь раз за 20 минут входил в один и тот же раг NORTHKOREA (−1.1 SOL за час)
             self.skipped[name] = f"монета уже дала убыток {fmt.ago(time.time() - lost)} назад — повторно не входим"

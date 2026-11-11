@@ -858,6 +858,12 @@ async def test_main_portfolio_m():
     tr.start_usd = lambda: 100.0
     tr.day_pnl, tr._day_key = {"M": -0.30}, tr.day_key()                                  # −$30 при SOL $100
     assert tr.day_stopped("M") and tr.day_stop_usd("M") == 25.0
+    # после убытка M не возвращается в монету сутки (остальные — час)
+    tr.day_pnl = {}
+    tr.loss_exits = {("M", "MIHAO"): time.time() - 3 * 3600, ("G", "MIHAO"): time.time() - 3 * 3600}
+    assert await tr._open("M", "MIHAO", "strong", None, copy, "W", 30.0) is None and "убыток" in tr.skipped["M"]
+    tr.balance["G"] = 1.0
+    assert await tr._open("G", "MIHAO", "strong", None, copy, "W", 30.0)
 
 
 async def test_m_enters_faster(monkeypatch):
