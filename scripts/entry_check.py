@@ -46,6 +46,8 @@ GRID = [dict(tp=tp, share=1.0, stop=stop, time_s=tm, gain=0.05, trail=None)
 # покупки трейдера, продажа — через 1–2 блока после сделки, пересёкшей стоп/тейк
 REAL = [(0.4, 0.4), (0.8, 0.4), (0.8, 0.8), (1.2, 0.8)]
 MAIN_REAL = (0.8, 0.4)               # «хороший бот»: покупка через 2 блока, продажа через 1
+SIZES_USD = (10, 20, 50, 100, 200)   # размер ставки: своя покупка и продажа двигают цену кривой
+K_CURVE = 30 * 1.073e9 / 1e9         # виртуальные резервы кривой: v_sol = sqrt(K × MC) (MC в SOL, 1 млрд токенов)
 EARLY_SLOTS = 8                      # первые ~3 с после покупки трейдера — без них быстрый вход не посчитать
 GAP_FULL = 60                        # дыру до первой своей сделки догружаем целиком, если в ней ≤ 60 транзакций
 GAP_WINDOW_MAX = 40                  # иначе — только первые ~3 с (если там ≤ 40 транзакций)
@@ -55,6 +57,17 @@ SCHEMES = {
     # M — сильные копии: 85% на +25%, 15% — раннер с трейлингом 30% (за трейдером не продаётся)
     "M": dict(tp=0.25, share=0.85, stop=0.08, time_s=300, gain=0.10, trail=0.30),
 }
+
+
+def vsol(mc: float) -> float:
+    return math.sqrt(K_CURVE * max(mc, 1e-9))
+
+
+def net_sized(ratio: float, mc0: float, size_sol: float) -> float:
+    """Как net, но со своим влиянием на цену: покупка на size_sol дороже на size/v_sol, продажа — дешевле;
+    приоритет 0.0005 SOL на транзакцию — доля от своей ставки."""
+    imp = (1 + size_sol / vsol(mc0)) * (1 + size_sol * ratio / vsol(mc0 * ratio))
+    return ratio / imp * (1 - FEE) ** 2 - 1 - 2 * 0.0005 / size_sol
 
 
 def net(ratio: float) -> float:
@@ -86,8 +99,10 @@ def fill_after(path: list[tuple[int, float, float, str, bool]], j: int, delay: f
 
 
 def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: float, trader: str,
-             sc: dict[str, Any], exit_delay: float | None = None) -> tuple[float, str]:
-    """Выход по сделкам после входа. path: (слот, время, MC, трейдер, покупка)."""
+             sc: dict[str, Any], exit_delay: float | None = None, size_sol: float | None = None) -> tuple[float, str]:
+    """Выход по сделкам после входа. path: (слот, время, MC, трейдер, покупка). size_sol — со своим влиянием на цену."""
+    def nf(ratio: float) -> float:
+        return net_sized(ratio, mc0, size_sol) if size_sol else net(ratio)
     t0 = path[i0][1]
     rem, got, peak, tp_done = 1.0, 0.0, mc0, False
     stop_mc = mc0 * (1 - sc["stop"]) if sc["stop"] is not None else -1.0
@@ -99,28 +114,28 @@ def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: floa
             break
         if sc["time_s"] and ts - t0 >= sc["time_s"] and not tp_done and net(peak / mc0) < sc["gain"]:
             got += rem * last_mc
-            return net(got / mc0), "нет роста"
+            return nf(got / mc0), "нет роста"
         last_mc = mc
         if tr == trader and not is_buy and not tp_done:
             got += rem * fill_after(path, j, exit_delay)
-            return net(got / mc0), "трейдер продал"
+            return nf(got / mc0), "трейдер продал"
         if mc <= stop_mc:
             got += rem * fill_after(path, j, exit_delay)
-            return net(got / mc0), "стоп"
+            return nf(got / mc0), "стоп"
         if tp_done and sc["trail"] and mc <= peak * (1 - sc["trail"]):
             got += rem * fill_after(path, j, exit_delay)
-            return net(got / mc0), "трейлинг"
+            return nf(got / mc0), "трейлинг"
         if not tp_done and mc >= tp_level:
             sell = rem if sc["share"] >= 1 else sc["share"]
             got += sell * fill_after(path, j, exit_delay)
             rem -= sell
             tp_done = True
             if rem <= 1e-9:
-                return net(got / mc0), "тейк"
+                return nf(got / mc0), "тейк"
         if mc > peak:
             peak = mc
     got += rem * last_mc
-    return net(got / mc0), "30 минут" if rem else "тейк"
+    return nf(got / mc0), "30 минут" if rem else "тейк"
 
 
 class Gapper:
@@ -405,6 +420,30 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         g_t, m_t = total(rows_m, gi, idx), total(rows_m, mi, idx)
         say(f"  {day[3:]}.{day[:2]}: {n} · {usd:+.0f}$ ({name}) · G {g_t[0]:+.0f}$ · M {m_t[0]:+.0f}$ ({m_t[1]}) "
             f"· итого {cum:+.0f}$")
+    try:
+        raw = await conn.fetchval("SELECT value FROM kv WHERE key='sol_usd'")
+        sol_usd = float((json.loads(raw) if isinstance(raw, str) else raw or {}).get("price") or 0)
+    except Exception:  # noqa: BLE001
+        sol_usd = 0.0
+    sol_usd = sol_usd or 150.0
+    d, xd = MAIN_REAL
+    sized = []
+    for usd in SIZES_USD:
+        size = usd / sol_usd
+        rows_s: list[list[float | None]] = []
+        for g in good:
+            e = entry_at(g["path"], g["s0"], d)
+            rows_s.append([simulate(g["path"], e[0], e[1], g["who"], sc, xd, size)[0] if e else None for sc in GRID]
+                          + [simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd, size)[0] if e else None,
+                             None])
+        wf_s, _ = walk_forward(rows_s)
+        n_tr = sum(1 for r in rows_s if r[0] is not None)
+        usd_total = wf_s * usd / 10
+        sized.append(f"${usd}: {usd_total:+.0f}$ ({usd_total / (n_tr * usd) if n_tr else 0:+.1%} на сделку, "
+                     f"G {total(rows_s, gi)[0] * usd / 10:+.0f}$)")
+    say(f"Размер ставки (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., схема по прошлым дням; "
+        f"учтено, что своя покупка и продажа двигают цену; SOL ${sol_usd:.0f}):")
+    say("  " + " · ".join(sized))
     by_how = collections.defaultdict(list)
     for i, g in enumerate(good):
         by_how[g["how"]].append(i)

@@ -35,6 +35,14 @@ def test_exit_delay_parameter_overrides_default(monkeypatch):
     assert why == "стоп" and r == pytest.approx(ec.net(25 / 30))
 
 
+def test_bigger_size_moves_price_against_us():
+    # без влияния (крошечная ставка) — почти как net; чем больше ставка, тем хуже результат той же сделки
+    assert ec.net_sized(1.3, 60, 1e-6) == pytest.approx(ec.net(1.3) + 2 * ec.PRIO - 2 * 0.0005 / 1e-6, abs=1e-3)
+    r = [ec.net_sized(1.3, 60, s) for s in (0.1, 0.5, 2.0)]
+    assert r[0] > r[1] > r[2]
+    assert r[0] - r[2] > 0.05                                    # 2 SOL на MC 60 SOL — заметно дороже
+
+
 def test_entry_after_delay_takes_price_of_that_moment():
     p = path(30, 33, 36, 40, 40, 40)
     assert ec.entry_at(p, 100, 0.4) == (1, 33)            # следующий слот
@@ -106,6 +114,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "копия сильная" in out and "Сверка" in out
     assert "БЫСТРЫЙ БОТ ПО ВСЕМ ДНЯМ" in out and "покупка +2 бл., продажа +1 бл." in out
     assert "бумага входит через ≈5.0 с" in out
+    assert "Размер ставки" in out and "$200:" in out
     # второй запуск — из кеша, без запросов
     await ec.main(DSN, rpc=NoRpc())
     out = capsys.readouterr().out
