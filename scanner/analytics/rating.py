@@ -3,7 +3,8 @@
 Оценка — по тому, что дали копии этого кошелька на бумаге: последние 20 закрытых копий в эталонных портфелях
 (G и испытательный H — одна и та же схема), только сделки, цена которых сошлась с рынком (не ⚠).
 score = сумма результатов / (копий + 4): средний результат копии, «стянутый» к нулю, пока копий мало, — один
-удачный икс не делает кошелёк лучшим, одна неудача не отправляет на паузу.
+удачный икс не делает кошелёк лучшим, одна неудача не отправляет на паузу. Результат копии выше +100% считается
+как +100% (выброс не решает за весь кошелёк).
 
 Уровни и что они меняют (пороги — в /settings):
   🟢 топ    — score ≥ +4% на копию и 5+ копий: позиция ×1.5;
@@ -87,9 +88,10 @@ async def compute(db: Any, cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                WHERE source_wallet IS NOT NULL AND portfolio = ANY($1::text[]) AND closed_at IS NOT NULL
                  AND exit_reason <> 'reset' AND NOT suspect AND closed_at > now() - interval '14 days') x
            WHERE rn <= $2""", list(REF_PORTFOLIOS), WINDOW)
+    from .origin import capped
     by: dict[str, list[float]] = {}
-    for r in rows:
-        by.setdefault(r["w"], []).append(float(r["pnl_pct"] or 0))
+    for r in rows:                      # икс выше +100% считается как +100%: одна ракета не делает кошелёк «топом»
+        by.setdefault(r["w"], []).append(capped(float(r["pnl_pct"] or 0)))
     manual = {r["address"]: r["manual_tier"] for r in await db.fetch(
         "SELECT address, manual_tier FROM wallet_rating WHERE manual_tier IS NOT NULL")}
     out: dict[str, dict[str, Any]] = {}

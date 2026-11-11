@@ -20,6 +20,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from .origin import capped
+
 if TYPE_CHECKING:
     from .engine import Engine
 
@@ -128,7 +130,7 @@ async def dataset(db: Any, days: int = 14) -> list[tuple[dict[str, Any], float, 
     out = []
     for r in rows:
         payload = r["payload"] if isinstance(r["payload"], dict) else {}
-        out.append((features(payload, r["level"] or "", r["mode"], r["opened_at"]), float(r["pnl_pct"] or 0),
+        out.append((features(payload, r["level"] or "", r["mode"], r["opened_at"]), capped(float(r["pnl_pct"] or 0)),
                     r["opened_at"].astimezone(TZ).strftime("%Y-%m-%d")))
     return out
 

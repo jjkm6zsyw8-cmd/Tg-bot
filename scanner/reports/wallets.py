@@ -66,7 +66,9 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
             # добавленный вручную кошелёк остаётся «своим», даже если разведка его когда-то смотрела
             w.update({"kind": "разведка" if r["status"] == "promoted" else "кандидат",
                       "status": STATUS.get(r["status"], r["status"]), "found": r["found_at"]})
+    from ..analytics.origin import origins
     from ..analytics.rating import TIERS
+    org = await origins(db)
     rating = {r["address"]: r for r in await db.fetch("SELECT * FROM wallet_rating")}
     papers: dict[tuple[str, str], dict[str, Any]] = {}
     for r in await db.fetch(
@@ -92,7 +94,8 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
         rows.append((pnl, [
             kind, w.get("status") or "", TIERS.get(rt.get("tier") or "", "") + (" ✋" if rt.get("manual_tier") else ""),
             _pct(rt.get("score")), verdict_of(kind, n, wins, pnl) if kind != "кандидат" else "",
-            w.get("label") or "", addr, w.get("source") or ("вручную" if kind.startswith("свой") else "автоотбор"),
+            w.get("label") or "", addr, org.get(addr) or w.get("source") or ("вручную, источник не помечен"
+                                                                            if kind.startswith("свой") else "автоотбор"),
             w.get("reason") or "", when(w.get("found")), w.get("decision") or "",
             n, p.get("portfolio") or "", wins, _pct(wins / n) if n else "", _num(pnl), round(pnl * sol_usd, 2),
             _pct(p.get("avg")), _pct(p.get("best")), _pct(p.get("worst")),

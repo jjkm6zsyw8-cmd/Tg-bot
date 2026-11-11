@@ -482,3 +482,9 @@ CREATE TABLE IF NOT EXISTS wallet_rating (
     sum_pct     double precision,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+-- откуда кошелёк (Axiom, Pump.fun, GMGN, другое): /addwallet … axiom, /import axiom, /origin
+CREATE TABLE IF NOT EXISTS wallet_origin (
+    address    text PRIMARY KEY,
+    origin     text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);

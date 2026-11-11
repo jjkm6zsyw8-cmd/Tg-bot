@@ -53,6 +53,14 @@ async def test_report_on_db():
                         port, f"M{n}", aid, base + timedelta(days=day, minutes=i), "take_profit" if pnl > 0 else "stop",
                         pnl, wallet)
                     n += 1
+        # икс: показывается отдельно, «без иксов» — итог без него
+        aid = await db.fetchval("INSERT INTO alerts(mint, mode, level) VALUES ('R', 'smart', 'normal') RETURNING id")
+        await db.execute(
+            """INSERT INTO paper_positions(portfolio, mint, alert_id, level, symbol, opened_at, closed_at, entry_mc,
+                   cost_sol, tokens, tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet)
+               VALUES ('G', 'R', $1, 'normal', 'ROCKET', $2, $2, 30, 0.1, 1, 1, 'take_profit', 2, 2, 'ROCKETW1')""",
+            aid, base + timedelta(days=2, hours=1))
+        await db.execute("INSERT INTO wallet_origin(address, origin) VALUES ('GOODWALLET1', 'axiom')")
         # сделка, не сошедшаяся с рынком, не считается
         aid = await db.fetchval("INSERT INTO alerts(mint, mode, level) VALUES ('X', 'smart', 'normal') RETURNING id")
         await db.execute(
@@ -62,8 +70,20 @@ async def test_report_on_db():
         text = await smart_report(db, 7)
     finally:
         await db.close()
-    assert "60 сд." in text and "в плюсе 30 (50%)" in text and "+51$" in text     # 30×2.5 − 30×0.8
+    assert "Итого: 61 сд. · в плюсе 31 (51%) · <b>+71$</b>" in text      # 30×2.5 − 30×0.8 + 20 (икс)
+    assert "На 2 аккаунта по $10 (одни и те же колы): <b>+142$</b>" in text
+    assert "Иксы (сделка ≥+100%), отдельно: 1 сд. · +20$ — ROCKET +200%" in text
+    assert "Без иксов: 60 сд. · в плюсе 30 (50%) · <b>+51$</b>" in text
+    assert "(без иксов +17$)" in text
+    assert "Для сравнения — копии своего списка по источникам" in text and "Axiom: 30 сд." in text
     assert "не сошлись с рынком и не считаются: 1" in text
     assert "Хороший: 30 сд. · в плюсе 30 · +75$" in text and "BADWALLET22" in text
-    assert "тейк 30 (+25%)" in text and "стоп 30 (-8%)" in text
-    assert "Что отличает плюсовые колы" in text and "капитализация" in text
+    assert "тейк 31 (+31%)" in text and "стоп 30 (-8%)" in text
+    assert "Что отличает плюсовые колы" in text and "капитализация" in text and "иксы выше +100%" in text
+
+
+def test_origin_parsing_and_cap():
+    from scanner.analytics.origin import capped, parse_origin
+    assert parse_origin("Axiom") == "axiom" and parse_origin("#gmgn") == "gmgn" and parse_origin("помпфан") == "pumpfun"
+    assert parse_origin("Вася") is None and parse_origin(None) is None
+    assert capped(3.0) == 1.0 and capped(-0.08) == -0.08

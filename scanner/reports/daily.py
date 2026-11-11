@@ -189,7 +189,8 @@ async def send_daily(db: Database, settings: Settings, day: date) -> None:
                      priority=5)
     try:                                    # отдельным сообщением — только smart-сигналы (то же, что /smart)
         from .smart import chunks, smart_report
-        smart = await smart_report(db, 7, str(settings.effective().get("timezone") or "Asia/Tbilisi"))
+        eff = settings.effective()
+        smart = await smart_report(db, 7, str(eff.get("timezone") or "Asia/Tbilisi"), int(eff.get("smart_accounts") or 2))
         for part in chunks(smart):
             await db.enqueue("text", {"text": part, "topic": "daily"}, priority=5)
     except Exception:  # noqa: BLE001 — разбор дня важнее

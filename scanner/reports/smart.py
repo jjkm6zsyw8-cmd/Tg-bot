@@ -56,8 +56,10 @@ def summary_line(pcts: list[float]) -> str:
             + (f" · плюсы/минусы ×{pf:.1f}" if pf is not None else ""))
 
 
-async def smart_report(db: Any, days: int = 7, tz: str = "Asia/Tbilisi") -> str:
+async def smart_report(db: Any, days: int = 7, tz: str = "Asia/Tbilisi", accounts: int = 2) -> str:
+    from ..analytics.origin import OUTLIER, UNMARKED, origins
     zone = _zone(tz)
+    accounts = max(1, int(accounts))
     rows = await db.fetch(
         """SELECT p.opened_at, p.pnl_pct, p.level, p.symbol, p.exit_reason, a.trader, p.source_wallet,
                   a.payload->'traders' AS traders
@@ -79,6 +81,16 @@ async def smart_report(db: Any, days: int = 7, tz: str = "Asia/Tbilisi") -> str:
     lines.append("Итого: " + summary_line(pcts) + (f" · открыто сейчас {opened}" if opened else ""))
     if not rows:
         return "\n".join(lines)
+    if accounts > 1:
+        lines.append(f"На {accounts} аккаунта по $10 (одни и те же колы): <b>{sum(pcts) * USD * accounts:+.0f}$</b>")
+    xs = [r for r in rows if float(r["pnl_pct"] or 0) >= OUTLIER]
+    if xs:
+        rest = [float(r["pnl_pct"] or 0) for r in rows if float(r["pnl_pct"] or 0) < OUTLIER]
+        lines.append(f"Иксы (сделка ≥+{OUTLIER:.0%}), отдельно: {len(xs)} сд. · "
+                     f"{sum(float(r['pnl_pct'] or 0) for r in xs) * USD:+.0f}$ — "
+                     + ", ".join(f"{esc(r['symbol'] or '?')} {float(r['pnl_pct'] or 0):+.0%} "
+                                 f"({r['opened_at'].astimezone(zone).strftime('%d.%m')})" for r in xs[:6]))
+        lines.append("Без иксов: " + summary_line(rest))
     one = [float(r["pnl_pct"] or 0) for r in rows if r["level"] != "strong"]
     strong = [float(r["pnl_pct"] or 0) for r in rows if r["level"] == "strong"]
     lines.append(f"Один кошелёк: {summary_line(one)}")
@@ -100,9 +112,11 @@ async def smart_report(db: Any, days: int = 7, tz: str = "Asia/Tbilisi") -> str:
         v = [float(r["pnl_pct"] or 0) for r in rs]
         cum += sum(v) * USD
         best = max(rs, key=lambda r: float(r["pnl_pct"] or 0))
+        no_x = [x for x in v if x < OUTLIER]
         lines.append(f"{day[3:]}.{day[:2]}: {len(v)} сд. · в плюсе {sum(x > 0 for x in v) / len(v):.0%} · "
-                     f"<b>{sum(v) * USD:+.0f}$</b> · лучшая {float(best['pnl_pct'] or 0):+.0%} "
-                     f"{esc(best['symbol'] or '')} · с начала {cum:+.0f}$")
+                     f"<b>{sum(v) * USD:+.0f}$</b>"
+                     + (f" (без иксов {sum(no_x) * USD:+.0f}$)" if len(no_x) < len(v) else "")
+                     + f" · лучшая {float(best['pnl_pct'] or 0):+.0%} {esc(best['symbol'] or '')} · с начала {cum:+.0f}$")
 
     labels = {r["address"]: r["label"] for r in await db.fetch(
         """SELECT address, label FROM traders WHERE label IS NOT NULL
@@ -120,14 +134,32 @@ async def smart_report(db: Any, days: int = 7, tz: str = "Asia/Tbilisi") -> str:
         for usd, w, v in show:
             lines.append(f"{name(w)}: {len(v)} сд. · в плюсе {sum(x > 0 for x in v)} · {usd:+.0f}$"
                          + (f"\n   <code>{w}</code>" if usd < 0 else ""))
+    # копии своего списка по источникам — какой источник даёт кошельки, на которых бумага в плюсе
+    org = await origins(db)
+    copies = await db.fetch(
+        """SELECT p.pnl_pct, COALESCE(p.source_wallet, a.trader) w FROM paper_positions p
+           JOIN alerts a ON a.id = p.alert_id
+           WHERE p.portfolio = 'G' AND a.mode = 'copy' AND p.closed_at IS NOT NULL AND NOT p.suspect
+             AND p.exit_reason <> 'reset' AND p.opened_at > now() - make_interval(days => $1)""", days)
+    by_o: dict[str, list[float]] = {}
+    for r in copies:
+        by_o.setdefault(org.get(r["w"] or "", UNMARKED), []).append(float(r["pnl_pct"] or 0))
+    if by_o:
+        lines.append("\n<b>Для сравнения — копии своего списка по источникам</b> (G, $10 на сделку)")
+        for o, v in sorted(by_o.items(), key=lambda kv: -sum(kv[1])):
+            no_x = [x for x in v if x < OUTLIER]
+            lines.append(f"{esc(o)}: {summary_line(v)}" + (f" · без иксов {sum(no_x) * USD:+.0f}$"
+                                                           if len(no_x) < len(v) else ""))
     lines += await _what_differs(db)
     return "\n".join(lines)
 
 
 async def _what_differs(db: Any, days: int = 14) -> list[str]:
     from ..analytics.autofilter import NAMES, dataset, fit, walk_forward
-    rows = [r for r in await dataset(db, days) if str(r[0].get("kind") or "").startswith("smart")]
-    out = [f"\n<b>Что отличает плюсовые колы</b> ({days} дн., {len(rows)} smart-сделок)"]
+    from ..analytics.origin import OUTLIER, capped
+    rows = [(x, capped(y), d) for x, y, d in await dataset(db, days) if str(x.get("kind") or "").startswith("smart")]
+    out = [f"\n<b>Что отличает плюсовые колы</b> ({days} дн., {len(rows)} smart-сделок; иксы выше +{OUTLIER:.0%} "
+           f"считаются как +{OUTLIER:.0%}, чтобы одна ракета не решала за всех)"]
     if len(rows) < 40:
         out.append(f"Пока мало сделок для разбора (нужно 40+, есть {len(rows)}).")
         return out

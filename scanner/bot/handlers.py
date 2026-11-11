@@ -21,7 +21,7 @@ NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005,
                 "paper_scout_usd": 10, "scout_slots": 20, "scout_max_auto": 15, "scout_min_copies": 6,
                 "paper_m_day_stop_pct": 0.25, "paper_m_size_cap": 0.30, "paper_entry_slip": 0.05,
                 "paper_m_entry_slip": 0.02, "rating_top": 0.04, "rating_pause": -0.03,
-                "rating_top_mult": 1.5}
+                "rating_top_mult": 1.5, "smart_accounts": 2}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -254,10 +254,15 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def cmd_addwallet(m: Message, command: CommandObject) -> None:
         parts = (command.args or "").split()
         if not parts or not is_valid_address(parts[0]):
-            return await reply(m, "Формат: /addwallet &lt;адрес&gt; &lt;метка&gt; [dev|trader]")
+            return await reply(m, "Формат: /addwallet &lt;адрес&gt; &lt;метка&gt; [dev|trader] [axiom|pumpfun|gmgn]")
+        from ..analytics.origin import ORIGINS, parse_origin, set_origin
         addr = parts[0]
+        origin = next((o for o in (parse_origin(p) for p in parts[1:]) if o), None)
+        parts = [parts[0]] + [p for p in parts[1:] if not parse_origin(p)]
         kind = parts[-1].lower() if len(parts) > 1 and parts[-1].lower() in ("dev", "trader") else None
         label = " ".join(p for p in parts[1:] if p.lower() not in ("dev", "trader"))[:64] or None
+        if origin:
+            await set_origin(db, [addr], origin)
         deployed = await db.fetchval("SELECT count(*) FROM tokens WHERE deployer=$1", addr)
         if kind == "dev" or (kind is None and deployed):
             from ..analytics.clusters import add_link, cluster_of, new_cluster
@@ -278,11 +283,17 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await db.execute("UPDATE traders SET active=true WHERE address=$1", addr)
         await db.job("reload")
         note = "" if ok else "\n⚠️ Не проходит автофильтр (" + "; ".join(fails) + "), но оставлен в списке по вашему выбору."
+        note += f"\nИсточник: {ORIGINS[origin]}" if origin else "\nИсточник не указан — /origin адрес axiom|pumpfun|gmgn"
         await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr, ext),
                     [[{"text": "Убрать из списка", "callback": f"wl:t:{addr}"}]])
 
-    async def import_wallets(m: Message, text: str) -> None:
+    async def import_wallets(m: Message, text: str, origin: str | None = None) -> None:
+        from ..analytics.origin import ORIGINS, parse_origin, set_origin
         from .importer import extract_wallets
+        first = text.strip().split(maxsplit=1)
+        if first and parse_origin(first[0]):                 # /import axiom … — источник первым словом
+            origin = origin or parse_origin(first[0])
+            text = first[1] if len(first) > 1 else ""
         found = extract_wallets(text)
         if not found:
             return await reply(m, "Не нашёл адресов кошельков. Пришлите файл экспорта из Axiom (JSON/CSV/TXT) "
@@ -294,11 +305,16 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $2) "
                              "ON CONFLICT (kind, address) DO UPDATE SET label=COALESCE(EXCLUDED.label, watchlist.label)",
                              addr, label)
+        if origin:
+            await set_origin(db, [a for a, _ in found], origin)
         await db.job("reload")
         await db.job("import_wallets", {"wallets": [[a, lb] for a, lb in found]})
         sample = "\n".join(f"• {esc(lb or '')} <code>{a[:4]}…{a[-4:]}</code>" for a, lb in found[:10])
         more = f"\n… и ещё {len(found) - 10}" if len(found) > 10 else ""
-        await reply(m, f"📥 Принял кошельков: <b>{len(found)}</b> (новых {new}).\n{sample}{more}\n\n"
+        src = (f"Источник: {ORIGINS[origin]}.\n" if origin else
+               "Источник не указан: в следующий раз — подпись к файлу <code>axiom</code> / <code>pumpfun</code> / "
+               "<code>gmgn</code> или /origin.\n")
+        await reply(m, f"📥 Принял кошельков: <b>{len(found)}</b> (новых {new}).\n{sample}{more}\n{src}\n"
                        "Слежка в реальном времени начнётся в течение минуты. Проверяю историю каждого "
                        "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в топик «Смарт-мани».")
 
@@ -472,7 +488,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         buf = await m.bot.download(doc)
         raw = buf.read() if buf is not None else b""
         text = raw.decode("utf-8-sig", errors="ignore")
-        await import_wallets(m, text)
+        from ..analytics.origin import parse_origin
+        origin = next((o for o in (parse_origin(w) for w in (m.caption or "").split()) if o), None)
+        await import_wallets(m, text, origin)
 
     @router.message(Command("removewallet"))
     async def cmd_removewallet(m: Message, command: CommandObject) -> None:
@@ -629,6 +647,34 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
         await paper_answer(m, cmd, 24 if cmd == "trades" else None)
 
+    @router.message(Command("origin"))
+    async def cmd_origin(m: Message, command: CommandObject) -> None:
+        """Откуда кошелёк: /origin адрес axiom|pumpfun|gmgn|other; /origin все axiom — все непомеченные из своего списка."""
+        from ..analytics.origin import ORIGINS, UNMARKED, origins, own_wallets, parse_origin, set_origin
+        parts = (command.args or "").split()
+        if len(parts) >= 2 and parse_origin(parts[-1]):
+            origin = parse_origin(parts[-1])
+            if parts[0].lower() in ("все", "all"):
+                marked = await origins(db)
+                addrs = [a for a in await own_wallets(db) if a not in marked]
+            else:
+                addrs = [p for p in parts[:-1] if is_valid_address(p)]
+            if not addrs:
+                return await reply(m, "Некого помечать: нет подходящих адресов.")
+            await set_origin(db, addrs, origin)  # type: ignore[arg-type]
+            return await reply(m, f"✅ Источник «{ORIGINS[origin]}» — кошельков: {len(addrs)}.")  # type: ignore[index]
+        marked = await origins(db)
+        own = await own_wallets(db)
+        cnt: dict[str, int] = {}
+        for a in own:
+            cnt[marked.get(a, UNMARKED)] = cnt.get(marked.get(a, UNMARKED), 0) + 1
+        await reply(m, "🏷 <b>Источники кошельков своего списка</b>\n"
+                       + ("\n".join(f"• {k}: {v}" for k, v in sorted(cnt.items(), key=lambda kv: -kv[1])) or "список пуст")
+                       + "\n\nПометить: <code>/origin адрес axiom</code> (pumpfun, gmgn, other)\n"
+                         "Все непомеченные сразу: <code>/origin все axiom</code>\n"
+                         "При добавлении: <code>/addwallet адрес метка axiom</code>, файл — с подписью "
+                         "<code>axiom</code>, список — <code>/import axiom</code> и адреса.")
+
     @router.message(Command("smart"))
     async def cmd_smart(m: Message, command: CommandObject) -> None:
         """Только smart-сигналы: итог при $10 на сделку, по дням, по кошелькам, что отличает плюсовые (/smart 14)."""
@@ -636,7 +682,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         cfg = await reload()
         arg = (command.args or "").strip().lower().rstrip("dд")
         days = min(30, max(1, int(arg))) if arg.isdigit() else 7
-        for part in chunks(await smart_report(db, days, str(cfg.get("timezone") or "Asia/Tbilisi"))):
+        for part in chunks(await smart_report(db, days, str(cfg.get("timezone") or "Asia/Tbilisi"),
+                                              int(cfg.get("smart_accounts") or 2))):
             await reply(m, part)
 
     @router.message(Command("filter"))
