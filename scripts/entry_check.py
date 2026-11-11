@@ -509,7 +509,11 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
                   t.deployer, t.created_slot, t.signature AS create_sig, t.initial_mc_sol
            FROM alerts a JOIN tokens t ON t.mint = a.mint
            WHERE a.mode = ANY($1::text[]) AND a.created_at > now() - make_interval(days => $2)
-           ORDER BY a.created_at""", list(OTHER_MODES), int(math.ceil(days)))
+             AND a.level <> 'watch'
+           ORDER BY a.created_at DESC LIMIT $3""", list(OTHER_MODES), int(math.ceil(days)),
+        int(os.environ.get("EC_OTHER_MAX", 1500)))
+    alerts = list(reversed(alerts))
+    rpc_cap = (gapper.calls if gapper else 0) + int(os.environ.get("EC_OTHER_RPC", 4000))
     if not alerts:
         return
     d, xd = MAIN_REAL
@@ -539,6 +543,9 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
         if not any(s0 < q[0] <= s0 + EARLY_SLOTS for q in full):
             if not gapper:
                 lost["без дозагрузки"] += 1
+                continue
+            if gapper.calls >= rpc_cap:
+                lost["лимит запросов"] += 1
                 continue
             after = next((q for q in full if q[0] > s0), None)
             status, extra = await gapper.fill(a["mint"], trig, after[5] if after else None, after[0] if after else None)
@@ -593,17 +600,18 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
         say("    трейлинг всей позиции: " + trail_line([r["trail_path"] for r in rs], xd))
 
 
-async def send_files(conn: Any, text: str) -> None:
+async def send_files(conn: Any, text: str | None) -> None:
     """Файлы в Telegram (топик отчётов): таблица тактик CSV (открывается в Excel/Numbers) и полный отчёт TXT."""
     import csv as _csv
     import io as _io
     stamp = __import__("datetime").datetime.now().strftime("%Y-%m-%d_%H%M")
     files = []
-    if FACT_CSV:
+    if FACT_CSV and text is None:
         buf = _io.StringIO()
         _csv.writer(buf, delimiter=";").writerows(FACT_CSV)
         files.append((f"tactics_{stamp}.csv", buf.getvalue(), "📊 Факт по тактикам: $ по дням, копии и smart"))
-    files.append((f"check_{stamp}.txt", text, "🔬 Полный отчёт проверки"))
+    if text is not None:
+        files.append((f"check_{stamp}.txt", text, "🔬 Полный отчёт проверки"))
     for name, body, caption in files:
         oid = await conn.fetchval("INSERT INTO outbox(kind, payload, priority) VALUES ('file', $1, 4) RETURNING id",
                                   json.dumps({"csv": body, "filename": name, "caption": caption, "topic": "daily"}))
@@ -740,6 +748,24 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         say(f"Запросов RPC за запуск: {gapper.calls}" + (f" (из кеша {gapper.stats['из кеша']})"
                                                        if gapper.stats["из кеша"] else ""))
 
+    d0, xd0 = MAIN_REAL
+    fact_groups = []
+    for label, pick in (("копии", lambda g: not g["kind"].startswith("smart")),
+                        ("smart", lambda g: g["kind"].startswith("smart"))):
+        ps = []
+        for g in good:
+            if pick(g):
+                e = entry_at(g["path"], g["s0"], d0)
+                if e:
+                    ps.append((g["path"], e[0], e[1], g["who"], g["day"]))
+        fact_groups.append((label, ps))
+    say("")
+    fact_lines = fact_table(fact_groups, xd0)
+    for ln in fact_lines:
+        say(ln)
+    if os.environ.get("EC_TG", "1") != "0":          # главное — сразу, не дожидаясь долгих разделов
+        await notify(conn, "\n".join(out[:4] + [""] + fact_lines))
+        await send_files(conn, None)
     # главный расчёт: реалистичный бот, все схемы выхода, каждый сигнал → результат
     mat: dict[tuple[float, float], list[list[float | None]]] = {}
     for d, xd in REAL:
@@ -774,20 +800,6 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             per.append((day, len(idx), usd, name))
         return tot, per
 
-    d0, xd0 = MAIN_REAL
-    fact_groups = []
-    for label, pick in (("копии", lambda g: not g["kind"].startswith("smart")),
-                        ("smart", lambda g: g["kind"].startswith("smart"))):
-        ps = []
-        for g in good:
-            if pick(g):
-                e = entry_at(g["path"], g["s0"], d0)
-                if e:
-                    ps.append((g["path"], e[0], e[1], g["who"], g["day"]))
-        fact_groups.append((label, ps))
-    say("")
-    for ln in fact_table(fact_groups, xd0):
-        say(ln)
     say("")
     say("БЫСТРЫЙ БОТ ПО ВСЕМ ДНЯМ ($10 на сделку). Покупка через N блоков после трейдера, продажа через M блоков "
         "после сигнала выхода (1 блок ≈ 0.4 с). «По прошлым дням» — схема выхода дня выбрана только по "
