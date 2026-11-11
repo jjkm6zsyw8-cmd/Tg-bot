@@ -56,7 +56,7 @@ def test_exits_take_profit_stop_trader(monkeypatch):
     assert why == "трейлинг" and r > 0.3
 
 
-async def test_main_runs_on_db(capsys):
+async def test_main_runs_on_db(capsys, monkeypatch):
     from scanner.db.pool import Database
     try:
         db = await Database(DSN).connect(min_size=1, max_size=2)
@@ -66,22 +66,53 @@ async def test_main_runs_on_db(capsys):
         await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
         await db.migrate()
         now = datetime.now(timezone.utc) - timedelta(hours=1)
-        aid = await db.fetchval("""INSERT INTO alerts(mint, mode, level, trader) VALUES ('M1', 'copy', 'strong', 'W')
-                                   RETURNING id""")
-        await db.execute("""INSERT INTO paper_positions(portfolio, mint, alert_id, level, opened_at, entry_mc, cost_sol,
-                               tokens, tokens_initial, source_wallet) VALUES ('G', 'M1', $1, 'strong', $2, 33, 0.1, 1, 1, 'W')""",
-                         aid, now + timedelta(seconds=5))
+        for mint, base in (("M1", 100), ("M2", 200)):
+            aid = await db.fetchval("""INSERT INTO alerts(mint, mode, level, trader) VALUES ($1, 'copy', 'strong', 'W')
+                                       RETURNING id""", mint)
+            await db.execute("""INSERT INTO paper_positions(portfolio, mint, alert_id, level, opened_at, entry_mc,
+                                   cost_sol, tokens, tokens_initial, source_wallet)
+                                VALUES ('G', $1, $2, 'strong', $3, 33, 0.1, 1, 1, 'W')""",
+                             mint, aid, now + timedelta(seconds=5))
+        # M1: первые секунды в базе есть
         for i, (mc, tr, buy) in enumerate([(30, "W", True), (31, "X", True), (33, "X", True), (36, "X", True),
                                            (40, "Y", True), (41, "Y", True)]):
             await db.execute("""INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol,
                                    slot, ts) VALUES ($1, 'M1', $2, $3, 0.1, 1, $4, $5, $6)""",
                              f"s{i}", tr, buy, float(mc), 100 + i, now + timedelta(seconds=0.4 * i))
+        # M2: покупка трейдера, потом своя первая сделка только через 30 слотов — первые секунды догружаются
+        for sig, slot, mc, tr in (("t0", 200, 30.0, "W"), ("t1", 230, 45.0, "X"), ("t2", 231, 46.0, "X")):
+            await db.execute("""INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol,
+                                   slot, ts) VALUES ($1, 'M2', $2, true, 0.1, 1, $3, $4, $5)""",
+                             sig, tr, mc, slot, now + timedelta(seconds=0.4 * (slot - 200)))
         await db.execute("""INSERT INTO copy_log(wallet, mint, side, action, ref_mc, entry_mc, delta)
                             VALUES ('W', 'M1', 'buy', 'copied', 30, 33, 0.1)""")
     finally:
         await db.close()
-    await ec.main(DSN)
+    calls = []
+
+    async def fake_fetch(self, mint, trig, before, first_after_slot):
+        calls.append((mint, trig["signature"], before))
+        t = now.timestamp()
+        return "full", [[201, t + 0.4, 31.0, "Z", True, "g1"], [203, t + 1.2, 34.0, "Z", True, "g2"]]
+    monkeypatch.setattr(ec.Gapper, "_fetch", fake_fetch)
+
+    class NoRpc:
+        async def close(self):
+            pass
+    await ec.main(DSN, rpc=NoRpc())
     out = capsys.readouterr().out
-    assert "посчитано 1" in out and "копия сильная" in out and "Сверка" in out
-    assert "Реалистичный быстрый бот" in out and "покупка +2 бл., продажа +1 бл." in out
+    assert "посчитано 2" in out and "видно сразу 1" in out and "догружено целиком 1" in out
+    assert calls == [("M2", "t0", "t1")]
+    assert "копия сильная" in out and "Сверка" in out
+    assert "БЫСТРЫЙ БОТ ПО ВСЕМ ДНЯМ" in out and "покупка +2 бл., продажа +1 бл." in out
     assert "бумага входит через ≈5.0 с" in out
+    # второй запуск — из кеша, без запросов
+    await ec.main(DSN, rpc=NoRpc())
+    out = capsys.readouterr().out
+    assert len(calls) == 1 and "из кеша 1" in out
+    db = await Database(DSN).connect(min_size=1, max_size=2)
+    try:
+        sent = await db.fetch("SELECT payload FROM outbox WHERE kind = 'text'")
+        assert sent and "Проверка «быстрый бот»" in sent[0]["payload"]["text"] and "<pre>" in sent[0]["payload"]["text"]
+    finally:
+        await db.close()
