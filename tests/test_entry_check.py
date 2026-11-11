@@ -28,6 +28,13 @@ def test_exit_fills_after_reaction_delay(monkeypatch):
     assert why == "стоп" and r == pytest.approx(ec.net(20 / 30))
 
 
+def test_exit_delay_parameter_overrides_default(monkeypatch):
+    monkeypatch.setattr(ec, "EXIT_DELAY_S", 1.0)
+    p = path(30, 30, 27, 25, 22, 20, 20)                          # стоп пробит на слоте 2
+    r, why = ec.simulate(p, 0, 30, "W", ec.SCHEMES["G"], 0.4)     # продажа через 1 блок — по 25
+    assert why == "стоп" and r == pytest.approx(ec.net(25 / 30))
+
+
 def test_entry_after_delay_takes_price_of_that_moment():
     p = path(30, 33, 36, 40, 40, 40)
     assert ec.entry_at(p, 100, 0.4) == (1, 33)            # следующий слот
@@ -76,3 +83,5 @@ async def test_main_runs_on_db(capsys):
     await ec.main(DSN)
     out = capsys.readouterr().out
     assert "посчитано 1" in out and "копия сильная" in out and "Сверка" in out
+    assert "Реалистичный быстрый бот" in out and "покупка +2 бл., продажа +1 бл." in out
+    assert "бумага входит через ≈5.0 с" in out

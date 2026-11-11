@@ -10,7 +10,8 @@
 
 Запуск на сервере (одна строка, без пересборки):
     cd /opt/tg-bot && docker compose exec -T analytics python - < scripts/entry_check.py
-Переменные: EC_DAYS — за сколько дней (по умолчанию 7).
+Переменные: EC_DAYS — за сколько дней (по умолчанию 7), EC_EXIT_DELAY — через сколько секунд после сигнала
+выхода ложится продажа (по умолчанию 1).
 """
 from __future__ import annotations
 
@@ -32,6 +33,10 @@ GRID_TP = (0.05, 0.07, 0.10, 0.15, 0.20, 0.25, 0.40, 0.60)
 GRID_STOP = (0.05, 0.08, 0.10, 0.15, 0.20, 0.30, None)
 GRID_TIME = (None, 600)
 GRID_DELAYS = (0.4, 1.0, 2.0, 3.0)
+# реалистичный быстрый бот: поток транзакций (gRPC) + быстрая отправка — покупка ложится через 1–3 блока после
+# покупки трейдера, продажа — через 1–2 блока после сделки, пересёкшей стоп/тейк
+REAL_ENTRY = (0.4, 0.8, 1.2)
+REAL_EXIT = (0.4, 0.8)
 SCHEMES = {
     # G — всё на +25% чистыми, стоп −8%, 5 минут на +10%, выход за трейдером
     "G": dict(tp=0.25, share=1.0, stop=0.08, time_s=300, gain=0.10, trail=None),
@@ -57,9 +62,9 @@ def entry_at(path: list[tuple[int, float, float, str, bool]], s0: int, delay: fl
     return (idx, path[idx][2]) if idx is not None else None
 
 
-def fill_after(path: list[tuple[int, float, float, str, bool]], j: int) -> float:
-    """Цена продажи: последняя сделка к слоту «сигнал выхода + EXIT_DELAY_S» (бот продаёт не мгновенно)."""
-    target = path[j][0] + math.ceil(EXIT_DELAY_S / SLOT_S)
+def fill_after(path: list[tuple[int, float, float, str, bool]], j: int, delay: float | None = None) -> float:
+    """Цена продажи: последняя сделка к слоту «сигнал выхода + задержка» (бот продаёт не мгновенно)."""
+    target = path[j][0] + math.ceil((EXIT_DELAY_S if delay is None else delay) / SLOT_S)
     mc = path[j][2]
     for slot, _ts, m, _tr, _b in path[j + 1:]:
         if slot > target:
@@ -69,7 +74,7 @@ def fill_after(path: list[tuple[int, float, float, str, bool]], j: int) -> float
 
 
 def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: float, trader: str,
-             sc: dict[str, Any]) -> tuple[float, str]:
+             sc: dict[str, Any], exit_delay: float | None = None) -> tuple[float, str]:
     """Выход по сделкам после входа. path: (слот, время, MC, трейдер, покупка)."""
     t0 = path[i0][1]
     rem, got, peak, tp_done, max_net = 1.0, 0.0, mc0, False, -1.0
@@ -84,17 +89,17 @@ def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: floa
             return net(got / mc0), "нет роста"
         last_mc = mc
         if tr == trader and not is_buy and not tp_done:
-            got += rem * fill_after(path, j)
+            got += rem * fill_after(path, j, exit_delay)
             return net(got / mc0), "трейдер продал"
         if sc["stop"] is not None and mc <= mc0 * (1 - sc["stop"]):
-            got += rem * fill_after(path, j)
+            got += rem * fill_after(path, j, exit_delay)
             return net(got / mc0), "стоп"
         if tp_done and sc["trail"] and mc <= peak * (1 - sc["trail"]):
-            got += rem * fill_after(path, j)
+            got += rem * fill_after(path, j, exit_delay)
             return net(got / mc0), "трейлинг"
         if not tp_done and mc >= tp_level:
             sell = rem if sc["share"] >= 1 else sc["share"]
-            got += sell * fill_after(path, j)
+            got += sell * fill_after(path, j, exit_delay)
             rem -= sell
             tp_done = True
             if rem <= 1e-9:
@@ -121,7 +126,8 @@ async def main(dsn: str | None = None) -> None:
     by_day: dict[str, dict[float, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
     wallets: dict[str, list[float]] = collections.defaultdict(list)
     seen_early, used, no_trigger, no_path = 0, 0, 0, 0
-    grid_paths: list[tuple[list[tuple[int, float, float, str, bool]], int, str]] = []
+    grid_paths: list[tuple[list[tuple[int, float, float, str, bool]], int, str, bool]] = []
+    lags: list[float] = []
     for s in sigs:
         who = s["source_wallet"] or s["alert_trader"]
         trig = await conn.fetchrow(
@@ -132,6 +138,7 @@ async def main(dsn: str | None = None) -> None:
         if not trig or not who:
             no_trigger += 1
             continue
+        lags.append((s["opened_at"] - trig["ts"]).total_seconds())
         rows = await conn.fetch(
             """SELECT slot, extract(epoch FROM ts) t, mc_sol, trader, is_buy FROM trades
                WHERE mint=$1 AND slot >= $2 AND ts <= $3::timestamptz + interval '31 minutes' AND mc_sol > 0
@@ -153,7 +160,8 @@ async def main(dsn: str | None = None) -> None:
             continue
         kind = f"{'копия' if s['mode'] == 'copy' else 'smart'} {'сильная' if s['level'] == 'strong' else 'одна'}"
         day = s["opened_at"].strftime("%d.%m")
-        grid_paths.append((path, int(trig["slot"]), who))
+        m_sig = (s["mode"] == "copy" and s["level"] == "strong") or (s["mode"] == "smart" and s["level"] != "strong")
+        grid_paths.append((path, int(trig["slot"]), who, m_sig))
         for d in DELAYS:
             e = entry_at(path, int(trig["slot"]), d)
             if not e:
@@ -170,6 +178,13 @@ async def main(dsn: str | None = None) -> None:
                 if (s["mode"] == "copy" and s["level"] == "strong") or (s["mode"] == "smart" and s["level"] != "strong"):
                     resm[d].append(rm)
     # сверка с фактом: реальный вход бумаги через 5 с (Jupiter) против расчёта по своим сделкам
+    seen = await conn.fetchrow(
+        """SELECT count(*) n,
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM received_at - ts)) med,
+                  percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM received_at - ts)) p90
+           FROM trades WHERE source = 'watch' AND ts > now() - interval '2 days'
+             AND trader IN (SELECT address FROM traders WHERE active OR manual
+                            UNION SELECT address FROM watchlist WHERE kind = 'trader')""")
     fact = await conn.fetch(
         """SELECT delta FROM copy_log WHERE delta IS NOT NULL AND ts > now() - make_interval(days => $1)""",
         int(math.ceil(days)))
@@ -198,7 +213,7 @@ async def main(dsn: str | None = None) -> None:
     if grid_paths:
         print(f"\nПеребор выходов ({len(grid_paths)} сигналов, $ при $10 на сделку, тейк/стоп/таймер 10 мин):")
         for d in GRID_DELAYS:
-            entries = [(p, entry_at(p, s0, d), who) for p, s0, who in grid_paths]
+            entries = [(p, entry_at(p, s0, d), who) for p, s0, who, _m in grid_paths]
             entries = [(p, e, who) for p, e, who in entries if e]
             rows_g = []
             for tp in GRID_TP:
@@ -216,6 +231,35 @@ async def main(dsn: str | None = None) -> None:
                   + "; ".join(f"{name(r)} {r[0]:+.0f}$ ({r[4]:.0%})" for r in rows_g[:4])
                   + " · для сравнения: " + "; ".join(f"{name(r)} {r[0]:+.0f}$" for r in rows_g
                                                       if (r[1], r[2], r[3]) in pick))
+    if grid_paths:
+        print(f"\nРеалистичный быстрый бот ({len(grid_paths)} сигналов, $ при $10): покупка ложится через N блоков "
+              f"после трейдера, продажа — через M блоков после сигнала выхода (1 блок ≈ 0.4 с)")
+        for d in REAL_ENTRY:
+            for xd in REAL_EXIT:
+                entries = [(p, entry_at(p, s0, d), who, m) for p, s0, who, m in grid_paths]
+                entries = [(p, e, who, m) for p, e, who, m in entries if e]
+                rows_r = []
+                for tp in GRID_TP:
+                    for stop in GRID_STOP:
+                        for tm in GRID_TIME:
+                            sc = dict(tp=tp, share=1.0, stop=stop, time_s=tm, gain=0.05, trail=None)
+                            rs = [simulate(p, e[0], e[1], who, sc, xd)[0] for p, e, who, _m in entries]
+                            rows_r.append((sum(rs) * 10, tp, stop, tm))
+                rows_r.sort(key=lambda r: -r[0])
+                g = [simulate(p, e[0], e[1], who, SCHEMES["G"], xd)[0] for p, e, who, _m in entries]
+                mm = [simulate(p, e[0], e[1], who, SCHEMES["M"], xd)[0] for p, e, who, m in entries if m]
+                name = lambda r: (f"+{r[1]:.0%}/{('−%d%%' % round(r[2] * 100)) if r[2] else 'без стопа'}"
+                                  f"{'/10м' if r[3] else ''}")
+                print(f"  покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл.: в плюсе "
+                      f"{sum(1 for r in rows_r if r[0] > 0)} из {len(rows_r)} · лучшие: "
+                      + "; ".join(f"{name(r)} {r[0]:+.0f}$" for r in rows_r[:3])
+                      + f" · схема G {sum(g) * 10:+.0f}$ · M {cell(mm)}")
+    print("\nСкорость нашего бота сейчас:")
+    if seen and seen["n"]:
+        print(f"  видит покупку отслеживаемого кошелька через ≈{seen['med']:.1f} с после блока (медиана, точность "
+              f"±0.5 с; 90% — до {seen['p90']:.1f} с), {seen['n']} сделок за 2 дня")
+    if lags:
+        print(f"  бумага входит через ≈{st.median(lags):.1f} с после блока трейдера (медиана по {len(lags)} сигналам)")
     ranked = sorted(((st.mean(v), w, len(v)) for w, v in wallets.items() if len(v) >= 3), reverse=True)
     if ranked:
         print("\nКошельки при входе через 1 с (3+ сигнала), лучшие и худшие:")
