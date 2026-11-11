@@ -629,6 +629,16 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
         await paper_answer(m, cmd, 24 if cmd == "trades" else None)
 
+    @router.message(Command("smart"))
+    async def cmd_smart(m: Message, command: CommandObject) -> None:
+        """Только smart-сигналы: итог при $10 на сделку, по дням, по кошелькам, что отличает плюсовые (/smart 14)."""
+        from ..reports.smart import chunks, smart_report
+        cfg = await reload()
+        arg = (command.args or "").strip().lower().rstrip("dд")
+        days = min(30, max(1, int(arg))) if arg.isdigit() else 7
+        for part in chunks(await smart_report(db, days, str(cfg.get("timezone") or "Asia/Tbilisi"))):
+            await reply(m, part)
+
     @router.message(Command("filter"))
     async def cmd_filter(m: Message) -> None:
         """Автофильтр сигналов: чему научился на сделках трейдеров, включён ли, что отсеивает."""

@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Tbilisi")
 NUM = ("mc", "age_s", "growth_1m", "holders", "top10", "snipers", "bundles", "insiders", "fresh_wallets",
        "wash_volume", "progress", "cluster", "buy_sol", "smart_in_coin", "hour")
-NAMES = {"mc": "капитализация", "age_s": "возраст монеты", "growth_1m": "рост за минуту до сигнала",
+NAMES = {"mc": "капитализация, SOL", "age_s": "возраст монеты, с", "growth_1m": "рост за минуту до сигнала (1 = +100%)",
          "holders": "холдеры", "top10": "доля топ-10", "snipers": "снайперы", "bundles": "бандлы",
          "insiders": "инсайдеры", "fresh_wallets": "свежие кошельки", "wash_volume": "накрутка объёма",
          "progress": "прогресс кривой", "cluster": "доля кластера дева", "buy_sol": "покупка трейдера, SOL",

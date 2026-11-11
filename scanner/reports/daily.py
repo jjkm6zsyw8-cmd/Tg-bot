@@ -2,6 +2,7 @@
 новые кандидаты, сделки пользователя. Короткая сводка в Telegram + CSV-файлом."""
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -13,6 +14,8 @@ from ..config import Settings
 from ..db.pool import Database
 from ..solana import short
 from .sim import SimTrade, best_windows, series, utc_day_bounds
+
+log = logging.getLogger(__name__)
 
 MISSED_REASONS = {**REASONS, "": "нет решения (не оценивалась)", "alerted": "алерт был",
                   "outage": "сбой источника", "latency": "задержка"}
@@ -184,6 +187,13 @@ async def send_daily(db: Database, settings: Settings, day: date) -> None:
     await db.enqueue("daily", {"text": text, "keyboard": kb or None,
                                "csv": csv_bytes.decode("utf-8"), "filename": f"day_{day.isoformat()}.csv"},
                      priority=5)
+    try:                                    # отдельным сообщением — только smart-сигналы (то же, что /smart)
+        from .smart import chunks, smart_report
+        smart = await smart_report(db, 7, str(settings.effective().get("timezone") or "Asia/Tbilisi"))
+        for part in chunks(smart):
+            await db.enqueue("text", {"text": part, "topic": "daily"}, priority=5)
+    except Exception:  # noqa: BLE001 — разбор дня важнее
+        log.exception("smart в разборе дня")
 
 
 def today_in(tz_name: str) -> date:
