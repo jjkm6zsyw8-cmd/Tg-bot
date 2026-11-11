@@ -436,6 +436,49 @@ def dca_line(paths: list[tuple[Any, int, float, str, str]], xd: float) -> list[s
                 f"({sum(1 for r in res if r[k] != 0)} сд.)" for k in wait_top)]
 
 
+# твои тактики — фиксированные, без подбора: факт по каждому дню на сделках из базы (порядок блоков)
+FACT_TACTICS: list[tuple[str, str, dict[str, Any] | None]] = [
+    ("Сейчас: G (тейк +25%, стоп −8%)", "sim", None),
+    ("Тейк +25%, без стопа", "sim", dict(tp=0.25, share=1.0, stop=None, time_s=None, gain=0, trail=None)),
+    ("$5+$5: докупка −30%, выход +15%, без стопа", "dca", dict(first=0.5, dip=0.30, tp=0.15, stop=None)),
+    ("$5+$5: докупка −30%, выход +25%, без стопа", "dca", dict(first=0.5, dip=0.30, tp=0.25, stop=None)),
+    ("$5+$5: докупка −20%, выход +25%, без стопа", "dca", dict(first=0.5, dip=0.20, tp=0.25, stop=None)),
+    ("Ждать −25%, весь $10, выход +25%", "dca", dict(first=0.0, dip=0.25, tp=0.25, stop=None)),
+    ("Ждать −30%, весь $10, выход +40%", "dca", dict(first=0.0, dip=0.30, tp=0.40, stop=None)),
+    ("Ждать −40%, весь $10, выход +60%", "dca", dict(first=0.0, dip=0.40, tp=0.60, stop=None)),
+    ("Трейл 20% сразу, стоп −10%", "sim", dict(tp=0.0, share=1e-9, stop=0.10, time_s=None, gain=0, trail=0.20)),
+    ("Трейл 40% после +25%, без стопа", "sim", dict(tp=0.25, share=1e-9, stop=None, time_s=None, gain=0, trail=0.40)),
+    ("70% на +25%, 30% трейл 15%, без стопа", "sim", dict(tp=0.25, share=0.70, stop=None, time_s=None, gain=0,
+                                                          trail=0.15)),
+]
+
+
+def fact_table(groups: list[tuple[str, list[tuple[Any, int, float, str, str]]]], xd: float) -> list[str]:
+    """Одна таблица: тактика → $ по дням (копии | smart), всего, сделок, в плюсе."""
+    out = []
+    days = sorted({p[4] for _l, ps in groups for p in ps})
+    out.append("ФАКТ ПО ТАКТИКАМ — сделки из базы в порядке блоков, $10 на сигнал, покупка через 2 блока, продажа "
+               "через 1; по дням " + " / ".join(f"{d[3:]}.{d[:2]}" for d in days))
+    for name, kind, sc in FACT_TACTICS:
+        parts = []
+        for label, ps in groups:
+            vals = []
+            for p, i0, mc0, who, day in ps:
+                if kind == "dca":
+                    v = simulate_dca(p, i0, mc0, sc, xd)  # type: ignore[arg-type]
+                    if sc["first"] == 0 and v == 0.0:  # type: ignore[index]
+                        continue                        # отката не было — сделки нет
+                else:
+                    v = simulate(p, i0, mc0, who, sc or SCHEMES["G"], xd)[0]
+                vals.append((day, v))
+            byd = [sum(v for d, v in vals if d == dd) * 10 for dd in days]
+            n = len(vals)
+            parts.append(f"{label} {sum(byd):+.0f}$ [" + " / ".join(f"{b:+.0f}" for b in byd) + f"] {n} сд., "
+                         f"в плюсе {sum(v > 0 for _d, v in vals) / n if n else 0:.0%}")
+        out.append(f"• {name}: " + " | ".join(parts))
+    return out
+
+
 OTHER_MODES = {"dev": "запуски девов (лотерея D)", "mydev": "мой дев", "new": "новые монеты",
                "new_dev_wallet": "новый кошелёк дева"}
 LOTTERY_D = dict(tp=1.0, share=0.34, stop=0.15, time_s=600, gain=0.10, trail=0.30)   # D: ⅓ на ×2, остаток трейл 30%
@@ -705,6 +748,20 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             per.append((day, len(idx), usd, name))
         return tot, per
 
+    d0, xd0 = MAIN_REAL
+    fact_groups = []
+    for label, pick in (("копии", lambda g: not g["kind"].startswith("smart")),
+                        ("smart", lambda g: g["kind"].startswith("smart"))):
+        ps = []
+        for g in good:
+            if pick(g):
+                e = entry_at(g["path"], g["s0"], d0)
+                if e:
+                    ps.append((g["path"], e[0], e[1], g["who"], g["day"]))
+        fact_groups.append((label, ps))
+    say("")
+    for ln in fact_table(fact_groups, xd0):
+        say(ln)
     say("")
     say("БЫСТРЫЙ БОТ ПО ВСЕМ ДНЯМ ($10 на сделку). Покупка через N блоков после трейдера, продажа через M блоков "
         "после сигнала выхода (1 блок ≈ 0.4 с). «По прошлым дням» — схема выхода дня выбрана только по "
