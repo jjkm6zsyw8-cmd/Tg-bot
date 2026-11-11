@@ -76,3 +76,17 @@ async def test_run_once_marks_bad_positions():
         assert await pc.run_once(None) == 0                                     # уже проверены
     finally:
         await db.close()
+
+
+def test_trade_path_keeps_block_order():
+    """Порядок важен: памп, потом слив — максимум ДО минимума; по свечам этого не видно."""
+    from scanner.analytics.pricecheck import trade_path
+    t0 = 1000.0
+    pump_then_dump = [(t0 + 1, 100.0), (t0 + 5, 220.0), (t0 + 20, 30.0), (t0 + 60, 32.0), (t0 + 1700, 25.0)]
+    p = trade_path(pump_then_dump, t0, 100.0)
+    assert p["mfe"] == pytest.approx(1.2) and p["mae"] == pytest.approx(-0.75)
+    assert p["hi_before_low"] == pytest.approx(1.2) and p["hi_after_low"] == pytest.approx(-0.75)   # после дна не отскочила
+    assert p["dip"] == 0.0 and p["low_s"] == 1700 and p["p30"] == pytest.approx(-0.75)
+    dump_then_pump = [(t0 + 1, 100.0), (t0 + 20, 70.0), (t0 + 60, 180.0), (t0 + 1700, 150.0)]
+    q = trade_path(dump_then_pump, t0, 100.0)
+    assert q["dip"] == pytest.approx(-0.30) and q["hi_after_low"] == pytest.approx(0.8)

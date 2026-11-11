@@ -1354,7 +1354,8 @@ class PaperTrader:
         w.writerow(["портфель", "монета", "адрес", "режим", "уровень", "кошелёк", "вход", "выход", "MC вход $",
                     "MC выход $", "MC максимум $", "вложено SOL", "получено SOL", "результат SOL", "результат %",
                     "причина выхода", "адрес кошелька", "проверка по рынку", "рост за 30 мин %",
-                    "просадка до пика %", "цена через 30 мин %", "вход по"])
+                    "просадка до пика %", "цена через 30 мин %", "вход по", "минимум за 30 мин %",
+                    "минимум через, с", "максимум до минимума %", "максимум после минимума %", "путь по"])
         pct = lambda v: "" if v is None else round(v * 100, 1)
         for r in await self._closed(since):
             w.writerow([
@@ -1368,6 +1369,8 @@ class PaperTrader:
                 EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""), r.get("source_wallet") or "",
                 "⚠ не в итоге" if r.get("suspect") else CHECK_NAMES.get(r.get("price_check") or "", "ещё нет"),
                 pct(r.get("path_mfe")), pct(r.get("path_dip")), pct(r.get("path_p30")), r.get("entry_src") or "",
+                pct(r.get("path_mae")), "" if r.get("path_low_s") is None else round(r["path_low_s"]),
+                pct(r.get("path_hi_before_low")), pct(r.get("path_hi_after_low")), r.get("path_src") or "",
             ])
         return out.getvalue()
 

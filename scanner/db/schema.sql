@@ -490,3 +490,8 @@ CREATE TABLE IF NOT EXISTS wallet_origin (
 );
 -- как посчитан вход бумаги: блок +2 (блокчейн) | оценка | рынок (Jupiter) | DexScreener
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS entry_src text;
+-- путь цены по сделкам в порядке блоков: когда минимум, максимум до минимума и после; источник пути (сделки | свечи)
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_low_s double precision;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_hi_before_low double precision;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_hi_after_low double precision;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS path_src text;

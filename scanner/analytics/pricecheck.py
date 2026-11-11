@@ -46,6 +46,23 @@ def path_stats(candles: list[list[float]], t0: float, entry_usd: float) -> dict[
             "peak_s": max(0.0, after[k][0] - t0), "p30": after[-1][4] / entry_usd - 1}
 
 
+def trade_path(trades: list[tuple[float, float]], t0: float, entry_mc: float) -> dict[str, float] | None:
+    """Путь цены за 30 мин после входа ПО СДЕЛКАМ в порядке блоков (не по минутным свечам, где внутри минуты не
+    видно, что было раньше — пик или провал). trades: (unix-время, MC). Минимум и когда; максимум до минимума и после;
+    пик и когда; цена через 30 мин."""
+    pts = [(ts, mc) for ts, mc in trades if t0 <= ts <= t0 + PATH_S and mc > 0]
+    if len(pts) < 3 or entry_mc <= 0:
+        return None
+    lo = min(range(len(pts)), key=lambda i: pts[i][1])
+    hi = max(range(len(pts)), key=lambda i: pts[i][1])
+    rel = lambda mc: mc / entry_mc - 1  # noqa: E731
+    return {"mfe": rel(pts[hi][1]), "mae": rel(pts[lo][1]),
+            "dip": min(0.0, rel(min(mc for _, mc in pts[:hi + 1]))), "peak_s": pts[hi][0] - t0,
+            "p30": rel(pts[-1][1]), "low_s": pts[lo][0] - t0,
+            "hi_before_low": rel(max(mc for _, mc in pts[:lo + 1])), "hi_after_low": rel(max(mc for _, mc in pts[lo:])),
+            "n": float(len(pts))}
+
+
 def within(price: float, lo: float, hi: float, tol: float = TOLERANCE) -> bool:
     return lo / tol <= price <= hi * tol
 
@@ -147,10 +164,21 @@ class PriceCheck:
                              sells.get(r["id"], []), sol_usd)
             bad = v in ("entry", "exit")
             ps = path_stats(candles, r["opened_at"].timestamp(), float(r["entry_mc"] or 0) * sol_usd / 1e9)
+            # путь по сделкам своего потока (порядок блоков точный) — если сделок хватает, он главный
+            trs = await self.db.fetch(
+                """SELECT extract(epoch FROM ts) t, mc_sol FROM trades WHERE mint=$1 AND mc_sol > 0
+                     AND ts >= $2 AND ts <= $2 + interval '30 minutes' ORDER BY slot, id""",
+                r["mint"], r["opened_at"])
+            tp_ = trade_path([(float(t["t"]), float(t["mc_sol"])) for t in trs], r["opened_at"].timestamp(),
+                             float(r["entry_mc"] or 0))
+            src = "сделки" if tp_ else ("свечи" if ps else None)
+            ps = tp_ or ps
             await self.db.execute(
                 """UPDATE paper_positions SET price_check=$2, suspect = suspect OR $3, path_mfe=$4, path_mae=$5,
-                       path_dip=$6, path_peak_s=$7, path_p30=$8 WHERE id=$1""",
-                r["id"], v, bad, *(ps[k] if ps else None for k in ("mfe", "mae", "dip", "peak_s", "p30")))
+                       path_dip=$6, path_peak_s=$7, path_p30=$8, path_low_s=$9, path_hi_before_low=$10,
+                       path_hi_after_low=$11, path_src=$12 WHERE id=$1""",
+                r["id"], v, bad, *(ps[k] if ps else None for k in ("mfe", "mae", "dip", "peak_s", "p30")),
+                *(tp_[k] if tp_ else None for k in ("low_s", "hi_before_low", "hi_after_low")), src)
             self.stats["checked"] += 1
             self.stats["bad"] += bad
             self.stats["nodata"] += v == "nodata"
