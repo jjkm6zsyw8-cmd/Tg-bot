@@ -268,7 +268,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     days = float(os.environ.get("EC_DAYS", 30))
     sigs = await conn.fetch(
         """SELECT DISTINCT ON (p.mint, date_trunc('minute', p.opened_at))
-                  p.mint, p.opened_at, p.level, p.source_wallet, a.mode, a.trader AS alert_trader
+                  p.mint, p.opened_at, p.level, p.source_wallet, a.mode, a.trader AS alert_trader, a.payload
            FROM paper_positions p JOIN alerts a ON a.id = p.alert_id
            WHERE a.mode IN ('copy', 'smart') AND p.opened_at > now() - make_interval(days => $1)
            ORDER BY p.mint, date_trunc('minute', p.opened_at), p.opened_at""", int(math.ceil(days)))
@@ -324,8 +324,17 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         path = [p[:5] for p in full]
         kind = f"{'копия' if s['mode'] == 'copy' else 'smart'} {'сильная' if s['level'] == 'strong' else 'одна'}"
         m_sig = (s["mode"] == "copy" and s["level"] == "strong") or (s["mode"] == "smart" and s["level"] != "strong")
+        pl = s["payload"]
+        pl = (json.loads(pl) if isinstance(pl, str) else pl) or {}
+        buy = pl.get("copy_sol")
+        if buy is None:
+            buy = max((float(t.get("buy_sol") or 0) for t in pl.get("traders") or [] if isinstance(t, dict)),
+                      default=None)
         good.append({"path": path, "s0": s0, "who": who, "m": m_sig, "how": how,
-                     "day": s["opened_at"].strftime("%m.%d"), "kind": kind})
+                     "day": s["opened_at"].strftime("%m.%d"), "kind": kind,
+                     "buy": float(buy) if buy is not None else None,
+                     "mc": float(pl["mc"]) if pl.get("mc") is not None else None,
+                     "growth": float(((pl.get("metrics") or {}).get("growth_1m")) or 0)})
         for d in DELAYS:
             e = entry_at(path, s0, d)
             if not e:
@@ -378,12 +387,13 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         v = [rows_m[i][k] for i in (idx if idx is not None else range(len(rows_m))) if rows_m[i][k] is not None]
         return sum(v) * 10, len(v), sum(x > 0 for x in v)   # type: ignore[operator]
 
-    def walk_forward(rows_m: list[list[float | None]]) -> tuple[float, list[tuple[str, int, float, str]]]:
-        """Схема выхода дня D выбирается только по дням до D (первый день — схема G)."""
+    def walk_forward(rows_m: list[list[float | None]],
+                     sel: set[int] | None = None) -> tuple[float, list[tuple[str, int, float, str]]]:
+        """Схема выхода дня D выбирается только по дням до D (первый день — схема G). sel — только эти сигналы."""
         per, tot = [], 0.0
         for day in days_l:
-            idx = [i for i, g in enumerate(good) if g["day"] == day]
-            past = [i for i, g in enumerate(good) if g["day"] < day]
+            idx = [i for i, g in enumerate(good) if g["day"] == day and (sel is None or i in sel)]
+            past = [i for i, g in enumerate(good) if g["day"] < day and (sel is None or i in sel)]
             if len(past) >= 30:
                 k = max(range(len(GRID)), key=lambda k: total(rows_m, k, past)[0])
                 name = sname(GRID[k])
@@ -492,6 +502,42 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             f"{dc:+.0f}$ | итого {cum:+.0f}$")
     say(f"  Всего: smart {n_s} сд. {tot_s:+.0f}$ ({tot_s / (10 * n_s) if n_s else 0:+.1%} на сделку) · копии "
         f"{n_c} сд. {tot_c:+.0f}$ ({tot_c / (10 * n_c) if n_c else 0:+.1%} на сделку)")
+    # как улучшить smart: копии через фильтры smart; схема выхода только для smart; какие smart-кошельки дают плюс
+    def usd_of(idx: list[int]) -> str:
+        v = [rows_m[i][gi] for i in idx if rows_m[i][gi] is not None]
+        return (f"{len(v)} сд. {sum(v) * 10:+.0f}$ ({sum(v) / len(v):+.1%}, в плюсе {sum(x > 0 for x in v) / len(v):.0%})"
+                if v else "0 сд.")  # type: ignore[operator]
+    copies = [i for i, g in enumerate(good) if not g["kind"].startswith("smart")]
+    f_buy = lambda g: g["buy"] is not None and g["buy"] >= 0.5
+    f_mc = lambda g: g["mc"] is not None and 20 <= g["mc"] <= 600
+    f_gr = lambda g: g["growth"] <= 1.0
+    say("")
+    say(f"Копии через фильтры smart (покупка ≥0.5 SOL, MC 20–600 SOL, рост за минуту ≤100%; схема G, "
+        f"+{round(d / SLOT_S)}/+{round(xd / SLOT_S)} бл.):")
+    passed = [i for i in copies if f_buy(good[i]) and f_mc(good[i]) and f_gr(good[i])]
+    say(f"  прошли бы все: {usd_of(passed)} · не прошли: {usd_of([i for i in copies if i not in set(passed)])}")
+    for name, f in (("покупка ≥0.5 SOL", f_buy), ("MC 20–600 SOL", f_mc), ("рост ≤100%", f_gr)):
+        say(f"  {name}: да {usd_of([i for i in copies if f(good[i])])} · нет "
+            f"{usd_of([i for i in copies if not f(good[i])])}")
+    pdays = collections.defaultdict(list)
+    for i in passed:
+        pdays[good[i]["day"]].append(i)
+    say("  прошли все, по дням: " + " · ".join(
+        f"{dd[3:]}.{dd[:2]} {sum(rows_m[i][gi] or 0 for i in ix) * 10:+.0f}$ ({len(ix)})"  # type: ignore[operator]
+        for dd, ix in sorted(pdays.items())))
+    smart_i = {i for i, g in enumerate(good) if g["kind"].startswith("smart")}
+    if smart_i:
+        wf_sm, per_sm = walk_forward(rows_m, smart_i)
+        say(f"Smart: схема выхода по прошлым дням (только smart) {wf_sm:+.0f}$ · схема G {usd_of(sorted(smart_i))}")
+        say("  по дням: " + " · ".join(f"{dd[3:]}.{dd[:2]} {u:+.0f}$ ({nm})" for dd, n, u, nm in per_sm if n))
+        by_w = collections.defaultdict(list)
+        for i in smart_i:
+            if rows_m[i][gi] is not None:
+                by_w[good[i]["who"]].append(rows_m[i][gi])
+        rk = sorted(((sum(v) * 10, w, len(v)) for w, v in by_w.items()), reverse=True)  # type: ignore[arg-type]
+        say(f"  smart-кошельков с сигналами: {len(rk)}; больше всех дали: "
+            + ", ".join(f"{w[:5]}…{w[-4:]} {u:+.0f}$ ({n})" for u, w, n in rk[:4])
+            + "; меньше всех: " + ", ".join(f"{w[:5]}…{w[-4:]} {u:+.0f}$ ({n})" for u, w, n in rk[-3:]))
     by_how = collections.defaultdict(list)
     for i, g in enumerate(good):
         by_how[g["how"]].append(i)
