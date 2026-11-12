@@ -476,6 +476,49 @@ DAY_COLS = [("smart", "smart (тейк +25%, без стопа)"),
             ("cf", "копии: холдеры 30–60, трейдер от 1 SOL, выход при мелкой докупке (тейк +25%)"),
             ("c5", "копии: трейдер от 5 SOL (тейк +25%)"),
             ("call", "все копии (тейк +25%), для сравнения")]
+# Реальное исполнение: покупка с лимитом проскальзывания не проходит, если к нашему блоку цена ушла выше цены
+# сигнала больше чем на лимит (за непрошедшую транзакцию — комиссия). Сэндвич не может забрать больше лимита.
+SLIPS = (0.05, 0.10, 0.15, 0.25)
+EXEC: dict[str, list[tuple[float, float]]] = collections.defaultdict(list)   # раздел → (рост цены до входа, итог)
+SOL_USD = [150.0]
+
+
+def ref_mc(path: list[tuple[int, float, float, str, bool]], s0: int, fallback: float) -> float:
+    """Цена, которую бот видит в момент сигнала: последняя сделка в блоке сигнала."""
+    ref = None
+    for slot, _t, mc, _tr, _b in path:
+        if slot > s0:
+            break
+        ref = mc
+    return ref or fallback
+
+
+def exec_lines() -> list[str]:
+    if not EXEC:
+        return []
+    fail = 0.0005 * SOL_USD[0] / 10                    # непрошедшая транзакция: приоритет, доля от $10
+    out = ["", "РЕАЛЬНОЕ ИСПОЛНЕНИЕ — лимит проскальзывания на покупку ($10 на сигнал, покупка +2 бл., продажа +1 бл.): "
+               "если к нашему блоку цена выше цены сигнала больше чем на лимит — покупка не проходит (минус комиссия "
+               "0.0005 SOL); сэндвич не может забрать больше лимита. «Запас» — средний % на прошедшую сделку: "
+               "столько можно терять на каждой сделке (сэндвичи, поздняя посадка), чтобы выйти в ноль."]
+    for k in ("smart", "mydev", "cf"):
+        xs = EXEC.get(k) or []
+        if not xs:
+            continue
+        mv = sorted(m for m, _r in xs)
+        parts = [f"без лимита {sum(r for _m, r in xs) * 10:+.0f}$ ({len(xs)} сд., запас "
+                 f"{sum(r for _m, r in xs) / len(xs):+.1%})"]
+        for sl in SLIPS:
+            ok = [r for m, r in xs if m <= sl]
+            nf = len(xs) - len(ok)
+            parts.append(f"лимит {sl:.0%}: {(sum(ok) - nf * fail) * 10:+.0f}$ (прошло {len(ok)}, не прошло {nf}, "
+                         f"запас {(sum(ok) / len(ok)) if ok else 0:+.1%})")
+        out.append(f"  {DAY_SHORT[k]}: цена к нашему блоку выше сигнала — медиана {mv[len(mv) // 2]:+.0%}, у 90% до "
+                   f"{mv[int(len(mv) * 0.9) - 1 if len(mv) > 1 else 0]:+.0%}")
+        out.append("    " + " · ".join(parts))
+    return out
+
+
 DAY_SHORT = {"smart": "smart", "mydev": "мой дев", "cf": "копии 30–60/от 1 SOL", "c5": "копии от 5 SOL",
              "call": "все копии"}
 DAY_SUM: dict[str, dict[str, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -582,8 +625,8 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
     выход — через 1 блок после сигнала, по сделкам. Первые секунды догружаются так же, как у копий."""
     days = float(os.environ.get("EC_OTHER_DAYS", 3))
     alerts = await conn.fetch(
-        """SELECT a.mint, a.mode, a.created_at, a.payload->'metrics'->>'cluster' AS share,
-                  t.deployer, t.created_slot, t.signature AS create_sig, t.initial_mc_sol
+        """SELECT a.mint, a.mode, a.created_at, a.payload->'metrics'->>'cluster' AS share, a.trader,
+                  t.deployer, t.created_slot, t.signature AS create_sig, t.initial_mc_sol, t.created_at AS t_created
            FROM alerts a JOIN tokens t ON t.mint = a.mint
            WHERE a.mode = ANY($1::text[]) AND a.level <> 'watch'
              AND a.created_at > now() - make_interval(days => CASE WHEN a.mode = 'mydev' THEN $4::int ELSE $2::int END)
@@ -601,7 +644,8 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
             """SELECT slot, ts, mc_sol, signature, pool FROM trades WHERE mint=$1 AND slot IS NOT NULL AND mc_sol > 0
                  AND ts <= $2::timestamptz AND ts > $2::timestamptz - interval '30 seconds'
                ORDER BY slot DESC, id DESC LIMIT 1""", a["mint"], a["created_at"])
-        if trig is None and a["mode"] == "dev" and a["created_slot"] and a["initial_mc_sol"]:
+        if trig is None and a["mode"] in ("dev", "mydev") and a["created_slot"] and a["initial_mc_sol"]:
+            # сделок до алерта в базе нет (алерт на создании монеты) — вход от блока создания
             trig = {"slot": a["created_slot"], "ts": a["created_at"], "mc_sol": a["initial_mc_sol"],
                     "signature": a["create_sig"], "pool": "pump"}
         if trig is None:
@@ -651,9 +695,17 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
         for label, sc in ROCKETS:
             res[label] = simulate(path, e[0], e[1], a["deployer"], sc, xd)[0]
         res["trail_path"] = (path, e[0], e[1], a["deployer"], res["day"])
+        dls = []
+        for dl in DELAYS:
+            ed = entry_at(path, s0, dl)
+            dls.append(simulate(path, ed[0], ed[1], a["deployer"], SCHEMES["G"], xd)[0] if ed else None)
+        res["dl"] = dls
+        res["dev"] = a["trader"] or a["deployer"]
+        res["lat"] = (a["created_at"] - a["t_created"]).total_seconds() if a["t_created"] else None
         groups[name].append(res)
         if a["mode"] == "mydev":
             day_add(res["day"], "mydev", res["G"])
+            EXEC["mydev"].append((e[1] / ref_mc(path, s0, e[1]) - 1, res["G"]))
     say("")
     say(f"ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА ({days:g} дн., мой дев — "
         f"{int(os.environ.get('EC_MYDEV_DAYS', 30))} дн., $10 на сделку; покупка через {round(d / SLOT_S)} бл. после "
@@ -687,6 +739,50 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
             + f" · по прошлым дням {wf:+.0f}$ · лучшая задним числом {sname(GRID[best])} "
               f"{sum(r['grid'][best] for r in rs) * 10:+.0f}$")
         say("    трейлинг всей позиции: " + trail_line([r["trail_path"] for r in rs], xd))
+        cells = []
+        for k, dl in enumerate(DELAYS):
+            v = [r["dl"][k] for r in rs if r["dl"][k] is not None]
+            if v:
+                cells.append(f"{dl:g} с {sum(v) * 10:+.0f}$ ({sum(v) / len(v):+.1%} на сд.)")
+        lat = sorted(r["lat"] for r in rs if r["lat"] is not None and r["lat"] >= 0) \
+            if name.startswith((OTHER_MODES["mydev"], OTHER_MODES["dev"])) else []
+        say("    скорость (вход через N с после сигнала, схема G): " + " · ".join(cells)
+            + (f" · алерт бота — через {lat[len(lat) // 2]:.1f} с после создания монеты (медиана; 90% — до "
+               f"{lat[int(len(lat) * 0.9) - 1 if len(lat) > 1 else 0]:.1f} с)" if lat else ""))
+        by_dev = collections.defaultdict(list)
+        for r in rs:
+            by_dev[r["dev"]].append(r["G"])
+        if len(by_dev) > 1:
+            rk = sorted(((sum(v) * 10, w, len(v)) for w, v in by_dev.items()), reverse=True)  # type: ignore[arg-type]
+            tot = sum(u for u, _w, _n in rk)
+            say(f"    по девам: {len(rk)} девов, в плюсе {sum(1 for u, _w, _n in rk if u > 0)}; лучшие: "
+                + ", ".join(f"{w[:5]}…{w[-4:]} {u:+.0f}$ ({n})" for u, w, n in rk[:5])
+                + "; худшие: " + ", ".join(f"{w[:5]}…{w[-4:]} {u:+.0f}$ ({n})" for u, w, n in rk[-3:])
+                + f" · без лучшего {tot - rk[0][0]:+.0f}$ · без лучших трёх {tot - sum(u for u, _w, _n in rk[:3]):+.0f}$")
+    # мой дев: где теряются сигналы — запуски девов из списка → журнал (скопировано / пропущено) → алерты → расчёт
+    tzname = os.environ.get("EC_TZ", "Asia/Tbilisi")
+    mdays = int(os.environ.get("EC_MYDEV_DAYS", 30))
+    logs = await conn.fetch(
+        """SELECT to_char(ts AT TIME ZONE $1, 'MM.DD') d, action, split_part(COALESCE(reason, ''), ':', 1) r,
+                  count(*) n FROM copy_log WHERE side = 'launch' AND ts > now() - make_interval(days => $2)
+           GROUP BY 1, 2, 3""", tzname, mdays)
+    als = await conn.fetch(
+        """SELECT to_char(created_at AT TIME ZONE $1, 'MM.DD') d, count(*) n FROM alerts
+           WHERE mode = 'mydev' AND created_at > now() - make_interval(days => $2) GROUP BY 1""", tzname, mdays)
+    n_devs = await conn.fetchval("SELECT count(*) FROM my_devs")
+    mine = next((rs for nm, rs in groups.items() if nm == OTHER_MODES["mydev"]), [])
+    days_m = sorted({r["d"] for r in logs} | {r["d"] for r in als} | {r["day"] for r in mine})
+    if days_m:
+        say(f"  мой дев — сигналы по дням (девов в списке сейчас {n_devs}): запуски девов из списка → пропущено "
+            f"(причина) → алертов → посчитано")
+        for dd in days_m:
+            cop = sum(r["n"] for r in logs if r["d"] == dd and r["action"] == "copied")
+            sk = [(r["r"] or "?", r["n"]) for r in logs if r["d"] == dd and r["action"] == "skipped"]
+            na = sum(r["n"] for r in als if r["d"] == dd)
+            nc = sum(1 for r in mine if r["day"] == dd)
+            say(f"    {dd[3:]}.{dd[:2]}: запусков {cop + sum(n for _r, n in sk)} → пропущено {sum(n for _r, n in sk)}"
+                + (" (" + ", ".join(f"{r} {n}" for r, n in sk) + ")" if sk else "")
+                + f" → алертов {na} → посчитано {nc}")
 
 
 async def send_files(conn: Any, text: str | None) -> None:
@@ -737,6 +833,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     import asyncpg
     conn = await asyncpg.connect(dsn or os.environ["DATABASE_URL"])
     DAY_SUM.clear()
+    EXEC.clear()
     days = float(os.environ.get("EC_DAYS", 30))
     sigs = await conn.fetch(
         """SELECT DISTINCT ON (p.mint, date_trunc('minute', p.opened_at))
@@ -932,6 +1029,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
     except Exception:  # noqa: BLE001
         sol_usd = 0.0
     sol_usd = sol_usd or 150.0
+    SOL_USD[0] = sol_usd
     d, xd = MAIN_REAL
     sized = []
     for usd in SIZES_USD:
@@ -1133,7 +1231,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             hv = hmap[g["mint"]][0]
         ent = g["path"][e[0]][0]
         fs = next((sl for sl, sol in g["tbuys"] if sl > ent and sol <= 0.06), None)
-        cs.append({"day": g["day"], "h": hv, "buy": g["tsol"],
+        cs.append({"day": g["day"], "h": hv, "buy": g["tsol"], "move": e[1] / ref_mc(g["path"], g["s0"], e[1]) - 1,
                    "A": simulate(g["path"], e[0], e[1], g["who"], sa_c, xd)[0],
                    "A+": simulate(g["path"], e[0], e[1], g["who"], sa_c, xd, force_slot=fs)[0],
                    "G": simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd)[0],
@@ -1142,13 +1240,16 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         day_add(x["day"], "call", x["A"])
         if x["h"] is not None and 30 <= x["h"] < 60 and x["buy"] >= 1.0:
             day_add(x["day"], "cf", x["A+"])
+            EXEC["cf"].append((x["move"], x["A+"]))
         if x["buy"] >= 5.0:
             day_add(x["day"], "c5", x["A"])
     for g in good:
         if g["kind"].startswith("smart"):
             e = entry_at(g["path"], g["s0"], d)
             if e:
-                day_add(g["day"], "smart", simulate(g["path"], e[0], e[1], g["who"], sa_c, xd)[0])
+                v = simulate(g["path"], e[0], e[1], g["who"], sa_c, xd)[0]
+                day_add(g["day"], "smart", v)
+                EXEC["smart"].append((e[1] / ref_mc(g["path"], g["s0"], e[1]) - 1, v))
     hf = [("любые", lambda h: True), ("от 10", lambda h: h is not None and h >= 10),
           ("от 30", lambda h: h is not None and h >= 30), ("30–60", lambda h: h is not None and 30 <= h < 60),
           ("от 60", lambda h: h is not None and h >= 60)]
@@ -1331,7 +1432,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             say(f"  {w[:6]}…{w[-4:]}: {m:+.1%} на сделку, {n} сигн.")
     if os.environ.get("EC_OTHER", "1") != "0":
         await check_other(conn, gapper, say)
-    for line in day_summary():
+    for line in exec_lines() + day_summary():
         say(line)
     text = "\n".join(out)
     if os.environ.get("EC_TG", "1") != "0":

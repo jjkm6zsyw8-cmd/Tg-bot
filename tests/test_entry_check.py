@@ -132,6 +132,19 @@ async def test_main_runs_on_db(capsys, monkeypatch):
                                    slot, ts) VALUES ($1, 'D1', 'B', true, 0.1, 1, $2, $3, $4)""",
                              f"d{i}", mc, 300 + i, now + timedelta(seconds=0.4 * i))
         await db.execute("INSERT INTO alerts(mint, mode, level) VALUES ('D1', 'dev', 'normal')")
+        # мой дев: запуск дева из списка; в журнале — один скопирован, один пропущен (конвейер)
+        await db.execute("""INSERT INTO tokens(mint, signature, deployer, current_owner, created_at, created_slot,
+                               initial_mc_sol) VALUES ('D2', 'CREATE2', 'MYDEV', 'MYDEV', $1, 500, 28.0)""", now)
+        for i, mc in enumerate([28.0, 30.0, 33.0, 40.0, 38.0, 45.0]):
+            await db.execute("""INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol,
+                                   slot, ts) VALUES ($1, 'D2', 'B', true, 0.1, 1, $2, $3, $4)""",
+                             f"m{i}", mc, 500 + i, now + timedelta(seconds=0.4 * i))
+        await db.execute("""INSERT INTO alerts(mint, mode, level, trader, created_at)
+                            VALUES ('D2', 'mydev', 'normal', 'MYDEV', $1)""", now + timedelta(seconds=1))
+        await db.execute("INSERT INTO my_devs(address) VALUES ('MYDEV')")
+        await db.execute("""INSERT INTO copy_log(ts, wallet, mint, side, action, reason) VALUES
+                            ($1, 'MYDEV', 'D2', 'launch', 'copied', 'дев запустил монету'),
+                            ($1, 'MYDEV', 'D3', 'launch', 'skipped', 'конвейер: прошлый запуск 1 мин назад')""", now)
         await db.execute("""INSERT INTO external_facts(entity, key, source, value, fetched_at)
                             VALUES ('token:M1', 'total_holders', 'rugcheck', '120', $1)""", now + timedelta(seconds=3))
     finally:
@@ -166,6 +179,10 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Вход частями" in out and "откат = медиана по прошлым дням" in out
     assert "Часть на уровне обычного роста" in out and "уровень = медиана роста" in out
     assert "Трейлинг всей позиции" in out and "копии (2): по прошлым дням" in out and "трейлинг всей позиции: по прошлым дням" in out
+    assert "• мой дев: 1 сигн." in out and "скорость (вход через N с после сигнала, схема G): 0.4 с" in out
+    assert "мой дев — сигналы по дням (девов в списке сейчас 1)" in out and "запусков 2 → пропущено 1 (конвейер 1)" in out
+    assert "→ алертов 1 → посчитано 1" in out
+    assert "РЕАЛЬНОЕ ИСПОЛНЕНИЕ" in out and "мой дев: цена к нашему блоку выше сигнала" in out and "лимит 5%:" in out
     assert "Сверка с бумагой A" in out and "нет в проверке 1 сд. — бумага +3$" in out
     assert "ИТОГ ПО ДНЯМ" in out and "все копии" in out and "(2 сд., в плюсе" in out and "ИТОГО (smart + мой дев" in out
     # второй запуск — из кеша, без запросов
