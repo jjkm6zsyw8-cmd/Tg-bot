@@ -106,6 +106,11 @@ async def test_main_runs_on_db(capsys, monkeypatch):
                                    cost_sol, tokens, tokens_initial, source_wallet)
                                 VALUES ('G', $1, $2, 'strong', $3, 33, 0.1, 1, 1, 'W')""",
                              mint, aid, now + timedelta(seconds=5))
+        # бумага A: сделка, которой нет среди smart-сигналов проверки, — в сверке отдельно
+        await db.execute("""INSERT INTO paper_positions(portfolio, mint, alert_id, level, opened_at, closed_at, entry_mc,
+                               cost_sol, tokens, tokens_initial, pnl_pct, pnl_sol, source_wallet)
+                            VALUES ('A', 'M1', $1, 'strong', $2, $2, 33, 0.1, 1, 1, 0.3, 0.03, 'W')""",
+                         aid, now + timedelta(seconds=5))
         # M1: первые секунды в базе есть
         for i, (mc, tr, buy) in enumerate([(30, "W", True), (31, "X", True), (33, "X", True), (36, "X", True),
                                            (40, "Y", True), (41, "Y", True)]):
@@ -161,6 +166,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Вход частями" in out and "откат = медиана по прошлым дням" in out
     assert "Часть на уровне обычного роста" in out and "уровень = медиана роста" in out
     assert "Трейлинг всей позиции" in out and "копии (2): по прошлым дням" in out and "трейлинг всей позиции: по прошлым дням" in out
+    assert "Сверка с бумагой A" in out and "нет в проверке 1 сд. — бумага +3$" in out
     assert "ИТОГ ПО ДНЯМ" in out and "все копии" in out and "(2 сд., в плюсе" in out and "ИТОГО (smart + мой дев" in out
     # второй запуск — из кеша, без запросов
     await ec.main(DSN, rpc=NoRpc())

@@ -29,6 +29,7 @@ import math
 import os
 import statistics as st
 from typing import Any
+from zoneinfo import ZoneInfo
 
 FEE = 0.0125
 PRIO = 0.0005 / 0.15                 # приоритет на одну транзакцию, доля позиции 0.15 SOL
@@ -460,6 +461,13 @@ FACT_TACTICS: list[tuple[str, str, dict[str, Any] | None]] = [
 
 FACT_CSV: list[list[Any]] = []          # та же таблица для файла
 
+# день — по часовому поясу дневного отчёта (Тбилиси), чтобы «12.11» здесь и в отчёте бумаги были одними сутками
+TZ = ZoneInfo(os.environ.get("EC_TZ", "Asia/Tbilisi"))
+
+
+def dkey(ts: Any) -> str:
+    return ts.astimezone(TZ).strftime("%m.%d")
+
 # Сводка по дням (копится с каждым запуском): одни и те же правила на все дни, без подбора.
 # Фильтр копий выбран по данным 05–12.11, дни после FILTER_FIXED — проверка на новых днях.
 FILTER_FIXED = "11.12"                  # мм.дд
@@ -638,7 +646,7 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
         peak = max((q[2] for q in path[e[0]:] if q[1] - t0 <= HORIZON_S), default=e[1]) / e[1]
         res = {"G": simulate(path, e[0], e[1], a["deployer"], SCHEMES["G"], xd)[0],
                "D": simulate(path, e[0], e[1], a["deployer"], LOTTERY_D, xd)[0],
-               "peak": peak, "day": a["created_at"].strftime("%m.%d"),
+               "peak": peak, "day": dkey(a["created_at"]),
                "grid": [simulate(path, e[0], e[1], a["deployer"], sc, xd)[0] for sc in GRID]}
         for label, sc in ROCKETS:
             res[label] = simulate(path, e[0], e[1], a["deployer"], sc, xd)[0]
@@ -795,7 +803,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
                  AND ts <= $4::timestamptz + interval '30 minutes' ORDER BY slot, id""", s["mint"], who, s0, trig["ts"])
         good.append({"path": path, "s0": s0, "who": who, "m": m_sig, "how": how, "mint": s["mint"],
                      "t_sig": s["opened_at"],
-                     "day": s["opened_at"].strftime("%m.%d"), "kind": kind,
+                     "day": dkey(s["opened_at"]), "kind": kind,
                      "tsol": float(trig["sol_amount"] or 0),
                      "tbuys": [(int(x["slot"]), float(x["sol_amount"] or 0)) for x in tb if x["is_buy"]],
                      "buy": float(buy) if buy is not None else None,
@@ -1014,6 +1022,47 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             f"{dc:+.0f}$ | итого {cum:+.0f}$")
     say(f"  Всего: smart {n_s} сд. {tot_s:+.0f}$ ({tot_s / (10 * n_s) if n_s else 0:+.1%} на сделку) · копии "
         f"{n_c} сд. {tot_c:+.0f}$ ({tot_c / (10 * n_c) if n_c else 0:+.1%} на сделку)")
+    # сверка с бумагой A (smart): та же монета, тот же вход ±2 мин; бумага — её фактический % × $10 (в портфеле A
+    # ставка 20% баланса × сила сигнала, т.е. $15–30 при $100 — поэтому $ в дневном отчёте больше)
+    pa = await conn.fetch(
+        """SELECT mint, opened_at, pnl_pct, pnl_sol, suspect FROM paper_positions
+           WHERE portfolio = 'A' AND closed_at IS NOT NULL AND pnl_pct IS NOT NULL
+             AND opened_at > now() - make_interval(days => $1)""", int(math.ceil(days)))
+    by_mint = collections.defaultdict(list)
+    for r in pa:
+        by_mint[r["mint"]].append(r)
+    sa_r = dict(tp=0.25, share=1.0, stop=None, time_s=None, gain=0, trail=None)
+    rec = collections.defaultdict(lambda: [0, 0.0, 0.0])          # день → [сделок, бумага, проверка]
+    matched = set()
+    for g in good:
+        if not g["kind"].startswith("smart"):
+            continue
+        r = next((r for r in by_mint.get(g["mint"], []) if abs((r["opened_at"] - g["t_sig"]).total_seconds()) <= 120
+                  and not r["suspect"]), None)
+        e = entry_at(g["path"], g["s0"], d)
+        if r is None or not e:
+            continue
+        matched.add((r["mint"], r["opened_at"]))
+        x = rec[g["day"]]
+        x[0] += 1
+        x[1] += float(r["pnl_pct"]) * 10
+        x[2] += simulate(g["path"], e[0], e[1], g["who"], sa_r, xd)[0] * 10
+    rest = collections.defaultdict(lambda: [0, 0.0, 0.0])         # бумага A, которых нет в проверке
+    for r in pa:
+        if (r["mint"], r["opened_at"]) in matched or r["suspect"]:
+            continue
+        x = rest[dkey(r["opened_at"])]
+        x[0] += 1
+        x[1] += float(r["pnl_pct"]) * 10
+        x[2] += float(r["pnl_sol"] or 0)
+    if rec or rest:
+        say("")
+        say("Сверка с бумагой A (smart; по дням Тбилиси; $10 на сделку): бумага по факту vs проверка на тех же сделках"
+            " · сделки бумаги, которых нет в проверке:")
+        for dd in sorted(set(rec) | set(rest)):
+            a_, b_ = rec.get(dd, [0, 0.0, 0.0]), rest.get(dd, [0, 0.0, 0.0])
+            say(f"  {dd[3:]}.{dd[:2]}: те же {a_[0]} сд. — бумага {a_[1]:+.0f}$, проверка {a_[2]:+.0f}$ · "
+                f"нет в проверке {b_[0]} сд. — бумага {b_[1]:+.0f}$")
     # холдеры в момент сигнала: RugCheck totalHolders (проверка монеты перед первым алертом; своё число по своему
     # потоку сделок занижено — подписка на монету включается после покупки трейдера)
     hold_rows = await conn.fetch(
