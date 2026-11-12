@@ -1411,7 +1411,8 @@ class PaperTrader:
                 round((r["max_mc"] or 0) * sol_usd), round(r["cost_sol"] or 0, 5), round(r["proceeds_sol"] or 0, 5),
                 round(r["pnl_sol"] or 0, 5), round((r["pnl_pct"] or 0) * 100, 1),
                 EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""), r.get("source_wallet") or "",
-                "⚠ не в итоге" if r.get("suspect") else CHECK_NAMES.get(r.get("price_check") or "", "ещё нет"),
+                ("⚠ не в итоге" + {"entry": ": вход", "exit": ": выход"}.get(r.get("price_check") or "", ""))
+                if r.get("suspect") else CHECK_NAMES.get(r.get("price_check") or "", "ещё нет"),
                 pct(r.get("path_mfe")), pct(r.get("path_dip")), pct(r.get("path_p30")), r.get("entry_src") or "",
                 pct(r.get("path_mae")), "" if r.get("path_low_s") is None else round(r["path_low_s"]),
                 pct(r.get("path_hi_before_low")), pct(r.get("path_hi_after_low")), r.get("path_src") or "",
