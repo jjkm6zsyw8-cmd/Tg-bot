@@ -605,7 +605,7 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
             trig = {"slot": a["created_slot"], "ts": a["created_at"], "mc_sol": a["initial_mc_sol"],
                     "signature": a["create_sig"], "pool": "pump"}
         if trig is None:
-            lost["нет сделок до алерта"] += 1
+            lost[(a["mode"], "нет сделок до алерта")] += 1
             continue
         rows = await conn.fetch(
             """SELECT slot, extract(epoch FROM ts) t, mc_sol, trader, is_buy, signature FROM trades
@@ -615,19 +615,19 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
         full = [(int(r["slot"]), float(r["t"]), float(r["mc_sol"]), r["trader"], r["is_buy"], r["signature"])
                 for r in rows]
         if len(full) < 2:
-            lost["нет цены после"] += 1
+            lost[(a["mode"], "нет цены после")] += 1
             continue
         if not any(s0 < q[0] <= s0 + EARLY_SLOTS for q in full):
             if not gapper:
-                lost["без дозагрузки"] += 1
+                lost[(a["mode"], "без дозагрузки")] += 1
                 continue
             if gapper.calls >= rpc_cap:
-                lost["лимит запросов"] += 1
+                lost[(a["mode"], "лимит запросов")] += 1
                 continue
             after = next((q for q in full if q[0] > s0), None)
             status, extra = await gapper.fill(a["mint"], trig, after[5] if after else None, after[0] if after else None)
             if status not in ("full", "window"):
-                lost[status] += 1
+                lost[(a["mode"], status)] += 1
                 continue
             have = {q[5] for q in full}
             full = sorted(full + [tuple(r) for r in extra if r[5] not in have], key=lambda q: q[0])
@@ -659,8 +659,12 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
         f"{int(os.environ.get('EC_MYDEV_DAYS', 30))} дн., $10 на сделку; покупка через {round(d / SLOT_S)} бл. после "
         f"последней сделки к алерту, у запуска — после создания; продажа через {round(xd / SLOT_S)} бл.; "
         f"цена видна 30 мин). Сейчас в бумагу идут только запуски девов «~1 SOL» (D).")
-    if lost:
-        say("  не посчитано: " + ", ".join(f"{k} {v}" for k, v in lost.items()))
+    for mode in OTHER_MODES:
+        ls = {k[1]: v for k, v in lost.items() if k[0] == mode}
+        if ls:
+            n_ok = sum(len(rs) for nm, rs in groups.items() if nm.startswith(OTHER_MODES[mode]))
+            say(f"  {OTHER_MODES[mode]}: посчитано {n_ok} из {n_ok + sum(ls.values())}, не посчитано: "
+                + ", ".join(f"{k} {v}" for k, v in ls.items()))
     for name, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         n = len(rs)
         hit = " · ".join(f"×{x}: {sum(r['peak'] >= x for r in rs) / n:.0%}" for x in (2, 5, 10))
