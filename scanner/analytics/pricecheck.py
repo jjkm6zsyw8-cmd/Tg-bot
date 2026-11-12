@@ -121,12 +121,13 @@ class PriceCheck:
         return out
 
     def verdict(self, candles: list[list[float]], entry: tuple[float, float], sells: list[tuple[float, float]],
-                sol_usd: float) -> str:
-        """ok | entry | exit | nodata. entry/sells — (unix-время, MC в SOL)."""
+                sol_usd: float, check_entry: bool = True) -> str:
+        """ok | entry | exit | nodata. entry/sells — (unix-время, MC в SOL). check_entry=False — цена входа взята
+        из сделки блокчейна (блок +2): она настоящая, минутной свечой её не проверяем."""
         if not candles:
             return "nodata"
         usd = lambda mc: mc * sol_usd / 1e9   # noqa: E731 — цена токена в $ (pump.fun: 1 млрд токенов)
-        rng = minute_range(candles, entry[0])
+        rng = minute_range(candles, entry[0]) if check_entry else None
         seen = False
         if rng:
             seen = True
@@ -142,7 +143,7 @@ class PriceCheck:
 
     async def run_once(self, http: aiohttp.ClientSession) -> int:
         rows = await self.db.fetch(
-            """SELECT id, mint, opened_at, entry_mc, source_wallet FROM paper_positions
+            """SELECT id, mint, opened_at, entry_mc, source_wallet, entry_src FROM paper_positions
                WHERE closed_at IS NOT NULL AND exit_reason <> 'reset' AND price_check IS NULL
                  AND opened_at < now() - interval '31 minutes' AND closed_at > now() - interval '12 hours'
                ORDER BY closed_at LIMIT 60""")
@@ -160,8 +161,11 @@ class PriceCheck:
                 candles = await self._candles(http, r["mint"])
             except (TimeoutError, aiohttp.ClientError, asyncio.TimeoutError):
                 break                                  # бюджет кончился или GeckoTerminal занят — продолжим позже
+            # вход по сделке блокчейна (блок +2) — настоящая цена: 12.11 из 14 таких «⚠ вход» у 11 цена после входа
+            # торговалась на уровне входа или ниже — свеча GeckoTerminal у свежей монеты отстаёт; проверяем только выход
             v = self.verdict(candles, (r["opened_at"].timestamp(), float(r["entry_mc"] or 0)),
-                             sells.get(r["id"], []), sol_usd)
+                             sells.get(r["id"], []), sol_usd,
+                             check_entry=not str(r["entry_src"] or "").startswith("блок"))
             bad = v in ("entry", "exit")
             ps = path_stats(candles, r["opened_at"].timestamp(), float(r["entry_mc"] or 0) * sol_usd / 1e9)
             # путь по сделкам своего потока (порядок блоков точный) — если сделок хватает, он главный

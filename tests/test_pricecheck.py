@@ -34,6 +34,9 @@ def test_verdict_entry_exit():
     assert pc.verdict(cs, (T0 + 10, 33.0), [], 100.0) == "entry"           # вход ниже рынка вдвое
     assert pc.verdict(cs, (T0 + 10, 70.0), [(T0 + 70, 33.0)], 100.0) == "exit"   # «стоп» по цене, которой не было
     assert pc.verdict([], (T0, 70.0), [], 100.0) == "nodata"
+    # вход по сделке блокчейна (блок +2) свечой не проверяется, выход — проверяется
+    assert pc.verdict(cs, (T0 + 10, 33.0), [], 100.0, check_entry=False) in ("ok", "nodata")
+    assert pc.verdict(cs, (T0 + 10, 33.0), [(T0 + 70, 33.0)], 100.0, check_entry=False) == "exit"
 
 
 async def test_run_once_marks_bad_positions():
