@@ -516,3 +516,5 @@ ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_sells integer;
 -- 12.11: входы по сделке блокчейна (блок +2), выкинутые сверкой минутной свечой, — вернуть в итог и перепроверить выход
 UPDATE paper_positions SET suspect=false, price_check=NULL
  WHERE suspect AND price_check='entry' AND entry_src LIKE 'блок%';
+-- 12.11: Y записал +98 SOL на позициях по $10 (×800) — такие сделки не в итог, пока не разберёмся
+UPDATE paper_positions SET suspect=true WHERE pnl_pct > 10 AND NOT suspect AND portfolio IN ('Y', 'K', 'R', 'H');

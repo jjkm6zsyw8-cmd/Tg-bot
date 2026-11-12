@@ -1067,8 +1067,9 @@ class PaperTrader:
         pct = pnl / p.cost_sol if p.cost_sol else 0.0
         suspect = False
         if pct > ANOMALY_PCT:
-            # больше +1000%: настоящая ракета или сбой цены? Спрашиваем Jupiter про цену выхода
-            suspect = await self.jupiter_check(p.mint, mc * (self.e.price.value or 150) / 1e9) is False
+            # больше +1000%: настоящая ракета или сбой цены? Jupiter должен ПОДТВЕРДИТЬ цену выхода; 12.11 Y записал
+            # +98 SOL на позициях по $10 — у свежей монеты Jupiter цены не знает, и раньше это пропускалось в итог
+            suspect = await self.jupiter_check(p.mint, mc * (self.e.price.value or 150) / 1e9) is not True
         await self.db.execute(
             """UPDATE paper_positions SET tokens=0, proceeds_sol=$2, closed_at=$3, exit_reason=$4, pnl_sol=$5,
                    pnl_pct=$6, max_mc=$7, suspect=$8 WHERE id=$1""", p.id, p.proceeds_sol, now, reason, pnl, pct,
