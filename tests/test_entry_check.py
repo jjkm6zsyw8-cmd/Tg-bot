@@ -53,6 +53,13 @@ def test_wait_for_dip_then_full_buy():
     assert lost < -0.3
 
 
+def test_force_exit_on_tiny_rebuy():
+    p = path(30, 31, 33, 34, 20, 15)
+    r, why = ec.simulate(p, 0, 30, "W", dict(tp=0.5, share=1.0, stop=None, time_s=None, gain=0, trail=None), 0.0,
+                         force_slot=103)
+    assert why == "мелкая докупка" and r == pytest.approx(ec.net(34 / 30))
+
+
 def test_bigger_size_moves_price_against_us():
     # без влияния (крошечная ставка) — почти как net; чем больше ставка, тем хуже результат той же сделки
     assert ec.net_sized(1.3, 60, 1e-6) == pytest.approx(ec.net(1.3) + 2 * ec.PRIO - 2 * 0.0005 / 1e-6, abs=1e-3)
@@ -145,6 +152,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Ракеты" in out and "копии (2): дошли до ×2" in out
     assert "Копии через фильтры smart" in out and "прошли бы все:" in out
     assert "ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА" in out and "• запуски девов (лотерея D): 1 сигн." in out
+    assert "Покупки и докупки трейдера" in out and "первая покупка трейдера →" in out
     assert "ФАКТ ПО ТАКТИКАМ" in out and "• $5+$5: докупка −30%, выход +15%, без стопа: копии" in out
     assert "Вход частями" in out and "откат = медиана по прошлым дням" in out
     assert "Часть на уровне обычного роста" in out and "уровень = медиана роста" in out

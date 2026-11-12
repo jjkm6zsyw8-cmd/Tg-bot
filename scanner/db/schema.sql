@@ -507,3 +507,9 @@ CREATE TABLE IF NOT EXISTS removed_wallets (
 -- 12.11: найденные разведкой (🔍) переходят из копий в smart — один раз, дальше их ведёт scout.demote
 UPDATE traders SET manual=false, pinned=true
  WHERE manual AND label LIKE '🔍%' AND address IN (SELECT address FROM scout WHERE status='promoted');
+-- трейдер-источник за 30 мин после нашего входа: сколько раз докупил, на сколько SOL, самая мелкая и крупная докупка, продаж
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_rebuys integer;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_rebuy_sol double precision;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_rebuy_min double precision;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_rebuy_max double precision;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_sells integer;

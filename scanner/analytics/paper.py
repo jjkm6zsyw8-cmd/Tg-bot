@@ -194,6 +194,13 @@ MODE_SHORT = {"trend": "тренд", "dev": "дев", "smart": "смарт", "ne
               "copy": "копия", "mydev": "мой дев"}
 
 
+def _num(v: Any) -> Any:
+    try:
+        return "" if v is None else round(float(v), 4)
+    except (TypeError, ValueError):
+        return ""
+
+
 def wallet_name(r: Any) -> str:
     """Чья это сделка: подпись кошелька из своего списка или короткий адрес."""
     w = r.get("source_wallet") or ""
@@ -1343,7 +1350,8 @@ class PaperTrader:
 
     async def _closed(self, since: datetime | None) -> list[Any]:
         return await self.db.fetch(
-            """SELECT p.*, a.mode, (SELECT t.mc FROM paper_trades t WHERE t.position_id = p.id AND t.side = 'sell'
+            """SELECT p.*, a.mode, COALESCE(a.payload->>'copy_sol', a.payload->'traders'->0->>'buy_sol') AS t_buy_sol,
+                      (SELECT t.mc FROM paper_trades t WHERE t.position_id = p.id AND t.side = 'sell'
                                     ORDER BY t.ts DESC LIMIT 1) AS exit_mc,
                       (SELECT w.label FROM watchlist w WHERE w.address = p.source_wallet AND w.label IS NOT NULL
                        LIMIT 1) AS source_label
@@ -1399,7 +1407,9 @@ class PaperTrader:
                     "MC выход $", "MC максимум $", "вложено SOL", "получено SOL", "результат SOL", "результат %",
                     "причина выхода", "адрес кошелька", "проверка по рынку", "рост за 30 мин %",
                     "просадка до пика %", "цена через 30 мин %", "вход по", "минимум за 30 мин %",
-                    "минимум через, с", "максимум до минимума %", "максимум после минимума %", "путь по"])
+                    "минимум через, с", "максимум до минимума %", "максимум после минимума %", "путь по",
+                    "трейдер купил, SOL", "докупок трейдера за 30 мин", "докупил всего, SOL", "самая мелкая докупка, SOL",
+                    "самая крупная докупка, SOL", "продаж трейдера за 30 мин"])
         pct = lambda v: "" if v is None else round(v * 100, 1)
         for r in await self._closed(since):
             w.writerow([
@@ -1416,6 +1426,9 @@ class PaperTrader:
                 pct(r.get("path_mfe")), pct(r.get("path_dip")), pct(r.get("path_p30")), r.get("entry_src") or "",
                 pct(r.get("path_mae")), "" if r.get("path_low_s") is None else round(r["path_low_s"]),
                 pct(r.get("path_hi_before_low")), pct(r.get("path_hi_after_low")), r.get("path_src") or "",
+                _num(r.get("t_buy_sol")), "" if r.get("t_rebuys") is None else r["t_rebuys"],
+                _num(r.get("t_rebuy_sol")), _num(r.get("t_rebuy_min")), _num(r.get("t_rebuy_max")),
+                "" if r.get("t_sells") is None else r["t_sells"],
             ])
         return out.getvalue()
 

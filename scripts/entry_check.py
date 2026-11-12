@@ -99,8 +99,10 @@ def fill_after(path: list[tuple[int, float, float, str, bool]], j: int, delay: f
 
 
 def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: float, trader: str,
-             sc: dict[str, Any], exit_delay: float | None = None, size_sol: float | None = None) -> tuple[float, str]:
-    """Выход по сделкам после входа. path: (слот, время, MC, трейдер, покупка). size_sol — со своим влиянием на цену."""
+             sc: dict[str, Any], exit_delay: float | None = None, size_sol: float | None = None,
+             force_slot: int | None = None) -> tuple[float, str]:
+    """Выход по сделкам после входа. path: (слот, время, MC, трейдер, покупка). size_sol — со своим влиянием на цену.
+    force_slot — выйти, как только путь дошёл до этого блока (правило «трейдер мелко докупил — выходим»)."""
     def nf(ratio: float) -> float:
         return net_sized(ratio, mc0, size_sol) if size_sol else net(ratio)
     t0 = path[i0][1]
@@ -116,6 +118,9 @@ def simulate(path: list[tuple[int, float, float, str, bool]], i0: int, mc0: floa
             got += rem * last_mc
             return nf(got / mc0), "нет роста"
         last_mc = mc
+        if force_slot is not None and slot >= force_slot:
+            got += rem * fill_after(path, j, exit_delay)
+            return nf(got / mc0), "мелкая докупка"
         if tr == trader and not is_buy and not tp_done:
             got += rem * fill_after(path, j, exit_delay)
             return nf(got / mc0), "трейдер продал"
@@ -665,7 +670,7 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             print(f"… {n_sig}/{len(sigs)} сигналов, запросов RPC {gapper.calls if gapper else 0}", flush=True)
         who = s["source_wallet"] or s["alert_trader"]
         trig = await conn.fetchrow(
-            """SELECT slot, ts, mc_sol, signature, pool FROM trades WHERE mint=$1 AND trader=$2 AND is_buy
+            """SELECT slot, ts, mc_sol, signature, pool, sol_amount FROM trades WHERE mint=$1 AND trader=$2 AND is_buy
                  AND slot IS NOT NULL AND ts <= $3::timestamptz AND ts > $3::timestamptz - interval '2 minutes'
                ORDER BY ts DESC, slot DESC LIMIT 1""",
             s["mint"], who, s["opened_at"]) if who else None
@@ -708,8 +713,13 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         if buy is None:
             buy = max((float(t.get("buy_sol") or 0) for t in pl.get("traders") or [] if isinstance(t, dict)),
                       default=None)
+        tb = await conn.fetch(
+            """SELECT slot, is_buy, sol_amount FROM trades WHERE mint=$1 AND trader=$2 AND slot > $3
+                 AND ts <= $4::timestamptz + interval '30 minutes' ORDER BY slot, id""", s["mint"], who, s0, trig["ts"])
         good.append({"path": path, "s0": s0, "who": who, "m": m_sig, "how": how,
                      "day": s["opened_at"].strftime("%m.%d"), "kind": kind,
+                     "tsol": float(trig["sol_amount"] or 0),
+                     "tbuys": [(int(x["slot"]), float(x["sol_amount"] or 0)) for x in tb if x["is_buy"]],
                      "buy": float(buy) if buy is not None else None,
                      "mc": float(pl["mc"]) if pl.get("mc") is not None else None,
                      "growth": float(((pl.get("metrics") or {}).get("growth_1m")) or 0)})
@@ -926,6 +936,65 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             f"{dc:+.0f}$ | итого {cum:+.0f}$")
     say(f"  Всего: smart {n_s} сд. {tot_s:+.0f}$ ({tot_s / (10 * n_s) if n_s else 0:+.1%} на сделку) · копии "
         f"{n_c} сд. {tot_c:+.0f}$ ({tot_c / (10 * n_c) if n_c else 0:+.1%} на сделку)")
+    # докупки трейдера: размер первой покупки, мелкая докупка (≈$1–2.5) — выход, крупная (≈$84+) — что дальше
+    say("")
+    say(f"Покупки и докупки трейдера (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., $10 на "
+        f"сигнал; 1 SOL ≈ $84):")
+    sa = dict(tp=0.25, share=1.0, stop=None, time_s=None, gain=0, trail=None)        # A: +25% без стопа
+    for label, pick in (("smart", lambda g: g["kind"].startswith("smart")),
+                        ("копии", lambda g: not g["kind"].startswith("smart"))):
+        grp = [(g, entry_at(g["path"], g["s0"], d)) for g in good if pick(g)]
+        grp = [(g, e) for g, e in grp if e]
+        if not grp:
+            continue
+        say(f"  {label} ({len(grp)}):")
+        # 1) размер первой покупки
+        parts = []
+        for lo, hi in ((0, 0.5), (0.5, 1), (1, 2), (2, 5), (5, 1e9)):
+            sub = [(g, e) for g, e in grp if lo <= g["tsol"] < hi]
+            if sub:
+                ra = sum(simulate(g["path"], e[0], e[1], g["who"], sa, xd)[0] for g, e in sub) * 10
+                rg = sum(simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd)[0] for g, e in sub) * 10
+                parts.append(f"{lo:g}–{hi:g} SOL: {len(sub)} сд. A {ra:+.0f}$ G {rg:+.0f}$" if hi < 1e9
+                             else f"от {lo:g} SOL: {len(sub)} сд. A {ra:+.0f}$ G {rg:+.0f}$")
+        say("    первая покупка трейдера → " + " · ".join(parts))
+        # 2) мелкая докупка после нашего входа — выходить сразу?
+        for thr in (0.015, 0.03, 0.06):
+            hit = []
+            for g, e in grp:
+                ent = g["path"][e[0]][0]
+                fs = next((sl for sl, sol in g["tbuys"] if sl > ent and sol <= thr), None)
+                if fs is not None:
+                    hit.append((g, e, fs))
+            if not hit:
+                continue
+            base_a = sum(simulate(g["path"], e[0], e[1], g["who"], sa, xd)[0] for g, e, _f in hit) * 10
+            rule_a = sum(simulate(g["path"], e[0], e[1], g["who"], sa, xd, force_slot=fs)[0] for g, e, fs in hit) * 10
+            base_g = sum(simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd)[0] for g, e, _f in hit) * 10
+            rule_g = sum(simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd, force_slot=fs)[0]
+                         for g, e, fs in hit) * 10
+            after = []
+            for g, e, fs in hit:
+                j = next((k for k, q in enumerate(g["path"]) if q[0] >= fs), None)
+                if j is None:
+                    continue
+                t1 = g["path"][j][1]
+                later = [q[2] for q in g["path"][j:] if q[1] - t1 <= 300]
+                if later:
+                    after.append(later[-1] / g["path"][j][2] - 1)
+            say(f"    мелкая докупка ≤{thr:g} SOL (≈${thr * 84:.1f}) после входа: {len(hit)} сд. · цена через 5 мин после "
+                f"неё (медиана) {st.median(after) if after else 0:+.0%} · A: держать {base_a:+.0f}$ / выйти сразу "
+                f"{rule_a:+.0f}$ · G: {base_g:+.0f}$ / {rule_g:+.0f}$")
+        # 3) крупная докупка после входа — хороший знак?
+        for thr in (1.0, 3.0):
+            yes = [(g, e) for g, e in grp if any(sl > g["path"][e[0]][0] and sol >= thr for sl, sol in g["tbuys"])]
+            no = [(g, e) for g, e in grp if (g, e) not in yes]
+            if yes:
+                ya = sum(simulate(g["path"], e[0], e[1], g["who"], sa, xd)[0] for g, e in yes) * 10
+                na = sum(simulate(g["path"], e[0], e[1], g["who"], sa, xd)[0] for g, e in no) * 10
+                say(f"    крупная докупка ≥{thr:g} SOL (≈${thr * 84:.0f}) после входа: {len(yes)} сд., A {ya:+.0f}$ "
+                    f"({ya / len(yes):+.2f}$ на сделку) · без неё: {len(no)} сд., A {na:+.0f}$ "
+                    f"({na / len(no) if no else 0:+.2f}$ на сделку)")
     # как улучшить smart: копии через фильтры smart; схема выхода только для smart; какие smart-кошельки дают плюс
     def usd_of(idx: list[int]) -> str:
         v = [rows_m[i][gi] for i in idx if rows_m[i][gi] is not None]

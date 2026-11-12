@@ -142,7 +142,7 @@ class PriceCheck:
 
     async def run_once(self, http: aiohttp.ClientSession) -> int:
         rows = await self.db.fetch(
-            """SELECT id, mint, opened_at, entry_mc FROM paper_positions
+            """SELECT id, mint, opened_at, entry_mc, source_wallet FROM paper_positions
                WHERE closed_at IS NOT NULL AND exit_reason <> 'reset' AND price_check IS NULL
                  AND opened_at < now() - interval '31 minutes' AND closed_at > now() - interval '12 hours'
                ORDER BY closed_at LIMIT 60""")
@@ -166,9 +166,17 @@ class PriceCheck:
             ps = path_stats(candles, r["opened_at"].timestamp(), float(r["entry_mc"] or 0) * sol_usd / 1e9)
             # путь по сделкам своего потока (порядок блоков точный) — если сделок хватает, он главный
             trs = await self.db.fetch(
-                """SELECT extract(epoch FROM ts) t, mc_sol FROM trades WHERE mint=$1 AND mc_sol > 0
-                     AND ts >= $2 AND ts <= $2 + interval '30 minutes' ORDER BY slot, id""",
+                """SELECT extract(epoch FROM ts) t, mc_sol, trader, is_buy, sol_amount FROM trades
+                   WHERE mint=$1 AND mc_sol > 0 AND ts >= $2 AND ts <= $2 + interval '30 minutes' ORDER BY slot, id""",
                 r["mint"], r["opened_at"])
+            # докупки и продажи трейдера-источника за 30 мин после нашего входа
+            mine = [float(t["sol_amount"] or 0) for t in trs if r["source_wallet"] and t["trader"] == r["source_wallet"]
+                    and t["is_buy"]]
+            t_sells = sum(1 for t in trs if r["source_wallet"] and t["trader"] == r["source_wallet"] and not t["is_buy"])
+            await self.db.execute(
+                """UPDATE paper_positions SET t_rebuys=$2, t_rebuy_sol=$3, t_rebuy_min=$4, t_rebuy_max=$5, t_sells=$6
+                   WHERE id=$1""", r["id"], len(mine), sum(mine), min(mine) if mine else None,
+                max(mine) if mine else None, t_sells)
             tp_ = trade_path([(float(t["t"]), float(t["mc_sol"])) for t in trs], r["opened_at"].timestamp(),
                              float(r["entry_mc"] or 0))
             src = "сделки" if tp_ else ("свечи" if ps else None)
