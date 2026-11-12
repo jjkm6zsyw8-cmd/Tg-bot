@@ -984,6 +984,78 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         say(f"  {label} ({len(grp)} с числом холдеров):")
         for ptxt in parts:
             say("    " + ptxt)
+    # копии: совмещение фильтров — холдеры (RugCheck) × сумма первой покупки трейдера × выход при мелкой докупке.
+    # Перебор комбинаций всегда находит «лучшую задним числом» — она завышена; честная цифра — комбинация на день D
+    # выбирается только по дням до D
+    say("")
+    say(f"Копии: совмещение фильтров — холдеры × сумма покупки трейдера × выход при мелкой докупке (≤0.06 SOL) "
+        f"(покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., $10 на сигнал):")
+    sa_c = dict(tp=0.25, share=1.0, stop=None, time_s=None, gain=0, trail=None)
+    cs = []
+    for g in good:
+        if g["kind"].startswith("smart"):
+            continue
+        e = entry_at(g["path"], g["s0"], d)
+        if not e:
+            continue
+        hv = None
+        if g["mint"] in hmap and abs((hmap[g["mint"]][1] - g["t_sig"]).total_seconds()) <= 600:
+            hv = hmap[g["mint"]][0]
+        ent = g["path"][e[0]][0]
+        fs = next((sl for sl, sol in g["tbuys"] if sl > ent and sol <= 0.06), None)
+        cs.append({"day": g["day"], "h": hv, "buy": g["tsol"],
+                   "A": simulate(g["path"], e[0], e[1], g["who"], sa_c, xd)[0],
+                   "A+": simulate(g["path"], e[0], e[1], g["who"], sa_c, xd, force_slot=fs)[0],
+                   "G": simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd)[0],
+                   "G+": simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd, force_slot=fs)[0]})
+    hf = [("любые", lambda h: True), ("от 10", lambda h: h is not None and h >= 10),
+          ("от 30", lambda h: h is not None and h >= 30), ("30–60", lambda h: h is not None and 30 <= h < 60),
+          ("от 60", lambda h: h is not None and h >= 60)]
+    bf = [("любая", 0.0), ("от 0.5", 0.5), ("от 1", 1.0), ("от 2", 2.0), ("от 5", 5.0)]
+    combos = []
+    for hn, hfun in hf:
+        for bn, bmin in bf:
+            for rule in ("", "+"):
+                combos.append((f"холдеры {hn} · покупка {bn} SOL" + (" · выход при мелкой докупке" if rule else ""),
+                               hfun, bmin, rule))
+
+    def pick(c: tuple[Any, ...], x: dict[str, Any]) -> bool:
+        return c[1](x["h"]) and x["buy"] >= c[2]
+    rows_c = []
+    for c in combos:
+        sub = [x for x in cs if pick(c, x)]
+        if len(sub) < 15:
+            continue
+        ra = [x["A" + c[3]] for x in sub]
+        rg = [x["G" + c[3]] for x in sub]
+        days_pos = sum(1 for dd in {x["day"] for x in sub} if sum(x["A" + c[3]] for x in sub if x["day"] == dd) > 0)
+        rows_c.append((sum(ra) * 10, c[0], len(sub), sum(v > 0 for v in ra) / len(ra), sum(rg) * 10, days_pos,
+                       len({x["day"] for x in sub})))
+    rows_c.sort(key=lambda r: -r[0])
+    say(f"  все копии: {len(cs)} сд. · A {sum(x['A'] for x in cs) * 10:+.0f}$ · G {sum(x['G'] for x in cs) * 10:+.0f}$")
+    say(f"  комбинаций с 15+ сделками: {len(rows_c)}, в плюсе (A): {sum(1 for r in rows_c if r[0] > 0)}")
+    for r in rows_c[:8]:
+        say(f"    {r[1]}: {r[2]} сд. · A {r[0]:+.0f}$ (в плюсе {r[3]:.0%}) · G {r[4]:+.0f}$ · дней в плюсе {r[5]} из {r[6]}")
+    # честно: комбинация на день — лучшая по прошлым дням (15+ сделок в прошлом)
+    days_c = sorted({x["day"] for x in cs})
+    wf_tot, wf_n, picks = 0.0, 0, []
+    for dd in days_c:
+        past = [x for x in cs if x["day"] < dd]
+        best = None
+        for c in combos:
+            sub = [x for x in past if pick(c, x)]
+            if len(sub) >= 15:
+                v = sum(x["A" + c[3]] for x in sub)
+                if best is None or v > best[0]:
+                    best = (v, c)
+        if best is None:
+            continue
+        today = [x for x in cs if x["day"] == dd and pick(best[1], x)]
+        usd = sum(x["A" + best[1][3]] for x in today) * 10
+        wf_tot += usd
+        wf_n += len(today)
+        picks.append(f"{dd[3:]}.{dd[:2]} {usd:+.0f}$ ({len(today)})")
+    say(f"  честно — фильтр на день выбран по прошлым дням: {wf_tot:+.0f}$ на {wf_n} сделках · " + " · ".join(picks))
     # докупки трейдера: размер первой покупки, мелкая докупка (≈$1–2.5) — выход, крупная (≈$84+) — что дальше
     say("")
     say(f"Покупки и докупки трейдера (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., $10 на "

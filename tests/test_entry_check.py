@@ -154,6 +154,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Ракеты" in out and "копии (2): дошли до ×2" in out
     assert "Копии через фильтры smart" in out and "прошли бы все:" in out
     assert "ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА" in out and "• запуски девов (лотерея D): 1 сигн." in out
+    assert "Копии: совмещение фильтров" in out and "честно — фильтр на день выбран по прошлым дням" in out
     assert "Холдеры в момент сигнала" in out and "100–200: 1 сд." in out
     assert "Покупки и докупки трейдера" in out and "первая покупка трейдера →" in out
     assert "ФАКТ ПО ТАКТИКАМ" in out and "• $5+$5: докупка −30%, выход +15%, без стопа: копии" in out
