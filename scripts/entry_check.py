@@ -597,7 +597,12 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
             past = [r for r in rs if r["day"] < dd]
             k = max(range(len(GRID)), key=lambda k: sum(r["grid"][k] for r in past)) if len(past) >= 30 else None
             wf += sum((r["grid"][k] if k is not None else r["G"]) for r in rs if r["day"] == dd) * 10
-        say(f"• {name}: {n} сигн. · дошли до {hit}")
+        say(f"• {name}: {n} сигн. · дошли до {hit} · в плюсе (G) {sum(r['G'] > 0 for r in rs) / n:.0%}")
+        say("    по дням, G: " + " · ".join(
+            f"{dd[3:]}.{dd[:2]} {sum(r['G'] for r in rs if r['day'] == dd) * 10:+.0f}$ "
+            f"({sum(r['day'] == dd for r in rs)} сд., в плюсе "
+            f"{sum(r['G'] > 0 for r in rs if r['day'] == dd) / sum(r['day'] == dd for r in rs):.0%})"
+            for dd in days_l))
         say(f"    G {sum(r['G'] for r in rs) * 10:+.0f}$ · D {sum(r['D'] for r in rs) * 10:+.0f}$ · "
             + " · ".join(f"{lbl} {sum(r[lbl] for r in rs) * 10:+.0f}$" for lbl, _ in ROCKETS)
             + f" · по прошлым дням {wf:+.0f}$ · лучшая задним числом {sname(GRID[best])} "
