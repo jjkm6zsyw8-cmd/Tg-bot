@@ -48,6 +48,14 @@ async def test_block_mc_takes_last_trade_up_to_block(monkeypatch):
     assert mc == pytest.approx(mc_sol(40.0, 8e8)) and rpc.tx_calls == ["s2b"]   # последняя в блоке 102, не 105
     rpc.sigs = [{"signature": "s9", "slot": 109}]
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == 30.0                # до блока +2 сделок не было
+    # запуск: других сделок до блока +2 нет — цена из самой транзакции создания (покупка дева)
+    rpc.sigs = []
+
+    def parse_create(tx, sig, slot, source, stats, pool_map=None):
+        return [Trade(signature=sig, mint="M", trader="DEV", is_buy=True, sol_amount=1, token_amount=1,
+                      v_sol=32.0, v_tokens=9e8)] if sig == "CREATE" else []
+    monkeypatch.setattr(parser, "parse_transaction", parse_create)
+    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) == pytest.approx(mc_sol(32.0, 9e8))
     tr.e.rpc = None
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) is None
 
@@ -250,17 +258,26 @@ async def test_tiny_rebuy_of_trader_exits_two_blocks_later(monkeypatch):
 
 
 async def test_mydev_entry_uses_dev_buy_in_create_block(monkeypatch):
-    tr, st, sold = realtime_trader(monkeypatch, [row(500, 34.0, trader="DEV")])   # покупка дева в блоке создания
-    opened = []
+    """12.11: цена в событии создания неверная (0.02 SOL) — вход только по сделке блокчейна (создание + покупка дева)."""
+    tr, st, sold = realtime_trader(monkeypatch, [])
+    opened, asked = [], []
 
     async def rec_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
         opened.append((name, mc, src))
         return None
 
-    async def no_trades_after(mint, sig, s0, target, trig_mc):
-        return trig_mc                                      # до блока +2 других сделок не было
-    tr._open, tr.block_mc = rec_open, no_trades_after
-    data = {"modes": ["mydev"], "symbol": "L", "mc": 28.0, "trigger_slot": 500, "trigger_sig": "CREATE",
-            "trigger_mc": 28.0, "trigger_at": time.time(), "trigger_create": True}
+    async def chain(mint, sig, s0, target, trig_mc, with_trigger=False):
+        asked.append((trig_mc, with_trigger))
+        return 34.0                                         # цена после покупки дева из транзакции создания
+    tr._open, tr.block_mc = rec_open, chain
+    data = {"modes": ["mydev"], "symbol": "L", "mc": 0.02, "trigger_slot": 500, "trigger_sig": "CREATE",
+            "trigger_mc": 0.02, "trigger_at": time.time(), "trigger_create": True}
     await tr.on_alert("M", "normal", None, data, "DEV")
-    assert opened == [("Y", 34.0, "блок")]                 # цена после покупки дева, а не стартовая 28
+    assert opened == [("Y", 34.0, "блок")] and asked == [(None, True)]
+    opened.clear()
+
+    async def nothing(*a, **k):
+        return None
+    tr.block_mc = nothing                                   # из блокчейна не узнали — не входим вовсе
+    await tr.on_alert("M2", "normal", None, data, "DEV")
+    assert opened == [] and "мой дев" in tr.skipped["*"]

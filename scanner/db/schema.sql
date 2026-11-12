@@ -518,3 +518,6 @@ UPDATE paper_positions SET suspect=false, price_check=NULL
  WHERE suspect AND price_check='entry' AND entry_src LIKE 'блок%';
 -- 12.11: Y записал +98 SOL на позициях по $10 (×800) — такие сделки не в итог, пока не разберёмся
 UPDATE paper_positions SET suspect=true WHERE pnl_pct > 10 AND NOT suspect AND portfolio IN ('Y', 'K', 'R', 'H');
+-- 12.11: Y входил по неверной цене из события создания (0.01…926 SOL) — все такие входы «по оценке» не в итог
+UPDATE paper_positions SET suspect=true
+ WHERE portfolio='Y' AND NOT suspect AND COALESCE(entry_src, '') NOT LIKE 'блок%';

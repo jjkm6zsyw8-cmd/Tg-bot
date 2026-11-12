@@ -605,9 +605,12 @@ class PaperTrader:
                 and bool(data.get("trigger_slot")) and bool(data.get("trigger_sig")) and bool(data.get("trigger_mc"))
                 and time.time() - float(data.get("trigger_at") or 0) <= 15)     # покупка трейдера свежая
 
-    async def block_mc(self, mint: str, trig_sig: str, s0: int, target: int, trig_mc: float) -> float | None:
+    async def block_mc(self, mint: str, trig_sig: str, s0: int, target: int, trig_mc: float | None,
+                       with_trigger: bool = False) -> float | None:
         """MC монеты на блок target: последняя сделка монеты в блоках s0…target после покупки трейдера (RPC).
-        Сделок не было — цена после покупки трейдера. None — узнать не удалось."""
+        Сделок не было — цена после покупки трейдера (trig_mc). with_trigger — сама транзакция-триггер тоже
+        разбирается (запуск: создание монеты + покупка дева в одной транзакции — её цена и есть цена после дева).
+        None — узнать не удалось."""
         rpc = getattr(self.e, "rpc", None)
         over = getattr(self.e, "rpc_over_budget", None)
         if rpc is None or (callable(over) and over()):
@@ -623,6 +626,8 @@ class PaperTrader:
         # ответ — от новых к старым; сортировка устойчивая: внутри блока порядок сохраняется
         cand = sorted((x for x in sigs or [] if not x.get("err") and x.get("slot") is not None
                        and s0 <= int(x["slot"]) <= target), key=lambda x: -int(x["slot"]))
+        if with_trigger:
+            cand.append({"signature": trig_sig, "slot": s0})     # самая старая — сама транзакция создания
         if not cand:
             return trig_mc                       # между покупкой трейдера и нашим блоком сделок не было
         pool_map: dict[str, str] = {}
@@ -632,7 +637,7 @@ class PaperTrader:
                 pool_map[amm] = mint
         except Exception:  # noqa: BLE001
             pass
-        for x in cand[:4]:
+        for x in cand[:4] + ([cand[-1]] if with_trigger and len(cand) > 4 else []):
             try:
                 tx = await rpc.transaction(x["signature"])
             except (RpcError, Exception):  # noqa: BLE001
@@ -655,10 +660,19 @@ class PaperTrader:
         target = s0 + ENTRY_BLOCKS
         trig_mc = float(data["trigger_mc"])
         if data.get("trigger_create"):
-            # запуск: цена после покупки дева в блоке создания (событие создания приходит раньше его сделки)
-            trig_mc = self.mc_at_slot(mint, s0) or trig_mc
-        mc = await self.block_mc(mint, str(data["trigger_sig"]), s0, target, trig_mc)
-        src = "блок"
+            # запуск «моего дева»: цена в событии создания у новых монет pump.fun неверная (12.11: 0.01…926 SOL при
+            # настоящих 30–80) — берём только цену из сделок блокчейна: транзакция создания с покупкой дева и сделки
+            # до блока +2. Не удалось — не входим (вход по неверной цене дал фальшивые +$8000 в Y)
+            mc = await self.block_mc(mint, str(data["trigger_sig"]), s0, target, None, with_trigger=True)
+            if mc is None or not (5 <= mc <= 5000):
+                self.no_price += 1
+                self.skipped["*"] = "мой дев: цену после покупки дева из блокчейна получить не удалось — не входим"
+                return
+            src = "блок"
+            trig_mc = mc
+        else:
+            mc = await self.block_mc(mint, str(data["trigger_sig"]), s0, target, trig_mc)
+            src = "блок"
         # 12.11: монета за 2 блока после покупки трейдера бывает ×2…×5 (за ним заходят копировщики) — это настоящая
         # цена, её не отбрасываем; не верим только явному сбою разбора (ниже трети или выше ×20)
         if mc is not None and not (1 / 3 <= mc / trig_mc <= 20):
