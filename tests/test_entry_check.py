@@ -127,6 +127,8 @@ async def test_main_runs_on_db(capsys, monkeypatch):
                                    slot, ts) VALUES ($1, 'D1', 'B', true, 0.1, 1, $2, $3, $4)""",
                              f"d{i}", mc, 300 + i, now + timedelta(seconds=0.4 * i))
         await db.execute("INSERT INTO alerts(mint, mode, level) VALUES ('D1', 'dev', 'normal')")
+        await db.execute("""INSERT INTO external_facts(entity, key, source, value, fetched_at)
+                            VALUES ('token:M1', 'total_holders', 'rugcheck', '120', $1)""", now + timedelta(seconds=3))
     finally:
         await db.close()
     calls = []
@@ -152,6 +154,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Ракеты" in out and "копии (2): дошли до ×2" in out
     assert "Копии через фильтры smart" in out and "прошли бы все:" in out
     assert "ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА" in out and "• запуски девов (лотерея D): 1 сигн." in out
+    assert "Холдеры в момент сигнала" in out and "100–200: 1 сд." in out
     assert "Покупки и докупки трейдера" in out and "первая покупка трейдера →" in out
     assert "ФАКТ ПО ТАКТИКАМ" in out and "• $5+$5: докупка −30%, выход +15%, без стопа: копии" in out
     assert "Вход частями" in out and "откат = медиана по прошлым дням" in out

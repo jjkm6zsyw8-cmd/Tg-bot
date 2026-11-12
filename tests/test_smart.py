@@ -34,7 +34,7 @@ async def test_report_on_db():
         await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
         await db.migrate()
         await db.execute("INSERT INTO traders(address, label) VALUES ('GOODWALLET1', 'Хороший')")
-        base = datetime.now(timezone.utc) - timedelta(days=3)
+        base = (datetime.now(timezone.utc) - timedelta(days=3)).replace(hour=8, minute=0)   # полдень по Тбилиси
         n = 0
         for day in range(3):
             for i in range(20):

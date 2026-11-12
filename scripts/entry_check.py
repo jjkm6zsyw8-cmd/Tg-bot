@@ -716,7 +716,8 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
         tb = await conn.fetch(
             """SELECT slot, is_buy, sol_amount FROM trades WHERE mint=$1 AND trader=$2 AND slot > $3
                  AND ts <= $4::timestamptz + interval '30 minutes' ORDER BY slot, id""", s["mint"], who, s0, trig["ts"])
-        good.append({"path": path, "s0": s0, "who": who, "m": m_sig, "how": how,
+        good.append({"path": path, "s0": s0, "who": who, "m": m_sig, "how": how, "mint": s["mint"],
+                     "t_sig": s["opened_at"],
                      "day": s["opened_at"].strftime("%m.%d"), "kind": kind,
                      "tsol": float(trig["sol_amount"] or 0),
                      "tbuys": [(int(x["slot"]), float(x["sol_amount"] or 0)) for x in tb if x["is_buy"]],
@@ -936,6 +937,53 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             f"{dc:+.0f}$ | итого {cum:+.0f}$")
     say(f"  Всего: smart {n_s} сд. {tot_s:+.0f}$ ({tot_s / (10 * n_s) if n_s else 0:+.1%} на сделку) · копии "
         f"{n_c} сд. {tot_c:+.0f}$ ({tot_c / (10 * n_c) if n_c else 0:+.1%} на сделку)")
+    # холдеры в момент сигнала: RugCheck totalHolders (проверка монеты перед первым алертом; своё число по своему
+    # потоку сделок занижено — подписка на монету включается после покупки трейдера)
+    hold_rows = await conn.fetch(
+        """SELECT entity, value, fetched_at FROM external_facts
+           WHERE key = 'total_holders' AND source = 'rugcheck' AND entity = ANY($1::text[])""",
+        [f"token:{g['mint']}" for g in good])
+    hmap = {}
+    for r in hold_rows:
+        try:
+            v = r["value"]
+            v = json.loads(v) if isinstance(v, str) else v
+            hmap[r["entity"][6:]] = (float(v), r["fetched_at"])
+        except (TypeError, ValueError):
+            continue
+    say("")
+    say(f"Холдеры в момент сигнала (RugCheck, проверка перед алертом; покупка +{round(d / SLOT_S)} бл., продажа "
+        f"+{round(xd / SLOT_S)} бл., $10 на сигнал):")
+    sa_h = dict(tp=0.25, share=1.0, stop=None, time_s=None, gain=0, trail=None)
+    buckets = ((0, 10), (10, 30), (30, 60), (60, 100), (100, 200), (200, 1e9))
+    for label, pick in (("smart", lambda g: g["kind"].startswith("smart")),
+                        ("копии", lambda g: not g["kind"].startswith("smart"))):
+        grp = []
+        for g in good:
+            if not pick(g) or g["mint"] not in hmap:
+                continue
+            hv, at = hmap[g["mint"]]
+            if abs((at - g["t_sig"]).total_seconds()) > 600:
+                continue                                    # число снято не в момент сигнала — не берём
+            e = entry_at(g["path"], g["s0"], d)
+            if e:
+                grp.append((g, e, hv))
+        if not grp:
+            say(f"  {label}: нет данных RugCheck")
+            continue
+        parts = []
+        for lo, hi in buckets:
+            sub = [(g, e) for g, e, hv in grp if lo <= hv < hi]
+            if not sub:
+                continue
+            ra = [simulate(g["path"], e[0], e[1], g["who"], sa_h, xd)[0] for g, e in sub]
+            rg = [simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd)[0] for g, e in sub]
+            name = f"{lo}–{hi:g}" if hi < 1e9 else f"от {lo}"
+            parts.append(f"{name}: {len(sub)} сд. · A {sum(ra) * 10:+.0f}$ (в плюсе {sum(x > 0 for x in ra) / len(ra):.0%})"
+                         f" · G {sum(rg) * 10:+.0f}$ (в плюсе {sum(x > 0 for x in rg) / len(rg):.0%})")
+        say(f"  {label} ({len(grp)} с числом холдеров):")
+        for ptxt in parts:
+            say("    " + ptxt)
     # докупки трейдера: размер первой покупки, мелкая докупка (≈$1–2.5) — выход, крупная (≈$84+) — что дальше
     say("")
     say(f"Покупки и докупки трейдера (покупка +{round(d / SLOT_S)} бл., продажа +{round(xd / SLOT_S)} бл., $10 на "

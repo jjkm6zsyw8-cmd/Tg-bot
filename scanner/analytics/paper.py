@@ -1385,6 +1385,8 @@ class PaperTrader:
     async def _closed(self, since: datetime | None) -> list[Any]:
         return await self.db.fetch(
             """SELECT p.*, a.mode, COALESCE(a.payload->>'copy_sol', a.payload->'traders'->0->>'buy_sol') AS t_buy_sol,
+                      (SELECT f.value::text FROM external_facts f WHERE f.entity = 'token:' || p.mint
+                         AND f.key = 'total_holders' AND f.source = 'rugcheck') AS holders_rc,
                       (SELECT t.mc FROM paper_trades t WHERE t.position_id = p.id AND t.side = 'sell'
                                     ORDER BY t.ts DESC LIMIT 1) AS exit_mc,
                       (SELECT w.label FROM watchlist w WHERE w.address = p.source_wallet AND w.label IS NOT NULL
@@ -1443,7 +1445,7 @@ class PaperTrader:
                     "просадка до пика %", "цена через 30 мин %", "вход по", "минимум за 30 мин %",
                     "минимум через, с", "максимум до минимума %", "максимум после минимума %", "путь по",
                     "трейдер купил, SOL", "докупок трейдера за 30 мин", "докупил всего, SOL", "самая мелкая докупка, SOL",
-                    "самая крупная докупка, SOL", "продаж трейдера за 30 мин"])
+                    "самая крупная докупка, SOL", "продаж трейдера за 30 мин", "холдеров (RugCheck, при алерте)"])
         pct = lambda v: "" if v is None else round(v * 100, 1)
         for r in await self._closed(since):
             w.writerow([
@@ -1463,6 +1465,7 @@ class PaperTrader:
                 _num(r.get("t_buy_sol")), "" if r.get("t_rebuys") is None else r["t_rebuys"],
                 _num(r.get("t_rebuy_sol")), _num(r.get("t_rebuy_min")), _num(r.get("t_rebuy_max")),
                 "" if r.get("t_sells") is None else r["t_sells"],
+                _num(r.get("holders_rc")),
             ])
         return out.getvalue()
 
