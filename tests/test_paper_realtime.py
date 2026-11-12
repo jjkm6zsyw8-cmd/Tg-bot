@@ -142,3 +142,61 @@ def test_trigger_from_trade_row():
     t = trigger_of({"slot": 5, "signature": "S", "mc_sol": 40.0})
     assert t["trigger_slot"] == 5 and t["trigger_sig"] == "S" and t["trigger_mc"] == 40.0 and t["trigger_at"] > 0
     assert trigger_of({"slot": None, "signature": "S", "mc_sol": 40.0}) == {}
+
+
+def test_swing_route_scheme_and_holder():
+    from scanner.analytics.copytrade import swing_like
+    tr = bare_trader({})
+    assert tr.route({"modes": ["swing"], "source_wallet": "W"}, "normal")[0] == {"R"}
+    from tests.test_paper import pos
+    r = pp.SCHEMES["R"]
+    p = pos()
+    p.portfolio = "R"
+    assert pp.decide_exit(p, 25.0, 10, r, 125, 0.0005) is None                  # −37% — держим (стоп −50%)
+    assert pp.decide_exit(p, 19.0, 10, r, 125, 0.0005) == ("stop", 1.0)
+    assert pp.decide_exit(p, 120.0, 20, r, 125, 0.0005) is None                 # ×3 — трейлинг включился
+    assert pp.decide_exit(p, 75.0, 30, r, 125, 0.0005) == ("trailing", 1.0)    # −37% от пика 120
+    assert pp.decide_exit(p, 41.0, 24 * 3600 + 1, r, 125, 0.0005)[0] in ("max_hold", "trailing")
+    assert swing_like({"median_hold_s": 3600}) and not swing_like({"median_hold_s": 600})
+    assert not swing_like({"median_hold_s": 3600, "linked_to_dev": True})
+
+
+async def test_engine_swing_buy_goes_to_paper(monkeypatch):
+    from scanner.analytics.engine import Engine
+    calls = []
+
+    class Paper:
+        async def on_alert(self, mint, level, aid, data, trader):
+            calls.append((mint, data["modes"], data.get("trigger_slot")))
+    eng = SimpleNamespace(cfg={}, paper=Paper())
+    st = SimpleNamespace(deployer="DEV", symbol="X", mc=500.0, mint="MX",
+                         trades=[SimpleNamespace(trader="W", is_buy=True)])
+    r = {"trader": "W", "sol_amount": 1.0, "slot": 10, "signature": "S", "mc_sol": 500.0}
+    Engine._on_swing_buy(eng, st, r)  # type: ignore[arg-type]
+    await asyncio.sleep(0.01)
+    assert calls == [("MX", ["swing"], 10)]
+    st.trades.append(SimpleNamespace(trader="W", is_buy=True))                  # докупка — не входим повторно
+    Engine._on_swing_buy(eng, st, r)  # type: ignore[arg-type]
+    await asyncio.sleep(0.01)
+    assert len(calls) == 1
+
+
+async def test_daily_reset_keeps_swing_positions():
+    tr = bare_trader({})
+    tr.lock = asyncio.Lock()
+    sqls = []
+
+    class DB:
+        async def execute(self, sql, *a):
+            sqls.append((sql, a))
+
+        async def kv_set(self, *a):
+            return None
+    tr.db = DB()
+    tr.balance, tr.paused = {n: 0.5 for n in pp.SCHEMES}, {}
+    for i, name in enumerate(("A", "R"), 1):
+        tr.positions[i] = pp.Position(id=i, portfolio=name, mint="M", opened_ts=0, entry_mc=40.0, cost_sol=0.1,
+                                      tokens=1.0, tokens_initial=1.0, target_mc=None)
+    await tr.reset(keep={"R"})
+    assert [p.portfolio for p in tr.positions.values()] == ["R"] and tr.balance["R"] == 0.5
+    assert sqls[0][1] == (["R"],) and not any(a and a[0] == "R" for _s, a in sqls[1:])

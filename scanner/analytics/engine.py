@@ -19,7 +19,7 @@ from ..config import Env, Settings
 from ..db.pool import Database
 from ..ingest.rpc import RpcError, SolanaRpc
 from . import clusters as cl
-from .copytrade import TIER_NAMES, refresh_traders_adaptive, smart_like
+from .copytrade import TIER_NAMES, refresh_traders_adaptive, smart_like, swing_like
 from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_profit
 from .features import launch_summary
 from .filters import check as check_filters
@@ -717,12 +717,23 @@ class Engine:
                 **trigger_of(r)}
         asyncio.create_task(self.paper.on_alert(st.mint, "normal", None, data, r["trader"]))
 
+    def _on_swing_buy(self, st: TokenState, r: Any) -> None:
+        """Держатель (≥30 мин) купил — «смарт-ракеты» R на бумаге (без алерта в чат, без рамок капитализации)."""
+        if r["trader"] == st.deployer or float(r["sol_amount"] or 0) < float(self.cfg.get("swing_min_buy_sol", 0.3)):
+            return
+        if sum(1 for t in st.trades if t.trader == r["trader"] and t.is_buy) > 1:
+            return                                   # докупка — только первый вход
+        data = {"modes": ["swing"], "symbol": st.symbol, "mc": st.mc, "source_wallet": r["trader"], **trigger_of(r)}
+        asyncio.create_task(self.paper.on_alert(st.mint, "normal", None, data, r["trader"]))
+
     async def _on_smart_trade(self, st: TokenState, r: Any) -> None:
         cfg = self.cfg
         trader = self.traders[r["trader"]]
         # свой список → раздел «Копитрейд» (наблюдение); кошелёк, который держит монету минутами и в плюсе по
         # копируемости, бот ведёт как smart — с фильтрами smart и в smart-портфели (analytics/copytrade.smart_like)
         own = bool(trader.get("manual")) and not smart_like(trader, cfg)
+        if r["is_buy"] and cfg.get("paper_swing", True) and swing_like(trader, cfg):
+            self._on_swing_buy(st, r)
         if not cfg.get("modes", {}).get("copy" if own else "smart", True):
             return
         line = {"is_buy": r["is_buy"], "label": trader["label"], "trader": r["trader"], "sol": r["sol_amount"],

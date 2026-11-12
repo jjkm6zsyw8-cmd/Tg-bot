@@ -95,7 +95,7 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         assert tr.balance["B"] == pytest.approx(0.3)                    # старт $30 (настройка) при SOL = $100
-        n = len(pp.SCHEMES) - 1                                          # H — только кандидаты разведки
+        n = len(pp.SCHEMES) - 2                                          # без H (разведка) и R (смарт-ракеты)
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0, "target_mc": 90.0}, None)
         assert len(tr.positions) == n and tr.balance["B"] == pytest.approx(0.21)   # «Сильный»: 20% × 1.5 = 30%
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0}, None)
@@ -568,7 +568,7 @@ async def test_daily_reset_with_summary(monkeypatch):
         assert await db.kv_get("paper:daily_reset") and not await db.fetchval("SELECT count(*) FROM outbox")
         await tr.on_alert("M1", "strong", None, {"symbol": "T", "mc": 40.0, "copy_wallet": "W", "copy_sol": 1.0}, "W")
         assert {p.rule for p in tr.positions.values()} == {"copy"}
-        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE rule='copy'") == len(pp.SCHEMES) - 1
+        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE rule='copy'") == len(pp.SCHEMES) - 2
         p = next(iter(tr.positions.values()))
         await tr._sell(p, "take_profit", 1.0, 60.0)
         await db.kv_set("paper:daily_reset", "2000-01-01")           # наступил новый день

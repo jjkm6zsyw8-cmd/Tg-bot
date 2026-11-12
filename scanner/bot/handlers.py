@@ -22,7 +22,8 @@ NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005,
                 "paper_m_day_stop_pct": 0.25, "paper_m_size_cap": 0.30, "paper_entry_slip": 0.05,
                 "paper_m_entry_slip": 0.02, "rating_top": 0.04, "rating_pause": -0.03,
                 "rating_top_mult": 1.5, "smart_accounts": 2,
-                "own_smart_min_hold_s": 180, "wallet_autoclean_min_copies": 10}
+                "own_smart_min_hold_s": 180, "wallet_autoclean_min_copies": 10, "swing_min_hold_s": 1800,
+                "swing_min_buy_sol": 0.3}
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database

@@ -68,6 +68,12 @@ SCOUT_START_MULT = 10          # H — наблюдение: старт ×10 ($1
 # C, D, E, F новых сделок не открывают (история остаётся).
 SMART_SET = "ABG"
 OFF_SET = "CDEF"
+# R — «смарт-ракеты» (свинг, с 12.11, наблюдение): новые покупки кошельков, которые держат монету часами (медиана
+# удержания ≥ 30 мин, своя база сделок), без рамок капитализации; по $10, держим до суток; выход — трейлинг 35% от
+# пика после +30%, вслед за трейдером, аварийный стоп −50%. Дневной сброс R не трогает (позиции живут сутки).
+SWING = "R"
+SWING_MAX_OPEN = 40
+SWING_USD = 10.0
 # M — боевая версия: один портфель, как бот торговал бы на реальные деньги. Подбор — бэктест всех сигналов 6–9.11
 # по минутным свечам рынка (модель сверена с бумагой на ценах Jupiter: −11.8% против −10.9% на сделку), со схемой G:
 #   сильная копия (твой кошелёк + ещё один отслеживаемый)   +11.8% на сделку, в плюсе 3 дня из 4, четвёртый ≈ 0
@@ -140,13 +146,17 @@ SCHEMES: dict[str, dict[str, Any]] = {
           "time_stop_gain": 0.10},
     "G": {**_G, "name": "G: smart — всё на +25%, стоп −8%, 5 мин на +10%, до 30 мин", "max_hold_s": 1800},
     SCOUT: {**_G, "name": "H: наблюдение — кандидаты разведки и копии своего списка, как G, по $10"},
+    SWING: {"name": "R: смарт-ракеты — держатели (≥30 мин), трейл 35% после +30%, стоп −50%, до суток, по $10",
+            "stop": 0.50, "tp_net": None, "tp_share": 0.0, "trail": 0.35, "trail_after_net": 0.30, "target": False,
+            "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 24 * 3600},
 }
 LEGEND = ("с 12.11 — только smart (по факту недели копии в минусе при любой тактике): "
           "A всё на +25% без стопа · B 70% на +25%, 30% трейл 15%, без стопа · G всё на +25%, стоп −8% · "
           "M — боевая (как A, позиция ≤30%, дневной стоп −25%) · H — наблюдение: кандидаты разведки и копии своего "
           "списка, по $10 · C, D, E, F новых сделок не открывают · держим до 30 мин · исполнение как у быстрого бота: "
           "покупка через 2 блока после трейдера по цене блокчейна, стоп/тейк по каждой сделке, продажа через 2 блока · "
-          "старт $100 (H — $1000)")
+          "старт $100 (H — $1000) · R — смарт-ракеты: новые покупки держателей (≥30 мин), трейл 35% после +30%, "
+          "стоп −50%, до суток, по $10, старт $1000, без дневного сброса")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -458,17 +468,24 @@ class PaperTrader:
                    AND exit_reason <> 'reset' AND NOT suspect GROUP BY portfolio""", start):
             self.day_pnl[r["portfolio"]] = float(r["s"] or 0)
 
-    async def reset(self) -> None:
+    async def reset(self, keep: set[str] | None = None) -> None:
+        """keep — портфели, которые не сбрасываются (дневной сброс не трогает R: позиции живут до суток)."""
+        keep = keep or set()
         async with self.lock:
             sol = self.e.price.value or 150
-            await self.db.execute("UPDATE paper_positions SET closed_at=now(), exit_reason='reset' WHERE closed_at IS NULL")
+            await self.db.execute("UPDATE paper_positions SET closed_at=now(), exit_reason='reset' "
+                                  "WHERE closed_at IS NULL AND NOT (portfolio = ANY($1::text[]))", list(keep))
             for n in SCHEMES:
+                if n in keep:
+                    continue
                 await self.db.execute(
                     "UPDATE paper_portfolios SET start_usd=$2, start_sol=$3, balance_sol=$3, paused=false, reset_at=now() "
                     "WHERE name=$1", n, self.start_usd(n), self.start_usd(n) / sol)
-            self.positions.clear()
+            self.positions = {i: p for i, p in self.positions.items() if p.portfolio in keep}
             self.day_pnl = {}                      # сброс — новый счёт и для дневного стопа лотереи
             for n in SCHEMES:
+                if n in keep:
+                    continue
                 self.balance[n] = self.start_usd(n) / sol
                 self.paused[n] = False
             await self.db.kv_set("paper:compared", None)
@@ -697,7 +714,8 @@ class PaperTrader:
             self.skipped[name] = "уже есть позиция по этой монете"
             return None
         lottery = self.is_lottery(name)
-        max_open = LOTTERY_MAX_OPEN if lottery else SCOUT_MAX_OPEN if name == SCOUT else MAX_OPEN
+        max_open = LOTTERY_MAX_OPEN if lottery else SCOUT_MAX_OPEN if name == SCOUT else \
+            SWING_MAX_OPEN if name == SWING else MAX_OPEN
         kind = self.kind_of(data) if name == MAIN else None
         if kind:
             lottery = kind == "lottery"
@@ -738,11 +756,13 @@ class PaperTrader:
             ratio = float(self.cfg.get("copy_ratio", 0.10))
             size = min(size, ratio * float(data["copy_sol"]))
         wallet = data.get("copy_wallet") or data.get("source_wallet")
-        if wallet and not lottery and name != SCOUT:
+        if wallet and not lottery and name not in (SCOUT, SWING):
             size *= float(self.wallet_rating(wallet).get("mult", 1.0))   # рейтинг кошелька: топ ×1.5 … слабый ×0.5
         if name == SCOUT:
             # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
             size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
+        if name == SWING:
+            size = float(self.cfg.get("paper_swing_usd", SWING_USD)) / (self.e.price.value or 150)
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * (float(self.cfg.get("paper_m_size_cap", M_SIZE_CAP)) if name == MAIN
                                                else 0.5))    # …но и не больше половины баланса (M — 30%)
@@ -1029,7 +1049,7 @@ class PaperTrader:
 
     def start_usd(self, name: str | None = None) -> float:
         base = float(self.cfg.get("paper_start_usd") or START_USD)
-        return base * SCOUT_START_MULT if name == SCOUT else base
+        return base * SCOUT_START_MULT if name in (SCOUT, SWING) else base
 
     def wallet_rating(self, wallet: str) -> dict[str, Any]:
         """Рейтинг кошелька (analytics/rating.py); нет копий — «новый», позиция ×0.75."""
@@ -1046,9 +1066,11 @@ class PaperTrader:
         """В какие портфели идёт сигнал и почему никуда, если пусто. Без modes (старые вызовы) — во все."""
         modes = set(data.get("modes") or [])
         if not modes:
-            return set(SCHEMES) - {SCOUT} - set(str(self.cfg.get("paper_off_set", OFF_SET))), ""
+            return set(SCHEMES) - {SCOUT, SWING} - set(str(self.cfg.get("paper_off_set", OFF_SET))), ""
         if "scout" in modes:
             return {SCOUT}, ""                       # кандидат разведки — только испытательный портфель
+        if "swing" in modes:
+            return {SWING}, ""                       # держатель купил новую монету — смарт-ракеты
         wallet = data.get("copy_wallet") or data.get("source_wallet")
         if wallet and modes & {"copy", "smart"} and not modes & {"dev", "mydev"} \
                 and self.wallet_rating(wallet).get("tier") == "paused":
@@ -1408,7 +1430,7 @@ class PaperTrader:
         text = await self.day_summary(tz)
         await self.flush_messages()
         await self.db.enqueue("text", {"topic": "paper", "text": text}, priority=4)
-        await self.reset()
+        await self.reset(keep={SWING})
         await self._msg(f"🔄 Новый день ({today}): все портфели снова по ${self.start_usd():.0f}")
 
     async def day_summary(self, tz: ZoneInfo) -> str:

@@ -188,6 +188,18 @@ def smart_like(t: Any, cfg: dict[str, Any] | None = None) -> bool:
         and not get("linked_to_dev")
 
 
+SWING_MIN_HOLD_S = 1800.0
+
+
+def swing_like(t: Any, cfg: dict[str, Any] | None = None) -> bool:
+    """Держатель для «смарт-ракет»: медиана удержания монеты ≥ 30 мин (по своей базе сделок), не связан с девами.
+    Копируемость не требуется — R это наблюдение: проверяем, ловят ли такие кошельки ракеты на новых покупках."""
+    get = t.get if hasattr(t, "get") else (lambda k, d=None: d)
+    hold = get("median_hold_s")
+    need = float((cfg or {}).get("swing_min_hold_s", SWING_MIN_HOLD_S))
+    return hold is not None and float(hold) >= need and not get("linked_to_dev")
+
+
 def tier(s30: TraderStats) -> str:
     return "excellent" if s30.copyability >= 0.15 and s30.win_rate >= 0.55 else "good"
 
