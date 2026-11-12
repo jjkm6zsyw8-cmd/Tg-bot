@@ -513,3 +513,6 @@ ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_rebuy_sol double precisio
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_rebuy_min double precision;
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_rebuy_max double precision;
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS t_sells integer;
+-- 12.11: входы по сделке блокчейна (блок +2), выкинутые сверкой минутной свечой, — вернуть в итог и перепроверить выход
+UPDATE paper_positions SET suspect=false, price_check=NULL
+ WHERE suspect AND price_check='entry' AND entry_src LIKE 'блок%';
