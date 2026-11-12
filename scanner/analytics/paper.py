@@ -171,7 +171,8 @@ TICK_S = 2.0          # проверка открытых позиций (сто
 # на рынке не было (сверка с минутными свечами GeckoTerminal)
 PRICE_EXITS = ("stop", "trailing", "target", "take_profit")
 CHECK_NAMES = {"ok": "ок", "nodata": "нет свечей", "entry": "⚠ вход", "exit": "⚠ выход"}
-ENTRY_SRC = {"блок": "блок +2 (блокчейн)", "оценка": "оценка: цена трейдера +2%", "jup": "рынок (Jupiter)",
+ENTRY_SRC = {"блок": "блок +2 (блокчейн)", "оценка": "оценка: цена трейдера +2%", "рынок": "рынок сейчас (блокчейн не ответил)",
+             "jup": "рынок (Jupiter)",
              "jupiter": "рынок (Jupiter)", "own": "свой поток", "dex": "DexScreener"}
 JUP_REFRESH_S = 4.0   # цены Jupiter открытых позиций — одним запросом раз в 4 с
 JUP_MAX_AGE_S = 8.0   # цена Jupiter годится для решения, если ей не больше 8 с
@@ -627,11 +628,17 @@ class PaperTrader:
         trig_mc = float(data["trigger_mc"])
         mc = await self.block_mc(mint, str(data["trigger_sig"]), s0, target, trig_mc)
         src = "блок"
-        if mc is not None and not (1 / 3 <= mc / trig_mc <= 3):
-            mc = None                            # в 3+ раза от цены трейдера за 2 блока — сбой разбора, не верим
+        # 12.11: монета за 2 блока после покупки трейдера бывает ×2…×5 (за ним заходят копировщики) — это настоящая
+        # цена, её не отбрасываем; не верим только явному сбою разбора (ниже трети или выше ×20)
+        if mc is not None and not (1 / 3 <= mc / trig_mc <= 20):
+            mc = None
         if mc is None:
-            mc = trig_mc * (1 + float(self.cfg.get("paper_entry_slip", ENTRY_SLIP)))
-            src = "оценка"
+            # блокчейн не ответил: НЕ цена трейдера (12.11 так 19 «входов» по цене до пампа дали фальшивые +50…+190%),
+            # а рынок сейчас (на ~3 с позже реального бота — осторожнее) и не дешевле цены трейдера + поправка
+            now_mc, _src = await self.market_mc(mint)
+            floor = trig_mc * (1 + float(self.cfg.get("paper_entry_slip", ENTRY_SLIP)))
+            mc = max(floor, now_mc) if now_mc and 1 / 3 <= now_mc / trig_mc <= 20 else floor
+            src = "рынок" if now_mc and mc == now_mc else "оценка"
         ref = float(data.get("entry_mc") or data.get("mc") or 0)
         if data.get("target_mc") and ref > 0 and 1 / 3 <= mc / ref <= 3 and abs(mc / ref - 1) > 0.10:
             data = {**data, "target_mc": float(data["target_mc"]) * mc / ref}
@@ -655,7 +662,7 @@ class PaperTrader:
         if any(not x.endswith("—") for x in sizes):
             sol_usd = self.e.price.value or 150
             await self._msg(f"📥 ${fmt.esc(data.get('symbol') or '?')} · MC {fmt.mc_usd(mc, sol_usd)} "
-                            f"({'блок +2' if src == 'блок' else 'оценка'}) · " + " · ".join(sizes) + " SOL")
+                            f"({ {'блок': 'блок +2', 'рынок': 'рынок'}.get(src, 'оценка')}) · " + " · ".join(sizes) + " SOL")
         # сделки монеты после нашего блока, пришедшие, пока ждали подтверждения, — проверяем выходы по ним
         st = self.e.states.get(mint) if getattr(self.e, "states", None) else None
         for t in sorted((t for t in getattr(st, "trades", None) or [] if t.slot and t.slot > target),

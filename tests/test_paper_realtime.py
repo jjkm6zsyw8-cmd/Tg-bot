@@ -100,6 +100,33 @@ async def test_realtime_entry_and_stop_exit_two_blocks_later(monkeypatch):
     assert sold == [("G", "stop", 27.0)]
 
 
+async def test_pumped_block_price_is_kept_and_fallback_uses_market(monkeypatch):
+    """12.11: за 2 блока монета ×4 — это настоящая цена входа (раньше отбрасывалась и бралась цена трейдера +2%)."""
+    tr, st, sold = realtime_trader(monkeypatch, [])
+    opened = []
+
+    async def rec_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((mc, src))
+        return None
+
+    async def pumped(*a):
+        return 120.0                                       # ×4 к цене трейдера 30
+    tr._open, tr.block_mc = rec_open, pumped
+    tr.route = lambda data, level: ({"G"}, "")
+    await tr.on_alert("M", "normal", None, signal(), "W")
+    assert opened == [(120.0, "блок")]
+    opened.clear()
+
+    async def none_block(*a):
+        return None
+
+    async def market(mint):
+        return 75.0, "jup"
+    tr.block_mc, tr.market_mc = none_block, market         # блокчейн не ответил — рынок сейчас, не цена трейдера
+    await tr.on_alert("M", "normal", None, signal(), "W")
+    assert opened == [(75.0, "рынок")]
+
+
 async def test_entry_falls_back_to_trader_price_plus_slip(monkeypatch):
     tr, st, sold = realtime_trader(monkeypatch, [])
     opened = []
@@ -110,7 +137,9 @@ async def test_entry_falls_back_to_trader_price_plus_slip(monkeypatch):
     async def rec_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
         opened.append((mc, src))
         return None
-    tr.block_mc, tr._open = none_block, rec_open
+    async def no_market(mint):
+        return None, ""
+    tr.block_mc, tr._open, tr.market_mc = none_block, rec_open, no_market
     tr.route = lambda data, level: ({"G"}, "")
     await tr.on_alert("M", "normal", None, signal(), "W")
     assert opened == [(pytest.approx(30.0 * 1.02), "оценка")]
