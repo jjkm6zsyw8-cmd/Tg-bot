@@ -74,6 +74,20 @@ OFF_SET = "CDEF"
 SWING = "R"
 SWING_MAX_OPEN = 40
 SWING_USD = 10.0
+# Y — «мой дев» (с 12.11, наблюдение): запуск монеты девом из своего списка, вход через 2 блока после создания по цене
+# блокчейна, схема G, по $10. Проверка по сделкам 10–12.11: 144 запуска, G +$194, все 54 варианта трейлинга в плюсе
+# (на входе через 5 с те же запуски давали минус — на запусках решает скорость).
+MYDEV = "Y"
+# K — «крупные копии» (наблюдение): копии своего списка, где трейдер зашёл от 5 SOL. По неделе 5–12.11: 38 сделок,
+# тейк +25% без стопа +$42 — единственная плюсовая группа копий; смотрим, держится ли.
+BIGCOPY = "K"
+BIGCOPY_SOL = 5.0
+# наблюдательные портфели: фиксированно $10 на сделку, старт ×10, до 40 открытых
+OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY)
+OBSERVE_USD = 10.0
+# 12.11: трейдер после нашего входа мелко докупил (≤0.06 SOL ≈ $5) — выходим сразу. По неделе (копии, 88 сделок):
+# цена через 5 мин после такой докупки −13% (медиана); «выйти сразу» +$71 против «держать» +$21
+TINY_REBUY_SOL = 0.06
 # M — боевая версия: один портфель, как бот торговал бы на реальные деньги. Подбор — бэктест всех сигналов 6–9.11
 # по минутным свечам рынка (модель сверена с бумагой на ценах Jupiter: −11.8% против −10.9% на сделку), со схемой G:
 #   сильная копия (твой кошелёк + ещё один отслеживаемый)   +11.8% на сделку, в плюсе 3 дня из 4, четвёртый ≈ 0
@@ -146,6 +160,9 @@ SCHEMES: dict[str, dict[str, Any]] = {
           "time_stop_gain": 0.10},
     "G": {**_G, "name": "G: smart — всё на +25%, стоп −8%, 5 мин на +10%, до 30 мин", "max_hold_s": 1800},
     SCOUT: {**_G, "name": "H: наблюдение — кандидаты разведки и копии своего списка, как G, по $10"},
+    MYDEV: {**_G, "name": "Y: мой дев — запуск девом из списка, вход через 2 блока после создания, как G, по $10",
+            "max_hold_s": 1800},
+    BIGCOPY: {**_G, "name": "K: крупные копии — трейдер зашёл от 5 SOL, как G, по $10", "max_hold_s": 1800},
     SWING: {"name": "R: смарт-ракеты — держатели (≥30 мин), трейл 35% после +30%, стоп −50%, до суток, по $10",
             "stop": 0.50, "tp_net": None, "tp_share": 0.0, "trail": 0.35, "trail_after_net": 0.30, "target": False,
             "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 24 * 3600},
@@ -156,7 +173,9 @@ LEGEND = ("с 12.11 — только smart (по факту недели коп�
           "списка, по $10 · C, D, E, F новых сделок не открывают · держим до 30 мин · исполнение как у быстрого бота: "
           "покупка через 2 блока после трейдера по цене блокчейна, стоп/тейк по каждой сделке, продажа через 2 блока · "
           "старт $100 (H — $1000) · R — смарт-ракеты: новые покупки держателей (≥30 мин), трейл 35% после +30%, "
-          "стоп −50%, до суток, по $10, старт $1000, без дневного сброса")
+          "стоп −50%, до суток, по $10, старт $1000, без дневного сброса · Y — мой дев: запуски девов из списка, вход "
+          "через 2 блока после создания, как G · K — крупные копии (трейдер от 5 SOL), как G · Y, K — по $10, старт "
+          "$1000 · во всех: трейдер мелко докупил (до ~$5) — выходим сразу")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -206,10 +225,12 @@ def wallet_name(r: Any) -> str:
     w = r.get("source_wallet") or ""
     return r.get("source_label") or (f"{w[:4]}…{w[-4:]}" if w else "")
 EXIT_SHORT = {"emergency": "дев продал", "trader_sell": "трейдер продал", "stop": "стоп", "take_profit": "тейк",
-              "target": "цель", "trailing": "трейлинг", "time_stop": "нет роста", "max_hold": "2ч без выхода"}
+              "target": "цель", "trailing": "трейлинг", "time_stop": "нет роста", "max_hold": "2ч без выхода",
+              "tiny_rebuy": "мелкая докупка"}
 EXIT_NAMES = {"emergency": "экстренный выход (продажа кластера дева)", "trader_sell": "трейдер-источник продал",
               "stop": "стоп-лосс", "take_profit": "тейк-профит 50%", "target": "цель", "trailing": "трейлинг-стоп",
-              "time_stop": "стоп по времени (нет +10% за 5–15 мин)", "max_hold": "максимальное удержание"}
+              "time_stop": "стоп по времени (нет +10% за 5–15 мин)", "max_hold": "максимальное удержание",
+              "tiny_rebuy": "трейдер мелко докупил (до ~$5) — выход"}
 
 
 # ---------------------------------------------------------------------- исполнение (чистые функции)
@@ -633,6 +654,9 @@ class PaperTrader:
         s0 = int(data["trigger_slot"])
         target = s0 + ENTRY_BLOCKS
         trig_mc = float(data["trigger_mc"])
+        if data.get("trigger_create"):
+            # запуск: цена после покупки дева в блоке создания (событие создания приходит раньше его сделки)
+            trig_mc = self.mc_at_slot(mint, s0) or trig_mc
         mc = await self.block_mc(mint, str(data["trigger_sig"]), s0, target, trig_mc)
         src = "блок"
         # 12.11: монета за 2 блока после покупки трейдера бывает ×2…×5 (за ним заходят копировщики) — это настоящая
@@ -729,7 +753,7 @@ class PaperTrader:
             return None
         lottery = self.is_lottery(name)
         max_open = LOTTERY_MAX_OPEN if lottery else SCOUT_MAX_OPEN if name == SCOUT else \
-            SWING_MAX_OPEN if name == SWING else MAX_OPEN
+            SWING_MAX_OPEN if name in OBSERVE else MAX_OPEN
         kind = self.kind_of(data) if name == MAIN else None
         if kind:
             lottery = kind == "lottery"
@@ -770,13 +794,13 @@ class PaperTrader:
             ratio = float(self.cfg.get("copy_ratio", 0.10))
             size = min(size, ratio * float(data["copy_sol"]))
         wallet = data.get("copy_wallet") or data.get("source_wallet")
-        if wallet and not lottery and name not in (SCOUT, SWING):
+        if wallet and not lottery and name not in OBSERVE:
             size *= float(self.wallet_rating(wallet).get("mult", 1.0))   # рейтинг кошелька: топ ×1.5 … слабый ×0.5
         if name == SCOUT:
             # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
             size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
-        if name == SWING:
-            size = float(self.cfg.get("paper_swing_usd", SWING_USD)) / (self.e.price.value or 150)
+        if name in (SWING, MYDEV, BIGCOPY):
+            size = float(self.cfg.get("paper_observe_usd", OBSERVE_USD)) / (self.e.price.value or 150)
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * (float(self.cfg.get("paper_m_size_cap", M_SIZE_CAP)) if name == MAIN
                                                else 0.5))    # …но и не больше половины баланса (M — 30%)
@@ -823,7 +847,8 @@ class PaperTrader:
         return size
 
     # ------------------------------------------------------------------ сопровождение
-    async def on_trade(self, st: "TokenState", eff: Any, trader: str, is_buy: bool, slot: int | None = None) -> None:
+    async def on_trade(self, st: "TokenState", eff: Any, trader: str, is_buy: bool, slot: int | None = None,
+                       sol: float | None = None) -> None:
         ps = [p for p in self.positions.values() if p.mint == st.mint and not p.closing]
         if not ps:
             return
@@ -837,6 +862,11 @@ class PaperTrader:
                     and not sc.get("ignore_trader_sell")
                     and not (p.tp_done and sc.get("follow_runner") is False)):   # остаток-«раннер» едет за иксом
                 reason = "trader_sell"
+            tiny = float(self.cfg.get("paper_tiny_rebuy_sol", TINY_REBUY_SOL) or 0)
+            if (reason is None and p.trader and trader == p.trader and is_buy and sol is not None and tiny > 0
+                    and 0 < float(sol) <= tiny and (slot is None or p.extra.get("entry_slot") is None
+                                                    or slot > p.extra["entry_slot"])):
+                reason = "tiny_rebuy"                # трейдер мелко докупил после нашего входа — монету обычно сливают
             entry_slot = p.extra.get("entry_slot")
             if entry_slot is not None and slot is not None and st.mc and st.mc > 0:
                 # как реальный бот: каждая сделка монеты после нашей покупки — проверка стопа/тейка/трейлинга
@@ -1063,7 +1093,7 @@ class PaperTrader:
 
     def start_usd(self, name: str | None = None) -> float:
         base = float(self.cfg.get("paper_start_usd") or START_USD)
-        return base * SCOUT_START_MULT if name in (SCOUT, SWING) else base
+        return base * SCOUT_START_MULT if name in OBSERVE else base
 
     def wallet_rating(self, wallet: str) -> dict[str, Any]:
         """Рейтинг кошелька (analytics/rating.py); нет копий — «новый», позиция ×0.75."""
@@ -1080,7 +1110,7 @@ class PaperTrader:
         """В какие портфели идёт сигнал и почему никуда, если пусто. Без modes (старые вызовы) — во все."""
         modes = set(data.get("modes") or [])
         if not modes:
-            return set(SCHEMES) - {SCOUT, SWING} - set(str(self.cfg.get("paper_off_set", OFF_SET))), ""
+            return set(SCHEMES) - set(OBSERVE) - set(str(self.cfg.get("paper_off_set", OFF_SET))), ""
         if "scout" in modes:
             return {SCOUT}, ""                       # кандидат разведки — только испытательный портфель
         if "swing" in modes:
@@ -1099,6 +1129,10 @@ class PaperTrader:
             # копии своего списка (кошельки-скальперы) — только наблюдение в H: за неделю 5–11.11 в минусе при любой
             # из 11 тактик; по ним считается рейтинг. Кошельки, которые держат монету минутами, бот ведёт как smart
             out.add(SCOUT)
+            if float(data.get("copy_sol") or 0) >= float(self.cfg.get("paper_bigcopy_sol", BIGCOPY_SOL)):
+                out.add(BIGCOPY)                     # трейдер зашёл крупно — отдельно смотрим в K
+        if "mydev" in modes and self.cfg.get("paper_mydev", True):
+            out.add(MYDEV)
         if "smart" in modes:
             out |= smart_set | {MAIN}
         if "dev" in modes and self.cfg.get("paper_lottery_on", False):

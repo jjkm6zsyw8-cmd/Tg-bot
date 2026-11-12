@@ -229,3 +229,38 @@ async def test_daily_reset_keeps_swing_positions():
     await tr.reset(keep={"R"})
     assert [p.portfolio for p in tr.positions.values()] == ["R"] and tr.balance["R"] == 0.5
     assert sqls[0][1] == (["R"],) and not any(a and a[0] == "R" for _s, a in sqls[1:])
+
+
+async def test_tiny_rebuy_of_trader_exits_two_blocks_later(monkeypatch):
+    tr, st, sold = realtime_trader(monkeypatch, [row(100, 30.0)])
+    await tr._open("G", "M", "normal", None, {}, "W", 30.0, "блок")
+    p = next(iter(tr.positions.values()))
+    p.extra["entry_slot"] = 102
+    st.trades.append(row(104, 33.0, trader="W"))
+    st.mc = 33.0
+    await tr.on_trade(st, None, "W", True, 104, 0.5)        # крупная докупка — держим
+    await asyncio.sleep(0.02)
+    assert not sold
+    st.trades.append(row(106, 32.0, trader="W"))
+    st.mc = 32.0
+    await tr.on_trade(st, None, "W", True, 106, 0.02)       # мелкая докупка ($1.7) — выходим
+    st.trades.append(row(108, 29.0))
+    await asyncio.sleep(0.05)
+    assert sold == [("G", "tiny_rebuy", 29.0)]
+
+
+async def test_mydev_entry_uses_dev_buy_in_create_block(monkeypatch):
+    tr, st, sold = realtime_trader(monkeypatch, [row(500, 34.0, trader="DEV")])   # покупка дева в блоке создания
+    opened = []
+
+    async def rec_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((name, mc, src))
+        return None
+
+    async def no_trades_after(mint, sig, s0, target, trig_mc):
+        return trig_mc                                      # до блока +2 других сделок не было
+    tr._open, tr.block_mc = rec_open, no_trades_after
+    data = {"modes": ["mydev"], "symbol": "L", "mc": 28.0, "trigger_slot": 500, "trigger_sig": "CREATE",
+            "trigger_mc": 28.0, "trigger_at": time.time(), "trigger_create": True}
+    await tr.on_alert("M", "normal", None, data, "DEV")
+    assert opened == [("Y", 34.0, "блок")]                 # цена после покупки дева, а не стартовая 28

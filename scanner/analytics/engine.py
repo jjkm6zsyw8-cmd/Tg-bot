@@ -271,7 +271,7 @@ class Engine:
         info.created_at = rec["created_at"]
         mine = self.my_devs.get(st.deployer) or (self.my_devs.get(st.creator) if st.creator else None)
         if mine is not None:
-            asyncio.create_task(self._my_dev_launch(st, mine))
+            asyncio.create_task(self._my_dev_launch(st, mine, rec))
         try:
             if not cfg.get("modes", {}).get("dev", True):
                 return
@@ -461,7 +461,7 @@ class Engine:
                 asyncio.create_task(self._resolve_rpc(st))
         await self._maybe_new_coin(st)
         if eff is not None and self.paper.positions:
-            await self.paper.on_trade(st, eff, trader, r["is_buy"], r["slot"])
+            await self.paper.on_trade(st, eff, trader, r["is_buy"], r["slot"], r["sol_amount"])
         entry = self.alerts.get(mint)
         if entry and eff is not None and time.monotonic() < entry.follow_until:
             await self._follow(st, entry, eff, r)
@@ -603,7 +603,7 @@ class Engine:
         await self.compose("new", st.mint, "normal", data)
 
     # ------------------------------------------------------------------ режим 2: смарт-мани
-    async def _my_dev_launch(self, st: TokenState, dev: dict[str, Any]) -> None:
+    async def _my_dev_launch(self, st: TokenState, dev: dict[str, Any], rec: Any = None) -> None:
         """Дев из своего списка запустил монету — алерт сразу, без внешних проверок (каждая секунда — это MC).
         Вход и цель — по его истории: цель чуть ниже нижней четверти его точек первой продажи."""
         cfg = self.cfg
@@ -641,7 +641,14 @@ class Engine:
             "signal": "мой дев", "metrics": {}, "violations": [], "cluster_id": st.cluster_id,
             "exit_rule": "Выход при первой продаже дева", "stage": "на кривой", "source_wallet": dev_addr,
         }
-        await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev")
+        slot0 = (rec["created_slot"] if rec is not None else None) or st.created_slot
+        sig0 = rec["signature"] if rec is not None else None
+        if slot0 and sig0 and st.mc:
+            # бумага Y входит как бот: через 2 блока после создания монеты, по цене блокчейна
+            data.update(trigger_slot=int(slot0), trigger_sig=sig0, trigger_mc=float(st.mc), trigger_at=time.time(),
+                        trigger_create=True)
+        await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev",
+                                  trader=dev_addr)
 
     async def _price_glitch(self, mint: str, mc_sol: float) -> bool:
         """Наш MC выше реального больше чем в 5 раз (по Jupiter сейчас, pump.fun: 1 млрд токенов)?

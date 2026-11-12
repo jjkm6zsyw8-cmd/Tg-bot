@@ -95,7 +95,7 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         assert tr.balance["B"] == pytest.approx(0.3)                    # старт $30 (настройка) при SOL = $100
-        n = len(pp.SCHEMES) - 2                                          # без H (разведка) и R (смарт-ракеты)
+        n = len(pp.SCHEMES) - len(pp.OBSERVE)                           # без наблюдательных H, R, Y, K
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0, "target_mc": 90.0}, None)
         assert len(tr.positions) == n and tr.balance["B"] == pytest.approx(0.21)   # «Сильный»: 20% × 1.5 = 30%
         await tr.on_alert("MINT1", "strong", None, {"symbol": "T", "mc": 40.0}, None)
@@ -127,7 +127,7 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         closed = [x for x in exits.split("\n") if x[:1] in "✅❌"]
         assert len(closed) == 1 and "G +" in closed[0]          # выходы по монете из 7 портфелей — одной строкой
         text = await tr.render(hourly=True)
-        assert "Бумага · за 1 час" in text and "<pre>" in text and "G" in text and text.count("\n") <= 12
+        assert "Бумага · за 1 час" in text and "<pre>" in text and "G" in text and text.count("\n") <= len(pp.SCHEMES) + 3
         period = await tr.render_period(1)
         assert "за 1 час" in period and "★" in period and "всё на +25%" in period
         whole = await tr.render()                                 # /paper и кнопка «Всё» (hours=None)
@@ -568,7 +568,7 @@ async def test_daily_reset_with_summary(monkeypatch):
         assert await db.kv_get("paper:daily_reset") and not await db.fetchval("SELECT count(*) FROM outbox")
         await tr.on_alert("M1", "strong", None, {"symbol": "T", "mc": 40.0, "copy_wallet": "W", "copy_sol": 1.0}, "W")
         assert {p.rule for p in tr.positions.values()} == {"copy"}
-        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE rule='copy'") == len(pp.SCHEMES) - 2
+        assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE rule='copy'") == len(pp.SCHEMES) - len(pp.OBSERVE)
         p = next(iter(tr.positions.values()))
         await tr._sell(p, "take_profit", 1.0, 60.0)
         await db.kv_set("paper:daily_reset", "2000-01-01")           # наступил новый день
@@ -596,10 +596,13 @@ def test_route_signals_to_portfolios():
     one_sol = {"cluster": 0.0342}
     targets, why = tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")
     assert not targets and "лотерея D выключена" in why
-    assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
+    assert tr.route({"modes": ["mydev"]}, "normal")[0] == {"Y"}                # мой дев — портфель Y
+    assert tr.route({"modes": ["copy"], "copy_sol": 6.0, "traders": [{}]}, "normal")[0] == {"H", "K"}   # крупная копия
     assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
     assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H"}
     assert not tr.route({}, "normal")[0] & set("CDEF")                    # закрытые портфели новых сделок не берут
+    tr.e.cfg = {"paper_mydev": False}
+    assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
     tr.e.cfg = {"paper_lottery_on": True, "paper_off_set": "CEF"}         # лотерею можно включить обратно
     assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == {"D"}
     tr.e.cfg = {"paper_smart_set": "G"}                                   # набор smart-портфелей настраивается

@@ -131,7 +131,7 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
         row = await db.fetchrow("SELECT entry_mc, delta FROM copy_log WHERE wallet='W' AND mint='M1'")
         assert row["entry_mc"] == 40.0 and row["delta"] == pytest.approx(40 / 38 - 1)
         # чья копия — в позиции, в CSV (подпись из своего списка) и в /trades
-        n_port = len(pp.SCHEMES) - 2 - len(pp.OFF_SET)                    # с 12.11: A, B, G и M (C–F закрыты, H и R отдельно)
+        n_port = len(pp.SCHEMES) - len(pp.OBSERVE) - len(pp.OFF_SET)                    # с 12.11: A, B, G и M (C–F закрыты, H и R отдельно)
         assert await db.fetchval("SELECT count(*) FROM paper_positions WHERE source_wallet='W'") == n_port * 3
         # цена уже на 33% выше его покупки — бумага не входит, в журнале «пропущено» с причиной
         eng.states["M4"] = SimpleNamespace(mc=40.0, mint="M4", trades=[SimpleNamespace(ts=time.time())])
