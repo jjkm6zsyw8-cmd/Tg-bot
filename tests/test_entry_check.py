@@ -161,6 +161,7 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     assert "Вход частями" in out and "откат = медиана по прошлым дням" in out
     assert "Часть на уровне обычного роста" in out and "уровень = медиана роста" in out
     assert "Трейлинг всей позиции" in out and "копии (2): по прошлым дням" in out and "трейлинг всей позиции: по прошлым дням" in out
+    assert "ИТОГ ПО ДНЯМ" in out and "все копии" in out and "(2 сд., в плюсе" in out and "ИТОГО (smart + мой дев" in out
     # второй запуск — из кеша, без запросов
     await ec.main(DSN, rpc=NoRpc())
     out = capsys.readouterr().out
@@ -168,7 +169,8 @@ async def test_main_runs_on_db(capsys, monkeypatch):
     db = await Database(DSN).connect(min_size=1, max_size=2)
     try:
         files = await db.fetch("SELECT payload FROM outbox WHERE kind = 'file' ORDER BY id")
-        assert [f["payload"]["filename"][:8] for f in files][:2] == ["tactics_", "check_20"]
+        assert [f["payload"]["filename"][:8] for f in files][:3] == ["tactics_", "check_20", "days_202"]
+        assert "день;smart" in files[2]["payload"]["csv"] and "всего;" in files[2]["payload"]["csv"]
         assert "тактика;сигналы;" in files[0]["payload"]["csv"] and "$5+$5: докупка −30%" in files[0]["payload"]["csv"]
         sent = await db.fetch("SELECT payload FROM outbox WHERE kind = 'text'")
         assert sent and "Проверка «быстрый бот»" in sent[0]["payload"]["text"] and "<pre>" in sent[0]["payload"]["text"]

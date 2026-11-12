@@ -460,6 +460,70 @@ FACT_TACTICS: list[tuple[str, str, dict[str, Any] | None]] = [
 
 FACT_CSV: list[list[Any]] = []          # та же таблица для файла
 
+# Сводка по дням (копится с каждым запуском): одни и те же правила на все дни, без подбора.
+# Фильтр копий выбран по данным 05–12.11, дни после FILTER_FIXED — проверка на новых днях.
+FILTER_FIXED = "11.12"                  # мм.дд
+DAY_COLS = [("smart", "smart (тейк +25%, без стопа)"),
+            ("mydev", "мой дев (G)"),
+            ("cf", "копии: холдеры 30–60, трейдер от 1 SOL, выход при мелкой докупке (тейк +25%)"),
+            ("c5", "копии: трейдер от 5 SOL (тейк +25%)"),
+            ("call", "все копии (тейк +25%), для сравнения")]
+DAY_SHORT = {"smart": "smart", "mydev": "мой дев", "cf": "копии 30–60/от 1 SOL", "c5": "копии от 5 SOL",
+             "call": "все копии"}
+DAY_SUM: dict[str, dict[str, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+DAYS_CSV: list[list[Any]] = []
+
+
+def day_add(day: str, col: str, v: float) -> None:
+    DAY_SUM[day][col].append(v)
+
+
+def day_summary() -> list[str]:
+    """Таблица по дням: $ и сделки по каждому сигналу; итого = smart + мой дев + копии с фильтром 30–60."""
+    DAYS_CSV.clear()
+    if not DAY_SUM:
+        return []
+    days = sorted(DAY_SUM)
+    out = ["", "ИТОГ ПО ДНЯМ — копится с каждым запуском ($10 на сигнал, покупка +2 бл., продажа +1 бл.; "
+               "итого = smart + мой дев + копии 30–60/от 1 SOL; фильтр копий выбран по 05–12.11, "
+               "дни с * — после выбора, честная проверка):"]
+    head = ["день"]
+    for _k, nm in DAY_COLS:
+        head += [f"{nm}, $", "сд."]
+    DAYS_CSV.append(head + ["итого, $"])
+    tot = collections.defaultdict(list)
+    for dd in days:
+        row = [f"{dd[3:]}.{dd[:2]}"]
+        parts = []
+        for k, nm in DAY_COLS:
+            v = DAY_SUM[dd].get(k, [])
+            tot[k] += v
+            row += [round(sum(v) * 10, 2), len(v)]
+            parts.append(f"{DAY_SHORT[k]} {sum(v) * 10:+.0f}$ ({len(v)})")
+        it = sum(sum(DAY_SUM[dd].get(k, [])) for k in ("smart", "mydev", "cf")) * 10
+        DAYS_CSV.append(row + [round(it, 2)])
+        out.append(f"  {dd[3:]}.{dd[:2]}{'*' if dd > FILTER_FIXED else ' '}: " + " · ".join(parts)
+                   + f" · итого {it:+.0f}$")
+    row = ["всего"]
+    for k, _nm in DAY_COLS:
+        row += [round(sum(tot[k]) * 10, 2), len(tot[k])]
+    it = sum(sum(tot[k]) for k in ("smart", "mydev", "cf")) * 10
+    DAYS_CSV.append(row + [round(it, 2)])
+    wr = ["в плюсе, %"]
+    for k, _nm in DAY_COLS:
+        wr += [round(100 * sum(x > 0 for x in tot[k]) / len(tot[k]), 1) if tot[k] else "", ""]
+    DAYS_CSV.append(wr + [""])
+    out.append("  всего: " + " · ".join(
+        f"{nm}: {sum(tot[k]) * 10:+.0f}$ ({len(tot[k])} сд., в плюсе "
+        f"{(sum(x > 0 for x in tot[k]) / len(tot[k])) if tot[k] else 0:.0%})" for k, nm in DAY_COLS))
+    out.append(f"  ИТОГО (smart + мой дев + копии 30–60/от 1 SOL): {it:+.0f}$")
+    after = [dd for dd in days if dd > FILTER_FIXED]
+    if after:
+        cf = sum(sum(DAY_SUM[dd].get("cf", [])) for dd in after) * 10
+        n = sum(len(DAY_SUM[dd].get("cf", [])) for dd in after)
+        out.append(f"  копии 30–60/от 1 SOL после выбора фильтра (честно): {cf:+.0f}$ ({n} сд.)")
+    return out
+
 
 def fact_table(groups: list[tuple[str, list[tuple[Any, int, float, str, str]]]], xd: float) -> list[str]:
     """Одна таблица: тактика → $ по дням (копии | smart), всего, сделок, в плюсе."""
@@ -513,10 +577,10 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
         """SELECT a.mint, a.mode, a.created_at, a.payload->'metrics'->>'cluster' AS share,
                   t.deployer, t.created_slot, t.signature AS create_sig, t.initial_mc_sol
            FROM alerts a JOIN tokens t ON t.mint = a.mint
-           WHERE a.mode = ANY($1::text[]) AND a.created_at > now() - make_interval(days => $2)
-             AND a.level <> 'watch'
+           WHERE a.mode = ANY($1::text[]) AND a.level <> 'watch'
+             AND a.created_at > now() - make_interval(days => CASE WHEN a.mode = 'mydev' THEN $4::int ELSE $2::int END)
            ORDER BY a.created_at DESC LIMIT $3""", list(OTHER_MODES), int(math.ceil(days)),
-        int(os.environ.get("EC_OTHER_MAX", 1500)))
+        int(os.environ.get("EC_OTHER_MAX", 3000)), int(os.environ.get("EC_MYDEV_DAYS", 30)))
     alerts = list(reversed(alerts))
     rpc_cap = (gapper.calls if gapper else 0) + int(os.environ.get("EC_OTHER_RPC", 4000))
     if not alerts:
@@ -580,8 +644,11 @@ async def check_other(conn: Any, gapper: Any, say: Any) -> None:
             res[label] = simulate(path, e[0], e[1], a["deployer"], sc, xd)[0]
         res["trail_path"] = (path, e[0], e[1], a["deployer"], res["day"])
         groups[name].append(res)
+        if a["mode"] == "mydev":
+            day_add(res["day"], "mydev", res["G"])
     say("")
-    say(f"ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА ({days:g} дн., $10 на сделку; покупка через {round(d / SLOT_S)} бл. после "
+    say(f"ДРУГИЕ СИГНАЛЫ НА СКОРОСТИ БОТА ({days:g} дн., мой дев — "
+        f"{int(os.environ.get('EC_MYDEV_DAYS', 30))} дн., $10 на сделку; покупка через {round(d / SLOT_S)} бл. после "
         f"последней сделки к алерту, у запуска — после создания; продажа через {round(xd / SLOT_S)} бл.; "
         f"цена видна 30 мин). Сейчас в бумагу идут только запуски девов «~1 SOL» (D).")
     if lost:
@@ -622,6 +689,10 @@ async def send_files(conn: Any, text: str | None) -> None:
         files.append((f"tactics_{stamp}.csv", buf.getvalue(), "📊 Факт по тактикам: $ по дням, копии и smart"))
     if text is not None:
         files.append((f"check_{stamp}.txt", text, "🔬 Полный отчёт проверки"))
+    if DAYS_CSV and text is not None:
+        buf = _io.StringIO()
+        _csv.writer(buf, delimiter=";").writerows(DAYS_CSV)
+        files.append((f"days_{stamp}.csv", buf.getvalue(), "📅 Итог по дням: smart, мой дев, копии с фильтрами"))
     for name, body, caption in files:
         oid = await conn.fetchval("INSERT INTO outbox(kind, payload, priority) VALUES ('file', $1, 4) RETURNING id",
                                   json.dumps({"csv": body, "filename": name, "caption": caption, "topic": "daily"}))
@@ -653,6 +724,7 @@ def sname(sc: dict[str, Any]) -> str:
 async def main(dsn: str | None = None, rpc: Any = None) -> str:
     import asyncpg
     conn = await asyncpg.connect(dsn or os.environ["DATABASE_URL"])
+    DAY_SUM.clear()
     days = float(os.environ.get("EC_DAYS", 30))
     sigs = await conn.fetch(
         """SELECT DISTINCT ON (p.mint, date_trunc('minute', p.opened_at))
@@ -1013,6 +1085,17 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
                    "A+": simulate(g["path"], e[0], e[1], g["who"], sa_c, xd, force_slot=fs)[0],
                    "G": simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd)[0],
                    "G+": simulate(g["path"], e[0], e[1], g["who"], SCHEMES["G"], xd, force_slot=fs)[0]})
+    for x in cs:
+        day_add(x["day"], "call", x["A"])
+        if x["h"] is not None and 30 <= x["h"] < 60 and x["buy"] >= 1.0:
+            day_add(x["day"], "cf", x["A+"])
+        if x["buy"] >= 5.0:
+            day_add(x["day"], "c5", x["A"])
+    for g in good:
+        if g["kind"].startswith("smart"):
+            e = entry_at(g["path"], g["s0"], d)
+            if e:
+                day_add(g["day"], "smart", simulate(g["path"], e[0], e[1], g["who"], sa_c, xd)[0])
     hf = [("любые", lambda h: True), ("от 10", lambda h: h is not None and h >= 10),
           ("от 30", lambda h: h is not None and h >= 30), ("30–60", lambda h: h is not None and 30 <= h < 60),
           ("от 60", lambda h: h is not None and h >= 60)]
@@ -1195,6 +1278,8 @@ async def main(dsn: str | None = None, rpc: Any = None) -> str:
             say(f"  {w[:6]}…{w[-4:]}: {m:+.1%} на сделку, {n} сигн.")
     if os.environ.get("EC_OTHER", "1") != "0":
         await check_other(conn, gapper, say)
+    for line in day_summary():
+        say(line)
     text = "\n".join(out)
     if os.environ.get("EC_TG", "1") != "0":
         await notify(conn, text)
