@@ -45,7 +45,7 @@ async def test_block_mc_takes_last_trade_up_to_block(monkeypatch):
                       v_sol=40.0, v_tokens=8e8)] if sig == "s2b" else []
     monkeypatch.setattr(parser, "parse_transaction", fake_parse)
     mc = await tr.block_mc("M", "TRIG", 100, 102, 30.0)
-    assert mc == pytest.approx(mc_sol(40.0, 8e8)) and rpc.tx_calls == ["s2b"]   # последняя в блоке 102, не 105
+    assert mc == pytest.approx(mc_sol(40.0, 8e8)) and rpc.tx_calls == ["s2b", "s2a"]   # блок 102, не 105
     rpc.sigs = [{"signature": "s9", "slot": 109}]
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == 30.0                # до блока +2 сделок не было
     # запуск: других сделок до блока +2 нет — цена из самой транзакции создания (покупка дева)
@@ -533,3 +533,19 @@ async def test_block_mc_create_without_dev_buy_and_reasons(monkeypatch):
     rpc.transaction = no_tx
     assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) is None
     assert tr._why_pop("M", "CREATE") == "узел не отдал транзакции блока"
+
+
+async def test_block_mc_takes_worst_price_of_the_block(monkeypatch):
+    """Порядок транзакций внутри блока узел отдаёт по-разному — цена блока +2 одна и та же: худшая для покупки."""
+    import scanner.ingest.pump_parser as parser
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+    prices = {"a": 40.0, "b": 55.0, "c": 47.0}
+
+    def parse(tx, sig, slot, src, stats, pool_map=None):
+        return [Trade(signature=sig, mint="M", trader="Y", is_buy=True, sol_amount=1, token_amount=1,
+                      v_sol=prices[sig], v_tokens=8e8)] if sig in prices else []
+    monkeypatch.setattr(parser, "parse_transaction", parse)
+    for order in (["a", "b", "c"], ["c", "a", "b"]):
+        tr.e.rpc = FakeRpc([{"signature": s_, "slot": 102} for s_ in order] + [{"signature": "old", "slot": 101}])
+        assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == pytest.approx(mc_sol(55.0, 8e8))

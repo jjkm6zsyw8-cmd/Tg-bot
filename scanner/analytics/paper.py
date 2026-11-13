@@ -136,6 +136,8 @@ ENTRY_VERIFY_X = 0.10              # расхождение со сверкой 
 ENTRY_RPC_DAILY = 3000             # запросов RPC в сутки на цену входа сверх общего лимита аналитики
 NO_RETRY = ("нет RPC", "дневной лимит запросов RPC")
 ENTRY_STATS_KEY = "paper:entry_stats"
+BLOCK_TX_MAX = 20                  # транзакций монеты в одном блоке разбираем не больше
+TX_MAX = 30                        # и всего на одну цену входа
 START_MC = 30.0 / 1_073_000_000.0 * 1e9   # MC (SOL) монеты pump.fun на старте кривой: 30 SOL / 1.073 млрд токенов
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
@@ -714,27 +716,39 @@ class PaperTrader:
             pass
         tried = got = 0
         created = False
-        for x in cand[:8] + ([cand[-1]] if with_trigger and len(cand) > 8 else []):
-            tried += 1
-            try:
-                tx = await rpc.transaction(x["signature"])
-                self._entry_rpc_add()
-            except Exception as exc:  # noqa: BLE001
-                return self._why(mint, trig_sig, "RPC отвечает 429 (лимит)" if "rate limited" in str(exc)
-                                 else "ошибка RPC")
-            if not tx:
-                continue
-            got += 1
-            # пул PumpSwap монеты — прямо из транзакции (в базе его бывает нет: 13.11 вечером все smart-сигналы
-            # на вышедших на PumpSwap монетах пропускались как «не разобрана»)
-            pools = {**pool_map, **sol_pools_of(tx, mint)}
-            all_evs = parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
-            created = created or any(isinstance(ev, TokenCreated) and ev.mint == mint for ev in all_evs)
-            evs = [ev for ev in all_evs if isinstance(ev, Trade) and ev.mint == mint]
-            if evs:
-                mc = mc_sol(evs[-1].v_sol, evs[-1].v_tokens)
-                if mc > 0:
-                    return mc
+        blocks: dict[int, list[dict[str, Any]]] = {}
+        for x in cand:
+            blocks.setdefault(int(x["slot"]), []).append(x)
+        for slot in sorted(blocks, reverse=True):         # от блока +2 вниз — первый блок со сделками монеты
+            mcs: list[float] = []
+            for x in blocks[slot][:BLOCK_TX_MAX]:
+                if tried >= TX_MAX:
+                    break
+                tried += 1
+                try:
+                    tx = await rpc.transaction(x["signature"])
+                    self._entry_rpc_add()
+                except Exception as exc:  # noqa: BLE001
+                    return self._why(mint, trig_sig, "RPC отвечает 429 (лимит)" if "rate limited" in str(exc)
+                                     else "ошибка RPC")
+                if not tx:
+                    continue
+                got += 1
+                # пул PumpSwap монеты — прямо из транзакции (в базе его бывает нет: 13.11 вечером все smart-сигналы
+                # на вышедших на PumpSwap монетах пропускались как «не разобрана»)
+                pools = {**pool_map, **sol_pools_of(tx, mint)}
+                all_evs = parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
+                created = created or any(isinstance(ev, TokenCreated) and ev.mint == mint for ev in all_evs)
+                mcs += [mc_sol(ev.v_sol, ev.v_tokens) for ev in all_evs if isinstance(ev, Trade) and ev.mint == mint]
+            mcs = [m for m in mcs if m > 0]
+            if mcs:
+                # порядок транзакций внутри блока узел отдаёт по-разному, а на запуске монеты цена внутри блока
+                # прыгает на десятки процентов (14.11: «мой дев» — 7 из 14 входов не сошлись со сверкой на +15…+99%).
+                # Наша покупка ляжет где-то в этом блоке — берём худшую для покупки цену блока: вход и сверка
+                # считаются одинаково, и вход не оказывается дешевле реального
+                return max(mcs)
+            if tried >= TX_MAX:
+                break
         if with_trigger and created:
             # монету создали без покупки дева, и до блока +2 сделок не было: реальный бот купил бы по цене старта
             # кривой pump.fun (резервы в событии создания у новых монет бывают неверными — берём стандартные)
