@@ -136,6 +136,7 @@ ENTRY_VERIFY_X = 0.10              # расхождение со сверкой 
 ENTRY_RPC_DAILY = 3000             # запросов RPC в сутки на цену входа сверх общего лимита аналитики
 NO_RETRY = ("нет RPC", "дневной лимит запросов RPC")
 ENTRY_STATS_KEY = "paper:entry_stats"
+START_MC = 30.0 / 1_073_000_000.0 * 1e9   # MC (SOL) монеты pump.fun на старте кривой: 30 SOL / 1.073 млрд токенов
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
@@ -653,7 +654,8 @@ class PaperTrader:
     def realtime(self, data: dict[str, Any]) -> bool:
         """Сигнал с покупкой трейдера (блок, подпись, цена) — исполняем как реальный бот."""
         return (bool(self.cfg.get("paper_realtime", True)) and not data.get("trend")
-                and bool(data.get("trigger_slot")) and bool(data.get("trigger_sig")) and bool(data.get("trigger_mc"))
+                and (bool(data.get("trigger_slot")) or bool(data.get("trigger_create")))
+                and bool(data.get("trigger_sig")) and bool(data.get("trigger_mc"))
                 and time.time() - float(data.get("trigger_at") or 0) <= 15)     # покупка трейдера свежая
 
     async def block_mc(self, mint: str, trig_sig: str, s0: int, target: int, trig_mc: float | None,
@@ -670,7 +672,7 @@ class PaperTrader:
             # общий лимит аналитики исчерпан — у цены входа свой запас (без неё бумага не входит вовсе)
             return self._why(mint, trig_sig, "дневной лимит запросов RPC")
         from ..ingest.pump_parser import ParseStats, parse_transaction
-        from ..models import Trade
+        from ..models import TokenCreated, Trade
         from .curve import mc_sol
         try:
             sigs = list(await rpc.signatures_for(mint, limit=1000, until=trig_sig) or [])
@@ -710,7 +712,10 @@ class PaperTrader:
                 pool_map[amm] = mint
         except Exception:  # noqa: BLE001
             pass
+        tried = got = 0
+        created = False
         for x in cand[:8] + ([cand[-1]] if with_trigger and len(cand) > 8 else []):
+            tried += 1
             try:
                 tx = await rpc.transaction(x["signature"])
                 self._entry_rpc_add()
@@ -719,16 +724,24 @@ class PaperTrader:
                                  else "ошибка RPC")
             if not tx:
                 continue
+            got += 1
             # пул PumpSwap монеты — прямо из транзакции (в базе его бывает нет: 13.11 вечером все smart-сигналы
             # на вышедших на PumpSwap монетах пропускались как «не разобрана»)
             pools = {**pool_map, **sol_pools_of(tx, mint)}
-            evs = [ev for ev in parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
-                   if isinstance(ev, Trade) and ev.mint == mint]
+            all_evs = parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
+            created = created or any(isinstance(ev, TokenCreated) and ev.mint == mint for ev in all_evs)
+            evs = [ev for ev in all_evs if isinstance(ev, Trade) and ev.mint == mint]
             if evs:
                 mc = mc_sol(evs[-1].v_sol, evs[-1].v_tokens)
                 if mc > 0:
                     return mc
-        return self._why(mint, trig_sig, "сделка монеты в блоке не разобрана")
+        if with_trigger and created:
+            # монету создали без покупки дева, и до блока +2 сделок не было: реальный бот купил бы по цене старта
+            # кривой pump.fun (резервы в событии создания у новых монет бывают неверными — берём стандартные)
+            return START_MC
+        if tried and not got:
+            return self._why(mint, trig_sig, "узел не отдал транзакции блока")
+        return self._why(mint, trig_sig, "в транзакциях блока нет сделки этой монеты на pump.fun")
 
     def _why(self, mint: str, sig: str, text: str) -> None:
         """Почему цену блока узнать не удалось (для счётчика пропусков)."""
@@ -770,12 +783,12 @@ class PaperTrader:
                               trader: str | None, targets: set[str]) -> None:
         """Вход как у реального бота: покупка через ENTRY_BLOCKS блока после покупки трейдера по цене блокчейна."""
         await asyncio.sleep(ENTRY_RPC_WAIT_S)
-        s0 = int(data["trigger_slot"])
-        target = s0 + ENTRY_BLOCKS
+        s0 = int(data.get("trigger_slot") or 0)
         trig_mc = float(data["trigger_mc"])
         sig = str(data["trigger_sig"])
         create = bool(data.get("trigger_create"))
-        mc, why = await self._block_price(mint, sig, s0, target, trig_mc, create)
+        mc, why, s0 = await self._block_price(mint, sig, s0, trig_mc, create)
+        target = s0 + ENTRY_BLOCKS
         if mc is None:
             # бумага входит только как реальный бот — по цене блока +2. Не узнали её — сделки нет (раньше входили
             # по «рынку сейчас» или «цене трейдера +2%»: 13.11 так шли 42% входов, и они искажали итог)
@@ -820,13 +833,21 @@ class PaperTrader:
                 if p.id in self.positions and not p.closing:
                     await self._check(p, float(t.mc), None, trade_slot=int(t.slot), now=t.ts)
 
-    async def _block_price(self, mint: str, sig: str, s0: int, target: int, trig_mc: float,
-                           create: bool) -> tuple[float | None, str]:
-        """Цена блока +2 с повторами (узел отдаёт свежие блоки с задержкой, бывают 429). (MC, причина неудачи)."""
+    async def _block_price(self, mint: str, sig: str, s0: int, trig_mc: float,
+                           create: bool) -> tuple[float | None, str, int]:
+        """Цена блока +2 с повторами (узел отдаёт свежие блоки с задержкой, бывают 429). (MC, причина неудачи, блок
+        сигнала). Блок создания монеты, если его ещё нет в базе, узнаём у RPC по подписи (13.11: 9 запусков
+        «моего дева» пропущены — узел в первую секунду ещё не знал транзакцию)."""
         why = "блокчейн не ответил"
         for pause in (0.0, *ENTRY_RETRY_S):
             if pause:
                 await asyncio.sleep(pause)
+            if not s0:
+                s0 = await self._slot_of(sig)
+                if not s0:
+                    why = "блок создания не найден"
+                    continue
+            target = s0 + ENTRY_BLOCKS
             if create:
                 # запуск «моего дева»: цена в событии создания у новых монет pump.fun неверная (12.11: 0.01…926 SOL
                 # при настоящих 30–80) — только цена из сделок блокчейна: создание с покупкой дева и сделки до +2
@@ -837,19 +858,30 @@ class PaperTrader:
             if mc is not None:
                 if create:
                     if 5 <= mc <= 5000:
-                        return mc, ""
-                    return None, "цена после покупки дева вне 5…5000 SOL"
+                        return mc, "", s0
+                    return None, "цена после покупки дева вне 5…5000 SOL", s0
                 if 1 / 3 <= mc / trig_mc <= 20:
                     # 12.11: монета за 2 блока бывает ×2…×5 (за трейдером заходят копировщики) — это настоящая цена
-                    return mc, ""
+                    return mc, "", s0
                 # цена блока далеко от цены трейдера: неверна одна из двух — рассудит рынок
                 now_mc, _src = await self.market_mc(mint)
                 if now_mc and 0.5 <= mc / now_mc <= 2:
-                    return mc, ""
-                return None, "цена блока не сходится ни с ценой трейдера, ни с рынком"
+                    return mc, "", s0
+                return None, "цена блока не сходится ни с ценой трейдера, ни с рынком", s0
             if why in NO_RETRY:
                 break
-        return None, why
+        return None, why, s0
+
+    async def _slot_of(self, sig: str) -> int:
+        rpc = getattr(self.e, "rpc", None)
+        if rpc is None or not hasattr(rpc, "signature_slots"):
+            return 0
+        try:
+            res = await rpc.signature_slots([sig])
+            self._entry_rpc_add()
+        except Exception:  # noqa: BLE001
+            return 0
+        return int((res or {}).get(sig) or 0)
 
     async def _verify_entry(self, ids: list[int], mint: str, sig: str, s0: int, target: int, trig_mc: float,
                             create: bool, mc: float) -> None:

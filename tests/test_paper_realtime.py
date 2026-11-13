@@ -464,11 +464,12 @@ async def test_block_mc_finds_pumpswap_pool_in_tx(monkeypatch):
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == pytest.approx(mc_sol(90.0, 2e8))
     tr.e.rpc = TxRpc(usdc)                                         # пул к USDC — не SOL, не берём
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) is None
-    assert tr._why_pop("M", "TRIG") == "сделка монеты в блоке не разобрана"
+    assert tr._why_pop("M", "TRIG") == "в транзакциях блока нет сделки этой монеты на pump.fun"
 
 
-async def test_mydev_launch_resolves_slot_and_needs_no_event_mc():
-    """13.11: запуски «моего дева» без блока или без MC в событии создания пропускались — блок узнаём у RPC."""
+async def test_mydev_launch_needs_no_slot_or_event_mc():
+    """13.11: запуски «моего дева» без блока или без MC в событии создания пропускались — алерт идёт сразу
+    (без ожидания RPC), блок создания бумага узнаёт сама."""
     from scanner.analytics.engine import Engine
     sent = []
 
@@ -477,13 +478,58 @@ async def test_mydev_launch_resolves_slot_and_needs_no_event_mc():
 
     async def log(*a, **k):
         return None
-
-    class Rpc:
-        async def signature_slots(self, sigs):
-            return {"CREATE": 777}
-    eng = SimpleNamespace(cfg={}, price=SimpleNamespace(value=100.0), rpc=Rpc(), _compose_inner=compose,
+    eng = SimpleNamespace(cfg={}, price=SimpleNamespace(value=100.0), _compose_inner=compose,
                           copyguard=SimpleNamespace(dev_gap_reason=lambda dev: None, log=log))
     st = SimpleNamespace(mc=0.0, deployer="DEV", symbol="L", created_ts=time.time(), cluster_id=None,
                          created_slot=None, mint="M")
     await Engine._my_dev_launch(eng, st, {"address": "DEV"}, {"created_slot": None, "signature": "CREATE"})
-    assert sent and sent[0]["trigger_slot"] == 777 and sent[0]["trigger_create"] and sent[0]["trigger_mc"] == 1.0
+    assert sent and sent[0]["trigger_slot"] == 0 and sent[0]["trigger_create"] and sent[0]["trigger_sig"] == "CREATE"
+
+
+async def test_mydev_entry_resolves_creation_slot(monkeypatch):
+    tr, st, sold = realtime_trader(monkeypatch, [])
+    opened, asked, tries = [], [], []
+
+    async def rec_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((name, mc, src))
+        return None
+
+    async def chain(mint, sig, s0, target, trig_mc, with_trigger=False):
+        asked.append((s0, target))
+        return 34.0
+
+    class Rpc:
+        async def signature_slots(self, sigs):
+            tries.append(sigs)
+            return {} if len(tries) == 1 else {"CREATE": 777}       # первый раз узел ещё не знает транзакцию
+    tr.e.rpc = Rpc()
+    tr._open, tr.block_mc = rec_open, chain
+    data = {"modes": ["mydev"], "symbol": "L", "mc": 0.0, "trigger_slot": 0, "trigger_sig": "CREATE",
+            "trigger_mc": 1.0, "trigger_at": time.time(), "trigger_create": True}
+    assert tr.realtime(data)
+    await tr.on_alert("M", "normal", None, data, "DEV")
+    assert opened == [("Y", 34.0, "блок")] and asked == [(777, 779)] and len(tries) == 2
+
+
+async def test_block_mc_create_without_dev_buy_and_reasons(monkeypatch):
+    """Создание без покупки дева и без сделок до блока +2 — цена старта кривой; иначе причина точнее."""
+    import scanner.ingest.pump_parser as parser
+    from scanner.models import TokenCreated
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+    rpc = FakeRpc([])
+    tr.e.rpc = rpc
+    monkeypatch.setattr(parser, "parse_transaction", lambda tx, sig, slot, src, stats, pool_map=None: [
+        TokenCreated(signature=sig, mint="M", deployer="DEV", creator="DEV", name="L", symbol="L", uri="",
+                     v_sol=0.001, v_tokens=1.0)])                    # резервы в событии неверные — не используем
+    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) == pytest.approx(pp.START_MC)
+    assert 27 < pp.START_MC < 29
+    monkeypatch.setattr(parser, "parse_transaction", lambda *a, **k: [])
+    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) is None
+    assert tr._why_pop("M", "CREATE") == "в транзакциях блока нет сделки этой монеты на pump.fun"
+
+    async def no_tx(sig):
+        return None
+    rpc.transaction = no_tx
+    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) is None
+    assert tr._why_pop("M", "CREATE") == "узел не отдал транзакции блока"

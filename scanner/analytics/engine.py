@@ -644,16 +644,11 @@ class Engine:
         }
         slot0 = (rec["created_slot"] if rec is not None else None) or st.created_slot
         sig0 = rec["signature"] if rec is not None else None
-        if sig0 and not slot0 and getattr(self, "rpc", None) is not None:
-            # блок создания ещё не записан (источник без слота) — спрашиваем у RPC: без него бумага не входит
-            try:
-                slot0 = (await self.rpc.signature_slots([sig0])).get(sig0)
-            except Exception:  # noqa: BLE001
-                slot0 = None
-        if slot0 and sig0:
+        if sig0:
             # бумага Y входит как бот: через 2 блока после создания монеты, по цене блокчейна (цену берёт из
-            # транзакции создания — MC события создания не нужен; 13.11 без него «мой дев» пропускался)
-            data.update(trigger_slot=int(slot0), trigger_sig=sig0, trigger_mc=float(st.mc or 0) or 1.0,
+            # транзакции создания — MC события создания не нужен; блок создания, если его ещё нет, бумага узнаёт
+            # у RPC сама — без задержки алерта)
+            data.update(trigger_slot=int(slot0 or 0), trigger_sig=sig0, trigger_mc=float(st.mc or 0) or 1.0,
                         trigger_at=time.time(), trigger_create=True)
         await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev",
                                   trader=dev_addr)
