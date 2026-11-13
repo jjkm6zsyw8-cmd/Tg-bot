@@ -60,12 +60,31 @@ async def test_block_mc_takes_last_trade_up_to_block(monkeypatch):
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) is None
 
 
+class NullDb:
+    def __init__(self):
+        self.sql = []
+
+    async def execute(self, sql, *a):
+        self.sql.append((sql, a))
+
+    async def fetchrow(self, sql, *a):
+        self.sql.append((sql, a))
+        return None
+
+    async def fetchval(self, sql, *a):
+        return None
+
+
 def realtime_trader(monkeypatch, trades):
     monkeypatch.setattr(pp, "ENTRY_RPC_WAIT_S", 0)
+    monkeypatch.setattr(pp, "ENTRY_RETRY_S", (0.0, 0.0))
+    monkeypatch.setattr(pp, "ENTRY_VERIFY_S", 0.0)
     monkeypatch.setattr(pp, "EXIT_WAIT_S", 0)
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
     st = SimpleNamespace(mint="M", mc=trades[-1].mc if trades else 30.0, trades=trades)
     tr = bare_trader({"M": st})
+    tr.db = NullDb()
+    tr.e.cfg = {}                                  # по умолчанию: вход только как реальный бот
     tr.e.fee_bps = 125
     tr.lock = asyncio.Lock()
     sold = []
@@ -108,7 +127,7 @@ async def test_realtime_entry_and_stop_exit_two_blocks_later(monkeypatch):
     assert sold == [("G", "stop", 27.0)]
 
 
-async def test_pumped_block_price_is_kept_and_fallback_uses_market(monkeypatch):
+async def test_pumped_block_price_is_kept(monkeypatch):
     """12.11: за 2 блока монета ×4 — это настоящая цена входа (раньше отбрасывалась и бралась цена трейдера +2%)."""
     tr, st, sold = realtime_trader(monkeypatch, [])
     opened = []
@@ -123,37 +142,63 @@ async def test_pumped_block_price_is_kept_and_fallback_uses_market(monkeypatch):
     tr.route = lambda data, level: ({"G"}, "")
     await tr.on_alert("M", "normal", None, signal(), "W")
     assert opened == [(120.0, "блок")]
-    opened.clear()
-
-    async def none_block(*a):
-        return None
-
-    async def market(mint):
-        return 75.0, "jup"
-    tr.block_mc, tr.market_mc = none_block, market         # блокчейн не ответил — рынок сейчас, не цена трейдера
-    await tr.on_alert("M", "normal", None, signal(), "W")
-    assert opened == [(75.0, "рынок")]
 
 
-async def test_entry_falls_back_to_trader_price_plus_slip(monkeypatch):
+async def test_no_entry_without_block_price(monkeypatch):
+    """13.11: 42% входов шли по угаданной цене («рынок сейчас», «цена трейдера +2%») и искажали итог —
+    теперь только цена блока +2: не узнали (после повторов) — сделки нет, причина считается."""
     tr, st, sold = realtime_trader(monkeypatch, [])
-    opened = []
-
-    async def none_block(*a):
-        return None
+    opened, calls = [], []
 
     async def rec_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
         opened.append((mc, src))
         return None
-    async def no_market(mint):
-        return None, ""
-    tr.block_mc, tr._open, tr.market_mc = none_block, rec_open, no_market
+
+    async def none_block(*a):
+        calls.append(a)
+        tr._why(a[0], a[1], "RPC отвечает 429 (лимит)")
+        return None
+
+    async def market(mint):
+        return 75.0, "jup"
+    tr.block_mc, tr._open, tr.market_mc = none_block, rec_open, market
     tr.route = lambda data, level: ({"G"}, "")
     await tr.on_alert("M", "normal", None, signal(), "W")
-    assert opened == [(pytest.approx(30.0 * 1.02), "оценка")]
+    assert opened == [] and len(calls) == 3                       # первая попытка и 2 повтора
+    assert "цена блока +2 не получена (RPC отвечает 429 (лимит))" in tr.skipped["*"]
+    assert tr.no_block["RPC отвечает 429 (лимит)"] == 1
+    # покупка трейдера давняя — по «рынку через 5 с» не входим
+    await tr.on_alert("M", "normal", None, signal(trigger_at=time.time() - 60), "W")
+    assert opened == [] and tr.no_block["покупка трейдера давняя (>15 с)"] == 1
+    # нет покупки в блоке вовсе
+    await tr.on_alert("M", "normal", None, {"modes": ["smart"], "mc": 30.0}, "W")
+    assert opened == [] and tr.no_block["нет покупки трейдера в блоке"] == 1
+
+
+async def test_block_price_far_from_trader_is_judged_by_market(monkeypatch):
+    tr, st, sold = realtime_trader(monkeypatch, [])
+    opened = []
+
+    async def rec_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((mc, src))
+        return None
+
+    async def far(*a):
+        return 900.0                                       # ×30 к цене трейдера 30: неверна цена трейдера или блока
+
+    async def market_agrees(mint):
+        return 850.0, "jup"
+    tr.block_mc, tr._open, tr.market_mc = far, rec_open, market_agrees
+    tr.route = lambda data, level: ({"G"}, "")
+    await tr.on_alert("M", "normal", None, signal(), "W")
+    assert opened == [(900.0, "блок")]                     # рынок подтвердил цену блока — неверной была цена трейдера
+
+    async def market_disagrees(mint):
+        return 31.0, "jup"
+    tr.market_mc = market_disagrees
     opened.clear()
-    await tr.on_alert("M", "normal", None, signal(trigger_at=time.time() - 60), "W")   # покупка давняя — старый путь
-    assert not opened or opened[0][1] != "оценка"
+    await tr.on_alert("M", "normal", None, signal(), "W")
+    assert opened == [] and "не сходится" in tr.skipped["*"]
 
 
 async def test_each_trade_checks_exit_and_trader_sell(monkeypatch):
@@ -280,4 +325,114 @@ async def test_mydev_entry_uses_dev_buy_in_create_block(monkeypatch):
         return None
     tr.block_mc = nothing                                   # из блокчейна не узнали — не входим вовсе
     await tr.on_alert("M2", "normal", None, data, "DEV")
-    assert opened == [] and "мой дев" in tr.skipped["*"]
+    assert opened == [] and "цена блока +2 не получена" in tr.skipped["*"]
+
+
+async def test_block_mc_reasons_and_node_lag(monkeypatch):
+    """Почему цену блока не узнали — пишется причина; пустой ответ верен, только если узел уже дошёл до блока +2."""
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+
+    class LagRpc(FakeRpc):
+        def __init__(self, slot):
+            super().__init__([])
+            self.slot = slot
+
+        async def call(self, method, params):
+            assert method == "getSlot"
+            return self.slot
+    tr.e.rpc = LagRpc(101)                                   # узел ещё на блоке 101 — сделки 102 мог не отдать
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) is None
+    assert tr._why_pop("M", "TRIG") == "узел ещё не дошёл до блока +2"
+    tr.e.rpc = LagRpc(103)                                   # узел дальше — сделок правда не было
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == 30.0
+
+    class BadRpc(FakeRpc):
+        async def signatures_for(self, *a, **k):
+            raise RuntimeError("getSignaturesForAddress: rate limited")
+    tr.e.rpc = BadRpc([])
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) is None
+    assert tr._why_pop("M", "TRIG") == "RPC отвечает 429 (лимит)"
+    # общий лимит аналитики исчерпан — у цены входа свой запас; кончился и он — причина «лимит»
+    tr.e.rpc = LagRpc(103)
+    tr.e.rpc_over_budget = lambda: True
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == 30.0
+    tr.e.cfg = {"paper_entry_rpc_daily": 0}
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) is None
+    assert tr._why_pop("M", "TRIG") == "дневной лимит запросов RPC"
+
+
+async def test_block_mc_pages_past_1000_newer(monkeypatch):
+    """Горячая монета: 1000 транзакций новее блока +2 — листаем дальше, а не считаем, что сделок не было."""
+    newer = [{"signature": f"n{i}", "slot": 200} for i in range(1000)]
+
+    class PagedRpc(FakeRpc):
+        async def signatures_for(self, address, limit=100, before=None, until=None):
+            return newer if before is None else [{"signature": "s2", "slot": 102}]
+    rpc = PagedRpc([])
+    tr = bare_trader({})
+    tr.e.rpc = rpc
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+    import scanner.ingest.pump_parser as parser
+    monkeypatch.setattr(parser, "parse_transaction", lambda tx, sig, slot, src, stats, pool_map=None: [
+        Trade(signature=sig, mint="M", trader="Y", is_buy=True, sol_amount=1, token_amount=1, v_sol=40.0,
+              v_tokens=8e8)] if sig == "s2" else [])
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == pytest.approx(mc_sol(40.0, 8e8))
+
+
+class BalanceDb:
+    def __init__(self, closed_row=None, reset_at=None):
+        self.closed_row, self.reset_at, self.sql = closed_row, reset_at, []
+
+    async def execute(self, sql, *a):
+        self.sql.append((sql, a))
+
+    async def fetchrow(self, sql, *a):
+        self.sql.append((sql, a))
+        return self.closed_row
+
+    async def fetchval(self, sql, *a):
+        return self.reset_at
+
+
+async def test_entry_verify_marks_suspect_and_voids_balance(monkeypatch):
+    """Сверка через 30 с не сошлась больше чем на 10% — сделка ⚠, её результат убирается из баланса."""
+    from datetime import datetime, timedelta, timezone
+    monkeypatch.setattr(pp, "ENTRY_VERIFY_S", 0.0)
+    tr = bare_trader({})
+    now = datetime.now(timezone.utc)
+    tr.db = BalanceDb({"portfolio": "A", "pnl_sol": 0.5, "closed_at": now}, reset_at=now - timedelta(hours=1))
+    tr.balance = {"A": 2.0}
+
+    async def verify_price(*a, **k):
+        return 40.0                                          # вход был по 30 — расхождение 25%
+    tr.block_mc = verify_price
+    await tr._verify_entry([7], "M", "TRIG", 100, 102, 30.0, False, 30.0)
+    assert tr.verified["не сошлась"] == 1
+    assert any("entry_verify_mc" in q for q, _a in tr.db.sql) and any("suspect=true" in q for q, _a in tr.db.sql)
+    assert tr.balance["A"] == pytest.approx(1.5)             # фальшивые +0.5 SOL больше не увеличивают ставки
+    # открытая позиция: ⚠ при закрытии
+    tr.positions[8] = pp.Position(id=8, portfolio="A", mint="M", opened_ts=time.time(), entry_mc=30.0, cost_sol=0.1,
+                                  tokens=1.0, tokens_initial=1.0, target_mc=None, trader="W", max_mc=30.0, extra={})
+    await tr._verify_entry([8], "M", "TRIG", 100, 102, 30.0, False, 30.0)
+    assert tr.positions[8].extra["suspect"] is True
+    # сошлась — ничего не меняем
+    tr.db.sql.clear()
+
+    async def same(*a, **k):
+        return 31.0
+    tr.block_mc = same
+    await tr._verify_entry([9], "M", "TRIG", 100, 102, 30.0, False, 30.0)
+    assert tr.verified["сошлась"] == 1 and not any("suspect=true" in q for q, _a in tr.db.sql)
+
+
+async def test_void_pnl_skips_after_reset():
+    from datetime import datetime, timedelta, timezone
+    tr = bare_trader({})
+    now = datetime.now(timezone.utc)
+    tr.db = BalanceDb(reset_at=now)
+    tr.balance = {"A": 2.0}
+    await tr.void_pnl("A", 0.5, now - timedelta(hours=2))    # сделка до сброса — баланс уже новый
+    assert tr.balance["A"] == 2.0
+    await tr.void_pnl("A", -0.3, now + timedelta(seconds=1)) # фальшивый минус тоже убирается
+    assert tr.balance["A"] == pytest.approx(2.3)

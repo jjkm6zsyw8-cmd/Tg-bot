@@ -143,7 +143,8 @@ class PriceCheck:
 
     async def run_once(self, http: aiohttp.ClientSession) -> int:
         rows = await self.db.fetch(
-            """SELECT id, mint, opened_at, entry_mc, source_wallet, entry_src FROM paper_positions
+            """SELECT id, mint, opened_at, entry_mc, source_wallet, entry_src, portfolio, pnl_sol, closed_at, suspect
+               FROM paper_positions
                WHERE closed_at IS NOT NULL AND exit_reason <> 'reset' AND price_check IS NULL
                  AND opened_at < now() - interval '31 minutes' AND closed_at > now() - interval '12 hours'
                ORDER BY closed_at LIMIT 60""")
@@ -191,6 +192,10 @@ class PriceCheck:
                        path_hi_after_low=$11, path_src=$12 WHERE id=$1""",
                 r["id"], v, bad, *(ps[k] if ps else None for k in ("mfe", "mae", "dip", "peak_s", "p30")),
                 *(tp_[k] if tp_ else None for k in ("low_s", "hi_before_low", "hi_after_low")), src)
+            paper = getattr(self.e, "paper", None)
+            if bad and not r["suspect"] and paper is not None:
+                # цена не сошлась с рынком — результат сделки убирается и из баланса (не раздувает ставки)
+                await paper.void_pnl(r["portfolio"], float(r["pnl_sol"] or 0), r["closed_at"])
             self.stats["checked"] += 1
             self.stats["bad"] += bad
             self.stats["nodata"] += v == "nodata"

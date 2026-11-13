@@ -90,7 +90,7 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         st = SimpleNamespace(mc=40.0, mint="MINT1", trades=[SimpleNamespace(ts=__import__("time").time())])
         settings = Settings(YamlConfig("config/config.yaml"))
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg={**settings.effective(), "paper_start_usd": 30, "paper_off_set": ""},
+                              cfg={**settings.effective(), "paper_realtime_only": False, "paper_start_usd": 30, "paper_off_set": ""},
                               states={"MINT1": st}, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
@@ -228,7 +228,7 @@ class FakeExt:
 
 def bare_trader(states, ext=None) -> pp.PaperTrader:
     tr = pp.PaperTrader.__new__(pp.PaperTrader)
-    tr.e = SimpleNamespace(states=states, ext=ext, price=SimpleNamespace(value=100.0), cfg={})
+    tr.e = SimpleNamespace(states=states, ext=ext, price=SimpleNamespace(value=100.0), cfg={"paper_realtime_only": False})
     tr.skipped = {}
     tr.positions = {}
     tr.jup_cache = {}
@@ -258,7 +258,7 @@ async def test_entry_price_sources(monkeypatch):
         opened.append((mc, src))
         return None
     tr = bare_trader({"M": fresh_state(28.0)}, FakeExt(300_000))     # $300k при SOL $100 = 3000 SOL
-    tr.e.cfg = {"paper_trends": True}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_trends": True}
     tr._open = fake_open
     tr.lock = __import__("asyncio").Lock()
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
@@ -340,7 +340,7 @@ async def test_persistent_dexscreener_glitch_needs_jupiter(monkeypatch, old_sche
 async def test_entry_skipped_when_jupiter_disagrees(monkeypatch):
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
     tr = bare_trader({}, FakeExt(300_000, jup=0.03))     # DexScreener $0.0003, Jupiter $0.03 — в 100 раз
-    tr.e.cfg = {"paper_trends": True}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_trends": True}
     tr.lock = __import__("asyncio").Lock()
     opened = []
 
@@ -422,9 +422,10 @@ async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
         settings = Settings(YamlConfig("config/config.yaml"))
         sts = {m: SimpleNamespace(mc=28.0, mint=m, trades=[SimpleNamespace(ts=time.time())]) for m in ("REAL", "FAKE")}
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg={**settings.effective(), "paper_off_set": ""}, states=sts, ext=None)
+                              cfg={**settings.effective(), "paper_realtime_only": False, "paper_off_set": ""}, states=sts, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
+        b0 = tr.balance["F"]
         for m in ("REAL", "FAKE"):
             await tr.on_alert(m, "strong", None, {"symbol": m, "mc": 28.0}, None)
         real = next(p for p in tr.positions.values() if p.mint == "REAL" and p.portfolio == "F")
@@ -435,8 +436,22 @@ async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
         rows = {r["mint"]: r["suspect"] for r in await db.fetch(
             "SELECT mint, suspect FROM paper_positions WHERE portfolio='F' AND closed_at IS NOT NULL")}
         assert rows == {"REAL": False, "FAKE": True}
+        # ⚠-сделка не меняет баланс: вернулась только её ставка, фальшивая прибыль ×1000 — нет
+        assert tr.balance["F"] == pytest.approx(b0 + real.proceeds_sol - real.cost_sol)
         text = await tr.render_period(None)
         assert "⚠ 1 с неверной ценой не входят в итог" in text
+        tr.no_block["RPC отвечает 429 (лимит)"] += 2
+        tr.verified["сошлась"] += 5
+        text = await tr.render_period(None)
+        assert "пропущено без цены блока +2: 2 (RPC отвечает 429 (лимит) 2)" in text and "🧱" in text
+        assert "сверка входа через 30 с: сошлась 5, не сошлась 0" in text
+        # отчёт /paper из процесса бота: своих счётчиков нет — берутся сохранённые аналитикой
+        tr._bump("no_block", "ошибка RPC")
+        await asyncio.sleep(0.05)
+        tr2 = pp.PaperTrader(eng)  # type: ignore[arg-type]
+        await tr2.start()
+        text2 = await tr2.render_period(None)
+        assert "пропущено без цены блока +2: 3" in text2 and "ошибка RPC 1" in text2 and "сошлась 5" in text2
     finally:
         await db.close()
 
@@ -517,11 +532,11 @@ async def test_no_reentry_after_loss_and_day_cap():
     night = datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc)        # 02:00 Батуми
     from tests.conftest import REAL_DAY_CAP
     assert REAL_DAY_CAP(tr, noon) is None                             # по умолчанию лимита нет (с 9.11)
-    tr.e.cfg = {"paper_day_cap_usd": 35}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_day_cap_usd": 35}
     assert REAL_DAY_CAP(tr, noon) == pytest.approx(0.35) and REAL_DAY_CAP(tr, night) is None   # $35 при SOL $100
-    tr.e.cfg = {"paper_day_cap_usd": 0}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_day_cap_usd": 0}
     assert REAL_DAY_CAP(tr, noon) is None                             # 0 — без лимита
-    tr.e.cfg = {}
+    tr.e.cfg = {"paper_realtime_only": False}
     tr.day_cap_sol = lambda now=None: 0.1                             # дневной лимит — только у лотереи (D, E)
     tr.balance["D"] = 0.33
     tr.day_pnl, tr._day_key = {}, tr.day_key()
@@ -542,7 +557,7 @@ async def test_trends_not_in_paper_by_default(monkeypatch):
     tr.lock = __import__("asyncio").Lock()
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
     assert not opened and "Тренды" in tr.skipped["*"]
-    tr.e.cfg = {"paper_trends": True}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_trends": True}
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
     assert opened
 
@@ -561,7 +576,7 @@ async def test_daily_reset_with_summary(monkeypatch):
         settings = Settings(YamlConfig("config/config.yaml"))
         st = SimpleNamespace(mc=40.0, mint="M1", trades=[SimpleNamespace(ts=time.time())])
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg={**settings.effective(), "paper_off_set": ""}, states={"M1": st}, ext=None)
+                              cfg={**settings.effective(), "paper_realtime_only": False, "paper_off_set": ""}, states={"M1": st}, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         await tr.maybe_daily_reset()                                 # первый запуск — только запомнить день
@@ -601,11 +616,11 @@ def test_route_signals_to_portfolios():
     assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
     assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H"}
     assert not tr.route({}, "normal")[0] & set("CDEF")                    # закрытые портфели новых сделок не берут
-    tr.e.cfg = {"paper_mydev": False}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_mydev": False}
     assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]
-    tr.e.cfg = {"paper_lottery_on": True, "paper_off_set": "CEF"}         # лотерею можно включить обратно
+    tr.e.cfg = {"paper_realtime_only": False, "paper_lottery_on": True, "paper_off_set": "CEF"}         # лотерею можно включить обратно
     assert tr.route({"modes": ["dev"], "metrics": one_sol}, "watch")[0] == {"D"}
-    tr.e.cfg = {"paper_smart_set": "G"}                                   # набор smart-портфелей настраивается
+    tr.e.cfg = {"paper_realtime_only": False, "paper_smart_set": "G"}                                   # набор smart-портфелей настраивается
     assert tr.route({"modes": ["smart"]}, "normal")[0] == {"G", "M"}
 
 
@@ -639,7 +654,7 @@ async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
     assert await tr._open("D", "M10", "watch", None, {}, None, 30.0)
     assert await tr._open("A", "M10", "normal", None, {}, None, 30.0)
     tr.positions.clear()
-    tr.e.cfg = {"paper_lottery_day_stop_usd": 35, "paper_day_stop_pct": 0.25}   # включены в /settings
+    tr.e.cfg = {"paper_realtime_only": False, "paper_lottery_day_stop_usd": 35, "paper_day_stop_pct": 0.25}   # включены в /settings
     tr.day_pnl["D"] = -0.36                                      # −$36 при SOL $100 (стоп $35)
     assert await tr._open("D", "M10", "watch", None, {}, None, 30.0) is None
     assert "дневной стоп" in tr.skipped["D"]
@@ -662,7 +677,7 @@ async def test_manual_reset_clears_lottery_day_stop():
         await db.migrate()
         settings = Settings(YamlConfig("config/config.yaml"))
         eng = SimpleNamespace(db=db, price=SimpleNamespace(value=100.0), fee_bps=None, settings=settings,
-                              cfg={**settings.effective(), "paper_lottery_day_stop_usd": 35}, states={}, ext=None)
+                              cfg={**settings.effective(), "paper_realtime_only": False, "paper_lottery_day_stop_usd": 35}, states={}, ext=None)
         tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
         await tr.start()
         await db.execute("""INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol,
@@ -796,7 +811,7 @@ async def test_main_portfolio_m():
     tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
     tr.priority = lambda: 0.0005
     tr.fee_bps = lambda: 125
-    tr.e.cfg = {"paper_position_share": 0.2, "paper_size_by_level": False}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_position_share": 0.2, "paper_size_by_level": False}
     ids = []
 
     class DB:
@@ -825,7 +840,7 @@ async def test_main_portfolio_m():
     assert "M" in tr.route({"modes": ["smart"], "traders": [{"address": "S"}]}, "normal")[0]
     assert "M" in tr.route({"modes": ["smart"], "traders": [{"address": "S"}, {"address": "T"}]}, "strong")[0]
     assert "M" not in tr.route({"modes": ["dev"], "metrics": {"cluster": 0.034}}, "watch")[0]
-    tr.e.cfg = {"paper_lottery_on": True, "paper_m_lottery": True}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_lottery_on": True, "paper_m_lottery": True}
     assert "M" in tr.route({"modes": ["dev"], "metrics": {"cluster": 0.034}}, "watch")[0]
     assert pp.SCHEMES["M"]["stop"] is None and pp.M_KINDS["smart"]["max_hold_s"] == 1800
     tr.e.rating = {"W": {"tier": "ok", "mult": 1.0}}
@@ -843,7 +858,7 @@ async def test_main_portfolio_m():
     await tr.on_trade(SimpleNamespace(mint="C1", mc=40.0), None, "W", False)
     assert checked == [("C1", "trader_sell")]
     # дневной стоп M — 25% старта
-    tr.e.cfg = {}
+    tr.e.cfg = {"paper_realtime_only": False}
     tr.start_usd = lambda: 100.0
     tr.day_pnl, tr._day_key = {"M": -0.30}, tr.day_key()                                  # −$30 при SOL $100
     assert tr.day_stopped("M") and tr.day_stop_usd("M") == 25.0
@@ -859,7 +874,7 @@ async def test_m_enters_faster(monkeypatch):
     """M входит раньше остальных (1 с против 5 с) — на тех же сигналах видно, что даёт скорость входа."""
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0.05)
     tr = bare_trader({})
-    tr.e.cfg = {"paper_m_entry_delay_s": 0.01}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_m_entry_delay_s": 0.01}
     prices = iter([30.0, 36.0])
     entered = []
 
