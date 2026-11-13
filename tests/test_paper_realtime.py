@@ -166,13 +166,13 @@ async def test_no_entry_without_block_price(monkeypatch):
     await tr.on_alert("M", "normal", None, signal(), "W")
     assert opened == [] and len(calls) == 3                       # первая попытка и 2 повтора
     assert "цена блока +2 не получена (RPC отвечает 429 (лимит))" in tr.skipped["*"]
-    assert tr.no_block["RPC отвечает 429 (лимит)"] == 1
+    assert tr.no_block["smart: RPC отвечает 429 (лимит)"] == 1
     # покупка трейдера давняя — по «рынку через 5 с» не входим
     await tr.on_alert("M", "normal", None, signal(trigger_at=time.time() - 60), "W")
-    assert opened == [] and tr.no_block["покупка трейдера давняя (>15 с)"] == 1
+    assert opened == [] and tr.no_block["smart: покупка трейдера давняя (>15 с)"] == 1
     # нет покупки в блоке вовсе
     await tr.on_alert("M", "normal", None, {"modes": ["smart"], "mc": 30.0}, "W")
-    assert opened == [] and tr.no_block["нет покупки трейдера в блоке"] == 1
+    assert opened == [] and tr.no_block["smart: нет покупки трейдера в блоке"] == 1
 
 
 async def test_block_price_far_from_trader_is_judged_by_market(monkeypatch):

@@ -223,6 +223,16 @@ MODE_SHORT = {"trend": "тренд", "dev": "дев", "smart": "смарт", "ne
               "copy": "копия", "mydev": "мой дев"}
 
 
+def signal_kind(data: dict[str, Any]) -> str:
+    """Тип сигнала для счётчика пропусков."""
+    modes = set(data.get("modes") or [])
+    for mode, name in (("mydev", "мой дев"), ("smart", "smart"), ("copy", "копия"), ("scout", "разведка"),
+                       ("swing", "ракеты"), ("dev", "запуск дева"), ("new", "новая монета")):
+        if mode in modes:
+            return name
+    return "другое"
+
+
 def verify_bad(r: Any) -> bool:
     """Вход не подтвердила сверка блокчейна через 30 с (расхождение больше ENTRY_VERIFY_X)."""
     v, e = r.get("entry_verify_mc"), r.get("entry_mc")
@@ -566,7 +576,7 @@ class PaperTrader:
         if self.cfg.get("paper_realtime_only", True) and not data.get("trend"):
             # без свежей покупки в блоке цену входа реального бота не узнать — по «рынку через 5 с» не входим
             why = "покупка трейдера давняя (>15 с)" if data.get("trigger_slot") else "нет покупки трейдера в блоке"
-            self._bump("no_block", why)
+            self._bump("no_block", f"{signal_kind(data)}: {why}")
             self.skipped["*"] = f"{why} — не входим: бумага входит только как реальный бот"
             return
         # M входит быстрее остальных — как бот на реальных деньгах (бэктест 6–9.11: результат почти целиком решает
@@ -754,7 +764,7 @@ class PaperTrader:
             # бумага входит только как реальный бот — по цене блока +2. Не узнали её — сделки нет (раньше входили
             # по «рынку сейчас» или «цене трейдера +2%»: 13.11 так шли 42% входов, и они искажали итог)
             self.no_price += 1
-            self._bump("no_block", why)
+            self._bump("no_block", f"{signal_kind(data)}: {why}")
             self.skipped["*"] = f"цена блока +2 не получена ({why}) — не входим"
             return
         if create:
@@ -860,6 +870,23 @@ class PaperTrader:
                RETURNING portfolio, pnl_sol, closed_at""", pid)
         if row:
             await self.void_pnl(row["portfolio"], float(row["pnl_sol"] or 0), row["closed_at"])
+
+    async def reconcile(self) -> None:
+        """Баланс = старт + закрытые сделки без ⚠ − деньги в открытых позициях. При запуске: до 13.11 результат ⚠
+        оставался в балансе и раздувал ставки — так он выравнивается сразу, а не только к ночному сбросу."""
+        for port in await self.db.fetch("SELECT name, start_sol, reset_at FROM paper_portfolios"):
+            name = port["name"]
+            if name not in self.balance:
+                continue
+            closed = await self.db.fetchval(
+                """SELECT COALESCE(sum(pnl_sol), 0) FROM paper_positions WHERE portfolio=$1 AND closed_at IS NOT NULL
+                   AND exit_reason <> 'reset' AND NOT suspect AND opened_at >= $2""", name, port["reset_at"])
+            in_open = sum(p.cost_sol - p.proceeds_sol for p in self.positions.values() if p.portfolio == name)
+            fair = max(0.0, float(port["start_sol"]) + float(closed or 0) - in_open)
+            if abs(fair - self.balance[name]) > 1e-6:
+                log.info("бумага %s: баланс %.4f → %.4f SOL (без сделок ⚠)", name, self.balance[name], fair)
+                self.balance[name] = fair
+                await self.db.execute("UPDATE paper_portfolios SET balance_sol=$2 WHERE name=$1", name, fair)
 
     async def void_pnl(self, name: str, pnl: float, closed_at: datetime | None) -> None:
         """Убрать результат ⚠-сделки из баланса и дневного итога портфеля (если с тех пор не было сброса)."""
@@ -1456,9 +1483,13 @@ class PaperTrader:
             v = sell_fill(mc, p.tokens, self.fee_bps(), self.priority()).sol if p.tokens else 0.0
             open_value += v
             open_lines.append((p, (p.proceeds_sol + v) / p.cost_sol - 1 if p.cost_sol else 0.0))
-        # сделки, которые самопроверка (свечи GeckoTerminal) или Jupiter пометили ⚠, в итог не идут
-        equity = self.balance.get(name, port["balance_sol"]) + open_value - sum(
-            r["pnl_sol"] or 0 for r in rows if r.get("suspect"))
+        # итог — от стартового баланса: закрытые сделки без ⚠ + открытые по последней цене. Не от текущего баланса:
+        # результат ⚠ из баланса теперь убирается сразу, и вычитать его ещё раз было бы ошибкой (13.11: B −77%
+        # вместо −57%)
+        equity = float(port["start_sol"]) + sum(r["pnl_sol"] or 0 for r in rows if not r.get("suspect")) + sum(
+            p.proceeds_sol + sell_fill(float(p.extra.get("last_mc") or p.entry_mc), p.tokens, self.fee_bps(),
+                                       self.priority()).sol - p.cost_sol if p.tokens else p.proceeds_sol - p.cost_sol
+            for p in open_ps)
         best = max(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
         worst = min(rows, key=lambda r: r["pnl_pct"] or 0, default=None)
         suspect_pnl = sum(r["pnl_sol"] or 0 for r in rows if r.get("suspect"))
@@ -1536,7 +1567,7 @@ class PaperTrader:
             parts = []
             if nb:
                 parts.append(f"пропущено без цены блока +2: {sum(nb.values())} ("
-                             + ", ".join(f"{k} {v}" for k, v in collections.Counter(nb).most_common(4)) + ")")
+                             + ", ".join(f"{k} {v}" for k, v in collections.Counter(nb).most_common(8)) + ")")
             if vf:
                 parts.append(f"сверка входа через 30 с: сошлась {vf.get('сошлась', 0)}, не сошлась "
                              f"{vf.get('не сошлась', 0)}" + (f", нет ответа {vf['нет ответа']}" if vf.get("нет ответа")

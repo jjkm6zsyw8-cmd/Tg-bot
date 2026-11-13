@@ -438,6 +438,14 @@ async def test_suspect_flag_only_when_jupiter_disagrees(monkeypatch):
         assert rows == {"REAL": False, "FAKE": True}
         # ⚠-сделка не меняет баланс: вернулась только её ставка, фальшивая прибыль ×1000 — нет
         assert tr.balance["F"] == pytest.approx(b0 + real.proceeds_sol - real.cost_sol)
+        # итог портфеля — без ⚠ и без двойного вычета (13.11: B −77% вместо −57%)
+        assert (await tr.summary("F"))["equity"] == pytest.approx(b0 + real.proceeds_sol - real.cost_sol)
+        # баланс, раздутый до исправления, выравнивается при запуске
+        tr.balance["F"] += 5.0
+        await tr.reconcile()
+        assert tr.balance["F"] == pytest.approx(b0 + real.proceeds_sol - real.cost_sol)
+        assert await db.fetchval("SELECT balance_sol FROM paper_portfolios WHERE name='F'") == pytest.approx(
+            b0 + real.proceeds_sol - real.cost_sol)
         text = await tr.render_period(None)
         assert "⚠ 1 с неверной ценой не входят в итог" in text
         tr.no_block["RPC отвечает 429 (лимит)"] += 2

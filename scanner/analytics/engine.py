@@ -201,6 +201,7 @@ class Engine:
         await self._load_traders()
         await self._load_references()
         await self.paper.start()
+        await self.paper.reconcile()          # баланс бумаги без сделок ⚠ (иначе фальшивая прибыль раздувает ставки)
         await self.copyguard.load()
         for p in self.paper.positions.values():   # монеты открытых бумажных позиций держим в памяти
             if p.mint not in self.states:
@@ -643,10 +644,11 @@ class Engine:
         }
         slot0 = (rec["created_slot"] if rec is not None else None) or st.created_slot
         sig0 = rec["signature"] if rec is not None else None
-        if slot0 and sig0 and st.mc:
-            # бумага Y входит как бот: через 2 блока после создания монеты, по цене блокчейна
-            data.update(trigger_slot=int(slot0), trigger_sig=sig0, trigger_mc=float(st.mc), trigger_at=time.time(),
-                        trigger_create=True)
+        if slot0 and sig0:
+            # бумага Y входит как бот: через 2 блока после создания монеты, по цене блокчейна (цену берёт из
+            # транзакции создания — MC события создания не нужен; 13.11 без него «мой дев» пропускался)
+            data.update(trigger_slot=int(slot0), trigger_sig=sig0, trigger_mc=float(st.mc or 0) or 1.0,
+                        trigger_at=time.time(), trigger_create=True)
         await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev",
                                   trader=dev_addr)
 
