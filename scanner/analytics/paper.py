@@ -223,6 +223,19 @@ MODE_SHORT = {"trend": "тренд", "dev": "дев", "smart": "смарт", "ne
               "copy": "копия", "mydev": "мой дев"}
 
 
+WSOL = "So11111111111111111111111111111111111111112"
+
+
+def sol_pools_of(tx: dict[str, Any], mint: str) -> dict[str, str]:
+    """Пулы монеты к SOL в транзакции: владелец счёта монеты, у которого есть и счёт WSOL (хранилища пула PumpSwap
+    принадлежат самому пулу). Пул к USDC/PUMP не берётся — его суммы не SOL (иначе MC завышался в 15–20 раз)."""
+    meta = tx.get("meta") or {}
+    bal = list(meta.get("postTokenBalances") or []) + list(meta.get("preTokenBalances") or [])
+    with_mint = {b.get("owner") for b in bal if b.get("mint") == mint and b.get("owner")}
+    with_sol = {b.get("owner") for b in bal if b.get("mint") == WSOL and b.get("owner")}
+    return {o: mint for o in with_mint & with_sol}
+
+
 def signal_kind(data: dict[str, Any]) -> str:
     """Тип сигнала для счётчика пропусков."""
     modes = set(data.get("modes") or [])
@@ -706,7 +719,10 @@ class PaperTrader:
                                  else "ошибка RPC")
             if not tx:
                 continue
-            evs = [ev for ev in parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pool_map)
+            # пул PumpSwap монеты — прямо из транзакции (в базе его бывает нет: 13.11 вечером все smart-сигналы
+            # на вышедших на PumpSwap монетах пропускались как «не разобрана»)
+            pools = {**pool_map, **sol_pools_of(tx, mint)}
+            evs = [ev for ev in parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
                    if isinstance(ev, Trade) and ev.mint == mint]
             if evs:
                 mc = mc_sol(evs[-1].v_sol, evs[-1].v_tokens)

@@ -644,6 +644,12 @@ class Engine:
         }
         slot0 = (rec["created_slot"] if rec is not None else None) or st.created_slot
         sig0 = rec["signature"] if rec is not None else None
+        if sig0 and not slot0 and getattr(self, "rpc", None) is not None:
+            # блок создания ещё не записан (источник без слота) — спрашиваем у RPC: без него бумага не входит
+            try:
+                slot0 = (await self.rpc.signature_slots([sig0])).get(sig0)
+            except Exception:  # noqa: BLE001
+                slot0 = None
         if slot0 and sig0:
             # бумага Y входит как бот: через 2 блока после создания монеты, по цене блокчейна (цену берёт из
             # транзакции создания — MC события создания не нужен; 13.11 без него «мой дев» пропускался)

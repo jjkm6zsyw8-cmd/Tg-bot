@@ -436,3 +436,54 @@ async def test_void_pnl_skips_after_reset():
     assert tr.balance["A"] == 2.0
     await tr.void_pnl("A", -0.3, now + timedelta(seconds=1)) # фальшивый минус тоже убирается
     assert tr.balance["A"] == pytest.approx(2.3)
+
+
+async def test_block_mc_finds_pumpswap_pool_in_tx(monkeypatch):
+    """Монета на PumpSwap, пула нет в базе — пул берётся из транзакции, только если он к SOL."""
+    usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+    class TxRpc(FakeRpc):
+        def __init__(self, quote):
+            super().__init__([{"signature": "s2", "slot": 102}])
+            self.quote = quote
+
+        async def transaction(self, sig):
+            return {"meta": {"postTokenBalances": [{"mint": "M", "owner": "POOL"}, {"mint": self.quote, "owner": "POOL"},
+                                                   {"mint": "M", "owner": "USER"}]}}
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))      # пула в базе нет
+    import scanner.ingest.pump_parser as parser
+
+    def parse(tx, sig, slot, src, stats, pool_map=None):
+        if (pool_map or {}).get("POOL") != "M":
+            return []
+        return [Trade(signature=sig, mint="M", trader="Y", is_buy=True, sol_amount=1, token_amount=1, v_sol=90.0,
+                      v_tokens=2e8, pool="pump-amm")]
+    monkeypatch.setattr(parser, "parse_transaction", parse)
+    tr.e.rpc = TxRpc(pp.WSOL)
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == pytest.approx(mc_sol(90.0, 2e8))
+    tr.e.rpc = TxRpc(usdc)                                         # пул к USDC — не SOL, не берём
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) is None
+    assert tr._why_pop("M", "TRIG") == "сделка монеты в блоке не разобрана"
+
+
+async def test_mydev_launch_resolves_slot_and_needs_no_event_mc():
+    """13.11: запуски «моего дева» без блока или без MC в событии создания пропускались — блок узнаём у RPC."""
+    from scanner.analytics.engine import Engine
+    sent = []
+
+    async def compose(mode, mint, level, data, signal=None, trader=None):
+        sent.append(data)
+
+    async def log(*a, **k):
+        return None
+
+    class Rpc:
+        async def signature_slots(self, sigs):
+            return {"CREATE": 777}
+    eng = SimpleNamespace(cfg={}, price=SimpleNamespace(value=100.0), rpc=Rpc(), _compose_inner=compose,
+                          copyguard=SimpleNamespace(dev_gap_reason=lambda dev: None, log=log))
+    st = SimpleNamespace(mc=0.0, deployer="DEV", symbol="L", created_ts=time.time(), cluster_id=None,
+                         created_slot=None, mint="M")
+    await Engine._my_dev_launch(eng, st, {"address": "DEV"}, {"created_slot": None, "signature": "CREATE"})
+    assert sent and sent[0]["trigger_slot"] == 777 and sent[0]["trigger_create"] and sent[0]["trigger_mc"] == 1.0
