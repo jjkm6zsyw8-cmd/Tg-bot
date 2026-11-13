@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 STATUS = {"queued": "в очереди на испытание", "probation": "на испытании", "promoted": "в своём списке (разведка)",
           "passed": "прошёл испытание, список полон", "rejected": "отсеян", "few": "мало сделок на испытании",
           "demoted": "убран: копии в минусе", "removed": "убран вручную"}
-HEAD = ["тип", "статус", "рейтинг", "оценка копии %", "вердикт", "метка", "адрес", "откуда", "почему попал", "найден", "решение",
+HEAD = ["тип", "статус", "рейтинг", "оценка копии %", "вердикт", "метка", "адрес", "откуда", "отбор", "почему попал",
+        "найден", "решение",
         "копий в бумаге", "портфель", "в плюсе", "винрейт копий %", "итог копий SOL", "итог копий $",
         "средняя копия %", "лучшая %", "худшая %", "копий на испытании (H)", "итог испытания %",
         "GMGN винрейт 7д %", "GMGN прибыль 7д $", "GMGN монет 7д", "GMGN удержание, с", "GMGN сливов хуже −50%",
@@ -66,9 +67,10 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
             # добавленный вручную кошелёк остаётся «своим», даже если разведка его когда-то смотрела
             w.update({"kind": "разведка" if r["status"] == "promoted" else "кандидат",
                       "status": STATUS.get(r["status"], r["status"]), "found": r["found_at"]})
-    from ..analytics.origin import origins
+    from ..analytics.origin import origins, picks
     from ..analytics.rating import TIERS
     org = await origins(db)
+    pk = await picks(db)
     rating = {r["address"]: r for r in await db.fetch("SELECT * FROM wallet_rating")}
     papers: dict[tuple[str, str], dict[str, Any]] = {}
     for r in await db.fetch(
@@ -96,7 +98,7 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
             _pct(rt.get("score")), verdict_of(kind, n, wins, pnl) if kind != "кандидат" else "",
             w.get("label") or "", addr, org.get(addr) or w.get("source") or ("вручную, источник не помечен"
                                                                             if kind.startswith("свой") else "автоотбор"),
-            w.get("reason") or "", when(w.get("found")), w.get("decision") or "",
+            pk.get(addr, ""), w.get("reason") or "", when(w.get("found")), w.get("decision") or "",
             n, p.get("portfolio") or "", wins, _pct(wins / n) if n else "", _num(pnl), round(pnl * sol_usd, 2),
             _pct(p.get("avg")), _pct(p.get("best")), _pct(p.get("worst")),
             int(h.get("n") or 0), _pct(float(h["pnl"]) / float(h["cost"])) if h.get("cost") else "",

@@ -15,6 +15,10 @@ ALIASES = {"axiom": "axiom", "аксиом": "axiom", "акси": "axiom",
            "пампфан": "pumpfun", "памп": "pumpfun",
            "gmgn": "gmgn", "гмгн": "gmgn",
            "other": "other", "другое": "other"}
+# как отобран кошелёк: по реализованному PnL (закрытые сделки), по нереализованному (открытые позиции в топе
+# pump.fun/GMGN) или без разницы — чтобы сравнивать, какой отбор даёт кошельки, на которых бумага в плюсе
+PICKS = {"realized": "реализованный PnL", "unrealized": "нереализованный PnL", "neutral": "нейтрально"}
+PICK_UNMARKED = "отбор не помечен"
 AUTO_SMART = "бот сам (smart)"
 UNMARKED = "не помечен"
 OUTLIER = 1.0          # +100%: выше — «икс», в оценках считается как +100%
@@ -53,3 +57,29 @@ async def own_wallets(db: Any) -> list[str]:
     rows = await db.fetch("""SELECT address FROM watchlist WHERE kind = 'trader'
                              UNION SELECT address FROM traders WHERE manual""")
     return [r["address"] for r in rows]
+
+
+def parse_pick(word: str | None) -> str | None:
+    """«нереализ», «unrealized», «открытые» → unrealized; «реализ», «закрытые» → realized; «нейтрал» → neutral."""
+    w = (word or "").strip().lower().lstrip("#/")
+    if not w:
+        return None
+    if w.startswith(("нереализ", "unrealiz", "unrealis", "открыт")):
+        return "unrealized"
+    if w.startswith(("реализ", "realiz", "realis", "закрыт")):
+        return "realized"
+    if w.startswith(("нейтрал", "neutral")):
+        return "neutral"
+    return None
+
+
+async def set_pick(db: Any, addresses: list[str], pick: str) -> None:
+    await db.p.executemany(
+        """INSERT INTO wallet_pick(address, pick, updated_at) VALUES ($1, $2, now())
+           ON CONFLICT (address) DO UPDATE SET pick = EXCLUDED.pick, updated_at = now()""",
+        [(a, pick) for a in addresses])
+
+
+async def picks(db: Any) -> dict[str, str]:
+    """Адрес → подпись способа отбора."""
+    return {r["address"]: PICKS.get(r["pick"], r["pick"]) for r in await db.fetch("SELECT address, pick FROM wallet_pick")}

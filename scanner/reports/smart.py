@@ -151,8 +151,32 @@ async def smart_report(db: Any, days: int = 7, tz: str = "Asia/Tbilisi", account
             no_x = [x for x in v if x < OUTLIER]
             lines.append(f"{esc(o)}: {summary_line(v)}" + (f" · без иксов {sum(no_x) * USD:+.0f}$"
                                                            if len(no_x) < len(v) else ""))
+    lines += await _by_pick(db, days)
     lines += await _what_differs(db)
     return "\n".join(lines)
+
+
+async def _by_pick(db: Any, days: int) -> list[str]:
+    """Свои кошельки по способу отбора: реализованный PnL / нереализованный / нейтрально — что даёт плюс.
+    H — копии по $10 (выход до 30 мин), R — смарт-ракеты по $10 (держатели, до суток)."""
+    from ..analytics.origin import PICK_UNMARKED, own_wallets, picks
+    pk = await picks(db)
+    own = set(await own_wallets(db))
+    rows = await db.fetch(
+        """SELECT portfolio, pnl_pct, source_wallet w FROM paper_positions
+           WHERE portfolio IN ('H', 'R') AND closed_at IS NOT NULL AND NOT suspect AND exit_reason <> 'reset'
+             AND source_wallet IS NOT NULL AND opened_at > now() - make_interval(days => $1)""", days)
+    by: dict[str, dict[str, list[float]]] = {}
+    for r in rows:
+        if r["w"] not in own:
+            continue
+        by.setdefault(pk.get(r["w"], PICK_UNMARKED), {}).setdefault(r["portfolio"], []).append(float(r["pnl_pct"] or 0))
+    if not by:
+        return []
+    out = ["\n<b>Свои кошельки по способу отбора</b> (H — копии по $10, до 30 мин · R — смарт-ракеты по $10, до суток)"]
+    for p, d in sorted(by.items(), key=lambda kv: -sum(sum(v) for v in kv[1].values())):
+        out.append(f"{esc(p)}: " + " · ".join(f"{port} {summary_line(d[port])}" for port in ("H", "R") if d.get(port)))
+    return out
 
 
 async def _what_differs(db: Any, days: int = 14) -> list[str]:

@@ -61,7 +61,8 @@ HELP = """<b>Pump.fun Dev Scanner</b>
 /trader &lt;адрес&gt; — профиль трейдера
 /watch &lt;адрес&gt; — сопровождение монеты
 /watchlist — что отслеживается
-/addwallet &lt;адрес&gt; &lt;метка&gt; [dev|trader]
+/addwallet — добавить кошелёк (источник и отбор спросит кнопками) · /import — импорт списка/файла
+/origin — откуда кошельки и как отобраны (реализованный / нереализованный PnL)
 /removewallet &lt;адрес&gt;
 /blacklist &lt;адрес&gt;
 /today — разбор дня · /backtest &lt;период&gt; [a=1 vs a=2]
@@ -78,6 +79,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     ext = ExternalHub(env, db)   # внешние источники только по командам /token, /dev, /trader
     router.message.outer_middleware(Whitelist(env.allowed_ids))
     router.callback_query.outer_middleware(Whitelist(env.allowed_ids))
+    from .wizard import Wizard
+    wiz = Wizard()                 # пошаговые меню /import и /addwallet на кнопках
 
     async def reload() -> dict[str, Any]:
         settings.overrides = await db.get_overrides()
@@ -121,6 +124,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     def main_menu() -> list[list[dict[str, Any]]]:
         return [
+            [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
+            [{"text": "📥 Импорт кошельков", "callback": "menu:import"},
+             {"text": "➕ Добавить кошелёк", "callback": "menu:add"}],
+            [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "📦 Выгрузка", "callback": "menu:export"}],
             [{"text": "Режимы", "callback": "menu:mode"}, {"text": "Настройки", "callback": "menu:settings"}],
             [{"text": "Отслеживаемое", "callback": "menu:watchlist"}, {"text": "Разбор дня", "callback": "menu:today"}],
             [{"text": "Итог серии", "callback": "menu:stats"}, {"text": "Состояние", "callback": "menu:health"}],
@@ -254,17 +261,27 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     @router.message(Command("addwallet"))
     async def cmd_addwallet(m: Message, command: CommandObject) -> None:
-        parts = (command.args or "").split()
+        if not (command.args or "").strip():
+            text, kb = wiz.start(m.from_user.id if m.from_user else 0, "add")
+            return await reply(m, text, kb)
+        await add_wallet(m, command.args or "")
+
+    async def add_wallet(m: Message, args: str, origin: str | None = None, pick: str | None = None) -> None:
+        parts = args.split()
         if not parts or not is_valid_address(parts[0]):
-            return await reply(m, "Формат: /addwallet &lt;адрес&gt; &lt;метка&gt; [dev|trader] [axiom|pumpfun|gmgn]")
-        from ..analytics.origin import ORIGINS, parse_origin, set_origin
+            return await reply(m, "Не похоже на адрес кошелька. Формат: <code>адрес метка</code> "
+                                  "[dev|trader] [axiom|pumpfun|gmgn] [реализ|нереализ|нейтрал]")
+        from ..analytics.origin import ORIGINS, PICKS, parse_origin, parse_pick, set_origin, set_pick
         addr = parts[0]
-        origin = next((o for o in (parse_origin(p) for p in parts[1:]) if o), None)
-        parts = [parts[0]] + [p for p in parts[1:] if not parse_origin(p)]
+        origin = next((o for o in (parse_origin(p) for p in parts[1:]) if o), origin)
+        pick = next((o for o in (parse_pick(p) for p in parts[1:]) if o), pick)
+        parts = [parts[0]] + [p for p in parts[1:] if not parse_origin(p) and not parse_pick(p)]
         kind = parts[-1].lower() if len(parts) > 1 and parts[-1].lower() in ("dev", "trader") else None
         label = " ".join(p for p in parts[1:] if p.lower() not in ("dev", "trader"))[:64] or None
         if origin:
             await set_origin(db, [addr], origin)
+        if pick:
+            await set_pick(db, [addr], pick)
         deployed = await db.fetchval("SELECT count(*) FROM tokens WHERE deployer=$1", addr)
         if kind == "dev" or (kind is None and deployed):
             from ..analytics.clusters import add_link, cluster_of, new_cluster
@@ -286,15 +303,21 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await db.job("reload")
         note = "" if ok else "\n⚠️ Не проходит автофильтр (" + "; ".join(fails) + "), но оставлен в списке по вашему выбору."
         note += f"\nИсточник: {ORIGINS[origin]}" if origin else "\nИсточник не указан — /origin адрес axiom|pumpfun|gmgn"
+        note += f" · отбор: {PICKS[pick]}" if pick else ""
         await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr, ext),
                     [[{"text": "Убрать из списка", "callback": f"wl:t:{addr}"}]])
 
-    async def import_wallets(m: Message, text: str, origin: str | None = None) -> None:
-        from ..analytics.origin import ORIGINS, parse_origin, set_origin
+    async def import_wallets(m: Message, text: str, origin: str | None = None, pick: str | None = None) -> None:
+        from ..analytics.origin import ORIGINS, PICKS, parse_origin, parse_pick, set_origin, set_pick
         from .importer import extract_wallets
-        first = text.strip().split(maxsplit=1)
-        if first and parse_origin(first[0]):                 # /import axiom … — источник первым словом
-            origin = origin or parse_origin(first[0])
+        for _ in range(2):                                   # /import axiom нереализ … — первыми словами
+            first = text.strip().split(maxsplit=1)
+            if first and parse_origin(first[0]):
+                origin = origin or parse_origin(first[0])
+            elif first and parse_pick(first[0]):
+                pick = pick or parse_pick(first[0])
+            else:
+                break
             text = first[1] if len(first) > 1 else ""
         found = extract_wallets(text)
         if not found:
@@ -309,13 +332,15 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                              addr, label)
         if origin:
             await set_origin(db, [a for a, _ in found], origin)
+        if pick:
+            await set_pick(db, [a for a, _ in found], pick)
         await db.job("reload")
         await db.job("import_wallets", {"wallets": [[a, lb] for a, lb in found]})
         sample = "\n".join(f"• {esc(lb or '')} <code>{a[:4]}…{a[-4:]}</code>" for a, lb in found[:10])
         more = f"\n… и ещё {len(found) - 10}" if len(found) > 10 else ""
-        src = (f"Источник: {ORIGINS[origin]}.\n" if origin else
-               "Источник не указан: в следующий раз — подпись к файлу <code>axiom</code> / <code>pumpfun</code> / "
-               "<code>gmgn</code> или /origin.\n")
+        src = (f"Источник: {ORIGINS[origin]}" if origin else
+               "Источник не указан (в следующий раз — /import без слов, бот спросит кнопками)") + (
+            f" · отбор: {PICKS[pick]}.\n" if pick else ".\n")
         await reply(m, f"📥 Принял кошельков: <b>{len(found)}</b> (новых {new}).\n{sample}{more}\n{src}\n"
                        "Слежка в реальном времени начнётся в течение минуты. Проверяю историю каждого "
                        "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в топик «Смарт-мани».")
@@ -478,8 +503,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         if m.document is not None:          # файл с подписью /import
             return await on_document(m)
         if not command.args:
-            return await reply(m, "Пришлите файл экспорта из трекера Axiom (JSON/CSV/TXT) прямо в этот чат "
-                                  "или адреса: <code>/import адрес подпись</code>, по одному в строке.")
+            text, kb = wiz.start(m.from_user.id if m.from_user else 0, "import")
+            return await reply(m, text, kb)
         await import_wallets(m, command.args)
 
     @router.message(F.document)
@@ -490,9 +515,11 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         buf = await m.bot.download(doc)
         raw = buf.read() if buf is not None else b""
         text = raw.decode("utf-8-sig", errors="ignore")
-        from ..analytics.origin import parse_origin
-        origin = next((o for o in (parse_origin(w) for w in (m.caption or "").split()) if o), None)
-        await import_wallets(m, text, origin)
+        from ..analytics.origin import parse_origin, parse_pick
+        st = wiz.waiting_input(m.from_user.id if m.from_user else 0) or {}
+        origin = next((o for o in (parse_origin(w) for w in (m.caption or "").split()) if o), st.get("origin"))
+        pick = next((o for o in (parse_pick(w) for w in (m.caption or "").split()) if o), st.get("pick"))
+        await import_wallets(m, text, origin, pick)
 
     @router.message(Command("removewallet"))
     async def cmd_removewallet(m: Message, command: CommandObject) -> None:
@@ -637,7 +664,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                 await reply(target, part, PERIOD_KEYBOARD if i == len(parts) - 1 else None)
             return
         text = await tr.history(20) if cmd == "history" else await tr.render_period(hours)
-        await reply(target, text, PERIOD_KEYBOARD)
+        await reply(target, text, PERIOD_KEYBOARD + [[{"text": "🔄 Сброс портфелей…", "callback": "pp:reset"}]])
 
     @router.message(Command("paper"))
     async def cmd_paper(m: Message, command: CommandObject) -> None:
@@ -652,8 +679,20 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     @router.message(Command("origin"))
     async def cmd_origin(m: Message, command: CommandObject) -> None:
         """Откуда кошелёк: /origin адрес axiom|pumpfun|gmgn|other; /origin все axiom — все непомеченные из своего списка."""
-        from ..analytics.origin import ORIGINS, UNMARKED, origins, own_wallets, parse_origin, set_origin
+        from ..analytics.origin import ORIGINS, origins, own_wallets, parse_origin, set_origin
         parts = (command.args or "").split()
+        from ..analytics.origin import PICKS, parse_pick, picks, set_pick
+        if len(parts) >= 2 and parse_pick(parts[-1]):
+            pick = parse_pick(parts[-1])
+            addrs = await own_wallets(db) if parts[0].lower() in ("все", "all") else \
+                [p for p in parts[:-1] if is_valid_address(p)]
+            if parts[0].lower() in ("все", "all"):
+                marked_p = await picks(db)
+                addrs = [a for a in addrs if a not in marked_p]
+            if not addrs:
+                return await reply(m, "Некого помечать: нет подходящих адресов.")
+            await set_pick(db, addrs, pick)  # type: ignore[arg-type]
+            return await reply(m, f"✅ Отбор «{PICKS[pick]}» — кошельков: {len(addrs)}.")  # type: ignore[index]
         if len(parts) >= 2 and parse_origin(parts[-1]):
             origin = parse_origin(parts[-1])
             if parts[0].lower() in ("все", "all"):
@@ -665,28 +704,70 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                 return await reply(m, "Некого помечать: нет подходящих адресов.")
             await set_origin(db, addrs, origin)  # type: ignore[arg-type]
             return await reply(m, f"✅ Источник «{ORIGINS[origin]}» — кошельков: {len(addrs)}.")  # type: ignore[index]
-        marked = await origins(db)
+        await reply(m, *(await origin_view()))
+
+    async def origin_view() -> tuple[str, list[list[dict[str, Any]]]]:
+        from ..analytics.origin import ORIGINS, PICK_UNMARKED, UNMARKED, origins, own_wallets, picks
+        marked, marked_p = await origins(db), await picks(db)
         own = await own_wallets(db)
         cnt: dict[str, int] = {}
+        cnt_p: dict[str, int] = {}
         for a in own:
             cnt[marked.get(a, UNMARKED)] = cnt.get(marked.get(a, UNMARKED), 0) + 1
-        await reply(m, "🏷 <b>Источники кошельков своего списка</b>\n"
-                       + ("\n".join(f"• {k}: {v}" for k, v in sorted(cnt.items(), key=lambda kv: -kv[1])) or "список пуст")
-                       + "\n\nПометить: <code>/origin адрес axiom</code> (pumpfun, gmgn, other)\n"
-                         "Все непомеченные сразу: <code>/origin все axiom</code>\n"
-                         "При добавлении: <code>/addwallet адрес метка axiom</code>, файл — с подписью "
-                         "<code>axiom</code>, список — <code>/import axiom</code> и адреса.")
+            cnt_p[marked_p.get(a, PICK_UNMARKED)] = cnt_p.get(marked_p.get(a, PICK_UNMARKED), 0) + 1
+        text = ("🏷 <b>Кошельки своего списка</b>\nОткуда:\n"
+                + ("\n".join(f"• {k}: {v}" for k, v in sorted(cnt.items(), key=lambda kv: -kv[1])) or "список пуст")
+                + "\nКак отобраны:\n"
+                + "\n".join(f"• {k}: {v}" for k, v in sorted(cnt_p.items(), key=lambda kv: -kv[1]))
+                + "\n\nОдин кошелёк: <code>/origin адрес axiom</code> или <code>/origin адрес нереализ</code>\n"
+                  "Новые — через «📥 Импорт кошельков» / «➕ Добавить кошелёк»: источник и отбор спросят кнопками.\n"
+                  "Пометить все непомеченные:")
+        kb = [[{"text": ORIGINS[o], "callback": f"og:o:{o}"} for o in ("pumpfun", "axiom", "gmgn")],
+              [{"text": "Реализ.", "callback": "og:p:realized"}, {"text": "Нереализ.", "callback": "og:p:unrealized"},
+               {"text": "Нейтрал", "callback": "og:p:neutral"}]]
+        return text, kb
+
+    @router.callback_query(F.data.startswith("og:"))
+    async def cb_origin_all(c: CallbackQuery) -> None:
+        from ..analytics.origin import ORIGINS, PICKS, origins, own_wallets, picks, set_origin, set_pick
+        _, kind, value = c.data.split(":", 2)
+        own = await own_wallets(db)
+        if kind == "o" and value in ORIGINS:
+            marked = await origins(db)
+            addrs = [a for a in own if a not in marked]
+            if addrs:
+                await set_origin(db, addrs, value)
+            await c.answer(f"Источник «{ORIGINS[value]}»: {len(addrs)}")
+        elif kind == "p" and value in PICKS:
+            marked_p = await picks(db)
+            addrs = [a for a in own if a not in marked_p]
+            if addrs:
+                await set_pick(db, addrs, value)
+            await c.answer(f"Отбор «{PICKS[value]}»: {len(addrs)}")
+        if c.message is not None:
+            text, kb = await origin_view()
+            await c.message.answer(text, parse_mode="HTML", reply_markup=build(kb))
 
     @router.message(Command("smart"))
     async def cmd_smart(m: Message, command: CommandObject) -> None:
         """Только smart-сигналы: итог при $10 на сделку, по дням, по кошелькам, что отличает плюсовые (/smart 14)."""
+        arg = (command.args or "").strip().lower().rstrip("dд")
+        await send_smart(m, min(30, max(1, int(arg))) if arg.isdigit() else 7)
+
+    async def send_smart(m: Message, days: int) -> None:
         from ..reports.smart import chunks, smart_report
         cfg = await reload()
-        arg = (command.args or "").strip().lower().rstrip("dд")
-        days = min(30, max(1, int(arg))) if arg.isdigit() else 7
-        for part in chunks(await smart_report(db, days, str(cfg.get("timezone") or "Asia/Tbilisi"),
-                                              int(cfg.get("smart_accounts") or 2))):
-            await reply(m, part)
+        parts = chunks(await smart_report(db, days, str(cfg.get("timezone") or "Asia/Tbilisi"),
+                                          int(cfg.get("smart_accounts") or 2)))
+        kb = [[{"text": ("● " if d == days else "") + f"{d} дн.", "callback": f"sm:{d}"} for d in (1, 3, 7, 14, 30)]]
+        for i, part in enumerate(parts):
+            await reply(m, part, kb if i == len(parts) - 1 else None)
+
+    @router.callback_query(F.data.startswith("sm:"))
+    async def cb_smart(c: CallbackQuery) -> None:
+        await c.answer("Считаю…")
+        if c.message is not None:
+            await send_smart(c.message, int(c.data[3:]))
 
     @router.message(Command("filter"))
     async def cmd_filter(m: Message) -> None:
@@ -739,6 +820,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     @router.message(Command("export"))
     async def cmd_export(m: Message) -> None:
+        await send_export(m)
+
+    async def send_export(m: Message) -> None:
         """Всё для разбора одним архивом: сделки за сутки и 30 дней, кошельки, журнал копитрейда."""
         from ..reports.export import build_export
         tr = await paper_view()
@@ -777,7 +861,15 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await c.answer("Считаю…")
         if c.message is None:
             return
-        if arg == "hist":
+        if arg == "reset":
+            await reply(c.message, "Сбросить все бумажные портфели к стартовому балансу?",
+                        [[{"text": "Да, сбросить", "callback": "pp:reset!"}, {"text": "Нет", "callback": "pp:no"}]])
+        elif arg == "reset!":
+            await db.job("paper", {"cmd": "reset"})
+            await reply(c.message, "Сбрасываю портфели… Подтверждение придёт в «Бумажная торговля».")
+        elif arg == "no":
+            pass
+        elif arg == "hist":
             await paper_answer(c.message, "history")
         elif arg == "day":
             await paper_answer(c.message, "trades", 24)
@@ -837,6 +929,20 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         what = c.data.split(":", 1)[1]
         await c.answer()
         m = c.message
+        if m is None:
+            return
+        if what == "paper":
+            return await paper_answer(m, "state")
+        if what == "smart":
+            return await send_smart(m, 7)
+        if what in ("import", "add"):
+            text, kb = wiz.start(c.from_user.id, what)
+            return await m.answer(text, parse_mode="HTML", reply_markup=build(kb))
+        if what == "origin":
+            text, kb = await origin_view()
+            return await m.answer(text, parse_mode="HTML", reply_markup=build(kb))
+        if what == "export":
+            return await send_export(m)
         if what == "mode":
             text, kb = mode_view(await reload())
         elif what == "settings":
@@ -968,6 +1074,27 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await db.execute("UPDATE traders SET active=true, manual=true WHERE address=$1", ref)
             await db.job("reload")
         await c.answer("Отслеживаю")
+
+    @router.callback_query(F.data.startswith("wz:"))
+    async def cb_wizard(c: CallbackQuery) -> None:
+        text, kb = wiz.on_button(c.from_user.id, c.data)
+        await c.answer()
+        if c.message is not None:
+            try:
+                await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
+            except Exception:  # noqa: BLE001 — сообщение старое или не изменилось
+                await c.message.answer(text, parse_mode="HTML", reply_markup=build(kb))
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def on_text(m: Message) -> None:
+        """Ответ на шаг 3 мастера: адреса для импорта или адрес с меткой для добавления."""
+        st = wiz.waiting_input(m.from_user.id if m.from_user else 0)
+        if st is None:
+            return
+        if st["kind"] == "import":
+            await import_wallets(m, m.text or "", st.get("origin"), st.get("pick"))
+        else:
+            await add_wallet(m, m.text or "", st.get("origin"), st.get("pick"))
 
     @router.callback_query(F.data.startswith("wl:"))
     async def cb_unwatch(c: CallbackQuery) -> None:

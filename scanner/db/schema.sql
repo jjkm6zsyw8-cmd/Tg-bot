@@ -524,3 +524,15 @@ UPDATE paper_positions SET suspect=true
 
 -- 13.11: сверка входа — цена блока +2, спрошенная повторно через 30 с (расхождение >10% — сделка ⚠)
 ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS entry_verify_mc double precision;
+
+-- как отобран кошелёк: realized (реализованный PnL, закрытые сделки) | unrealized (открытые позиции) | neutral
+CREATE TABLE IF NOT EXISTS wallet_pick (
+    address    text PRIMARY KEY,
+    pick       text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+-- 13.11: 16 кошельков, добавленных 12.11 в 15:53–15:59 (Батуми), — из топа pump.fun по открытым позициям
+INSERT INTO wallet_pick(address, pick)
+SELECT address, 'unrealized' FROM watchlist
+ WHERE kind = 'trader' AND created_at >= '2026-11-12 11:50:00+00' AND created_at < '2026-11-12 12:05:00+00'
+ON CONFLICT (address) DO NOTHING;

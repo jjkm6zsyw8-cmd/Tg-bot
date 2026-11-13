@@ -67,6 +67,14 @@ async def test_report_on_db():
             """INSERT INTO paper_positions(portfolio, mint, alert_id, level, opened_at, closed_at, entry_mc, cost_sol,
                    tokens, tokens_initial, exit_reason, pnl_sol, pnl_pct, suspect)
                VALUES ('G', 'X', $1, 'normal', now(), now(), 30, 0.1, 1, 1, 'take_profit', 5, 5, true)""", aid)
+        # свои кошельки по способу отбора: H (копии) и R (смарт-ракеты)
+        await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', 'OPENPOS1', 'держатель')")
+        await db.execute("INSERT INTO wallet_pick(address, pick) VALUES ('OPENPOS1', 'unrealized')")
+        for port, pnl in (("H", -0.1), ("R", 0.4), ("R", -0.2)):
+            await db.execute(
+                """INSERT INTO paper_positions(portfolio, mint, level, opened_at, closed_at, entry_mc, cost_sol, tokens,
+                       tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet)
+                   VALUES ($1, 'P', 'normal', now(), now(), 30, 0.1, 1, 1, 'stop', $2, $2, 'OPENPOS1')""", port, pnl)
         text = await smart_report(db, 7)
     finally:
         await db.close()
@@ -79,7 +87,40 @@ async def test_report_on_db():
     assert "не сошлись с рынком и не считаются: 1" in text
     assert "Хороший: 30 сд. · в плюсе 30 · +75$" in text and "BADWALLET22" in text
     assert "тейк 31 (+31%)" in text and "стоп 30 (-8%)" in text
+    assert "Свои кошельки по способу отбора" in text and "нереализованный PnL: H 1 сд." in text and "R 2 сд." in text
     assert "Что отличает плюсовые колы" in text and "капитализация" in text and "иксы выше +100%" in text
+
+
+def test_pick_parsing():
+    from scanner.analytics.origin import parse_pick
+    assert parse_pick("нереализ") == "unrealized" and parse_pick("Нереализованный") == "unrealized"
+    assert parse_pick("реализованный") == "realized" and parse_pick("закрытые") == "realized"
+    assert parse_pick("unrealized") == "unrealized" and parse_pick("#нейтрал") == "neutral"
+    assert parse_pick("openmind") is None and parse_pick("лега") is None and parse_pick(None) is None
+
+
+def test_wizard_steps():
+    """/import без слов: источник → отбор → ждём файл/адреса; отмена и чужой пользователь."""
+    from scanner.bot.wizard import Wizard
+    w = Wizard()
+    text, kb = w.start(1, "import")
+    assert "Шаг 1 из 3" in text and any(b["callback"] == "wz:o:axiom" for row in kb for b in row)
+    assert w.waiting_input(1) is None                                  # адреса ещё рано
+    text, kb = w.on_button(1, "wz:o:axiom")
+    assert "Источник: Axiom" in text and any(b["callback"] == "wz:p:unrealized" for row in kb for b in row)
+    text, kb = w.on_button(1, "wz:p:unrealized")
+    assert "Шаг 3 из 3" in text and "нереализованный PnL" in text and "ответом на это сообщение" in text
+    assert w.waiting_input(2) is None                                  # у другого пользователя мастера нет
+    st = w.waiting_input(1)
+    assert st == {**st, "kind": "import", "origin": "axiom", "pick": "unrealized"}
+    assert w.waiting_input(1) is None                                  # ввод принят — мастер закончен
+    w.start(1, "add")
+    w.on_button(1, "wz:o:-")
+    assert w.get(1)["origin"] is None
+    text, kb = w.on_button(1, "wz:x")
+    assert "Отменено" in text and w.get(1) is None
+    text, kb = w.on_button(3, "wz:o:gmgn")                             # мастер не начат / истёк
+    assert "начните заново" in text
 
 
 def test_origin_parsing_and_cap():
