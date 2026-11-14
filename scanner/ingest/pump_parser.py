@@ -199,10 +199,27 @@ def decode_event(data: bytes, ctx: TxContext, pool_to_mint: dict[str, str] | Non
         mint = (pool_to_mint or {}).get(pool)
         if not mint:
             return None  # пул не из Pump.fun миграции или ещё неизвестен
+        # Цена в пуле считается по «эффективным» резервам: настоящие SOL в пуле + виртуальные (поле в конце события).
+        # С осени 2026 у новых пулов виртуальные резервы ≈17.5 SOL; без них MC выходил заниженным, а движения цены —
+        # завышенными (при 26 SOL в пуле рост +25% читался как +34%)
+        virtual = 0.0
+        try:
+            r.take(32 * 5)                       # счета пользователя, получатели комиссии, создатель монеты
+            r.u64(); r.u64()                     # комиссия создателя: ставка и сумма
+            if disc == D_AMM_BUY:
+                r.u8()                           # track_volume
+                r.u64(); r.u64(); r.u64(); r.i64(); r.u64()
+                r.string()                       # ix_name
+            r.u64(); r.u64(); r.u64(); r.u64()   # кэшбэк и выкуп: ставки и суммы
+            virtual = int.from_bytes(r.take(16), "little", signed=True) / LAMPORTS
+        except ValueError:
+            virtual = 0.0                        # старое короткое событие — виртуальных резервов нет
+        if pool_quote + virtual <= 0:
+            virtual = 0.0
         return Trade(
             signature=ctx.signature, mint=mint, trader=user, is_buy=disc == D_AMM_BUY,
             sol_amount=quote_amount, token_amount=base_amount,
-            v_sol=pool_quote, v_tokens=pool_base, fee_sol=lp_fee + protocol_fee,
+            v_sol=pool_quote + virtual, v_tokens=pool_base, fee_sol=lp_fee + protocol_fee,
             pool="pump-amm", slot=ctx.slot, ts=_ts(ts), source=ctx.source,
         )
     return None

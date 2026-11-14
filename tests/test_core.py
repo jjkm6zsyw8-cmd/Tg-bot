@@ -115,6 +115,40 @@ def test_create_event_tells_what_the_coin_is_paired_with():
     assert isinstance(old, TokenCreated) and old.quote_mint is None and old.token_program == ""
 
 
+REAL_AMM_BUY = (
+    "Z/RSHyz1d3cbofhqAAAAAEF+ZbwAAAAAjjIWAAAAAABnBVDaXQMAAPBBFgAAAAAAXCjsg866AAD+/TqqEQAAAI4yFgAAAAAAFAAAAAAAAAA7CwAA"
+    "AAAAAAUAAAAAAAAAzwIAAAAAAABm+hUAAAAAACvvFQAAAAAAcFe69a9xUOoIp0XyxhI3/NENDg9m9gd+mOSWiQPSlrxjXEVNwvoK2ufvPG3NF3DK"
+    "relOa/d0rtig2FaqlNQ8nzs/MKQjvughVEIW/uid7xqrG6WMVu3G+sT2q3YgETZxawtgo5/OKsorNu9mOiwwEGSbUl1n/IzzI+H0MICATBEAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYlogaDQm8sQqZ8blWm1l2lGwCtqr4LfZ"
+    "DgP7cfHoom9fAAAAAAAAAFk1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAVAAAAYnV5X2V4YWN0X3F1b3Rl"
+    "X2luX3YyAAAAAAAAAAAAAAAAAAAAAIgTAAAAAAAAZwEAAAAAAADuFHcVBAAAAAAAAAAAAAAAAYL9SWS3cwMAAAAAAAAAAAAAAAAAAAAAAJF7OAIA"
+    "AAAAAAAAAAAAAAA=")
+REAL_AMM_SELL = (
+    "Pi83CqUD3CpsoPhqAAAAANT5mfDyAAAAAAAAAAAAAADU+Znw8gAAACZbq+QVAAAAfyGJJTi6AAA11Vi7EQAAAK1sURwAAAAAFAAAAAAAAAC1fw4A"
+    "AAAAAAUAAAAAAAAA7p8DAAAAAAD47EIcAAAAAHBu+hsAAAAAcFe69a9xUOoIp0XyxhI3/NENDg9m9gd+mOSWiQPSlrwNCJFGVatrnmldKGgiGrFv"
+    "p2nMBcP4N6eDh0m/irU1EMv7qBRVjmeTM3M48u6zDkv0hbOB6Cum6lIwJMtT/7QR55ykDiFyMJ8MEwkkcYgXwt0EW/D2FAUDIEA2H+I86k0AAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYlogaDQm8sQqZ8blWm1l2lGwCtqr4LfZ"
+    "DgP7cfHoom9fAAAAAAAAAJreRAAAAAAAAAAAAAAAAAAAAAAAAAAAAIgTAAAAAAAA988BAAAAAAAi9NQVBAAAAAAAAAAAAAAAAYL9SWS3cwMAAAAA"
+    "AAAAAAAAAAAAAAAAAM+tIQIAAAAAAAAAAAAAAAA=")
+
+
+def test_pumpswap_price_uses_effective_reserves():
+    """С осени 2026 у пулов PumpSwap есть виртуальные резервы (≈17.5 SOL, поле в конце события). Цена — по сумме
+    настоящих и виртуальных резервов; без виртуальных MC выходил заниженным, а движения цены — завышенными."""
+    import base64
+    from scanner.ingest.pump_parser import TxContext, decode_event
+    ctx = TxContext(signature="S", slot=1, block_time=None, signer="X", source="rpc")
+    pool = "8ZYFaK1ZoKurD5quoyptmWZZTX4osv9mYSSLJAo3JYAF"
+    buy = decode_event(base64.b64decode(REAL_AMM_BUY), ctx, {pool: "M"})
+    assert isinstance(buy, Trade) and buy.is_buy and buy.pool == "pump-amm"
+    assert buy.v_sol == pytest.approx(75.870 + 17.540, abs=0.01)             # настоящие 75.87 SOL + виртуальные 17.54
+    assert curve.mc_sol(buy.v_sol, buy.v_tokens) == pytest.approx(454.8, abs=0.2)
+    sell = decode_event(base64.b64decode(REAL_AMM_SELL), ctx, {pool: "M"})
+    assert isinstance(sell, Trade) and not sell.is_buy and sell.sol_amount == pytest.approx(0.4751, abs=1e-4)
+    assert curve.mc_sol(sell.v_sol, sell.v_tokens) == pytest.approx(457.6, abs=0.2)
+    assert decode_event(base64.b64decode(REAL_AMM_BUY), ctx, {}) is None       # пул неизвестен — сделку не берём
+
+
 def test_failed_tx_is_ignored():
     tx = tx_with_logs(create_event(addr("m3"), addr("d3")))
     tx["meta"]["err"] = {"InstructionError": [0, "Custom"]}
