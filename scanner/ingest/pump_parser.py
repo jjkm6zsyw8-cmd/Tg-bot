@@ -122,11 +122,21 @@ def decode_event(data: bytes, ctx: TxContext, pool_to_mint: dict[str, str] | Non
         v_tok = r.u64() / TOK if r.remaining() >= 8 else 1_073_000_000.0
         v_sol = r.u64() / LAMPORTS if r.remaining() >= 8 else 30.0
         real_tok = r.u64() / TOK if r.remaining() >= 8 else 793_100_000.0
+        # новые поля события (2026): программа токена, режимы и — главное — к чему монета в паре. С ноября 2026
+        # монеты запускают и в паре к USDC или к другой монете: цены и суммы у таких — не в SOL
+        token_program, mayhem, cashback, quote_mint = "", False, False, None
+        if r.remaining() >= 8 + 32 + 2 + 32:
+            r.u64()                              # token_total_supply
+            token_program = r.pubkey()
+            mayhem, cashback = bool(r.u8()), bool(r.u8())
+            quote_mint = r.pubkey()
+            quote_mint = "" if quote_mint == SYSTEM_PROGRAM else quote_mint   # нулевой ключ — пара к SOL
         return TokenCreated(
             signature=ctx.signature, mint=mint, deployer=user, creator=creator,
             name=name, symbol=symbol, uri=uri, bonding_curve=curve,
             v_sol=v_sol, v_tokens=v_tok, real_tokens=real_tok,
             slot=ctx.slot, ts=_ts(ts), source=ctx.source,
+            token_program=token_program, quote_mint=quote_mint, mayhem=mayhem, cashback=cashback,
         )
     if disc == D_TRADE:
         mint = r.pubkey()

@@ -511,19 +511,28 @@ async def test_mydev_entry_resolves_creation_slot(monkeypatch):
     assert opened == [("Y", 34.0, "блок")] and asked == [(777, 779)] and len(tries) == 2
 
 
-async def test_block_mc_create_without_dev_buy_and_reasons(monkeypatch):
-    """Создание без покупки дева и без сделок до блока +2 — цена старта кривой; иначе причина точнее."""
+async def test_block_mc_non_sol_pair_is_never_entered(monkeypatch):
+    """14.11: монеты «моего дева» в паре не к SOL (USDC, акции, другие монеты) торгуются в другой валюте.
+    Вход по ним «по цене старта кривой SOL» дал фальшивые +44…+194% (17 сделок, +$172) — теперь не входим."""
     import scanner.ingest.pump_parser as parser
     from scanner.models import TokenCreated
     tr = bare_trader({})
     tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
     rpc = FakeRpc([])
     tr.e.rpc = rpc
-    monkeypatch.setattr(parser, "parse_transaction", lambda tx, sig, slot, src, stats, pool_map=None: [
-        TokenCreated(signature=sig, mint="M", deployer="DEV", creator="DEV", name="L", symbol="L", uri="",
-                     v_sol=0.001, v_tokens=1.0)])                    # резервы в событии неверные — не используем
-    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) == pytest.approx(pp.START_MC)
-    assert 27 < pp.START_MC < 29
+
+    def created(quote_mint):
+        return lambda tx, sig, slot, src, stats, pool_map=None: [
+            TokenCreated(signature=sig, mint="M", deployer="DEV", creator="DEV", name="L", symbol="L", uri="",
+                         quote_mint=quote_mint)]
+    monkeypatch.setattr(parser, "parse_transaction", created("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"))
+    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) is None
+    assert tr._why_pop("M", "CREATE") == "монета в паре не к SOL"
+    # пара к SOL, но дев не купил и сделок до блока +2 не было — цену не выдумываем
+    monkeypatch.setattr(parser, "parse_transaction", created(""))
+    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) is None
+    assert tr._why_pop("M", "CREATE") == "создана без покупки в SOL и без сделок до блока +2"
+    assert not hasattr(pp, "START_MC")
     monkeypatch.setattr(parser, "parse_transaction", lambda *a, **k: [])
     assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) is None
     assert tr._why_pop("M", "CREATE") == "в транзакциях блока нет сделки этой монеты на pump.fun"

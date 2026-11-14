@@ -75,6 +75,46 @@ def test_parser_tolerates_new_trailing_fields_and_counts_errors():
     assert stats.errors == 1
 
 
+# Настоящие события из сети (14.11.2026): создание монеты в паре к SOL и в паре к USDC, покупка дева в USDC
+REAL_CREATE_SOL = (
+    "G3KpTd7rY3YPAAAARnJpZGF5IHRoZSAxM3RoBQAAADExLzEzPAAAAGh0dHBzOi8vbWV0YWRhdGEuajd0cmFja2VyLmlvL21ldGFkYXRhLzk1Y2I2"
+    "OTBjNjA1NTRjNzkuanNvbhNQEfiB1cUHejA5A9aHnKdz2eJltwdHjhW1Jq46UYGPCbiGl8OMBguW11lY/vNcoxuNnwoIsVs/zZNfMTomY/0RJ/Hy"
+    "Teylx7Fld6uu/fwhw4UB9LyEamIIjUBJsLB+c/zekxYJETj4yymBHM+b+LKgylh2zpmHqMXt3omFE5FoH3r3agAAAAAAENhH488DAACsI/wGAAAA"
+    "AHjF+1HRAgAAgMakfo0DAAbd9uHudY/eGEJdvORszdq2GvxNg7kNJ/69+SjYoYv8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACs"
+    "I/wGAAAAAAAAAAAAAAABAA==")
+REAL_CREATE_USDC = (
+    "G3KpTd7rY3YTAAAAR2VuZXJhdGlvbmFsIEJvdW5jZQYAAABCT1VOQ0U8AAAAaHR0cHM6Ly9tZXRhZGF0YS5qN3RyYWNrZXIuaW8vbWV0YWRhdGEv"
+    "YTBhZGI3YTNmNjkwNGI1ZS5qc29uXQPqSBH+3H7798j8M6oApFYjx/26jE5s4yIWLhI3dF/3JXwjyPcRdZ05e4d85/kpkIyoGdCIpYP/1AiAx2LC"
+    "exEn8fJN7KXHsWV3q679/CHDhQH0vIRqYgiNQEmwsH5z5xUZRHOueYWjNl3bOd4Lc9UmlNBJ67jd7rgOPS0qRznXx/dqAAAAAAAQ2EfjzwMAALnS"
+    "/wAAAAAAeMX7UdECAACAxqR+jQMABt324e51j94YQl285GzN2rYa/E2DuQ0n/r35KNihi/wAAMb6evO+2606PWXzaqvJdDGxu+TC0vbg5HymAgNF"
+    "L11hALnS/wAAAAAAAAAAAAAAAAEA")
+REAL_TRADE_USDC = (
+    "vdt/007mYe5dA+pIEf7cfvv3yPwzqgCkViPH/bqMTmzjIhYuEjd0XwAAAAAAAAAAs12xvEYwAAABESfx8k3spcexZXerrv38IcOFAfS8hGpiCI1A"
+    "SbCwfnPXx/dqAAAAAAAAAAAAAAAATbImi5yfAwAAAAAAAAAAAE0aFD8LoQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABfAAAAAAAA"
+    "AC5hIAAAAAAA5xUZRHOueYWjNl3bOd4Lc9UmlNBJ67jd7rgOPS0qRzkeAAAAAAAAAKM5CgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAEgAAAGJ1eV9leGFjdF9xdW90ZV9pbgAAAAAAAAAAAAAAAAAAAAAAiBMAAAAAAACXMBAAAAAAAAAAAADG+nrzvtutOj1l82qryXQxsbvk"
+    "wtL24OR8pgIDRS9dYddgUA0AAAAA1xkjDQEAAADXYFANAAAAAB4AAAAAAAAAozkKAAAAAACjOQoAAAAAAAAAAAAAAAAA")
+
+
+def test_create_event_tells_what_the_coin_is_paired_with():
+    """14.11: монеты запускают и в паре не к SOL (USDC, акции, другие монеты). Событие создания говорит, к чему пара;
+    сделки таких монет идут не в SOL и как сделки в SOL не читаются (иначе MC был бы в чужих единицах)."""
+    import base64
+    from scanner.ingest.pump_parser import TxContext, decode_event
+    ctx = TxContext(signature="S", slot=1, block_time=None, signer="X", source="rpc")
+    sol = decode_event(base64.b64decode(REAL_CREATE_SOL), ctx)
+    assert isinstance(sol, TokenCreated) and sol.symbol == "11/13" and sol.quote_mint == ""          # пара к SOL
+    assert sol.token_program == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" and not sol.mayhem and not sol.cashback
+    assert sol.v_sol == 30.0 and sol.v_tokens == 1_073_000_000.0
+    usdc = decode_event(base64.b64decode(REAL_CREATE_USDC), ctx)
+    assert isinstance(usdc, TokenCreated) and usdc.symbol == "BOUNCE"
+    assert usdc.quote_mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"                        # пара к USDC
+    assert decode_event(base64.b64decode(REAL_TRADE_USDC), ctx) is None                              # сделка не в SOL
+    # старое короткое событие (без новых полей) — к чему пара, неизвестно
+    old = decode_event(create_event(addr("oldmint"), addr("olddev")), ctx)
+    assert isinstance(old, TokenCreated) and old.quote_mint is None and old.token_program == ""
+
+
 def test_failed_tx_is_ignored():
     tx = tx_with_logs(create_event(addr("m3"), addr("d3")))
     tx["meta"]["err"] = {"InstructionError": [0, "Custom"]}

@@ -138,7 +138,6 @@ NO_RETRY = ("нет RPC", "дневной лимит запросов RPC")
 ENTRY_STATS_KEY = "paper:entry_stats"
 BLOCK_TX_MAX = 20                  # транзакций монеты в одном блоке разбираем не больше
 TX_MAX = 30                        # и всего на одну цену входа
-START_MC = 30.0 / 1_073_000_000.0 * 1e9   # MC (SOL) монеты pump.fun на старте кривой: 30 SOL / 1.073 млрд токенов
 DAY_STOP_PCT = 0.0            # дневной стоп копий, доля старта (0 — нет; с 9.11 выключен, включается в /settings)
 LOTTERY_FILTERED = "D"
 LOTTERY_DEV_SHARE = (0.030, 0.035)
@@ -715,7 +714,7 @@ class PaperTrader:
         except Exception:  # noqa: BLE001
             pass
         tried = got = 0
-        created = False
+        created: Any = None
         blocks: dict[int, list[dict[str, Any]]] = {}
         for x in cand:
             blocks.setdefault(int(x["slot"]), []).append(x)
@@ -738,7 +737,7 @@ class PaperTrader:
                 # на вышедших на PumpSwap монетах пропускались как «не разобрана»)
                 pools = {**pool_map, **sol_pools_of(tx, mint)}
                 all_evs = parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
-                created = created or any(isinstance(ev, TokenCreated) and ev.mint == mint for ev in all_evs)
+                created = created or next((ev for ev in all_evs if isinstance(ev, TokenCreated) and ev.mint == mint), None)
                 mcs += [mc_sol(ev.v_sol, ev.v_tokens) for ev in all_evs if isinstance(ev, Trade) and ev.mint == mint]
             mcs = [m for m in mcs if m > 0]
             if mcs:
@@ -749,10 +748,12 @@ class PaperTrader:
                 return max(mcs)
             if tried >= TX_MAX:
                 break
-        if with_trigger and created:
-            # монету создали без покупки дева, и до блока +2 сделок не было: реальный бот купил бы по цене старта
-            # кривой pump.fun (резервы в событии создания у новых монет бывают неверными — берём стандартные)
-            return START_MC
+        if created is not None and created.quote_mint:
+            # 14.11: «мой дев» запускает монеты и в паре не к SOL (USDC, акции, другие монеты) — их сделки идут
+            # в другой валюте. Вход «по цене старта кривой SOL» давал по ним фальшивые +44…+194% (17 сделок, +$172)
+            return self._why(mint, trig_sig, "монета в паре не к SOL")
+        if with_trigger and created is not None:
+            return self._why(mint, trig_sig, "создана без покупки в SOL и без сделок до блока +2")
         if tried and not got:
             return self._why(mint, trig_sig, "узел не отдал транзакции блока")
         return self._why(mint, trig_sig, "в транзакциях блока нет сделки этой монеты на pump.fun")

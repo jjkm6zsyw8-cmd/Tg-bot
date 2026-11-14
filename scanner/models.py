@@ -28,6 +28,10 @@ class TokenCreated:
     ts: datetime = field(default_factory=utcnow)
     source: str = ""
     received_at: datetime = field(default_factory=utcnow)
+    token_program: str = ""     # программа токена монеты (Token-2022 у create_v2); "" — в событии не было
+    quote_mint: str | None = None   # в паре к чему: "" — SOL, адрес — USDC или другая монета, None — неизвестно
+    mayhem: bool = False
+    cashback: bool = False
 
 
 @dataclass(slots=True)

@@ -536,3 +536,9 @@ INSERT INTO wallet_pick(address, pick)
 SELECT address, 'unrealized' FROM watchlist
  WHERE kind = 'trader' AND created_at >= '2026-11-12 11:50:00+00' AND created_at < '2026-11-12 12:05:00+00'
 ON CONFLICT (address) DO NOTHING;
+
+-- 14.11: «мой дев» на монетах в паре не к SOL — вход был записан по цене старта кривой SOL (27.959 SOL),
+-- а монета торгуется в другой валюте: фальшивые +44…+194% (17 сделок за 14.11). В итог не идут.
+UPDATE paper_positions SET suspect = true, price_check = 'entry'
+ WHERE portfolio = 'Y' AND NOT suspect AND entry_mc BETWEEN 27.958 AND 27.960
+   AND opened_at >= '2026-11-13 20:00:00+00' AND opened_at < '2026-11-16 00:00:00+00';
