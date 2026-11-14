@@ -970,6 +970,22 @@ class PaperTrader:
                 return float(t.mc)
         return None
 
+    def exit_mc_at_slot(self, mint: str, slot: int) -> float | None:
+        """Цена продажи в блоке slot: из последнего блока со сделками не позже slot — худшая для продажи (минимум).
+        Порядок сделок внутри блока неизвестен; так продажа считается так же осторожно, как вход (максимум блока)."""
+        st = self.e.states.get(mint) if getattr(self.e, "states", None) else None
+        best_slot, mcs = None, []
+        for t in reversed(getattr(st, "trades", None) or []):
+            if t.slot is None or t.slot > slot or not t.mc or t.mc <= 0:
+                continue
+            if best_slot is None:
+                best_slot = t.slot
+            if t.slot == best_slot:
+                mcs.append(float(t.mc))
+            elif t.slot < best_slot:
+                break
+        return min(mcs) if mcs else None
+
     async def _exit_blocks(self, p: Position, reason: str, share: float, slot0: int) -> None:
         """Продажа как у реального бота: ложится через EXIT_BLOCKS блока после сделки, давшей сигнал."""
         target = slot0 + EXIT_BLOCKS
@@ -980,7 +996,7 @@ class PaperTrader:
             if any((t.slot or 0) > target for t in trades[-30:]):
                 break
             await asyncio.sleep(0.2)
-        mc = self.mc_at_slot(p.mint, target) or float(p.extra.get("last_mc") or p.entry_mc)
+        mc = self.exit_mc_at_slot(p.mint, target) or float(p.extra.get("last_mc") or p.entry_mc)
         p.extra["last_mc"] = mc
         async with self.lock:
             if p.id not in self.positions or p.tokens <= 0:

@@ -549,3 +549,11 @@ async def test_block_mc_takes_worst_price_of_the_block(monkeypatch):
     for order in (["a", "b", "c"], ["c", "a", "b"]):
         tr.e.rpc = FakeRpc([{"signature": s_, "slot": 102} for s_ in order] + [{"signature": "old", "slot": 101}])
         assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == pytest.approx(mc_sol(55.0, 8e8))
+
+
+async def test_exit_takes_worst_price_of_the_block(monkeypatch):
+    """Продажа — худшая цена последнего блока со сделками (порядок внутри блока неизвестен), как вход — худшая."""
+    trades = [row(101, 31.0), row(103, 40.0), row(106, 44.0), row(106, 38.0), row(106, 41.0), row(108, 50.0)]
+    tr, st, sold = realtime_trader(monkeypatch, trades)
+    assert tr.exit_mc_at_slot("M", 106) == 38.0 and tr.exit_mc_at_slot("M", 105) == 40.0
+    assert tr.exit_mc_at_slot("M", 100) is None
