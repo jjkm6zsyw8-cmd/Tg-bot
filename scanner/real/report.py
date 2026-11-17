@@ -234,8 +234,8 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     kb.append([{"text": "▶️ Продолжить входы", "callback": "rl:resume"} if paused else
                {"text": "⛔ Стоп входов", "callback": "rl:pause"},
                {"text": "💰 Продать всё…", "callback": "rl:sellall"}])
-    kb.append([{"text": "📋 Сделки", "callback": "rl:trades"}, {"text": "⚖️ Против бумаги", "callback": "rl:cmp"},
-               {"text": "📄 Файл", "callback": "rl:csv"}])
+    kb.append([{"text": "📋 Сделки", "callback": "rl:trades"}, {"text": "⚖️ Против бумаги", "callback": "rl:cmp"}])
+    kb.append([{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}, {"text": "📄 CSV сделок", "callback": "rl:csv"}])
     kb.append([{"text": "🎯 Методы", "callback": "rl:wme:g"}, {"text": "⚙️ Настройки", "callback": "rl:set"},
                {"text": "🧪 Проверка", "callback": "rl:check"}])
     return "\n".join(lines), kb
@@ -543,7 +543,13 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
     if action == "trades":
         return Reply(await trades_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]])
     if action == "cmp":
-        return Reply(await compare_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]])
+        return Reply(await compare_text(db, cfg), [[{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"},
+                                                    {"text": "← Назад", "callback": "rl:view"}]])
+    if action == "xlsx":
+        from ..reports.excel import build_xlsx
+        data, caption = await build_xlsx(db, cfg)
+        stamp = datetime.now(tz_of(cfg)).strftime("%Y-%m-%d_%H%M")
+        return Reply(document=(data, f"report_{stamp}.xlsx", caption))
     if action == "csv":
         text, n = await trades_csv(db, cfg)
         return Reply(document=(text.encode("utf-8-sig"), "real_trades.csv",

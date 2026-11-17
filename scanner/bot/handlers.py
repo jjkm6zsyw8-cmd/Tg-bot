@@ -828,6 +828,15 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def cmd_export(m: Message) -> None:
         await send_export(m)
 
+    @router.message(Command("excel"))
+    async def cmd_excel(m: Message) -> None:
+        """Вся отчётность одним файлом Excel: реальный бот, сравнение с бумагой, пропуски, бумага, кошельки, разведка."""
+        from ..reports.excel import build_xlsx
+        cfg = await reload()
+        data, caption = await build_xlsx(db, cfg)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+        await m.answer_document(BufferedInputFile(data, filename=f"report_{stamp}.xlsx"), caption=caption)
+
     async def send_export(m: Message) -> None:
         """Всё для разбора одним архивом: сделки за сутки и 30 дней, кошельки, журнал копитрейда."""
         from ..reports.export import build_export

@@ -54,7 +54,7 @@ async def test_status_before_first_start(db):
     assert "Методы: Smart A · Мой дев G (только тень)" in text
     cbs = callbacks(kb)
     for c in ("rl:view", "rl:mode:off", "rl:mode:shadow", "rl:mode:live", "rl:pause", "rl:sellall", "rl:trades",
-              "rl:cmp", "rl:csv", "rl:set", "rl:check", "rl:wme:g", "rl:wl"):
+              "rl:cmp", "rl:csv", "rl:xlsx", "rl:set", "rl:check", "rl:wme:g", "rl:wl"):
         assert c in cbs
     assert all(len(c.encode()) <= 64 for c in cbs)                      # ограничение Telegram на данные кнопки
     assert "пока нет" in await report.trades_text(db, {})
@@ -129,6 +129,30 @@ async def test_status_trades_file_and_comparison(db):
     cmp2 = await report.compare_text(db, {})
     assert "Бумага A / Y вошла, а бот — нет: 2" in cmp2
     assert "$UNK (бумага A +25%) — бот: тень: монета не найдена в сети" in cmp2
+    # вся отчётность одним Excel: листы, строки, числа — числами
+    import io
+
+    from openpyxl import load_workbook
+    r = await report.on_callback(db, reloader(db), "xlsx")
+    data, name, caption = r.document
+    assert name.startswith("report_") and name.endswith(".xlsx") and "реальный бот — 2 сделок" in caption
+    wb = load_workbook(io.BytesIO(data))
+    assert wb.sheetnames == ["Сводка", "Бот по дням", "Сделки бота", "Бот против бумаги", "Бумага без бота",
+                             "Пропуски бота", "Бумага по дням", "Сделки бумаги", "Smart-кошельки", "Разведка"]
+    trades_ws = wb["Сделки бота"]
+    head = [c.value for c in trades_ws[1]]
+    assert head[:4] == ["Кошелёк", "Режим", "Метод", "Монета"] and "Чей сигнал (адрес)" in head
+    assert trades_ws.max_row == 3 and trades_ws.cell(2, 7).value == "TRADER"
+    pct = trades_ws.cell(2, head.index("Итог, %") + 1)
+    assert isinstance(pct.value, float) and pct.number_format == "0.0%"
+    missed = [[c.value for c in row] for row in wb["Бумага без бота"].iter_rows(min_row=2)]
+    assert any(r[2] == "UNK" and r[6] == "тень: монета не найдена в сети" for r in missed)
+    assert any("причина не записана" in str(r[6]) for r in missed)
+    vs = [[c.value for c in row] for row in wb["Бот против бумаги"].iter_rows(min_row=2)]
+    assert any(r[6] == "A" and r[7] == pytest.approx(0.30) for r in vs)
+    days = [[c.value for c in row] for row in wb["Бумага по дням"].iter_rows(min_row=2)]
+    assert any(r[1] == "A" and r[2] == 3 for r in days)                      # 101, 103, 104
+    assert wb["Пропуски бота"]["A2"].value == "Режим" and wb["Пропуски бота"]["D3"].value == 1   # сколько раз и почему
     r = await report.on_callback(db, reloader(db), "csv")
     assert r.document and r.document[1] == "real_trades.csv" and "Сделки реального бота: 2" in r.document[2]
     assert (await report.on_callback(db, reloader(db), "trades")).text == trades
