@@ -112,9 +112,9 @@ async def run_tool(cmd: str, db: Database) -> None:
         text = await run(RealTrader(eng), [a for a in args if not a.startswith("-")] or None)   # type: ignore[arg-type]
         print(re.sub(r"<[^>]+>", "", text))
     elif cmd == "lookalike":
-        # поиск по образцу smart A вручную: python -m scanner lookalike [--hours 24] [--age N] [--all] [кошелёк …]
+        # поиск по образцу smart A вручную: python -m scanner lookalike [--hours 24] [--age N] [--amm] [--all] [--coins] [кошелёк …]
         from datetime import datetime, timezone
-        from .analytics.lookalike import cfg_get, diagnose, evaluate, format_cli
+        from .analytics.lookalike import cfg_get, coin_details, diagnose, evaluate, format_cli
         from .config import Settings, YamlConfig, load_env
         env = load_env()
         cfg = dict(Settings(YamlConfig(env.config_path), await db.get_overrides()).effective())
@@ -122,6 +122,8 @@ async def run_tool(cmd: str, db: Database) -> None:
         skip = {args.index(k) + 1 for k in opt}
         if "--age" in opt:
             cfg["lk_max_age_min"] = opt["--age"]
+        if "--amm" in args or "--all" in args:      # PumpSwap (в автопоиске пока выключен)
+            cfg["lk_amm"] = True
         if "--all" in args:                         # все покупки на PumpSwap — для отслеживаемых кошельков (7BNax)
             cfg["lk_amm_prior"] = 0
         wallets = [a for i, a in enumerate(args) if not a.startswith("-") and i not in skip] or None
@@ -130,6 +132,8 @@ async def run_tool(cmd: str, db: Database) -> None:
         print(format_cli(evals, cfg))
         for w in wallets or []:
             print("\n" + await diagnose(db, cfg, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
+            if "--coins" in args:                   # по монетам: цена в базе по источникам против бумаги A
+                print("\n" + await coin_details(db, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

@@ -207,10 +207,26 @@ async def test_pumpswap_buys_of_old_coins(db):
     for i in range(12):
         await amm_coin(db, "SWAPPER", now - timedelta(hours=10) + timedelta(minutes=20 * i), recorded_before=True)
         await amm_coin(db, "TRIGGER", now - timedelta(hours=10) + timedelta(minutes=20 * i), recorded_before=False)
-    evals = await LK.evaluate(db, {}, now)
+    assert "SWAPPER" not in await LK.evaluate(db, {}, now)   # PumpSwap в автопоиске выключен, пока не сверен
+    evals = await LK.evaluate(db, {"lk_amm": True}, now)
     assert evals["SWAPPER"].n == 12 and evals["SWAPPER"].hit == 1.0 and evals["SWAPPER"].good({})
     assert "TRIGGER" not in evals                     # монету начали записывать после его покупки — не в счёт
-    assert (await LK.evaluate(db, {"lk_amm_prior": 0}, now, wallets=["TRIGGER"]))["TRIGGER"].n == 12   # --all
+    assert (await LK.evaluate(db, {"lk_amm": True, "lk_amm_prior": 0}, now, wallets=["TRIGGER"]))["TRIGGER"].n == 12
     assert (await LK.evaluate(db, {"lk_amm": False}, now, wallets=["SWAPPER"]))["SWAPPER"].n == 0
     text = await LK.diagnose(db, {}, "SWAPPER", now, 24)
     assert "на кривой pump 0, на PumpSwap 12" in text
+
+
+async def test_coin_details_by_source(db):
+    now = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    await amm_coin(db, "SWAPPER", now - timedelta(hours=1), recorded_before=True)
+    mint = await db.fetchval("SELECT mint FROM trades WHERE trader='SWAPPER' LIMIT 1")
+    await db.execute("UPDATE trades SET source='pumpportal' WHERE mint=$1 AND mc_sol=560", mint)
+    await db.execute(
+        """INSERT INTO paper_positions(portfolio, mint, opened_at, entry_mc, max_mc, cost_sol, tokens, tokens_initial,
+               pnl_pct, exit_reason) VALUES ('A', $1, $2, 410, 560, 0.1, 1, 1, 25, 'take_profit')""",
+        mint, now - timedelta(hours=1) + timedelta(seconds=2))
+    text = await LK.coin_details(db, "SWAPPER", now, 24)
+    line = text.splitlines()[1]
+    assert line.startswith(mint[:6]) and "pump-amm" in line and "| 1: 560→560→560 |" in line
+    assert "410→560, +25% take_profit" in line

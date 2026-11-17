@@ -42,7 +42,8 @@ DEFAULTS: dict[str, Any] = {
     "lk_hours": 24.0,                   # за сколько часов брать покупки
     "lk_min_sol": 0.3, "lk_max_sol": 5.0,
     "lk_max_age_min": 25,               # кривая: покупки в первые N минут монеты (дальше данные о цене неполные)
-    "lk_amm": True,                     # PumpSwap (там торгует 7BNax)
+    "lk_amm": False,                    # PumpSwap (там торгует 7BNax) — выключен, пока расчёт не сошёлся с бумагой:
+                                        # 18.11 у 7BNax вышло 10% тейков против 81% у бумаги A (разбор: --coins)
     "lk_amm_prior": 3,                  # PumpSwap: столько сделок других за 2 мин до покупки (монету уже записывали)
     "lk_min_coins": 10, "lk_max_coins": 300,
     "lk_traders": 400,                  # сколько активных кошельков проверять за раз
@@ -217,6 +218,56 @@ DIAG = """
            string_agg(DISTINCT t.pool, ', ') pools
     FROM trades t LEFT JOIN tokens k ON k.mint = t.mint
     WHERE t.trader = $1 AND t.ts >= $2 AND t.ts < $3"""
+
+
+COINS = """
+    WITH b AS (
+        SELECT DISTINCT ON (t.mint) t.mint, t.ts, t.slot, t.mc_sol, t.source, t.pool
+        FROM trades t WHERE t.trader = $1 AND t.is_buy AND t.ts >= $2 AND t.ts < $3
+        ORDER BY t.mint, t.ts),
+    b2 AS (SELECT * FROM b ORDER BY ts DESC LIMIT $4)
+    SELECT b2.mint, b2.ts, b2.pool, b2.mc_sol buy_mc, b2.source buy_src,
+           e.mc entry_mc, e.source entry_src, extract(epoch FROM e.ts - b2.ts) entry_s,
+           w.n_pp, w.n_other, w.peak_pp, w.peak_other, w.first_pp, w.first_other, w.last_pp, w.last_other,
+           p.entry_mc paper_entry, p.max_mc paper_max, p.pnl_pct paper_pct, p.exit_reason paper_exit,
+           extract(epoch FROM p.opened_at - b2.ts) paper_s
+    FROM b2
+    LEFT JOIN LATERAL (
+        SELECT x.mc_sol mc, x.source, x.ts FROM trades x
+        WHERE x.mint = b2.mint AND x.ts > b2.ts AND x.trader <> $1 ORDER BY x.ts LIMIT 1) e ON true
+    LEFT JOIN LATERAL (
+        SELECT count(*) FILTER (WHERE y.source = 'pumpportal') n_pp, count(*) FILTER (WHERE y.source <> 'pumpportal') n_other,
+               max(y.mc_sol) FILTER (WHERE y.source = 'pumpportal') peak_pp,
+               max(y.mc_sol) FILTER (WHERE y.source <> 'pumpportal') peak_other,
+               (array_agg(y.mc_sol ORDER BY y.ts) FILTER (WHERE y.source = 'pumpportal'))[1] first_pp,
+               (array_agg(y.mc_sol ORDER BY y.ts) FILTER (WHERE y.source <> 'pumpportal'))[1] first_other,
+               (array_agg(y.mc_sol ORDER BY y.ts DESC) FILTER (WHERE y.source = 'pumpportal'))[1] last_pp,
+               (array_agg(y.mc_sol ORDER BY y.ts DESC) FILTER (WHERE y.source <> 'pumpportal'))[1] last_other
+        FROM trades y WHERE y.mint = b2.mint AND y.ts > b2.ts AND y.ts <= b2.ts + interval '300 seconds') w ON true
+    LEFT JOIN LATERAL (
+        SELECT * FROM paper_positions pp WHERE pp.mint = b2.mint AND pp.portfolio = 'A'
+          AND pp.opened_at BETWEEN b2.ts - interval '30 seconds' AND b2.ts + interval '120 seconds'
+        ORDER BY pp.opened_at LIMIT 1) p ON true
+    ORDER BY b2.ts DESC"""
+
+
+async def coin_details(db: Any, wallet: str, until: datetime, hours: float, limit: int = 12) -> str:
+    """По монетам: его покупка, наш вход, цена за 5 минут по источникам (PumpPortal / свой разбор блоков) и что
+    записала бумага A — чтобы увидеть, где расчёт расходится с бумагой."""
+    rows = await db.fetch(COINS, wallet, until - timedelta(hours=hours), until, limit)
+    f = lambda v: "—" if v is None else f"{v:.0f}"  # noqa: E731
+    out = ["монета | время UTC | площадка | он купил по MC (источник) | первая сделка после него | "
+           "5 мин PumpPortal: сделок, первая→пик→последняя | 5 мин свой разбор: то же | бумага A: вход→макс, итог"]
+    for r in rows:
+        paper = (f"{f(r['paper_entry'])}→{f(r['paper_max'])}, {r['paper_pct']:+.0f}% {r['paper_exit'] or ''}"
+                 if r["paper_entry"] is not None and r["paper_pct"] is not None else
+                 f"{f(r['paper_entry'])}→{f(r['paper_max'])}" if r["paper_entry"] is not None else "нет")
+        out.append(
+            f"{r['mint'][:6]} | {r['ts'].strftime('%d.%m %H:%M:%S')} | {r['pool']} | {f(r['buy_mc'])} ({r['buy_src']}) | "
+            f"{f(r['entry_mc'])} ({r['entry_src'] or '—'}, +{(r['entry_s'] or 0):.1f} с) | "
+            f"{r['n_pp'] or 0}: {f(r['first_pp'])}→{f(r['peak_pp'])}→{f(r['last_pp'])} | "
+            f"{r['n_other'] or 0}: {f(r['first_other'])}→{f(r['peak_other'])}→{f(r['last_other'])} | {paper}")
+    return "\n".join(out)
 
 
 async def diagnose(db: Any, cfg: dict[str, Any], wallet: str, until: datetime, hours: float) -> str:
