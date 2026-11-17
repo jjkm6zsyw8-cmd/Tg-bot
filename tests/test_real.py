@@ -941,3 +941,15 @@ async def test_sell_without_key_asks_for_help(db, monkeypatch):
     assert p.id in tr.positions and p.extra["stuck"] == 1 and len(chain.sent) == 1
     texts = [r["payload"]["text"] for r in await db.fetch("SELECT payload FROM outbox ORDER BY id")]
     assert any("нет ключа кошелька" in t and str(MINT) in t for t in texts)
+
+
+async def test_shadow_position_price_is_polled_from_chain(db):
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain)
+    await tr.start()
+    await fire(tr, chain)
+    chain.set_mc(MINT, 54.0)                                   # поток сделок молчит, цена выросла
+    await tr.tick()
+    await asyncio.sleep(0.2)
+    assert not tr.positions and await db.fetchval("SELECT exit_reason FROM real_positions") == "take_profit"

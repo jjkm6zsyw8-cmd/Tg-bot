@@ -106,6 +106,7 @@ class RealTrader:
         self.wid: int | None = int(profile["id"]) if profile else None
         self.name = str(profile.get("name") or "") if profile else ""
         self.accept_new = True                      # False — только доводит открытые позиции (полоса без кошелька)
+        self.external_poll = False                  # True — цену открытых позиций проверяет менеджер кошельков (desk)
         self._helius_key = getattr(getattr(engine, "env", None), "helius_key", "") or ""
         if wallet is not None or profile is not None or wallet_note is not None:
             self.wallet, self.wallet_note = wallet, wallet_note or ("задан" if wallet is not None else "не задан")
@@ -1080,10 +1081,13 @@ class RealTrader:
                     self._start_exit(p, str(reason), float(share))
                 continue
             self._check(p, float(p.extra.get("last_mc") or p.entry_mc), None, confirmed=True)   # выходы по времени
-        live = [p for p in self.positions.values() if p.extra.get("mode") == "live" and not p.closing]
-        if live and self.chain is not None and now - self._last_poll >= float(self.get("real_poll_s")):
+        # цена открытых позиций — прямо из сети, и в бою, и в тени (17.11: тень видела цену только по сделкам из
+        # потока, пропустила пик +32% и вышла на +19%, когда бумага взяла тейк)
+        open_ps = self.pollable()
+        if open_ps and not self.external_poll and self.chain is not None \
+                and now - self._last_poll >= float(self.get("real_poll_s")):
             self._last_poll = now
-            await self._poll(live)
+            await self._poll(open_ps)
         if self.to_close and not self._sweeping and self.wallet is not None and self.wallet.can_sign \
                 and self.chain is not None:
             asyncio.create_task(self._sweep_safe())
@@ -1091,19 +1095,29 @@ class RealTrader:
         if now - self._last_status >= 5:
             await self.publish_status()
 
+    def pollable(self) -> list[Position]:
+        """Открытые позиции, цену которых надо проверить (не продаются прямо сейчас и не ждут повтора продажи)."""
+        return [p for p in self.positions.values() if not p.closing and not p.extra.get("retry_at")]
+
+    def on_state(self, p: Position, st: dict[str, Any]) -> None:
+        """Цена позиции из сети (кривая / пул) — решение о выходе."""
+        if st.get("venue") and st.get("mc"):
+            p.extra["venue"] = st["venue"]
+            self._check(p, float(st["mc"]), None, confirmed=True)
+
     async def _poll(self, ps: list[Position]) -> None:
-        """Запасной контроль цены боевых позиций: состояние кривой/пула из блокчейна одним запросом
-        (поток сделок мог отстать или оборваться)."""
-        ps = ps[:12]
+        """Контроль цены открытых позиций: состояние кривой/пула из блокчейна одним запросом на 16 монет
+        (по многим монетам сделки из потока не приходят или приходят с опозданием)."""
+        mints = list(dict.fromkeys(p.mint for p in ps))[:16]
         try:
-            sts, _ = await self._states([Pubkey.from_string(p.mint) for p in ps])
+            sts, _ = await self._states([Pubkey.from_string(m) for m in mints])
         except Exception as exc:  # noqa: BLE001
             log.warning("реальный бот: состояние позиций: %s", str(exc)[:120])
             return
-        for p, st in zip(ps, sts):
-            if st.get("venue") and st.get("mc"):
-                p.extra["venue"] = st["venue"]
-                self._check(p, float(st["mc"]), None, confirmed=True)
+        by_mint = dict(zip(mints, sts))
+        for p in ps:
+            if p.mint in by_mint:
+                self.on_state(p, by_mint[p.mint])
 
     async def _sweep_safe(self) -> None:
         self._sweeping = True

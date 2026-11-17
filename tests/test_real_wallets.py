@@ -340,3 +340,30 @@ async def test_trades_in_dollars_use_real_sol_price_with_wallets(db):
     assert f"+${row['pnl_sol'] * 74:.2f}" in text and f"+${row['pnl_sol'] * 150:.2f}" not in text
     view, _kb = await report.status_view(db, {})
     assert f"+${row['pnl_sol'] * 74:.2f}" in view
+
+
+async def test_desk_checks_price_of_shadow_positions_from_chain(db):
+    """17.11: тень видела цену только по сделкам из потока, пропустила пик +32% и вышла на +19% по продаже трейдера.
+    Теперь цена всех открытых позиций всех кошельков проверяется в сети — одним запросом на всех."""
+    chain = FakeChain()
+    m2 = pk("mint-two")
+    chain.add_curve(MINT, 40.0)
+    chain.add_curve(m2, 40.0)
+    desk = make_desk(db, chain)
+    await desk.start()
+    w1 = await desk.create_wallet("A")
+    w2 = await desk.create_wallet("B")
+    await fire(desk, chain)
+    await fire(desk, chain, m2)
+    assert len(desk.positions) == 4 and all(p.extra["mode"] == "shadow" for p in desk.positions.values())
+    chain.set_mc(MINT, 54.0)                                   # поток молчит, цена выросла
+    calls = chain.calls
+    desk._last_poll = 0.0
+    await desk.tick()
+    await asyncio.sleep(0.2)
+    assert chain.calls - calls <= 6                            # один запрос цен на оба кошелька (плюс продажи)
+    left = {(p.extra.get("mode"), p.mint) for p in desk.positions.values()}
+    assert left == {("shadow", str(m2))} and len(desk.positions) == 2
+    reasons = {r["exit_reason"] for r in await db.fetch("SELECT exit_reason FROM real_positions WHERE closed_at IS NOT NULL")}
+    assert reasons == {"take_profit"}
+    assert desk.lanes[w1].external_poll and desk.lanes[w2].external_poll

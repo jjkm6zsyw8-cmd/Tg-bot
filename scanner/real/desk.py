@@ -71,6 +71,7 @@ class RealDesk:
         self.chain = chain if chain is not None else make_chain(engine)
         self.lanes: dict[int | None, RealTrader] = {}
         self._last_status = 0.0
+        self._last_poll = 0.0
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ то, что зовёт движок
@@ -115,12 +116,40 @@ class RealDesk:
 
     async def tick(self) -> None:
         for lane in list(self.lanes.values()):
+            lane.external_poll = True
             try:
                 await lane.tick()
             except Exception:  # noqa: BLE001 — сбой одного кошелька не задевает остальные
                 log.exception("реальный бот %s: цикл", lane.name or "общий")
+        await self.poll_prices()
         if time.time() - self._last_status >= 5:
             await self.publish_status()
+
+    async def poll_prices(self) -> None:
+        """Цена открытых позиций всех кошельков — из сети, одним запросом на 16 монет (а не запрос на кошелёк)."""
+        lanes = [lane for lane in self.lanes.values() if lane.pollable()]
+        if not lanes or self.chain is None:
+            return
+        every = min(float(lane.get("real_poll_s")) for lane in lanes)
+        if time.time() - self._last_poll < every:
+            return
+        self._last_poll = time.time()
+        mints = list(dict.fromkeys(p.mint for lane in lanes for p in lane.pollable()))
+        for i in range(0, len(mints), 16):
+            chunk = mints[i:i + 16]
+            try:
+                sts, _ = await lanes[0]._states([Pubkey.from_string(m) for m in chunk])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("реальный бот: цена позиций: %s", str(exc)[:120])
+                return
+            by_mint = dict(zip(chunk, sts))
+            for lane in lanes:
+                for p in lane.pollable():
+                    if p.mint in by_mint:
+                        try:
+                            lane.on_state(p, by_mint[p.mint])
+                        except Exception:  # noqa: BLE001
+                            log.exception("реальный бот: решение по позиции %s", p.mint)
 
     async def command(self, p: dict[str, Any]) -> None:
         """Команды из Telegram (через очередь заданий)."""
