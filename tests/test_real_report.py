@@ -92,6 +92,12 @@ async def test_status_trades_file_and_comparison(db):
     assert not tr.positions
     trades = await report.trades_text(db, {})
     assert "✅ 👻" in trades and "❌ 👻" in trades and "тейк" in trades and "вручную" in trades and "вход +2 бл." in trades
+    assert "· за TRADER" in trades                                          # чей сигнал
+    await db.execute("INSERT INTO traders(address, label) VALUES ('TRADER', '🔍 лучший')")
+    assert "· за 🔍 лучший (TRADER)" in await report.trades_text(db, {})
+    await db.execute("DELETE FROM traders WHERE address='TRADER'")
+    assert report.trader_name("7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5", None) == "7BNa…LGH5"
+    assert report.trader_name("7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5", "🔍 7BNa…LGH5") == "🔍 7BNa…LGH5"
     csv_text, n = await report.trades_csv(db, {})
     rows = csv_text.strip().splitlines()
     assert n == 2 and len(rows) == 3 and rows[0].startswith("режим;сигнал;монета") and str(MINT) in csv_text

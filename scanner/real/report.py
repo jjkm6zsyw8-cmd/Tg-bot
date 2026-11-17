@@ -320,8 +320,9 @@ def settings_view(cfg: dict[str, Any], wid: int | None = None, name: str = "") -
 # ---------------------------------------------------------------------- сделки
 async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20, wallet: Any = "all") -> str:
     every = wallet == "all"
-    rows = await db.fetch("SELECT * FROM real_positions WHERE closed_at IS NOT NULL "
-                          "AND ($2 OR wallet_id IS NOT DISTINCT FROM $3::bigint) ORDER BY closed_at DESC LIMIT $1",
+    rows = await db.fetch("SELECT p.*, t.label trader_label FROM real_positions p "
+                          "LEFT JOIN traders t ON t.address = p.trader WHERE p.closed_at IS NOT NULL "
+                          "AND ($2 OR p.wallet_id IS NOT DISTINCT FROM $3::bigint) ORDER BY p.closed_at DESC LIMIT $1",
                           limit, every, None if every else wallet)
     if not rows:
         return "📋 Закрытых сделок реального бота пока нет."
@@ -335,8 +336,15 @@ async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20, wallet: Any
             f"{r['closed_at'].astimezone(tz):%d.%m %H:%M} ${esc(r['symbol'] or '?')} ({KINDS.get(r['kind'], r['kind'])}) "
             f"{float(r['pnl_pct'] or 0):+.0%} {money(float(r['pnl_sol'] or 0), sol_usd)} · "
             f"{EXIT_NAMES.get(r['exit_reason'], r['exit_reason'])}"
-            + (f" · вход +{blocks} бл." if blocks is not None else ""))
+            + (f" · вход +{blocks} бл." if blocks is not None else "")
+            + (f" · за {esc(trader_name(r['trader'], r['trader_label']))}" if r["trader"] else ""))
     return "\n".join(lines)
+
+
+def trader_name(addr: str, label: str | None) -> str:
+    """Чей сигнал: метка из списка (🔍 / 🧬 — найден разведкой) или начало и конец адреса."""
+    short = f"{addr[:4]}…{addr[-4:]}" if len(addr) > 10 else addr
+    return f"{label} ({short})" if label and short not in label else label or short
 
 
 async def trades_csv(db: Any, cfg: dict[str, Any]) -> tuple[str, int]:
