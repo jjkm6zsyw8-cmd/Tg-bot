@@ -25,7 +25,7 @@ DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "G"}
 
 # вид: usd | sol | pct | num | sec | bool | choice
 SETTINGS: dict[str, tuple[str, Any, float, float, float, str, str]] = {
-    "real_stake_usd": ("Ставка на сделку, $", 5.0, 1.0, 1.0, 1000.0, "usd",
+    "real_stake_usd": ("Ставка на сделку, $", 5.0, 5.0, 1.0, 1000.0, "usd",
                        "Фиксированная сумма на вход. Потолок — REAL_MAX_STAKE_USD на сервере."),
     "real_max_impact": ("Своя покупка двигает цену не больше чем на", 0.03, 0.01, 0.005, 0.20, "pct",
                         "Ставка урезается так, чтобы собственная покупка не сдвигала цену монеты сильнее."),
