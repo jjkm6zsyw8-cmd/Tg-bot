@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import csv
 import io
@@ -679,6 +680,11 @@ class PaperTrader:
         from ..ingest.pump_parser import ParseStats, parse_transaction
         from ..models import TokenCreated, Trade
         from .curve import mc_sol
+        if await self.pair_of(mint, rpc):
+            # 16–17.11: проверка по транзакции создания срабатывала только когда в блоках до +2 не было сделок;
+            # у монет с покупкой дева в USDC/акциях цена бралась раньше проверки (80 фальшивых сделок, +$1148).
+            # Счёт кривой в сети говорит валюту пары сразу
+            return self._why(mint, trig_sig, "монета в паре не к SOL")
         try:
             sigs = list(await rpc.signatures_for(mint, limit=1000, until=trig_sig) or [])
             self._entry_rpc_add()
@@ -722,6 +728,31 @@ class PaperTrader:
         blocks: dict[int, list[dict[str, Any]]] = {}
         for x in cand:
             blocks.setdefault(int(x["slot"]), []).append(x)
+        parsed: dict[str, list[Any]] = {}
+
+        async def events(x: dict[str, Any]) -> list[Any] | None:
+            """События транзакции (None — узел не отдал); у каждой транзакции — один запрос."""
+            if x["signature"] in parsed:
+                return parsed[x["signature"]]
+            tx = await rpc.transaction(x["signature"])
+            self._entry_rpc_add()
+            if not tx:
+                return None
+            # пул PumpSwap монеты — прямо из транзакции (в базе его бывает нет: 13.11 вечером все smart-сигналы
+            # на вышедших на PumpSwap монетах пропускались как «не разобрана»)
+            pools = {**pool_map, **sol_pools_of(tx, mint)}
+            parsed[x["signature"]] = parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
+            return parsed[x["signature"]]
+
+        if with_trigger:
+            # запуск: сначала сама транзакция создания — в ней валюта пары; не к SOL — дальше не считаем
+            try:
+                evs = await events({"signature": trig_sig, "slot": s0})
+            except Exception:  # noqa: BLE001
+                evs = None
+            created = next((ev for ev in evs or [] if isinstance(ev, TokenCreated) and ev.mint == mint), None)
+            if created is not None and created.quote_mint:
+                return self._why(mint, trig_sig, "монета в паре не к SOL")
         for slot in sorted(blocks, reverse=True):         # от блока +2 вниз — первый блок со сделками монеты
             mcs: list[float] = []
             for x in blocks[slot][:BLOCK_TX_MAX]:
@@ -729,19 +760,16 @@ class PaperTrader:
                     break
                 tried += 1
                 try:
-                    tx = await rpc.transaction(x["signature"])
-                    self._entry_rpc_add()
+                    all_evs = await events(x)
                 except Exception as exc:  # noqa: BLE001
                     return self._why(mint, trig_sig, "RPC отвечает 429 (лимит)" if "rate limited" in str(exc)
                                      else "ошибка RPC")
-                if not tx:
+                if all_evs is None:
                     continue
                 got += 1
-                # пул PumpSwap монеты — прямо из транзакции (в базе его бывает нет: 13.11 вечером все smart-сигналы
-                # на вышедших на PumpSwap монетах пропускались как «не разобрана»)
-                pools = {**pool_map, **sol_pools_of(tx, mint)}
-                all_evs = parse_transaction(tx, x["signature"], int(x["slot"]), "rpc", ParseStats(), pools)
                 created = created or next((ev for ev in all_evs if isinstance(ev, TokenCreated) and ev.mint == mint), None)
+                if created is not None and created.quote_mint:
+                    return self._why(mint, trig_sig, "монета в паре не к SOL")
                 mcs += [mc_sol(ev.v_sol, ev.v_tokens) for ev in all_evs if isinstance(ev, Trade) and ev.mint == mint]
             mcs = [m for m in mcs if m > 0]
             if mcs:
@@ -761,6 +789,74 @@ class PaperTrader:
         if tried and not got:
             return self._why(mint, trig_sig, "узел не отдал транзакции блока")
         return self._why(mint, trig_sig, "в транзакциях блока нет сделки этой монеты на pump.fun")
+
+    async def pair_of(self, mint: str, rpc: Any = None) -> str | None:
+        """Валюта пары монеты по счёту её кривой в сети: "" — SOL, адрес — другая валюта (USDC, токен акции,
+        другая монета), None — узнать не удалось (тогда решает проверка по транзакции создания)."""
+        cache = self.__dict__.setdefault("_pair", {})
+        if mint in cache:
+            return cache[mint]
+        rpc = rpc or getattr(self.e, "rpc", None)
+        if rpc is None or not hasattr(rpc, "call"):
+            return None
+        try:
+            from solders.pubkey import Pubkey
+
+            from ..real.pump import curve_address, parse_curve
+            res = await rpc.call("getAccountInfo", [str(curve_address(Pubkey.from_string(mint))),
+                                                    {"encoding": "base64", "commitment": "confirmed"}])
+            self._entry_rpc_add()
+            val = (res or {}).get("value") if isinstance(res, dict) else None
+            if not val:
+                return None
+            quote = parse_curve(base64.b64decode(val["data"][0])).quote_mint
+        except Exception:  # noqa: BLE001
+            return None
+        if len(cache) > 20_000:
+            cache.clear()
+        cache[mint] = quote
+        return quote
+
+    async def mark_non_sol(self, hours: float = 72.0) -> int:
+        """Сделки последних hours часов по монетам в паре не к SOL (проверка по счёту кривой в сети) — ⚠, не в
+        итоге и не в балансе. Запускается при старте аналитики: убирает такие сделки, открытые до исправления."""
+        rpc = getattr(self.e, "rpc", None)
+        if rpc is None or not hasattr(rpc, "call"):
+            return 0
+        from solders.pubkey import Pubkey
+
+        from ..real.pump import curve_address, parse_curve
+        rows = await self.db.fetch(
+            """SELECT id, mint FROM paper_positions WHERE NOT suspect AND exit_reason IS DISTINCT FROM 'reset'
+               AND opened_at > now() - make_interval(hours => $1)""", int(hours))
+        mints = sorted({r["mint"] for r in rows})
+        bad: set[str] = set()
+        cache = self.__dict__.setdefault("_pair", {})
+        for i in range(0, len(mints), 100):
+            chunk = mints[i:i + 100]
+            try:
+                res = await rpc.call("getMultipleAccounts", [[str(curve_address(Pubkey.from_string(m))) for m in chunk],
+                                                             {"encoding": "base64", "commitment": "confirmed"}])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("бумага: проверка валюты пары: %s", str(exc)[:160])
+                continue
+            for m, acc in zip(chunk, (res or {}).get("value") or []):
+                if not acc:
+                    continue
+                try:
+                    quote = parse_curve(base64.b64decode(acc["data"][0])).quote_mint
+                except Exception:  # noqa: BLE001
+                    continue
+                cache[m] = quote
+                if quote:
+                    bad.add(m)
+        ids = [r["id"] for r in rows if r["mint"] in bad]
+        for pid in ids:
+            await self.mark_suspect(pid)
+        if ids:
+            await self.db.execute("UPDATE paper_positions SET price_check='entry' WHERE id = ANY($1::bigint[])", ids)
+            log.warning("бумага: %d сделок по монетам в паре не к SOL помечены ⚠", len(ids))
+        return len(ids)
 
     def _why(self, mint: str, sig: str, text: str) -> None:
         """Почему цену блока узнать не удалось (для счётчика пропусков)."""

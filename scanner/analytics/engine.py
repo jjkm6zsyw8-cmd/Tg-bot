@@ -212,6 +212,14 @@ class Engine:
         await self._load_traders()
         await self._load_references()
         await self.paper.start()
+        try:    # сделки по монетам в паре не к SOL (до исправления 17.11) — ⚠, не в итоге
+            n = await asyncio.wait_for(self.paper.mark_non_sol(), timeout=90)
+            if n:
+                await self.db.enqueue("text", {"topic": "paper", "text": (
+                    f"📒 Бумага: {n} сделок по монетам в паре не к SOL (USDC, акции, другие монеты) помечены ⚠ — "
+                    "их цена считалась не в SOL, в итог и баланс они не входят.")}, priority=6)
+        except Exception:  # noqa: BLE001
+            log.exception("бумага: проверка валюты пары")
         await self.paper.reconcile()          # баланс бумаги без сделок ⚠ (иначе фальшивая прибыль раздувает ставки)
         if self.real is not None:
             try:

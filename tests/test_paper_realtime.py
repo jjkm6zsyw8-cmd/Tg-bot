@@ -566,3 +566,108 @@ async def test_exit_takes_worst_price_of_the_block(monkeypatch):
     tr, st, sold = realtime_trader(monkeypatch, trades)
     assert tr.exit_mc_at_slot("M", 106) == 38.0 and tr.exit_mc_at_slot("M", 105) == 40.0
     assert tr.exit_mc_at_slot("M", 100) is None
+
+
+def curve_bytes(quote: str | None) -> str:
+    import base64
+    import struct
+
+    from solders.pubkey import Pubkey
+
+    from scanner.real import pump
+    raw = (pump.D_CURVE_ACCOUNT + struct.pack("<QQQQQ", 10**15, 30 * 10**9, 7 * 10**14, 0, 10**15) + bytes([0])
+           + bytes(32) + bytes([0, 0]) + bytes(Pubkey.from_string(quote) if quote else bytes(32)))
+    return base64.b64encode(raw).decode()
+
+
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+COIN = "7gyGAp71YXQRoxmFBaHxofQXAipvgHyBKPyxmdSJxyvz"
+
+
+async def test_block_mc_checks_pair_on_chain_before_any_price(monkeypatch):
+    """16–17.11: у монет с покупкой дева в USDC/акциях цена бралась из сделки раньше проверки валюты пары
+    (80 фальшивых сделок «мой дев»). Теперь пара проверяется по счёту кривой — до расчёта цены."""
+    import scanner.ingest.pump_parser as parser
+    from scanner.models import TokenCreated, Trade
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+    rpc = FakeRpc([{"signature": "s2", "slot": 102}])
+    asked = []
+
+    async def call(method, params, retries=1):
+        asked.append(method)
+        return {"value": {"data": [curve_bytes(USDC), "base64"]}}
+    rpc.call = call
+    tr.e.rpc = rpc
+    monkeypatch.setattr(parser, "parse_transaction", lambda *a, **k: [
+        Trade(signature="s2", mint=COIN, trader="Y", is_buy=True, sol_amount=1, token_amount=1, v_sol=30.0, v_tokens=1.073e9)])
+    assert await tr.block_mc(COIN, "CREATE", 100, 102, None, with_trigger=True) is None
+    assert tr._why_pop(COIN, "CREATE") == "монета в паре не к SOL" and asked == ["getAccountInfo"] and not rpc.tx_calls
+    # пара к SOL — цена считается как обычно; ответ кеширован (второй раз счёт не запрашивается)
+    tr2 = bare_trader({})
+    tr2.db = tr.db
+    rpc2 = FakeRpc([{"signature": "s2", "slot": 102}])
+
+    async def call_sol(method, params, retries=1):
+        asked.append(method)
+        return {"value": {"data": [curve_bytes(None), "base64"]}}
+    rpc2.call = call_sol
+    tr2.e.rpc = rpc2
+    asked.clear()
+    assert await tr2.block_mc(COIN, "TRIG", 100, 102, 30.0) == pytest.approx(mc_sol(30.0, 1.073e9))
+    assert await tr2.block_mc(COIN, "TRIG", 100, 102, 30.0) == pytest.approx(mc_sol(30.0, 1.073e9))
+    assert asked == ["getAccountInfo"]
+    # счёт кривой не получили — решает транзакция создания: она разбирается первой, даже если в блоке +2 есть сделка
+    tr3 = bare_trader({})
+    tr3.db = tr.db
+    tr3.e.rpc = FakeRpc([{"signature": "s2", "slot": 102}])
+
+    def parse(tx, sig, slot, src, stats, pool_map=None):
+        if sig == "CREATE":
+            return [TokenCreated(signature=sig, mint=COIN, deployer="DEV", creator="DEV", name="L", symbol="L", uri="",
+                                 quote_mint=USDC)]
+        return [Trade(signature=sig, mint=COIN, trader="Y", is_buy=True, sol_amount=1, token_amount=1, v_sol=30.0,
+                      v_tokens=1.073e9)]
+    monkeypatch.setattr(parser, "parse_transaction", parse)
+    assert await tr3.block_mc(COIN, "CREATE", 100, 102, None, with_trigger=True) is None
+    assert tr3._why_pop(COIN, "CREATE") == "монета в паре не к SOL" and tr3.e.rpc.tx_calls == ["CREATE"]
+
+
+async def test_mark_non_sol_voids_past_trades(monkeypatch):
+    from tests.test_paper import DSN
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        from solders.pubkey import Pubkey
+        good, bad = str(Pubkey.from_bytes(b"g" * 32)), str(Pubkey.from_bytes(b"b" * 32))
+        for mint, pnl in ((good, 0.01), (bad, 0.5), (bad, 0.2)):
+            await db.execute(
+                """INSERT INTO paper_positions(portfolio, mint, opened_at, entry_mc, cost_sol, tokens, tokens_initial,
+                       closed_at, exit_reason, pnl_sol, pnl_pct) VALUES ('Y', $1, now(), 27.959, 0.1, 1, 1, now(),
+                       'take_profit', $2, $3)""", mint, pnl, pnl * 10)
+        tr = bare_trader({})
+        tr.db = db
+        tr.balance = {"Y": 2.0}
+        tr._day_key = tr.day_key()
+
+        class Rpc:
+            async def call(self, method, params, retries=1):
+                assert method == "getMultipleAccounts"
+                from scanner.real import pump
+                want = {str(pump.curve_address(Pubkey.from_string(good))): None,
+                        str(pump.curve_address(Pubkey.from_string(bad))): USDC}
+                return {"value": [{"data": [curve_bytes(want[k]), "base64"]} for k in params[0]]}
+        tr.e.rpc = Rpc()
+        assert await tr.mark_non_sol() == 2
+        rows = await db.fetch("SELECT mint, suspect, price_check FROM paper_positions ORDER BY id")
+        assert [(r["mint"] == bad, r["suspect"], r["price_check"]) for r in rows] == [
+            (False, False, None), (True, True, "entry"), (True, True, "entry")]
+        assert tr.balance["Y"] == pytest.approx(2.0 - 0.7)                 # фальшивая прибыль убрана из баланса
+        assert await tr.mark_non_sol() == 0                                  # повторно — ничего
+    finally:
+        db.pool.terminate()
