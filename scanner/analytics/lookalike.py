@@ -6,8 +6,9 @@
 и проверяет копией в H (вход с задержкой копитрейда) — такой кошелёк там отсеивается: «дельта входа +43%».
 
 Здесь меряется именно это свойство, по своей базе сделок (сделки каждой новой монеты первые 30 минут):
-1. Активные кошельки за сутки: покупки 0.3–5 SOL на кривой pump.fun, в первые 25 минут жизни монеты, не дев монеты,
-   не в первые 5 секунд (снайперы); 10–300 разных монет.
+1. Активные кошельки за сутки: покупки 0.3–5 SOL, не дев монеты, не в первые 5 секунд (снайперы); 10–300 разных
+   монет. Покупки — там, где в базе есть полная цена после них: на кривой pump.fun в первые 25 минут монеты и на
+   PumpSwap (там торгует 7BNax), если монету записывали ещё до его покупки.
 2. По каждому — до 40 последних покупок «копией A» на истории: вход — первая сделка через 2 блока после него,
    дальше 5 минут: цена дошла до +25% чистыми — тейк; он продал раньше — выход по его продаже; иначе — по цене
    через 5 минут. Комиссии — как у бумаги.
@@ -40,7 +41,9 @@ DEFAULTS: dict[str, Any] = {
     "lk_confirm_every_h": 1.0,          # как часто проверять найденных на новых сделках
     "lk_hours": 24.0,                   # за сколько часов брать покупки
     "lk_min_sol": 0.3, "lk_max_sol": 5.0,
-    "lk_max_age_min": 25,               # покупки в первые N минут монеты (дальше данные о цене неполные)
+    "lk_max_age_min": 25,               # кривая: покупки в первые N минут монеты (дальше данные о цене неполные)
+    "lk_amm": True,                     # PumpSwap (там торгует 7BNax)
+    "lk_amm_prior": 3,                  # PumpSwap: столько сделок других за 2 мин до покупки (монету уже записывали)
     "lk_min_coins": 10, "lk_max_coins": 300,
     "lk_traders": 400,                  # сколько активных кошельков проверять за раз
     "lk_sample": 40,                    # последних покупок на кошелёк
@@ -135,30 +138,43 @@ def hit_ratio(cfg: dict[str, Any]) -> float:
     return (1 + float(cfg_get(cfg, "lk_tp"))) / (1 - float(cfg_get(cfg, "lk_fee")))
 
 
-def buys_sql(max_age_min: float) -> str:
-    """Покупки на кривой pump.fun в первые max_age_min минут монеты: сделки всех монет хранятся первые 30 минут,
-    дальше — только у отслеживаемых и растущих (там выборка смещена к победителям)."""
+def buys_sql(max_age_min: float, amm_prior: int | None) -> str:
+    """Покупки, после которых в базе есть полная цена:
+    • кривая pump.fun — в первые max_age_min минут монеты (сделки всех новых монет хранятся первые 30 минут);
+    • PumpSwap (с 18.11: 7BNax торгует только там — 1080 покупок за 4 дня, ни одной на кривой, половина — в монеты
+      старше 3 часов) — если монету уже записывали до его покупки: amm_prior+ сделок других кошельков за 2 минуты
+      до неё. Сделки PumpSwap хранятся только у отслеживаемых монет; без этого условия попадали бы монеты, которые
+      начали записывать из-за роста, — выборка сместилась бы к победителям. None — PumpSwap не смотреть."""
+    if amm_prior is None:
+        amm = "false"
+    elif amm_prior <= 0:
+        amm = "t.pool = 'pump-amm'"
+    else:
+        amm = (f"""t.pool = 'pump-amm' AND (SELECT count(*) FROM (SELECT 1 FROM trades p WHERE p.mint = t.mint
+              AND p.ts >= t.ts - interval '120 seconds' AND p.ts < t.ts AND p.trader <> t.trader
+              LIMIT {int(amm_prior)}) z) >= {int(amm_prior)}""")
     return f"""
     SELECT t.trader, t.mint, t.ts, t.slot
     FROM trades t JOIN tokens k ON k.mint = t.mint
-    WHERE t.ts >= $1 AND t.ts < $2 AND t.is_buy AND t.pool = 'pump'
+    WHERE t.ts >= $1 AND t.ts < $2 AND t.is_buy
       AND t.sol_amount BETWEEN $3 AND $4
       AND t.ts > k.created_at + interval '5 seconds'
-      AND t.ts < k.created_at + make_interval(mins => {int(max_age_min)})
-      AND t.trader <> k.deployer"""
+      AND t.trader <> k.deployer
+      AND ((t.pool = 'pump' AND t.ts < k.created_at + make_interval(mins => {int(max_age_min)}))
+           OR ({amm}))"""
 
 
-def active_sql(max_age_min: float) -> str:
+def active_sql(max_age_min: float, amm_prior: int | None) -> str:
     return f"""
-    SELECT trader, count(DISTINCT mint) coins FROM ({buys_sql(max_age_min)}) b
+    SELECT trader, count(DISTINCT mint) coins FROM ({buys_sql(max_age_min, amm_prior)}) b
     GROUP BY 1 HAVING count(DISTINCT mint) BETWEEN $5 AND $6
     ORDER BY 2 DESC LIMIT $7"""
 
 
-def copies_sql(max_age_min: float) -> str:
+def copies_sql(max_age_min: float, amm_prior: int | None) -> str:
     return f"""
     WITH f AS (
-        SELECT DISTINCT ON (trader, mint) * FROM ({buys_sql(max_age_min)} AND t.trader = ANY($5::text[])) b
+        SELECT DISTINCT ON (trader, mint) * FROM ({buys_sql(max_age_min, amm_prior)} AND t.trader = ANY($5::text[])) b
         ORDER BY trader, mint, ts),
     b AS (SELECT *, row_number() OVER (PARTITION BY trader ORDER BY ts DESC) rn FROM f)
     SELECT b.trader, b.mint, e.mc entry, extract(epoch FROM e.ts) entry_ts,
@@ -190,6 +206,7 @@ def copies_sql(max_age_min: float) -> str:
 DIAG = """
     SELECT count(*) FILTER (WHERE t.is_buy) buys, count(*) FILTER (WHERE NOT t.is_buy) sells,
            count(*) FILTER (WHERE t.is_buy AND t.pool = 'pump') curve,
+           count(*) FILTER (WHERE t.is_buy AND t.pool = 'pump-amm') amm,
            count(*) FILTER (WHERE t.is_buy AND t.sol_amount BETWEEN $4 AND $5) sized,
            count(*) FILTER (WHERE t.is_buy AND k.mint IS NOT NULL) known,
            count(DISTINCT t.mint) FILTER (WHERE t.is_buy) coins,
@@ -211,12 +228,14 @@ async def diagnose(db: Any, cfg: dict[str, Any], wallet: str, until: datetime, h
     age = ", ".join(f"{a:.0f}" for a in (r["age"] or [])) or "—"
     size = ", ".join(f"{a:.2f}" for a in (r["size"] or [])) or "—"
     fmt = lambda ts: ts.strftime("%d.%m %H:%M") if ts else "—"  # noqa: E731
-    return (f"{wallet}: покупок {r['buys']} (монет {r['coins']}), продаж {r['sells']}; на кривой pump {r['curve']}; "
+    return (f"{wallet}: покупок {r['buys']} (монет {r['coins']}), продаж {r['sells']}; на кривой pump {r['curve']}, "
+            f"на PumpSwap {r['amm']}; "
             f"размер {cfg_get(cfg, 'lk_min_sol')}–{cfg_get(cfg, 'lk_max_sol')} SOL: {r['sized']}; монета в базе: "
             f"{r['known']}\n  возраст монеты при покупке, мин (10/25/50/75/90%): {age}\n"
             f"  размер покупки, SOL (10/50/90%): {size}\n  первая покупка {fmt(r['first_buy'])} UTC, последняя "
             f"{fmt(r['last_buy'])} UTC; площадки: {r['pools']}\n  в проверку идут покупки в первые "
-            f"{cfg_get(cfg, 'lk_max_age_min')} мин монеты (--age N — шире)")
+            f"{cfg_get(cfg, 'lk_max_age_min')} мин монеты (--age N — шире) и PumpSwap, если монету записывали до "
+            f"покупки (--all — все его покупки на PumpSwap)")
 
 
 async def _fetch(db: Any, q: str, *a: Any, timeout_s: float = 120) -> list[Any]:
@@ -237,14 +256,16 @@ async def evaluate(db: Any, cfg: dict[str, Any], until: datetime, hours: float |
     lo, hi = float(cfg_get(cfg, "lk_min_sol")), float(cfg_get(cfg, "lk_max_sol"))
     timeout = float(cfg_get(cfg, "lk_timeout_s"))
     age = float(cfg_get(cfg, "lk_max_age_min"))
+    prior = int(cfg_get(cfg, "lk_amm_prior")) if cfg_get(cfg, "lk_amm") else None
     if wallets is None:
-        rows = await _fetch(db, active_sql(age), t_from, t_to, lo, hi, int(cfg_get(cfg, "lk_min_coins")),
+        rows = await _fetch(db, active_sql(age, prior), t_from, t_to, lo, hi, int(cfg_get(cfg, "lk_min_coins")),
                             int(cfg_get(cfg, "lk_max_coins")), int(cfg_get(cfg, "lk_traders")), timeout_s=timeout)
         wallets = [r["trader"] for r in rows]
     out: dict[str, Eval] = {w: Eval(w) for w in wallets}
     ratio = hit_ratio(cfg)
     for i in range(0, len(wallets), 100):
-        rows = await _fetch(db, copies_sql(age), t_from, t_to, lo, hi, wallets[i:i + 100], int(cfg_get(cfg, "lk_sample")),
+        rows = await _fetch(db, copies_sql(age, prior), t_from, t_to, lo, hi, wallets[i:i + 100],
+                            int(cfg_get(cfg, "lk_sample")),
                             horizon, ENTRY_MAX_S, ratio, timeout_s=timeout)
         for r in rows:
             e0 = float(r["entry_ts"])

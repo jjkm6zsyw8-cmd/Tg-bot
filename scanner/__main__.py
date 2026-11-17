@@ -112,7 +112,7 @@ async def run_tool(cmd: str, db: Database) -> None:
         text = await run(RealTrader(eng), [a for a in args if not a.startswith("-")] or None)   # type: ignore[arg-type]
         print(re.sub(r"<[^>]+>", "", text))
     elif cmd == "lookalike":
-        # поиск по образцу smart A вручную: python -m scanner lookalike [--hours 24] [кошелёк …]
+        # поиск по образцу smart A вручную: python -m scanner lookalike [--hours 24] [--age N] [--all] [кошелёк …]
         from datetime import datetime, timezone
         from .analytics.lookalike import cfg_get, diagnose, evaluate, format_cli
         from .config import Settings, YamlConfig, load_env
@@ -122,6 +122,8 @@ async def run_tool(cmd: str, db: Database) -> None:
         skip = {args.index(k) + 1 for k in opt}
         if "--age" in opt:
             cfg["lk_max_age_min"] = opt["--age"]
+        if "--all" in args:                         # все покупки на PumpSwap — для отслеживаемых кошельков (7BNax)
+            cfg["lk_amm_prior"] = 0
         wallets = [a for i, a in enumerate(args) if not a.startswith("-") and i not in skip] or None
         now = datetime.now(timezone.utc)
         evals = await evaluate(db, cfg, now, hours=opt.get("--hours"), wallets=wallets)

@@ -51,10 +51,11 @@ async def db():
     d.pool.terminate()
 
 
-async def trade(db, mint, trader, buy, sol, mc, slot, ts):
+async def trade(db, mint, trader, buy, sol, mc, slot, ts, pool="pump"):
     await db.execute(
-        """INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol, slot, ts)
-           VALUES ($1, $2, $3, $4, $5, 1000, $6, $7, $8)""", f"s{next(SEQ)}", mint, trader, buy, sol, mc, slot, ts)
+        """INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol, slot, ts, pool)
+           VALUES ($1, $2, $3, $4, $5, 1000, $6, $7, $8, $9)""", f"s{next(SEQ)}", mint, trader, buy, sol, mc, slot, ts,
+        pool)
 
 
 async def coin(db, who, born, kind, deployer="DEV"):
@@ -181,3 +182,35 @@ async def test_confirms_as_soon_as_ten_new_buys(db):
     events = await lk.run(now=now + timedelta(hours=3, minutes=5))
     assert await db.fetchval("SELECT status FROM scout WHERE address='FAST'") == "promoted"
     assert any("✅" in e for e in events)
+
+
+async def amm_coin(db, who, at, recorded_before):
+    """Старая монета на PumpSwap (вышла с кривой день назад): он покупает в `at`, через 20 с цена +37%.
+    recorded_before — монету записывали ещё до его покупки (сделки других за 2 минуты до неё)."""
+    mint = f"P{next(SEQ)}"
+    await db.execute("""INSERT INTO tokens(mint, signature, deployer, current_owner, created_at, migrated_at)
+                        VALUES ($1, $2, 'DEV', 'DEV', $3, $3)""", mint, f"c{mint}", at - timedelta(days=1))
+    s = 5000
+    if recorded_before:
+        for i in range(3):
+            await trade(db, mint, f"x{next(SEQ)}", True, 0.5, 400, s - 100 + i, at - timedelta(seconds=60 - i),
+                        "pump-amm")
+    await trade(db, mint, who, True, 1.8, 400, s, at, "pump-amm")
+    await trade(db, mint, f"x{next(SEQ)}", True, 0.5, 410, s + 2, at + timedelta(seconds=1), "pump-amm")
+    await trade(db, mint, f"x{next(SEQ)}", True, 3.0, 560, s + 50, at + timedelta(seconds=21), "pump-amm")
+    await trade(db, mint, who, False, 1.8, 520, s + 300, at + timedelta(seconds=120), "pump-amm")
+
+
+async def test_pumpswap_buys_of_old_coins(db):
+    """18.11: 7BNax торгует только на PumpSwap (монеты старше часов) — поиск по одной кривой его не видел."""
+    now = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    for i in range(12):
+        await amm_coin(db, "SWAPPER", now - timedelta(hours=10) + timedelta(minutes=20 * i), recorded_before=True)
+        await amm_coin(db, "TRIGGER", now - timedelta(hours=10) + timedelta(minutes=20 * i), recorded_before=False)
+    evals = await LK.evaluate(db, {}, now)
+    assert evals["SWAPPER"].n == 12 and evals["SWAPPER"].hit == 1.0 and evals["SWAPPER"].good({})
+    assert "TRIGGER" not in evals                     # монету начали записывать после его покупки — не в счёт
+    assert (await LK.evaluate(db, {"lk_amm_prior": 0}, now, wallets=["TRIGGER"]))["TRIGGER"].n == 12   # --all
+    assert (await LK.evaluate(db, {"lk_amm": False}, now, wallets=["SWAPPER"]))["SWAPPER"].n == 0
+    text = await LK.diagnose(db, {}, "SWAPPER", now, 24)
+    assert "на кривой pump 0, на PumpSwap 12" in text
