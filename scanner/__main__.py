@@ -1,7 +1,8 @@
 """Точка входа: python -m scanner {ingest|analytics|bot|web|migrate|all}.
 
-Разовые команды: recluster, history, verify; реальный бот — real-keygen (создать кошелёк) и real-check
-(проверка сборки сделок на живой сети без денег)."""
+Разовые команды: recluster, history, verify; реальный бот — real-keygen (кошелёк в .env), real-masterkey (ключ
+шифра для кошельков, создаваемых в Telegram), real-check (проверка сборки сделок на живой сети без денег),
+real-export (ключи кошельков — только на экран сервера, для переноса в Phantom)."""
 from __future__ import annotations
 
 import asyncio
@@ -42,7 +43,7 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history", "verify", "real-check"):
+    if cmd in ("recluster", "history", "verify", "real-check", "real-export"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -109,6 +110,21 @@ async def run_tool(cmd: str, db: Database) -> None:
         eng = SimpleNamespace(db=db, env=env, cfg=settings.effective(), price=SimpleNamespace(value=price), states={})
         text = await run(RealTrader(eng), [a for a in args if not a.startswith("-")] or None)   # type: ignore[arg-type]
         print(re.sub(r"<[^>]+>", "", text))
+    elif cmd == "real-export":
+        # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
+        from .real.vault import load_vault
+        vault, note = load_vault()
+        rows = await db.fetch("SELECT id, name, pubkey, secret_enc, archived FROM real_wallets ORDER BY id")
+        print("# ВНИМАНИЕ: ниже приватные ключи. Не пересылайте их никому и не отправляйте в чат.", file=sys.stderr)
+        for r in rows:
+            if r["secret_enc"] is None:
+                print(f"{r['id']}\t{r['name']}\t{r['pubkey']}\tключ в .env (REAL_PRIVATE_KEY)")
+                continue
+            try:
+                key = str(vault.decrypt(bytes(r["secret_enc"]), r["pubkey"]))
+            except Exception as exc:  # noqa: BLE001
+                key = f"не расшифрован: {exc} ({note})"
+            print(f"{r['id']}\t{r['name']}{' (удалён)' if r['archived'] else ''}\t{r['pubkey']}\t{key}")
     elif cmd == "history":
         from .history.dune import load
         key = os.environ.get("DUNE_API_KEY", "")
@@ -126,5 +142,8 @@ if __name__ == "__main__":
     if command == "real-keygen":        # до настройки логов и базы: в stdout — только строки для .env
         from .real.keys import keygen
         raise SystemExit(keygen())
+    if command == "real-masterkey":
+        from .real.vault import masterkey_gen
+        raise SystemExit(masterkey_gen())
     setup_logging(os.environ.get("LOG_LEVEL", "INFO"), command)
     asyncio.run(main(command))

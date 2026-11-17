@@ -129,8 +129,8 @@ class Engine:
         self.paper = PaperTrader(self)
         self.real: Any = None
         try:        # реальный бот (scanner/real) — отдельный модуль: если он не поднялся, остальной бот работает
-            from ..real.executor import RealTrader
-            self.real = RealTrader(self)
+            from ..real.desk import RealDesk
+            self.real = RealDesk(self)
         except Exception:  # noqa: BLE001
             log.exception("реальный бот не запущен")
         from .pricecheck import PriceCheck

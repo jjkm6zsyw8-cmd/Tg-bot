@@ -18,7 +18,7 @@ import random
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Collection
 
 import aiohttp
 from solders.hash import Hash
@@ -68,9 +68,19 @@ def tip_ix(user: Pubkey, lamports: int, dont_front: bool = True) -> Instruction:
     return Instruction(pump.SYSTEM, struct.pack("<IQ", 2, lamports), metas)
 
 
-def check_instructions(ixs: list[Instruction], user: Pubkey, max_spend_lamports: int) -> None:
-    """Белый список. max_spend_lamports — сколько SOL эта транзакция вправе потратить на сделку (ставка)."""
+def transfer_ix(src: Pubkey, dst: Pubkey, lamports: int) -> Instruction:
+    """Перевод SOL (системная инструкция Transfer)."""
+    return Instruction(pump.SYSTEM, struct.pack("<IQ", 2, lamports), [AccountMeta(src, True, True),
+                                                                      AccountMeta(dst, False, True)])
+
+
+def check_instructions(ixs: list[Instruction], user: Pubkey, max_spend_lamports: int,
+                       withdraw_to: Collection[Pubkey] = ()) -> None:
+    """Белый список. max_spend_lamports — сколько SOL эта транзакция вправе потратить на сделку (ставка).
+    withdraw_to — адреса для вывода (только из REAL_WITHDRAW_TO на сервере; у сделок — пусто): перевод туда
+    разрешён на любую сумму, на любой другой адрес — запрещён."""
     own_wsol = pump.ata(user, pump.WSOL, pump.TOKEN)
+    withdraw_to = set(withdraw_to)
     for ix in ixs:
         pid, data, keys = ix.program_id, bytes(ix.data), [m.pubkey for m in ix.accounts]
         if pid == COMPUTE_BUDGET:
@@ -85,6 +95,8 @@ def check_instructions(ixs: list[Instruction], user: Pubkey, max_spend_lamports:
             elif keys[1] == own_wsol:
                 if lamports > max_spend_lamports:
                     raise Forbidden("обёртка SOL больше ставки")
+            elif keys[1] in withdraw_to:
+                pass                                       # вывод на свой адрес из .env сервера
             else:
                 raise Forbidden(f"перевод SOL на посторонний адрес {keys[1]}")
             continue

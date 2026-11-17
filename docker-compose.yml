@@ -9,7 +9,8 @@ x-app: &app
   env_file: .env
   environment:
     <<: *env
-    REAL_PRIVATE_KEY: ""               # ключ кошелька реального бота получает только сервис analytics (ниже)
+    REAL_PRIVATE_KEY: ""               # ключ кошелька и ключ шифра кошельков реального бота
+    REAL_MASTER_KEY: ""                #   получает только сервис analytics (ниже)
   volumes:
     - ./config:/app/config:ro          # пороги и шаблоны ссылок меняются без пересборки
     - ./logs:/app/logs
@@ -42,7 +43,7 @@ services:
 
   analytics:
     <<: *app
-    environment: *env                  # единственный сервис, которому виден REAL_PRIVATE_KEY из .env
+    environment: *env                  # единственный сервис, которому видны REAL_PRIVATE_KEY и REAL_MASTER_KEY
     command: ["analytics"]
 
   bot:

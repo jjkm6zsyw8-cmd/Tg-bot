@@ -66,12 +66,32 @@ def paid_mc(lamports: int, tokens_raw: int) -> float:
     return lamports * 10_000 / (10_000 + pump.FEE_BPS) / tokens_raw * pump.SUPPLY_RAW / 1e9
 
 
+def make_chain(engine: Any) -> rtx.Chain | None:
+    """Свой клиент RPC реального бота (без дневного лимита аналитики): чтение сети, отправка, подтверждение."""
+    env = getattr(engine, "env", None)
+    if env is None:
+        return None
+    from ..ingest.rpc import SolanaRpc
+    return rtx.Chain(SolanaRpc(env.rpc_endpoint, rps=40, concurrency=16, timeout=6,
+                               fallback=env.rpc_fallback_url or None))
+
+
 class RealTrader:
-    def __init__(self, engine: "Engine", chain: rtx.Chain | None = None, wallet: Wallet | None = None):
+    def __init__(self, engine: "Engine", chain: rtx.Chain | None = None, wallet: Wallet | None = None,
+                 profile: dict[str, Any] | None = None, wallet_note: str | None = None):
+        """profile — кошелёк из таблицы real_wallets ({id, name, settings}): у каждого кошелька свой режим, ставка,
+        позиции, стопы и журнал. Без профиля — «общая полоса» (настройки /real, ключ из .env или без кошелька)."""
         self.e = engine
         self.db = engine.db
-        self._helius_key = ""
-        self.wallet, self.wallet_note = (wallet, "задан") if wallet is not None else load_wallet()
+        self.profile = profile
+        self.wid: int | None = int(profile["id"]) if profile else None
+        self.name = str(profile.get("name") or "") if profile else ""
+        self.accept_new = True                      # False — только доводит открытые позиции (полоса без кошелька)
+        self._helius_key = getattr(getattr(engine, "env", None), "helius_key", "") or ""
+        if wallet is not None or profile is not None or wallet_note is not None:
+            self.wallet, self.wallet_note = wallet, wallet_note or ("задан" if wallet is not None else "не задан")
+        else:
+            self.wallet, self.wallet_note = load_wallet()
         self.chain = chain if chain is not None else self._make_chain()
         self.positions: dict[int, Position] = {}
         self.balance: int | None = None             # лампорты на кошельке (кэш)
@@ -95,16 +115,13 @@ class RealTrader:
 
     # ------------------------------------------------------------------ окружение
     def _make_chain(self) -> rtx.Chain | None:
-        env = getattr(self.e, "env", None)
-        if env is None:
-            return None
-        from ..ingest.rpc import SolanaRpc
-        self._helius_key = env.helius_key
-        return rtx.Chain(SolanaRpc(env.rpc_endpoint, rps=40, concurrency=16, timeout=6,
-                                   fallback=env.rpc_fallback_url or None))
+        return make_chain(self.e)
 
     @property
     def cfg(self) -> dict[str, Any]:
+        """Действующие настройки: общие (/real → ⚙️) и поверх них — настройки этого кошелька."""
+        if self.profile and self.profile.get("settings"):
+            return {**self.e.cfg, **self.profile["settings"]}
         return self.e.cfg
 
     def get(self, key: str) -> Any:
@@ -140,7 +157,25 @@ class RealTrader:
         return SCHEMES[self.get(S.SCHEME_KEYS.get(kind or "smart", "real_scheme"))]
 
     def paused(self) -> str:
-        return str(self.cfg.get("real_paused") or "")
+        """Стоп-кран: общий (для всех кошельков) или этого кошелька."""
+        own = (self.profile or {}).get("settings") or {}
+        return str(self.e.cfg.get("real_paused") or "") or str(own.get("real_paused") or "")
+
+    async def set_setting(self, key: str, value: Any) -> None:
+        """Записать настройку туда, где она живёт: в профиль кошелька или в общие настройки."""
+        if self.profile is None:
+            await self.db.set_override(key, value)
+            return
+        st = dict(self.profile.get("settings") or {})
+        if value is None:
+            st.pop(key, None)
+        else:
+            st[key] = value
+        self.profile["settings"] = st
+        await self.db.execute("UPDATE real_wallets SET settings=$2 WHERE id=$1", self.wid, st)
+
+    def status_key(self) -> str:
+        return STATUS_KEY if self.wid is None else f"{STATUS_KEY}:{self.wid}"
 
     def day_key(self) -> str:
         paper = getattr(self.e, "paper", None)
@@ -184,7 +219,7 @@ class RealTrader:
     # ------------------------------------------------------------------ запуск
     async def start(self) -> None:
         self._roll_day()
-        for r in await self.db.fetch("SELECT * FROM real_positions WHERE closed_at IS NULL"):
+        for r in await self.db.fetch("SELECT * FROM real_positions WHERE closed_at IS NULL AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
             ex = dict(r["extra"] or {})
             ex.update(mode=r["mode"], kind=r["kind"], venue=r["venue"], token_program=r["token_program"],
                       tokens_raw=int(r["tokens_raw"] or 0), rent=float(r["rent_sol"] or 0),
@@ -198,20 +233,21 @@ class RealTrader:
                 tp_done=bool(r["tp_done"]), alert_id=r["alert_id"], extra=ex)
         today = self.day_key()
         for r in await self.db.fetch("SELECT mode, pnl_sol, closed_at FROM real_positions WHERE closed_at IS NOT NULL "
-                                     "AND closed_at > now() - interval '30 hours'"):
+                                     "AND closed_at > now() - interval '30 hours' AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
             if self._day_of(r["closed_at"]) == today:
                 self.day_pnl[r["mode"]] = self.day_pnl.get(r["mode"], 0.0) + float(r["pnl_sol"] or 0)
-        for r in await self.db.fetch("SELECT fee_sol, created_at FROM real_orders WHERE mode = 'live' "
-                                     "AND status = 'failed' AND fee_sol > 0 AND created_at > now() - interval '30 hours'"):
+        for r in await self.db.fetch("SELECT fee_sol, created_at FROM real_orders WHERE mode = 'live' AND status = 'failed' "
+                                     "AND fee_sol > 0 AND created_at > now() - interval '30 hours' AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
             if self._day_of(r["created_at"]) == today:
                 self.day_pnl["live"] = self.day_pnl.get("live", 0.0) - float(r["fee_sol"])
         self._armed_seen = self.cfg.get("real_armed_at")
         self.live_total = await self._live_total_db()
         for r in await self.db.fetch("SELECT mint, max(closed_at) t FROM real_positions WHERE pnl_sol < 0 "
-                                     "AND closed_at > now() - interval '7 days' GROUP BY 1"):
+                                     "AND closed_at > now() - interval '7 days' AND wallet_id IS NOT DISTINCT FROM $1 GROUP BY 1", self.wid):
             self.lost[r["mint"]] = r["t"].timestamp()
         for r in await self.db.fetch("SELECT DISTINCT mint, token_program FROM real_positions WHERE mode = 'live' "
-                                     "AND closed_at > now() - interval '3 days' AND token_program IS NOT NULL"):
+                                     "AND closed_at > now() - interval '3 days' AND token_program IS NOT NULL "
+                                     "AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
             self.to_close[r["mint"]] = (r["token_program"], time.time() + 60, 1)   # не закрытые до остановки счета
         await self.refresh_balance(force=True)
         try:
@@ -226,10 +262,10 @@ class RealTrader:
         armed = self._armed_at()
         pnl = await self.db.fetchval(
             "SELECT COALESCE(sum(pnl_sol), 0) FROM real_positions WHERE mode = 'live' AND closed_at IS NOT NULL "
-            "AND ($1::timestamptz IS NULL OR opened_at >= $1::timestamptz)", armed)
+            "AND ($1::timestamptz IS NULL OR opened_at >= $1::timestamptz) AND wallet_id IS NOT DISTINCT FROM $2", armed, self.wid)
         fees = await self.db.fetchval(
             "SELECT COALESCE(sum(fee_sol), 0) FROM real_orders WHERE mode = 'live' AND status = 'failed' "
-            "AND ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)", armed)
+            "AND ($1::timestamptz IS NULL OR created_at >= $1::timestamptz) AND wallet_id IS NOT DISTINCT FROM $2", armed, self.wid)
         return float(pnl or 0) - float(fees or 0)
 
     async def _recover(self) -> None:
@@ -238,7 +274,8 @@ class RealTrader:
         if self.chain is None or self.wallet is None:
             return
         rows = await self.db.fetch("SELECT *, extract(epoch FROM now() - created_at) AS age_s FROM real_orders "
-                                   "WHERE status = 'sent' AND side = 'buy' AND created_at > now() - interval '30 minutes'")
+                                   "WHERE status = 'sent' AND side = 'buy' AND created_at > now() - interval '30 minutes' "
+                                   "AND wallet_id IS NOT DISTINCT FROM $1", self.wid)
         for o in rows:
             await self._recover_buy(o)
         for p in [p for p in self.positions.values() if p.extra.get("mode") == "live"]:
@@ -284,6 +321,8 @@ class RealTrader:
     async def on_signal(self, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
                         trader: str | None, targets: set[str]) -> None:
         """Сигнал бумаги: smart (идёт в боевой портфель M) или «мой дев» (портфель Y)."""
+        if not self.accept_new:
+            return
         modes = set(data.get("modes") or [])
         kind = "smart" if MAIN in targets and "smart" in modes else \
             "mydev" if MYDEV in targets and "mydev" in modes else None
@@ -343,7 +382,9 @@ class RealTrader:
             if sum(1 for t in self.buys if now - t < 3600) >= int(self.get("real_max_buys_hour")):
                 return "лимит покупок в час"
             need = float(self.get("real_min_stake_usd")) / sol_usd + float(self.get("real_reserve_sol"))
-            if self.balance is not None and self.balance / 1e9 < need:
+            # по кэшу — только если он свежий: после пополнения кошелька старый «0» не должен блокировать входы
+            # (точный баланс читается вместе с состоянием монеты при входе)
+            if self.balance is not None and time.time() - self._balance_at < 60 and self.balance / 1e9 < need:
                 return "на кошельке мало SOL"
         return None
 
@@ -513,12 +554,12 @@ class RealTrader:
         try:
             return await self.db.fetchval(
                 """INSERT INTO real_orders(position_id, mode, side, mint, stake_sol, tokens_raw, min_out, slippage,
-                       signature, status, error, slot, wait_ms, cu, fee_sol, attempt, note, base)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id""",
+                       signature, status, error, slot, wait_ms, cu, fee_sol, attempt, note, base, wallet_id)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id""",
                 pid, base["mode"], side, base["mint"], kw.get("stake_sol"), kw.get("tokens_raw"), kw.get("min_out"),
                 kw.get("slippage"), kw.get("signature"), status, (str(kw["error"])[:300] if kw.get("error") else None),
                 kw.get("slot"), kw.get("wait_ms"), kw.get("cu"), kw.get("fee_sol"), int(kw.get("attempt") or 1),
-                kw.get("note"), kw.get("payload") or {})
+                kw.get("note"), kw.get("payload") or {}, self.wid)
         except Exception:  # noqa: BLE001
             log.exception("real_orders")
             return None
@@ -666,12 +707,12 @@ class RealTrader:
         pid = await self.db.fetchval(
             """INSERT INTO real_positions(mode, kind, mint, symbol, trader, alert_id, venue, token_program, opened_at,
                    trigger_slot, trigger_mc, lag_s, entry_mc, entry_slot, cost_sol, tokens, tokens_raw, rent_sol,
-                   buy_sig, max_mc, extra)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$13,$20) RETURNING id""",
+                   buy_sig, max_mc, extra, wallet_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$13,$20,$21) RETURNING id""",
             base["mode"], base["kind"], base["mint"], base["symbol"], base["trader"], base["alert_id"], base["venue"],
             base["token_program"], datetime.now(timezone.utc), base.get("trigger_slot"), base.get("trigger_mc"),
             base.get("lag_s"), entry_mc, slot, cost_sol, tokens_raw / 1e6, tokens_raw, rent_sol, sig,
-            {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9})
+            {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9}, self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
                                    tokens_raw=tokens_raw, position_id=pid, note=note)
@@ -944,7 +985,7 @@ class RealTrader:
     async def _check_stops(self) -> None:
         sol_usd = self.sol_usd()
         if -self.live_total * sol_usd >= float(self.get("real_total_stop_usd")) and self.get("real_mode") == "live":
-            await self.db.set_override("real_mode", "shadow")
+            await self.set_setting("real_mode", "shadow")
             await self._say(f"🛑 💵 Общий стоп: убыток боя {self.live_total * sol_usd:+.2f}$ дошёл до лимита "
                             f"${self.get('real_total_stop_usd'):g}. Бой выключен, бот в режиме «тень». "
                             "Открытые позиции будут закрыты по правилам.")
@@ -954,7 +995,7 @@ class RealTrader:
 
     async def _check_fail_pause(self) -> None:
         if self.fails >= int(self.get("real_fail_pause")) and not self.paused():
-            await self.db.set_override("real_paused", f"{self.fails} неудачных транзакций подряд")
+            await self.set_setting("real_paused", f"{self.fails} неудачных транзакций подряд")
             await self._say(f"⏸ 💵 {self.fails} неудачных транзакций подряд — входы остановлены. Открытые позиции "
                             "бот продолжает закрывать. Разберитесь и нажмите «▶️ Продолжить» в /real.")
 
@@ -1101,7 +1142,12 @@ class RealTrader:
             return NO_FUNDS
         return str(err)[:160]
 
+    async def say_raw(self, text: str) -> None:
+        await self._say(text)
+
     async def _say(self, text: str) -> None:
+        if self.name:
+            text = f"👛 <b>{fmt.esc(self.name)}</b> · {text}"
         try:
             await self.db.enqueue("text", {"topic": TOPIC, "text": text}, priority=8)
         except Exception:  # noqa: BLE001
@@ -1111,7 +1157,8 @@ class RealTrader:
         self._last_status = time.time()
         self._roll_day()
         try:
-            await self.db.kv_set(STATUS_KEY, {
+            await self.db.kv_set(self.status_key(), {
+                "wallet_id": self.wid, "name": self.name, "accept_new": self.accept_new,
                 "at": datetime.now(timezone.utc).isoformat(), "mode": self.mode(), "want": self.get("real_mode"),
                 "why_not_live": self.why_not_live(), "wallet": str(self.wallet.pubkey) if self.wallet else None,
                 "can_sign": bool(self.wallet and self.wallet.can_sign), "wallet_note": self.wallet_note,

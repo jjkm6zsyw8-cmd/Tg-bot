@@ -83,6 +83,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     router.callback_query.outer_middleware(Whitelist(env.allowed_ids))
     from .wizard import Wizard
     wiz = Wizard()                 # пошаговые меню /import и /addwallet на кнопках
+    from ..ingest.rpc import SolanaRpc
+    # только чтение: свежий баланс в карточке кошелька реального бота (ключей у сервиса бота нет)
+    balance_rpc = SolanaRpc(env.rpc_endpoint, rps=3, concurrency=2, timeout=4, fallback=env.rpc_fallback_url or None)
 
     async def reload() -> dict[str, Any]:
         settings.overrides = await db.get_overrides()
@@ -127,7 +130,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     def main_menu() -> list[list[dict[str, Any]]]:
         return [
             [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
-            [{"text": "💵 Реальный бот", "callback": "menu:real"}],
+            [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "👛 Кошельки", "callback": "rl:wl"}],
             [{"text": "📥 Импорт кошельков", "callback": "menu:import"},
              {"text": "➕ Добавить кошелёк", "callback": "menu:add"}],
             [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "📦 Выгрузка", "callback": "menu:export"}],
@@ -889,8 +892,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     @router.callback_query(F.data.startswith("rl:"))
     async def cb_real(c: CallbackQuery) -> None:
-        r = await real_report.on_callback(db, reload, c.data[3:])
+        r = await real_report.on_callback(db, reload, c.data[3:], balance_rpc)
         await c.answer(r.toast[:190] if r.toast else None)
+        if r.ask and c.from_user is not None:
+            wiz.ask(c.from_user.id, r.ask)           # следующее текстовое сообщение — ответ (название кошелька)
         if c.message is None:
             return
         if r.document is not None:
@@ -1121,6 +1126,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         st = wiz.waiting_input(m.from_user.id if m.from_user else 0)
         if st is None:
             return
+        if st["kind"] == "wallet_name":
+            from ..real.wallets_ui import create_and_wait
+            r = await create_and_wait(db, await reload(), (m.text or "").strip()[:32], balance_rpc)
+            return await reply(m, r.text or "", r.kb)
         if st["kind"] == "import":
             await import_wallets(m, m.text or "", st.get("origin"), st.get("pick"))
         else:

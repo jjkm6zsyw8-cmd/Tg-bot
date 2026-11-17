@@ -37,6 +37,10 @@ class Wizard:
         self.state[uid] = {"kind": kind, "origin": None, "pick": None, "step": "origin", "until": time.time() + WAIT_S}
         return f"{TITLES[kind]}\nШаг 1 из 3 — откуда кошел{'ьки' if kind == 'import' else 'ёк'}?", origin_kb()
 
+    def ask(self, uid: int, kind: str) -> None:
+        """Ждать от пользователя одно текстовое сообщение (например, название нового кошелька)."""
+        self.state[uid] = {"kind": kind, "step": "input", "until": time.time() + WAIT_S}
+
     def get(self, uid: int) -> dict[str, Any] | None:
         st = self.state.get(uid)
         if st is not None and st["until"] < time.time():

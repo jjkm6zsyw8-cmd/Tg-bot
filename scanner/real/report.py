@@ -40,6 +40,7 @@ class Reply:
     toast: str = ""
     edit: bool = False                         # заменить текст сообщения с кнопкой, а не слать новое
     document: tuple[bytes, str, str] | None = None     # (содержимое, имя файла, подпись)
+    ask: str = ""                              # ждать текст от пользователя (например, название кошелька)
 
 
 def tz_of(cfg: dict[str, Any]) -> ZoneInfo:
@@ -72,22 +73,54 @@ async def load_status(db: Any) -> tuple[dict[str, Any], float | None]:
     return st, age
 
 
-async def totals(db: Any, since: datetime | None = None) -> dict[str, dict[str, float]]:
-    """Итог закрытых сделок по режимам: число, в плюс, итог в SOL; для боя — комиссии отклонённых транзакций."""
+async def totals(db: Any, since: datetime | None = None, wallet: Any = "all") -> dict[str, dict[str, float]]:
+    """Итог закрытых сделок по режимам: число, в плюс, итог в SOL; для боя — комиссии отклонённых транзакций.
+    wallet — номер кошелька (None — общая полоса без кошелька), "all" — все вместе."""
     out: dict[str, dict[str, float]] = {m: {"n": 0, "wins": 0, "pnl": 0.0, "fails": 0, "fail_fees": 0.0}
                                         for m in ("shadow", "live")}
+    every = wallet == "all"
+    wid = None if every else wallet
     for r in await db.fetch(
             "SELECT mode, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) wins, COALESCE(sum(pnl_sol), 0) pnl "
             "FROM real_positions WHERE closed_at IS NOT NULL AND ($1::timestamptz IS NULL OR closed_at >= $1) "
-            "GROUP BY mode", since):
+            "AND ($2 OR wallet_id IS NOT DISTINCT FROM $3::bigint) GROUP BY mode", since, every, wid):
         if r["mode"] in out:
             out[r["mode"]].update(n=int(r["n"]), wins=int(r["wins"]), pnl=float(r["pnl"]))
     for r in await db.fetch(
             "SELECT mode, count(*) n, COALESCE(sum(fee_sol), 0) fees FROM real_orders WHERE status = 'failed' "
             "AND mode = 'live' AND side IN ('buy', 'sell') AND signature IS NOT NULL "
-            "AND ($1::timestamptz IS NULL OR created_at >= $1) GROUP BY mode", since):
+            "AND ($1::timestamptz IS NULL OR created_at >= $1) AND ($2 OR wallet_id IS NOT DISTINCT FROM $3::bigint) "
+            "GROUP BY mode", since, every, wid):
         out["live"].update(fails=int(r["n"]), fail_fees=float(r["fees"]))
     return out
+
+
+DESK_KEY = "real:desk"
+
+
+async def load_desk(db: Any) -> tuple[dict[str, Any], float | None]:
+    """Состояние кошельков (публикует аналитика) и его возраст в секундах."""
+    st = await db.kv_get(DESK_KEY) or {}
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(st["at"])).total_seconds()
+    except Exception:  # noqa: BLE001
+        age = None
+    return st, age
+
+
+async def wallet_rows(db: Any) -> list[Any]:
+    """Кошельки из списка — без ключей: бот (Telegram) их не читает никогда."""
+    return await db.fetch("SELECT id, name, pubkey, source, settings, created_at, secret_enc IS NOT NULL AS stored "
+                          "FROM real_wallets WHERE NOT archived ORDER BY id")
+
+
+async def lane_status(db: Any, wid: int) -> tuple[dict[str, Any], float | None]:
+    st = await db.kv_get(f"{STATUS_KEY}:{wid}") or {}
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(st["at"])).total_seconds()
+    except Exception:  # noqa: BLE001
+        age = None
+    return st, age
 
 
 def _row(name: str, t: dict[str, float], sol_usd: float) -> str:
@@ -100,32 +133,66 @@ def _row(name: str, t: dict[str, float], sol_usd: float) -> str:
 # ---------------------------------------------------------------------- главный экран
 async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     st, age = await load_status(db)
+    desk, desk_age = await load_desk(db)
+    wallets = await wallet_rows(db)
+    if desk:
+        age = desk_age
     sol_usd = float(st.get("sol_usd") or (await db.kv_get("sol_usd", {}) or {}).get("price") or 150)
     want = S.get(cfg, "real_mode")
-    mode = st.get("mode") if age is not None and age < STALE_S else None
+    fresh = age is not None and age < STALE_S
+    mode = st.get("mode") if fresh and st else None
     lines = ["💵 <b>Реальный бот</b>"]
     if age is None:
         lines.append("⚠️ Исполнитель ещё не запускался (сервис analytics не обновлён или не поднялся).")
     elif age >= STALE_S:
         lines.append(f"⚠️ Исполнитель не отвечает {age / 60:.0f} мин — сервис analytics остановлен или перезапускается.")
-    shown = mode or want
-    lines.append(f"Режим: {MODE_ICON[shown]} <b>{S.MODES[shown]}</b>")
-    if want == "live" and mode and mode != "live":
-        lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(st.get('why_not_live') or 'нет разрешения на сервере')}.")
     paused = str(cfg.get("real_paused") or "")
-    if paused:
-        lines.append(f"⛔ Новые входы остановлены: {esc(paused)}")
-    if st.get("wallet"):
-        bal = st.get("balance_sol")
-        lines.append(f"Кошелёк: <code>{st['wallet']}</code> · "
-                     + (f"{bal:.4f} SOL (${bal * sol_usd:.2f})" if bal is not None else "баланс неизвестен")
-                     + f" · ключ {'есть' if st.get('can_sign') else 'не задан'}")
+    statuses: list[tuple[str, dict[str, Any]]] = []     # (имя кошелька, состояние его полосы)
+    if st and fresh:
+        statuses.append(("", st))
+    kb: Kb = [[{"text": "🔄 Обновить", "callback": "rl:view"}]]
+    if wallets:
+        lines.append(f"<b>Кошельки: {len(wallets)}</b>")
+        for w in wallets:
+            ws, wage = await lane_status(db, int(w["id"]))
+            wfresh = wage is not None and wage < STALE_S
+            if wfresh:
+                statuses.append((w["name"], ws))
+            wmode = ws.get("mode") if wfresh else S.get({**cfg, **(w["settings"] or {})}, "real_mode")
+            bal = ws.get("balance_sol") if wfresh else None
+            lines.append(f"{MODE_ICON.get(wmode, '')} {esc(w['name'])} — "
+                         + (f"{bal:.4f} SOL (${bal * sol_usd:.2f})" if bal is not None else "баланс неизвестен")
+                         + f" · позиций {len(ws.get('open') or []) if wfresh else 0}")
+        if paused:
+            lines.append(f"⛔ Новые входы остановлены у всех кошельков: {esc(paused)}")
+        lines.append(f"По умолчанию для кошельков: ставка {S.fmt('real_stake_usd', S.get(cfg, 'real_stake_usd'))}, "
+                     f"позиций до {S.get(cfg, 'real_max_open')}, дневной стоп "
+                     f"{S.fmt('real_day_stop_usd', S.get(cfg, 'real_day_stop_usd'))}, общий стоп "
+                     f"{S.fmt('real_total_stop_usd', S.get(cfg, 'real_total_stop_usd'))} — у каждого кошелька "
+                     "можно своё.")
+        kb.append([{"text": f"👛 Кошельки ({len(wallets)})", "callback": "rl:wl"}])
     else:
-        lines.append("Кошелёк не задан — тень считает сделки по состоянию сети, без симуляции транзакций.")
-    lines.append(f"Ставка <b>{S.fmt('real_stake_usd', S.get(cfg, 'real_stake_usd'))}</b> (потолок сервера "
-                 f"${S.max_stake_usd():g}) · позиций до {S.get(cfg, 'real_max_open')} · дневной стоп "
-                 f"{S.fmt('real_day_stop_usd', S.get(cfg, 'real_day_stop_usd'))} · общий стоп "
-                 f"{S.fmt('real_total_stop_usd', S.get(cfg, 'real_total_stop_usd'))}")
+        shown = mode or want
+        lines.append(f"Режим: {MODE_ICON[shown]} <b>{S.MODES[shown]}</b>")
+        if want == "live" and mode and mode != "live":
+            lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(st.get('why_not_live') or 'нет разрешения на сервере')}.")
+        if paused:
+            lines.append(f"⛔ Новые входы остановлены: {esc(paused)}")
+        if st.get("wallet"):
+            bal = st.get("balance_sol")
+            lines.append(f"Кошелёк: <code>{st['wallet']}</code> · "
+                         + (f"{bal:.4f} SOL (${bal * sol_usd:.2f})" if bal is not None else "баланс неизвестен")
+                         + f" · ключ {'есть' if st.get('can_sign') else 'не задан'}")
+        else:
+            lines.append("Кошелёк не задан — тень считает сделки по состоянию сети, без симуляции транзакций.")
+        lines.append(f"Ставка <b>{S.fmt('real_stake_usd', S.get(cfg, 'real_stake_usd'))}</b> (потолок сервера "
+                     f"${S.max_stake_usd():g}) · позиций до {S.get(cfg, 'real_max_open')} · дневной стоп "
+                     f"{S.fmt('real_day_stop_usd', S.get(cfg, 'real_day_stop_usd'))} · общий стоп "
+                     f"{S.fmt('real_total_stop_usd', S.get(cfg, 'real_total_stop_usd'))}")
+        kb.append([{"text": ("● " if want == m else "") + f"{MODE_ICON[m]} {MODE_SHORT[m].capitalize()}"
+                    + ("…" if m == "live" and want != "live" else ""), "callback": f"rl:mode:{m}"}
+                   for m in ("off", "shadow", "live")])
+        kb.append([{"text": "👛 Кошельки: создать и пополнить", "callback": "rl:wl"}])
     kinds = []
     if S.get(cfg, "real_smart"):
         kinds.append(f"smart — {S.get(cfg, 'real_scheme')} ({scheme_text(S.get(cfg, 'real_scheme'))})")
@@ -133,19 +200,15 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
         kinds.append(f"мой дев — {S.get(cfg, 'real_scheme_mydev')} ({scheme_text(S.get(cfg, 'real_scheme_mydev'))})"
                      + ("" if S.get(cfg, "real_live_mydev") else " — в бою не участвует, только тень"))
     lines.append("Сигналы и выход: " + ("; ".join(kinds) if kinds else "все выключены"))
-    kb: Kb = [[{"text": "🔄 Обновить", "callback": "rl:view"}]]
-    kb.append([{"text": ("● " if want == m else "") + f"{MODE_ICON[m]} {MODE_SHORT[m].capitalize()}"
-                + ("…" if m == "live" and want != "live" else ""), "callback": f"rl:mode:{m}"}
-               for m in ("off", "shadow", "live")])
-    opened = st.get("open") or [] if mode else []
+    opened = [(name, o) for name, x in statuses for o in (x.get("open") or [])]
     if opened:
         lines.append(f"\n<b>Открыто: {len(opened)}</b>")
-        for o in opened[:10]:
+        for name, o in opened[:10]:
             lines.append(f"• {MODE_ICON.get(o.get('mode'), '')} ${esc(o.get('symbol') or '?')} "
                          f"({KINDS.get(o.get('kind'), o.get('kind'))}) {float(o.get('net') or 0):+.0%} · "
-                         f"{float(o.get('age_s') or 0) / 60:.0f} мин"
+                         f"{float(o.get('age_s') or 0) / 60:.0f} мин" + (f" · {esc(name)}" if name else "")
                          + (" · 🆘 продажа не проходит" if o.get("stuck") else ""))
-        for o in opened[:4]:
+        for _name, o in opened[:4]:
             if o.get("id"):
                 kb.append([{"text": f"Продать ${(o.get('symbol') or '?')[:12]}", "callback": f"rl:sell:{o['id']}"}])
     today, alltime = await totals(db, day_start(cfg)), await totals(db)
@@ -156,10 +219,14 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     if alltime["live"]["fails"]:
         lines.append(f"Отклонённые сетью транзакции боя: {int(alltime['live']['fails'])}, комиссии "
                      f"{money(-alltime['live']['fail_fees'], sol_usd)} (уже в итоге).")
-    skips = st.get("skips") or {}
-    if skips and mode:
-        lines.append("\n<b>Пропуски</b> (с запуска " + _since(st.get("since"), cfg) + "):")
-        lines += [f"• {esc(k)} — {v}" for k, v in list(skips.items())[:8]]
+    skips: dict[str, int] = {}
+    for _name, x in statuses:
+        for k, v in (x.get("skips") or {}).items():
+            skips[k] = skips.get(k, 0) + int(v)
+    if skips:
+        since = min((x.get("since") or "" for _n, x in statuses if x.get("since")), default=None)
+        lines.append("\n<b>Пропуски</b> (с запуска " + _since(since, cfg) + "):")
+        lines += [f"• {esc(k)} — {v}" for k, v in sorted(skips.items(), key=lambda kv: -kv[1])[:8]]
     kb.append([{"text": "▶️ Продолжить входы", "callback": "rl:resume"} if paused else
                {"text": "⛔ Стоп входов", "callback": "rl:pause"},
                {"text": "💰 Продать всё…", "callback": "rl:sellall"}])
@@ -213,34 +280,44 @@ async def live_confirm_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
 
 
 # ---------------------------------------------------------------------- настройки
-def settings_view(cfg: dict[str, Any]) -> tuple[str, Kb]:
-    lines = ["⚙️ <b>Настройки реального бота</b>", "Меняются кнопками «−» и «+», действуют сразу."]
+def settings_view(cfg: dict[str, Any], wid: int | None = None, name: str = "") -> tuple[str, Kb]:
+    """Общие настройки (wid=None) или настройки одного кошелька (поверх общих). Описания — только в общих:
+    у кошелька экран короче, чтобы влезал в одно сообщение."""
+    one = wid is not None
+    pre, back = (f"rl:ws:{wid}:", f"rl:w:{wid}") if one else ("rl:s:", "rl:view")
+    lines = [f"⚙️ <b>Настройки кошелька {esc(name)}</b>" if one else "⚙️ <b>Настройки реального бота</b>",
+             "Меняются кнопками «−» и «+», действуют сразу."
+             + (" Только для этого кошелька; остальное — общие настройки /real." if one else "")]
     kb: Kb = []
     for key, (label, _default, _step, _lo, _hi, _kind, desc) in S.SETTINGS.items():
         shown = S.fmt(key, S.get(cfg, key))
-        lines.append(f"• {label}: <b>{shown}</b>" + (f" — {desc}" if desc else ""))
-        kb.append([{"text": "−", "callback": f"rl:s:{key}:-"}, {"text": f"{label[:22]}: {shown}", "callback": "rl:set"},
-                   {"text": "+", "callback": f"rl:s:{key}:+"}])
+        lines.append(f"• {label}: <b>{shown}</b>" + (f" — {desc}" if desc and not one else ""))
+        kb.append([{"text": "−", "callback": f"{pre}{key}:-"},
+                   {"text": f"{label[:22]}: {shown}", "callback": back if one else "rl:set"},
+                   {"text": "+", "callback": f"{pre}{key}:+"}])
     lines.append("")
     for key, (label, _default, desc) in S.TOGGLES.items():
         on = S.get(cfg, key)
-        lines.append(f"• {label}: <b>{'да' if on else 'нет'}</b>" + (f" — {desc}" if desc else ""))
-        kb.append([{"text": f"{'✅' if on else '⬜'} {label[:40]}", "callback": f"rl:t:{key}"}])
+        lines.append(f"• {label}: <b>{'да' if on else 'нет'}</b>" + (f" — {desc}" if desc and not one else ""))
+        kb.append([{"text": f"{'✅' if on else '⬜'} {label[:40]}",
+                    "callback": f"rl:wt:{wid}:{key}" if one else f"rl:t:{key}"}])
     lines.append("")
     for kind, key in S.SCHEME_KEYS.items():
         cur = S.get(cfg, key)
         lines.append(f"• Правила выхода, {KINDS[kind]}: <b>{cur}</b> — {scheme_text(cur)}")
-        kb.append([{"text": ("● " if cur == s else "") + f"{KINDS[kind]}: {s}", "callback": f"rl:sc:{kind}:{s}"}
-                   for s in S.SCHEMES])
+        kb.append([{"text": ("● " if cur == s else "") + f"{KINDS[kind]}: {s}",
+                    "callback": f"rl:wsc:{wid}:{kind}:{s}" if one else f"rl:sc:{kind}:{s}"} for s in S.SCHEMES])
     lines.append(f"\nПотолок ставки на сервере: ${S.max_stake_usd():g} (REAL_MAX_STAKE_USD в .env).")
-    kb.append([{"text": "← Назад", "callback": "rl:view"}])
+    kb.append([{"text": "← Назад", "callback": back}])
     return "\n".join(lines), kb
 
 
 # ---------------------------------------------------------------------- сделки
-async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20) -> str:
-    rows = await db.fetch("SELECT * FROM real_positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT $1",
-                          limit)
+async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20, wallet: Any = "all") -> str:
+    every = wallet == "all"
+    rows = await db.fetch("SELECT * FROM real_positions WHERE closed_at IS NOT NULL "
+                          "AND ($2 OR wallet_id IS NOT DISTINCT FROM $3::bigint) ORDER BY closed_at DESC LIMIT $1",
+                          limit, every, None if every else wallet)
     if not rows:
         return "📋 Закрытых сделок реального бота пока нет."
     sol_usd = float((await db.kv_get(STATUS_KEY) or {}).get("sol_usd") or 150)
@@ -342,10 +419,14 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14) -> str:
 
 
 # ---------------------------------------------------------------------- нажатия кнопок
-async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], data: str) -> Reply:
-    """data — то, что после «rl:» в кнопке. reload() возвращает действующие настройки (после записи — свежие)."""
+async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], data: str, rpc: Any = None) -> Reply:
+    """data — то, что после «rl:» в кнопке. reload() возвращает действующие настройки (после записи — свежие).
+    rpc — клиент сети для свежего баланса в карточке кошелька (необязательно)."""
     cfg = await reload()
     action, _, rest = data.partition(":")
+    if action.startswith("w"):
+        from .wallets_ui import on_wallet_callback
+        return await on_wallet_callback(db, cfg, action, rest, rpc)
 
     async def main(toast: str = "", edit: bool = True) -> Reply:
         text, kb = await status_view(db, await reload())

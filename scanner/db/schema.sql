@@ -604,3 +604,20 @@ CREATE TABLE IF NOT EXISTS real_orders (
 ALTER TABLE real_orders ADD COLUMN IF NOT EXISTS base jsonb NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS real_orders_created_idx ON real_orders (created_at);
 CREATE INDEX IF NOT EXISTS real_orders_position_idx ON real_orders (position_id);
+
+-- Кошельки реального бота, созданные кнопкой в Telegram (scanner/real/vault.py). Ключ — только зашифрованный
+-- (AES-256-GCM, ключ шифра REAL_MASTER_KEY — в .env на сервере). source=env — ключ в .env (REAL_PRIVATE_KEY), в базе
+-- его нет. settings — настройки кошелька поверх общих (режим, ставка, стопы, сигналы, правила выхода).
+CREATE TABLE IF NOT EXISTS real_wallets (
+    id          bigserial PRIMARY KEY,
+    name        text NOT NULL,
+    pubkey      text NOT NULL UNIQUE,
+    secret_enc  bytea,
+    source      text NOT NULL DEFAULT 'tg',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    archived    boolean NOT NULL DEFAULT false,
+    settings    jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+ALTER TABLE real_positions ADD COLUMN IF NOT EXISTS wallet_id bigint;
+ALTER TABLE real_orders ADD COLUMN IF NOT EXISTS wallet_id bigint;
+CREATE INDEX IF NOT EXISTS real_positions_wallet_idx ON real_positions (wallet_id, opened_at);
