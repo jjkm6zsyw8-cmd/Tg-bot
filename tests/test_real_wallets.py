@@ -260,7 +260,7 @@ async def test_wallet_screens_flow(db, monkeypatch):
         await desk.lanes[wid].refresh_balance(force=True)
         await desk.lanes[wid].publish_status()
         r = await UI.on_wallet_callback(db, {}, "w", str(wid))
-        assert "0.2500 SOL" in r.text and addr in r.text and "ключ: ключ в базе (зашифрован)" in r.text
+        assert "0.2500 SOL" in r.text and addr in r.text and "· ключ в базе (зашифрован)" in r.text
         for c in (f"rl:wd:{wid}", f"rl:wo:{wid}", f"rl:wm:{wid}:live", f"rl:wsg:{wid}", f"rl:wx:{wid}", f"rl:wa:{wid}"):
             assert c in cbs(r.kb)
         assert all(len(c.encode()) <= 64 for c in cbs(r.kb))

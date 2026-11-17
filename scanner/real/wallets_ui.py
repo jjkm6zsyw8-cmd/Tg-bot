@@ -105,7 +105,7 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
     want = S.get(wcfg, "real_mode")
     mode = ws.get("mode") if fresh else want
     key = (ws.get("wallet_note") if fresh else None) or (
-        "в базе (зашифрован)" if w["stored"] else "в .env" if w["source"] == "env" else "нет")
+        "ключ в базе (зашифрован)" if w["stored"] else "ключ в .env" if w["source"] == "env" else "ключа нет")
     lines = [f"👛 <b>{esc(w['name'])}</b>",
              f"Адрес: <code>{w['pubkey']}</code>",
              "Баланс: " + (f"<b>{bal:.4f} SOL</b> (${bal * sol_usd:.2f})" if bal is not None else "неизвестен"),
@@ -116,7 +116,7 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
              + ("" if S.get(wcfg, "real_live_mydev") else " (в бою — нет)")
              + f" · выход: {S.get(wcfg, 'real_scheme')} / {S.get(wcfg, 'real_scheme_mydev')}",
              f"Стопы: день {S.fmt('real_day_stop_usd', S.get(wcfg, 'real_day_stop_usd'))}, всего "
-             f"{S.fmt('real_total_stop_usd', S.get(wcfg, 'real_total_stop_usd'))} · ключ: {esc(key)}"]
+             f"{S.fmt('real_total_stop_usd', S.get(wcfg, 'real_total_stop_usd'))} · {esc(key)}"]
     if want == "live" and fresh and mode != "live":
         lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(ws.get('why_not_live') or 'нет разрешения на сервере')}.")
     if not fresh:
