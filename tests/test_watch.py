@@ -230,6 +230,55 @@ def test_rpc_switches_to_fallback_on_repeated_429():
     assert SolanaRpc("https://x").fallback is None            # без запасного — как раньше
 
 
+async def test_rpc_switches_to_fallback_when_key_is_refused():
+    """17.11: новый ключ Helius отвечал «Forbidden» (403) — запросы падали, бумага не получала цену входа.
+    Теперь 401/403 от основного узла — сразу на запасной (тот же запрос повторяется там)."""
+    import asyncio as _a
+
+    from aiohttp import web
+
+    from scanner.ingest.rpc import RpcError, SolanaRpc
+    hits = {"primary": 0, "public": 0}
+
+    async def primary(request):
+        hits["primary"] += 1
+        return web.Response(status=403, text="Forbidden")
+
+    async def public(request):
+        hits["public"] += 1
+        body = await request.json()
+        return web.json_response({"jsonrpc": "2.0", "id": body["id"], "result": 123})
+
+    async def broken(request):
+        return web.Response(status=502, text="<html>Bad gateway</html>")
+    app = web.Application()
+    app.router.add_post("/primary", primary)
+    app.router.add_post("/public", public)
+    app.router.add_post("/broken", broken)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    try:
+        rpc = SolanaRpc(f"{base}/primary", rps=100, fallback=f"{base}/public")
+        assert await rpc.call("getSlot", [], retries=2) == 123
+        assert rpc.on_fallback and rpc.denied == 1 and hits == {"primary": 1, "public": 1}
+        assert await rpc.call("getSlot", []) == 123 and hits["primary"] == 1     # дальше — сразу запасной
+        solo = SolanaRpc(f"{base}/broken", rps=100)                             # не JSON — понятная ошибка
+        try:
+            await solo.call("getSlot", [], retries=0)
+            raise AssertionError("ожидалась ошибка")
+        except RpcError as exc:
+            assert "not JSON" in str(exc)
+        await rpc.close()
+        await solo.close()
+    finally:
+        await runner.cleanup()
+        await _a.sleep(0)
+
+
 def test_watch_switches_to_fallback():
     w = WatchSource("wss://helius", {}, "wss://public")
     w.on_failure(Exception("server rejected WebSocket connection: HTTP 429"))

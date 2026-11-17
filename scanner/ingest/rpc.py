@@ -47,6 +47,7 @@ class SolanaRpc:
         self._session: aiohttp.ClientSession | None = None
         self.calls = 0
         self.rate_limited = 0
+        self.denied = 0                 # ответов 401/403 (ключ не принят)
         self.max_tx_version = 1         # Solana: транзакции v0 и v1 (2026); выше — поднимется по ответу узла
         self.pause_until = 0.0          # общая пауза после 429: запросы ждут, а не долбят RPC
         self._consecutive_429 = 0
@@ -97,7 +98,13 @@ class SolanaRpc:
                         if resp.status == 429:
                             self._on_429(resp.headers.get("Retry-After"))
                             raise RpcError("rate limited")
-                        data = await resp.json(content_type=None)
+                        if resp.status in (401, 403):
+                            self._on_denied(resp.status)
+                            raise RpcError(f"access denied (HTTP {resp.status})")
+                        try:
+                            data = await resp.json(content_type=None)
+                        except ValueError as exc:      # «Forbidden», страница ошибки шлюза и т. п.
+                            raise RpcError(f"HTTP {resp.status}: answer is not JSON") from exc
                 self._consecutive_429 = 0
                 if "error" in data:
                     err = data["error"]
@@ -107,12 +114,23 @@ class SolanaRpc:
                     raise RpcError(str(err))   # ошибки запроса не повторяем
                 return data.get("result")
             except (aiohttp.ClientError, asyncio.TimeoutError, RpcError) as exc:
-                retryable = not isinstance(exc, RpcError) or "rate limited" in str(exc)
+                retryable = not isinstance(exc, RpcError) or any(
+                    x in str(exc) for x in ("rate limited", "access denied", "not JSON"))
                 if attempt >= retries or not retryable:
                     raise RpcError(f"{method}: {exc}") from exc
                 await asyncio.sleep(delay)
                 delay *= 2
         return None
+
+    def _on_denied(self, status: int) -> None:
+        """Основной узел отказал в доступе (401/403): ключ Helius не принят — неверный, ограничен по IP / домену
+        или аккаунт ещё не активирован. 30 мин работаем через запасной узел, потом пробуем основной снова."""
+        self.denied += 1
+        if self.fallback and self.url == self.primary:
+            self.url = self.fallback
+            self.fallback_until = time.monotonic() + 1800
+            log.warning("RPC: основной узел отвечает %s — ключ Helius не принят; 30 мин работаю через запасной",
+                        status)
 
     def _on_429(self, retry_after: str | None) -> None:
         self.rate_limited += 1
