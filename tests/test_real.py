@@ -815,9 +815,9 @@ async def test_sell_that_landed_during_a_crash_is_recovered(db, monkeypatch):
 async def test_total_stop_switches_live_off(db, monkeypatch):
     chain = FakeChain()
     chain.add_curve(MINT, 40.0)
-    tr = live(db, chain, monkeypatch, real_total_stop_usd=5)
+    tr = live(db, chain, monkeypatch, real_total_stop_usd=10)
     await tr.start()
-    tr.live_total = -3.5 / 150                                            # уже потеряно $3.5
+    tr.live_total = -8.5 / 150                                            # уже потеряно $8.5
     await fire(tr, chain)
     chain.set_mc(MINT, 26.0)                                              # −35% → ещё около −$1.9
     await tr.command({"cmd": "sell_all"})
