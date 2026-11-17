@@ -1,0 +1,424 @@
+"""Экран /real в Telegram: состояние реального бота, кнопки управления, сделки, сравнение с бумагой, настройки.
+
+Работает в сервисе бота и читает только базу: состояние исполнителя (kv «real:status», аналитика обновляет его
+раз в 5 с), таблицы real_positions / real_orders и настройки. Команды исполнителю уходят через очередь заданий
+(db.job("real", …)) — так же, как у бумаги. Ключа кошелька здесь нет и быть не может.
+
+Все нажатия обрабатывает on_callback(): он возвращает Reply (текст, кнопки, всплывающая подпись, файл), а
+обработчик в bot/handlers.py только показывает его. Поэтому логику экрана можно проверять тестами без Telegram.
+"""
+from __future__ import annotations
+
+import csv
+import io
+import statistics
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
+
+from ..alerts.format import esc
+from ..analytics.paper import SCHEMES as PAPER_SCHEMES
+from . import settings as S
+
+STATUS_KEY = "real:status"
+STALE_S = 90.0
+KINDS = {"smart": "smart", "mydev": "мой дев"}
+MODE_ICON = {"off": "⚪", "shadow": "👻", "live": "💵"}
+MODE_SHORT = {"off": "выкл", "shadow": "тень", "live": "бой"}
+EXIT_NAMES = {"take_profit": "тейк", "stop": "стоп", "trailing": "трейлинг", "time_stop": "нет роста",
+              "max_hold": "время", "trader_sell": "трейдер продал", "tiny_rebuy": "мелкая докупка",
+              "emergency": "дев продаёт", "manual": "вручную", "sell_all": "продать всё", "gone": "токенов нет"}
+PAPER_OF = {"smart": "M", "mydev": "Y"}        # с каким бумажным портфелем сравнивается вид сигнала
+Kb = list[list[dict[str, Any]]]
+
+
+@dataclass
+class Reply:
+    text: str | None = None
+    kb: Kb | None = None
+    toast: str = ""
+    edit: bool = False                         # заменить текст сообщения с кнопкой, а не слать новое
+    document: tuple[bytes, str, str] | None = None     # (содержимое, имя файла, подпись)
+
+
+def tz_of(cfg: dict[str, Any]) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
+    except Exception:  # noqa: BLE001
+        return ZoneInfo("Asia/Tbilisi")
+
+
+def day_start(cfg: dict[str, Any]) -> datetime:
+    return datetime.now(tz_of(cfg)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def money(sol: float, sol_usd: float) -> str:
+    v = sol * sol_usd
+    return f"{'+' if v > 0 else '−' if v < 0 else ''}${abs(v):.2f}"
+
+
+def scheme_text(name: str) -> str:
+    return str(PAPER_SCHEMES[name]["name"]).split(": ", 1)[-1].replace("smart — ", "")
+
+
+async def load_status(db: Any) -> tuple[dict[str, Any], float | None]:
+    """Состояние исполнителя и его возраст в секундах (None — исполнитель ещё не запускался)."""
+    st = await db.kv_get(STATUS_KEY) or {}
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(st["at"])).total_seconds()
+    except Exception:  # noqa: BLE001
+        age = None
+    return st, age
+
+
+async def totals(db: Any, since: datetime | None = None) -> dict[str, dict[str, float]]:
+    """Итог закрытых сделок по режимам: число, в плюс, итог в SOL; для боя — комиссии отклонённых транзакций."""
+    out: dict[str, dict[str, float]] = {m: {"n": 0, "wins": 0, "pnl": 0.0, "fails": 0, "fail_fees": 0.0}
+                                        for m in ("shadow", "live")}
+    for r in await db.fetch(
+            "SELECT mode, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) wins, COALESCE(sum(pnl_sol), 0) pnl "
+            "FROM real_positions WHERE closed_at IS NOT NULL AND ($1::timestamptz IS NULL OR closed_at >= $1) "
+            "GROUP BY mode", since):
+        if r["mode"] in out:
+            out[r["mode"]].update(n=int(r["n"]), wins=int(r["wins"]), pnl=float(r["pnl"]))
+    for r in await db.fetch(
+            "SELECT mode, count(*) n, COALESCE(sum(fee_sol), 0) fees FROM real_orders WHERE status = 'failed' "
+            "AND mode = 'live' AND side IN ('buy', 'sell') AND signature IS NOT NULL "
+            "AND ($1::timestamptz IS NULL OR created_at >= $1) GROUP BY mode", since):
+        out["live"].update(fails=int(r["n"]), fail_fees=float(r["fees"]))
+    return out
+
+
+def _row(name: str, t: dict[str, float], sol_usd: float) -> str:
+    n = int(t["n"])
+    win = f"{t['wins'] / n:.0%}" if n else "—"
+    total = t["pnl"] - t.get("fail_fees", 0.0)
+    return f"{name:<13}{n:>5} {win:>6} {money(total, sol_usd):>9}"
+
+
+# ---------------------------------------------------------------------- главный экран
+async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
+    st, age = await load_status(db)
+    sol_usd = float(st.get("sol_usd") or (await db.kv_get("sol_usd", {}) or {}).get("price") or 150)
+    want = S.get(cfg, "real_mode")
+    mode = st.get("mode") if age is not None and age < STALE_S else None
+    lines = ["💵 <b>Реальный бот</b>"]
+    if age is None:
+        lines.append("⚠️ Исполнитель ещё не запускался (сервис analytics не обновлён или не поднялся).")
+    elif age >= STALE_S:
+        lines.append(f"⚠️ Исполнитель не отвечает {age / 60:.0f} мин — сервис analytics остановлен или перезапускается.")
+    shown = mode or want
+    lines.append(f"Режим: {MODE_ICON[shown]} <b>{S.MODES[shown]}</b>")
+    if want == "live" and mode and mode != "live":
+        lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(st.get('why_not_live') or 'нет разрешения на сервере')}.")
+    paused = str(cfg.get("real_paused") or "")
+    if paused:
+        lines.append(f"⛔ Новые входы остановлены: {esc(paused)}")
+    if st.get("wallet"):
+        bal = st.get("balance_sol")
+        lines.append(f"Кошелёк: <code>{st['wallet']}</code> · "
+                     + (f"{bal:.4f} SOL (${bal * sol_usd:.2f})" if bal is not None else "баланс неизвестен")
+                     + f" · ключ {'есть' if st.get('can_sign') else 'не задан'}")
+    else:
+        lines.append("Кошелёк не задан — тень считает сделки по состоянию сети, без симуляции транзакций.")
+    lines.append(f"Ставка <b>{S.fmt('real_stake_usd', S.get(cfg, 'real_stake_usd'))}</b> (потолок сервера "
+                 f"${S.max_stake_usd():g}) · позиций до {S.get(cfg, 'real_max_open')} · дневной стоп "
+                 f"{S.fmt('real_day_stop_usd', S.get(cfg, 'real_day_stop_usd'))} · общий стоп "
+                 f"{S.fmt('real_total_stop_usd', S.get(cfg, 'real_total_stop_usd'))}")
+    kinds = []
+    if S.get(cfg, "real_smart"):
+        kinds.append(f"smart — {S.get(cfg, 'real_scheme')} ({scheme_text(S.get(cfg, 'real_scheme'))})")
+    if S.get(cfg, "real_mydev"):
+        kinds.append(f"мой дев — {S.get(cfg, 'real_scheme_mydev')} ({scheme_text(S.get(cfg, 'real_scheme_mydev'))})"
+                     + ("" if S.get(cfg, "real_live_mydev") else " — в бою не участвует, только тень"))
+    lines.append("Сигналы и выход: " + ("; ".join(kinds) if kinds else "все выключены"))
+    kb: Kb = [[{"text": "🔄 Обновить", "callback": "rl:view"}]]
+    kb.append([{"text": ("● " if want == m else "") + f"{MODE_ICON[m]} {MODE_SHORT[m].capitalize()}"
+                + ("…" if m == "live" and want != "live" else ""), "callback": f"rl:mode:{m}"}
+               for m in ("off", "shadow", "live")])
+    opened = st.get("open") or [] if mode else []
+    if opened:
+        lines.append(f"\n<b>Открыто: {len(opened)}</b>")
+        for o in opened[:10]:
+            lines.append(f"• {MODE_ICON.get(o.get('mode'), '')} ${esc(o.get('symbol') or '?')} "
+                         f"({KINDS.get(o.get('kind'), o.get('kind'))}) {float(o.get('net') or 0):+.0%} · "
+                         f"{float(o.get('age_s') or 0) / 60:.0f} мин"
+                         + (" · 🆘 продажа не проходит" if o.get("stuck") else ""))
+        for o in opened[:4]:
+            if o.get("id"):
+                kb.append([{"text": f"Продать ${(o.get('symbol') or '?')[:12]}", "callback": f"rl:sell:{o['id']}"}])
+    today, alltime = await totals(db, day_start(cfg)), await totals(db)
+    table = [f"{'':<13}{'сдел.':>5} {'в плюс':>6} {'итог':>9}",
+             _row("Тень сегодня", today["shadow"], sol_usd), _row("Тень всего", alltime["shadow"], sol_usd),
+             _row("Бой сегодня", today["live"], sol_usd), _row("Бой всего", alltime["live"], sol_usd)]
+    lines.append("\n<pre>" + "\n".join(table) + "</pre>")
+    if alltime["live"]["fails"]:
+        lines.append(f"Отклонённые сетью транзакции боя: {int(alltime['live']['fails'])}, комиссии "
+                     f"{money(-alltime['live']['fail_fees'], sol_usd)} (уже в итоге).")
+    skips = st.get("skips") or {}
+    if skips and mode:
+        lines.append("\n<b>Пропуски</b> (с запуска " + _since(st.get("since"), cfg) + "):")
+        lines += [f"• {esc(k)} — {v}" for k, v in list(skips.items())[:8]]
+    kb.append([{"text": "▶️ Продолжить входы", "callback": "rl:resume"} if paused else
+               {"text": "⛔ Стоп входов", "callback": "rl:pause"},
+               {"text": "💰 Продать всё…", "callback": "rl:sellall"}])
+    kb.append([{"text": "📋 Сделки", "callback": "rl:trades"}, {"text": "⚖️ Против бумаги", "callback": "rl:cmp"},
+               {"text": "📄 Файл", "callback": "rl:csv"}])
+    kb.append([{"text": "⚙️ Настройки", "callback": "rl:set"}, {"text": "🧪 Проверка на сети", "callback": "rl:check"}])
+    return "\n".join(lines), kb
+
+
+def _since(iso: str | None, cfg: dict[str, Any]) -> str:
+    try:
+        return datetime.fromisoformat(str(iso)).astimezone(tz_of(cfg)).strftime("%d.%m %H:%M")
+    except Exception:  # noqa: BLE001
+        return "—"
+
+
+# ---------------------------------------------------------------------- включение боя
+async def live_confirm_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
+    st, age = await load_status(db)
+    sol_usd = float(st.get("sol_usd") or 150)
+    fresh = age is not None and age < STALE_S
+    allowed, can_sign = bool(st.get("live_allowed")) and fresh, bool(st.get("can_sign")) and fresh
+    bal = st.get("balance_sol") if fresh else None
+    need = S.get(cfg, "real_min_stake_usd") / sol_usd + S.get(cfg, "real_reserve_sol")
+    first = await db.fetchval("SELECT min(opened_at) FROM real_positions WHERE mode = 'shadow'")
+    days = (datetime.now(timezone.utc) - first).total_seconds() / 86400 if first else 0.0
+    t = (await totals(db))["shadow"]
+    ok = lambda v: "✅" if v else "❌"  # noqa: E731
+    lines = ["💵 <b>Включить бой — торговлю реальными деньгами?</b>", "",
+             f"{ok(fresh)} исполнитель работает",
+             f"{ok(allowed)} бой разрешён на сервере (REAL_LIVE=1 в .env)",
+             f"{ok(can_sign)} ключ кошелька задан на сервере",
+             f"{ok(bal is not None and bal >= need)} на кошельке есть SOL: "
+             + (f"{bal:.4f} (нужно от {need:.3f})" if bal is not None else "баланс неизвестен"),
+             "",
+             f"Тень за {days:.1f} дн.: сделок {int(t['n'])}, в плюс "
+             + (f"{t['wins'] / t['n']:.0%}" if t["n"] else "—") + f", итог {money(t['pnl'], sol_usd)} при ставке "
+             f"{S.fmt('real_stake_usd', S.get(cfg, 'real_stake_usd'))}.",
+             "Ваше правило: бой — только после 2+ недель положительного итога без денег и вашего отдельного решения.",
+             "",
+             f"Что будет: ставка {S.fmt('real_stake_usd', S.get(cfg, 'real_stake_usd'))} на сделку, одновременно до "
+             f"{S.get(cfg, 'real_max_open')} позиций, дневной стоп "
+             f"{S.fmt('real_day_stop_usd', S.get(cfg, 'real_day_stop_usd'))}, общий стоп "
+             f"{S.fmt('real_total_stop_usd', S.get(cfg, 'real_total_stop_usd'))} (после него бой сам выключится)."]
+    if not (allowed and can_sign):
+        lines += ["", "Сейчас включить нельзя: не выполнены условия на сервере. Как их выполнить — docs/REAL_BOT.md, "
+                      "раздел «Как включить бой»."]
+        return "\n".join(lines), [[{"text": "Назад", "callback": "rl:view"}]]
+    return "\n".join(lines), [[{"text": "Да, включить бой", "callback": "rl:mode:live!", "style": "danger"},
+                               {"text": "Нет", "callback": "rl:view"}]]
+
+
+# ---------------------------------------------------------------------- настройки
+def settings_view(cfg: dict[str, Any]) -> tuple[str, Kb]:
+    lines = ["⚙️ <b>Настройки реального бота</b>", "Меняются кнопками «−» и «+», действуют сразу."]
+    kb: Kb = []
+    for key, (label, _default, _step, _lo, _hi, _kind, desc) in S.SETTINGS.items():
+        shown = S.fmt(key, S.get(cfg, key))
+        lines.append(f"• {label}: <b>{shown}</b>" + (f" — {desc}" if desc else ""))
+        kb.append([{"text": "−", "callback": f"rl:s:{key}:-"}, {"text": f"{label[:22]}: {shown}", "callback": "rl:set"},
+                   {"text": "+", "callback": f"rl:s:{key}:+"}])
+    lines.append("")
+    for key, (label, _default, desc) in S.TOGGLES.items():
+        on = S.get(cfg, key)
+        lines.append(f"• {label}: <b>{'да' if on else 'нет'}</b>" + (f" — {desc}" if desc else ""))
+        kb.append([{"text": f"{'✅' if on else '⬜'} {label[:40]}", "callback": f"rl:t:{key}"}])
+    lines.append("")
+    for kind, key in S.SCHEME_KEYS.items():
+        cur = S.get(cfg, key)
+        lines.append(f"• Правила выхода, {KINDS[kind]}: <b>{cur}</b> — {scheme_text(cur)}")
+        kb.append([{"text": ("● " if cur == s else "") + f"{KINDS[kind]}: {s}", "callback": f"rl:sc:{kind}:{s}"}
+                   for s in S.SCHEMES])
+    lines.append(f"\nПотолок ставки на сервере: ${S.max_stake_usd():g} (REAL_MAX_STAKE_USD в .env).")
+    kb.append([{"text": "← Назад", "callback": "rl:view"}])
+    return "\n".join(lines), kb
+
+
+# ---------------------------------------------------------------------- сделки
+async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20) -> str:
+    rows = await db.fetch("SELECT * FROM real_positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT $1",
+                          limit)
+    if not rows:
+        return "📋 Закрытых сделок реального бота пока нет."
+    sol_usd = float((await db.kv_get(STATUS_KEY) or {}).get("sol_usd") or 150)
+    tz = tz_of(cfg)
+    lines = [f"📋 <b>Последние сделки реального бота</b> ({len(rows)})"]
+    for r in rows:
+        blocks = (r["extra"] or {}).get("blocks_after")
+        lines.append(
+            f"{'✅' if (r['pnl_sol'] or 0) > 0 else '❌'} {MODE_ICON.get(r['mode'], '')} "
+            f"{r['closed_at'].astimezone(tz):%d.%m %H:%M} ${esc(r['symbol'] or '?')} ({KINDS.get(r['kind'], r['kind'])}) "
+            f"{float(r['pnl_pct'] or 0):+.0%} {money(float(r['pnl_sol'] or 0), sol_usd)} · "
+            f"{EXIT_NAMES.get(r['exit_reason'], r['exit_reason'])}"
+            + (f" · вход +{blocks} бл." if blocks is not None else ""))
+    return "\n".join(lines)
+
+
+async def trades_csv(db: Any, cfg: dict[str, Any]) -> tuple[str, int]:
+    rows = await db.fetch("SELECT * FROM real_positions ORDER BY opened_at")
+    tz = tz_of(cfg)
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["режим", "сигнал", "монета", "адрес монеты", "трейдер", "площадка", "открыта", "закрыта",
+                "блоков после сигнала", "задержка, с", "MC сигнала, SOL", "MC входа, SOL", "MC выхода, SOL",
+                "потрачено, SOL", "получено, SOL", "итог, SOL", "итог, %", "причина выхода", "алерт",
+                "подпись покупки", "подпись продажи", "примечание"])
+    f = lambda v, n=6: "" if v is None else f"{float(v):.{n}f}".replace(".", ",")  # noqa: E731
+    for r in rows:
+        extra = r["extra"] or {}
+        w.writerow([MODE_SHORT.get(r["mode"], r["mode"]), KINDS.get(r["kind"], r["kind"]), r["symbol"] or "", r["mint"],
+                    r["trader"] or "", r["venue"] or "", f"{r['opened_at'].astimezone(tz):%d.%m.%Y %H:%M:%S}",
+                    f"{r['closed_at'].astimezone(tz):%d.%m.%Y %H:%M:%S}" if r["closed_at"] else "",
+                    "" if extra.get("blocks_after") is None else extra["blocks_after"], f(r["lag_s"], 2),
+                    f(r["trigger_mc"], 2), f(r["entry_mc"], 2), f(r["exit_mc"], 2), f(r["cost_sol"]),
+                    f(r["proceeds_sol"]), f(r["pnl_sol"]), f(None if r["pnl_pct"] is None else r["pnl_pct"] * 100, 1),
+                    EXIT_NAMES.get(r["exit_reason"], r["exit_reason"] or ""), r["alert_id"] or "", r["buy_sig"] or "",
+                    r["sell_sig"] or "", extra.get("note") or ""])
+    return buf.getvalue(), len(rows)
+
+
+# ---------------------------------------------------------------------- сравнение с бумагой
+async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14) -> str:
+    """Те же сигналы у реального бота и у бумаги: расходится ли цена входа и результат."""
+    rows = await db.fetch(
+        """SELECT r.mode, r.kind, r.pnl_pct, r.pnl_sol, r.entry_mc, (r.extra->>'blocks_after')::int AS blocks,
+                  p.pnl_pct AS p_pct, p.entry_mc AS p_mc
+           FROM real_positions r
+           LEFT JOIN LATERAL (
+               SELECT pp.pnl_pct, pp.entry_mc FROM paper_positions pp
+               WHERE pp.alert_id = r.alert_id AND pp.mint = r.mint AND NOT pp.suspect AND pp.closed_at IS NOT NULL
+                 AND pp.exit_reason <> 'reset' AND pp.portfolio = CASE r.kind WHEN 'smart' THEN 'M' ELSE 'Y' END
+               ORDER BY pp.id LIMIT 1) p ON true
+           WHERE r.closed_at IS NOT NULL AND r.closed_at > now() - make_interval(days => $1)""", int(days))
+    if not rows:
+        return f"⚖️ За {days} дн. закрытых сделок реального бота нет — сравнивать нечего."
+    sol_usd = float((await db.kv_get(STATUS_KEY) or {}).get("sol_usd") or 150)
+    head = f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"
+    table, notes = [head], []
+    for mode in ("live", "shadow"):
+        for kind in ("smart", "mydev"):
+            rs = [r for r in rows if r["mode"] == mode and r["kind"] == kind]
+            if not rs:
+                continue
+            n = len(rs)
+            wins = sum(1 for r in rs if (r["pnl_sol"] or 0) > 0)
+            avg = sum(float(r["pnl_pct"] or 0) for r in rs) / n
+            total = sum(float(r["pnl_sol"] or 0) for r in rs)
+            name = f"{MODE_SHORT[mode]} {KINDS[kind]}"
+            table.append(f"{name:<17}{n:>5} {wins / n:>6.0%} {avg:>+7.1%} {money(total, sol_usd):>9}")
+            both = [r for r in rs if r["p_pct"] is not None]
+            if both:
+                p_avg = sum(float(r["p_pct"]) for r in both) / len(both)
+                p_wins = sum(1 for r in both if float(r["p_pct"]) > 0)
+                r_avg = sum(float(r["pnl_pct"] or 0) for r in both) / len(both)
+                table.append(f"{' бумага ' + PAPER_OF[kind] + ', те же':<17}{len(both):>5} {p_wins / len(both):>6.0%} "
+                             f"{p_avg:>+7.1%} {'':>9}")
+                prem = [float(r["entry_mc"]) / float(r["p_mc"]) - 1 for r in both if r["entry_mc"] and r["p_mc"]]
+                notes.append(f"{name}: на тех же {len(both)} сигналах бот {r_avg:+.1%} на сделку, бумага {p_avg:+.1%}"
+                             + (f"; цена входа бота против бумаги {statistics.median(prem):+.1%} (медиана)" if prem
+                                else ""))
+            blocks = [int(r["blocks"]) for r in rs if r["blocks"] is not None]
+            if blocks:
+                notes.append(f"{name}: вход через {statistics.median(blocks):.0f} бл. после сигнала (медиана; "
+                             f"от {min(blocks)} до {max(blocks)}); бумага считает 2")
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    first = await db.fetchval("SELECT min(opened_at) FROM real_positions")
+    since = max(since, first) if first else since
+    missed = await db.fetchval(
+        """SELECT count(*) FROM paper_positions pp WHERE pp.portfolio IN ('M', 'Y') AND pp.opened_at >= $1
+             AND pp.exit_reason IS DISTINCT FROM 'reset' AND NOT pp.suspect
+             AND NOT EXISTS (SELECT 1 FROM real_positions r WHERE r.alert_id = pp.alert_id AND r.mint = pp.mint)""",
+        since)
+    extra = sum(1 for r in rows if r["p_pct"] is None)
+    out = [f"⚖️ <b>Реальный бот против бумаги</b> · {days} дн.", "<pre>" + "\n".join(table) + "</pre>"]
+    out += [f"• {esc(x)}" for x in notes]
+    out.append(f"• Бумага (M, Y) вошла, а бот — нет: {int(missed or 0)} · бот вошёл, а закрытой сделки бумаги по "
+               f"сигналу нет: {extra}")
+    out.append("Причины, по которым бот не входил, — в разделе «Пропуски» на главном экране /real.")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------- нажатия кнопок
+async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], data: str) -> Reply:
+    """data — то, что после «rl:» в кнопке. reload() возвращает действующие настройки (после записи — свежие)."""
+    cfg = await reload()
+    action, _, rest = data.partition(":")
+
+    async def main(toast: str = "", edit: bool = True) -> Reply:
+        text, kb = await status_view(db, await reload())
+        return Reply(text, kb, toast, edit)
+
+    async def conf(toast: str = "") -> Reply:
+        text, kb = settings_view(await reload())
+        return Reply(text, kb, toast, True)
+
+    if action in ("view", "no"):
+        return await main("Обновлено" if action == "view" else "")
+    if action == "mode":
+        if rest in ("off", "shadow"):
+            await db.set_override("real_mode", rest)
+            return await main(f"Режим: {S.MODES[rest]}")
+        if rest == "live":
+            if S.get(cfg, "real_mode") == "live":
+                return await main("Бой уже выбран")
+            text, kb = await live_confirm_view(db, cfg)
+            return Reply(text, kb, "", True)
+        if rest == "live!":
+            st, age = await load_status(db)
+            if age is None or age >= STALE_S or not st.get("live_allowed") or not st.get("can_sign"):
+                text, kb = await live_confirm_view(db, cfg)
+                return Reply(text, kb, "Бой не включён: условия на сервере не выполнены", True)
+            await db.set_override("real_armed_at", datetime.now(timezone.utc).isoformat())
+            await db.set_override("real_mode", "live")
+            return await main("Бой включён")
+        return await main()
+    if action == "pause":
+        await db.set_override("real_paused", "остановлено кнопкой")
+        return await main("Новые входы остановлены")
+    if action == "resume":
+        await db.set_override("real_paused", None)
+        await db.job("real", {"cmd": "resume"})
+        return await main("Входы разрешены")
+    if action == "sellall":
+        return Reply("Продать все открытые позиции реального бота по рынку прямо сейчас?",
+                     [[{"text": "Да, продать всё", "callback": "rl:sellall!", "style": "danger"},
+                       {"text": "Нет", "callback": "rl:no"}]], "", True)
+    if action == "sellall!":
+        await db.job("real", {"cmd": "sell_all"})
+        return await main("Продаю всё — итог придёт в тему «Реальный бот»")
+    if action == "sell" and rest.isdigit():
+        await db.job("real", {"cmd": "sell", "id": int(rest)})
+        return await main("Продаю позицию")
+    if action == "trades":
+        return Reply(await trades_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]])
+    if action == "cmp":
+        return Reply(await compare_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]])
+    if action == "csv":
+        text, n = await trades_csv(db, cfg)
+        return Reply(document=(text.encode("utf-8-sig"), "real_trades.csv",
+                               f"📄 Сделки реального бота: {n}. Открывается в Numbers / Excel."))
+    if action == "check":
+        await db.job("real", {"cmd": "check"})
+        return Reply(toast="Проверяю на живой сети — результат придёт в тему «Реальный бот» через несколько секунд")
+    if action == "set":
+        return await conf()
+    if action == "s":
+        key, _, sign = rest.rpartition(":")
+        if key in S.SETTINGS and sign in ("+", "-"):
+            v = S.step(cfg, key, sign)
+            await db.set_override(key, v)
+            return await conf(f"{S.SETTINGS[key][0]}: {S.fmt(key, v)}")
+        return await conf()
+    if action == "t":
+        if rest in S.TOGGLES:
+            await db.set_override(rest, not S.get(cfg, rest))
+        return await conf("Сохранено")
+    if action == "sc":
+        kind, _, name = rest.partition(":")
+        if kind in S.SCHEME_KEYS and name in S.SCHEMES:
+            await db.set_override(S.SCHEME_KEYS[kind], name)
+        return await conf("Сохранено")
+    return await main()

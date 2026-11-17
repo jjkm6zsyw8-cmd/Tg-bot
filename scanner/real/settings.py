@@ -123,9 +123,9 @@ def fmt(key: str, v: Any) -> str:
     if kind == "usd":
         return f"${v:g}"
     if kind == "pct":
-        return f"{v:.0%}"
+        return f"{round(v * 100, 2):g}%"
     if kind == "sol":
-        return f"{v:g} SOL"
+        return f"{v:.6f}".rstrip("0").rstrip(".") + " SOL"
     if kind == "sec":
         return f"{v:g} с"
     return f"{v:g}"

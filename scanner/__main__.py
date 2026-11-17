@@ -1,4 +1,7 @@
-"""Точка входа: python -m scanner {ingest|analytics|bot|web|migrate|all}."""
+"""Точка входа: python -m scanner {ingest|analytics|bot|web|migrate|all}.
+
+Разовые команды: recluster, history, verify; реальный бот — real-keygen (создать кошелёк) и real-check
+(проверка сборки сделок на живой сети без денег)."""
 from __future__ import annotations
 
 import asyncio
@@ -39,7 +42,7 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history", "verify"):
+    if cmd in ("recluster", "history", "verify", "real-check"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -94,6 +97,18 @@ async def run_tool(cmd: str, db: Database) -> None:
         await db.enqueue("daily", {"text": text, "csv": csv_bytes.decode("utf-8"),
                                    "filename": f"verify_{day.isoformat()}_{days}d.csv"}, priority=4)
         print("\nОтчёт и CSV отправлены в топик «Разбор дня».")
+    elif cmd == "real-check":
+        import re
+        from types import SimpleNamespace
+        from .config import Settings, YamlConfig, load_env
+        from .real.executor import RealTrader
+        from .real.selfcheck import run
+        env = load_env()
+        settings = Settings(YamlConfig(env.config_path), await db.get_overrides())
+        price = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+        eng = SimpleNamespace(db=db, env=env, cfg=settings.effective(), price=SimpleNamespace(value=price), states={})
+        text = await run(RealTrader(eng), [a for a in args if not a.startswith("-")] or None)   # type: ignore[arg-type]
+        print(re.sub(r"<[^>]+>", "", text))
     elif cmd == "history":
         from .history.dune import load
         key = os.environ.get("DUNE_API_KEY", "")
@@ -108,5 +123,8 @@ async def run_tool(cmd: str, db: Database) -> None:
 
 if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if command == "real-keygen":        # до настройки логов и базы: в stdout — только строки для .env
+        from .real.keys import keygen
+        raise SystemExit(keygen())
     setup_logging(os.environ.get("LOG_LEVEL", "INFO"), command)
     asyncio.run(main(command))

@@ -28,6 +28,7 @@ from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
 from ..reports.backtest import run_backtest
+from ..real import report as real_report
 from ..reports.daily import build_daily, today_in
 from ..solana import is_valid_address, short
 from . import views
@@ -65,6 +66,7 @@ HELP = """<b>Pump.fun Dev Scanner</b>
 /origin — откуда кошельки и как отобраны (реализованный / нереализованный PnL)
 /removewallet &lt;адрес&gt;
 /blacklist &lt;адрес&gt;
+/real — реальный бот: режим (выкл / тень / бой), стоп-кран, сделки, настройки
 /today — разбор дня · /backtest &lt;период&gt; [a=1 vs a=2]
 /stats — итог серии · /mute &lt;минуты&gt; · /health
 /quiet 01:00-08:00 · /tz Europe/Moscow · /dailytime 21:00 · /mywallet &lt;адрес&gt;"""
@@ -125,6 +127,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     def main_menu() -> list[list[dict[str, Any]]]:
         return [
             [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
+            [{"text": "💵 Реальный бот", "callback": "menu:real"}],
             [{"text": "📥 Импорт кошельков", "callback": "menu:import"},
              {"text": "➕ Добавить кошелёк", "callback": "menu:add"}],
             [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "📦 Выгрузка", "callback": "menu:export"}],
@@ -878,6 +881,30 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         else:
             await paper_answer(c.message, "period", None if arg == "all" else float(arg))
 
+    # ------------------------------------------------------------------ реальный бот (scanner/real/report.py)
+    @router.message(Command("real"))
+    async def cmd_real(m: Message) -> None:
+        text, kb = await real_report.status_view(db, await reload())
+        await reply(m, text, kb)
+
+    @router.callback_query(F.data.startswith("rl:"))
+    async def cb_real(c: CallbackQuery) -> None:
+        r = await real_report.on_callback(db, reload, c.data[3:])
+        await c.answer(r.toast[:190] if r.toast else None)
+        if c.message is None:
+            return
+        if r.document is not None:
+            data, name, caption = r.document
+            await c.message.answer_document(BufferedInputFile(data, filename=name), caption=caption)
+        elif r.text and r.edit and len(r.text) <= 4000:
+            try:
+                await c.message.edit_text(r.text, parse_mode="HTML", reply_markup=build(r.kb),
+                                          link_preview_options=NO_PREVIEW)
+            except Exception:  # noqa: BLE001 — «текст не изменился» и подобное
+                pass
+        elif r.text:
+            await reply(c.message, r.text, r.kb)
+
     @router.message(Command("testalert"))
     async def cmd_testalert(m: Message) -> None:
         await sender.setup_topics()
@@ -933,6 +960,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return
         if what == "paper":
             return await paper_answer(m, "state")
+        if what == "real":
+            text, kb = await real_report.status_view(db, await reload())
+            return await reply(m, text, kb)
         if what == "smart":
             return await send_smart(m, 7)
         if what in ("import", "add"):

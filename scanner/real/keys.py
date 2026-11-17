@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 
 from solders.keypair import Keypair
@@ -79,3 +80,23 @@ def load_wallet(env: Any = None) -> tuple[Wallet | None, str]:
         except Exception:  # noqa: BLE001
             return None, f"{ENV_WALLET} — не адрес Solana"
     return None, "кошелёк не задан"
+
+
+def keygen(env: Any = None, out: Any = None, err: Any = None) -> int:
+    """Создать кошелёк бота: `python -m scanner real-keygen >> .env`.
+
+    В стандартный вывод идут ровно две строки для файла .env (ключ и адрес), на экран (stderr) — только адрес
+    для пополнения. Ключ нигде больше не появляется. Если ключ уже задан — отказ: новый ключ поверх старого
+    означал бы потерю доступа к кошельку с деньгами. Строки для экрана начинаются с «#»: даже попав в .env,
+    они останутся комментариями."""
+    env = os.environ if env is None else env
+    out, err = out or sys.stdout, err or sys.stderr
+    if (env.get(ENV_KEY) or "").strip():
+        print(f"# {ENV_KEY} уже задан в .env — новый кошелёк не создаю.", file=err)
+        return 1
+    kp = Keypair()
+    print(f"{ENV_KEY}={kp}", file=out)
+    print(f"{ENV_WALLET}={kp.pubkey()}", file=out)
+    print(f"# Кошелёк реального бота создан. Адрес для пополнения: {kp.pubkey()}", file=err)
+    print("# Ключ записан в .env на сервере. Не показывайте его никому и не отправляйте в чат.", file=err)
+    return 0
