@@ -11,7 +11,8 @@
    половины купленного (не трейдер, а холдер); уже в своём списке; отсеянные недавно. С GMGN — ещё статистика кошелька
    за 7 дней: винрейт, прибыль, сколько монет, среднее удержание (бот-снайпер держит секунды), доля сливов хуже −50%,
    запускает ли сам монеты.
-2. Испытательный срок (до 4 дней, до 20 кошельков одновременно): бот подписывается на кошелёк и копирует каждую его
+2. Испытательный срок (до 4 дней, до 40 кошельков одновременно; за сутки меньше 2 копий — место следующему):
+   бот подписывается на кошелёк и копирует каждую его
    покупку в бумажный портфель H по $10 — с той же задержкой, рыночной ценой и выходами, что настоящие копии (как G).
    Это главный фильтр: красивый PnL на GMGN не значит, что его можно повторить с задержкой в 2 секунды.
 3. Решение: 6+ закрытых копий, итог в плюсе и прибыльных ≥ 40% → в свой список (копируется как свои кошельки,
@@ -44,10 +45,12 @@ log = logging.getLogger(__name__)
 EVERY_S = 900
 DEFAULTS: dict[str, Any] = {
     "scout_enabled": True,
-    "scout_slots": 20,                 # кошельков на испытании одновременно
+    "scout_slots": 40,                 # кошельков на испытании одновременно (18.11: 20 → 40 — кандидатов
+                                       # «рядом со smart» много, испытание было забито)
     "scout_max_auto": 15,              # сколько кошельков разведки держать в своём списке (0 — не добавлять)
     "scout_min_copies": 6,             # копий на испытании для решения
     "scout_probation_days": 4,
+    "scout_idle_days": 1.0,            # за сутки меньше 2 копий — неактивен, место отдаётся следующему
     "scout_min_winrate": 0.40,         # доля прибыльных копий
     "scout_min_profit_usd": 300,       # GMGN: прибыль на монете, $
     "scout_gmgn_min_winrate": 0.45,    # GMGN 7 дней
@@ -58,6 +61,7 @@ DEFAULTS: dict[str, Any] = {
 BAD_TAGS = {"sniper", "bundler", "rat_trader", "dev", "dex_bot", "insider", "creator", "sandwich_bot"}
 REJECT_DAYS = 14
 FEW_TRADES_DAYS = 7
+IDLE_DAYS = 2                          # неактивный за сутки — можно проверить снова через 2 дня
 
 
 def cfg_get(cfg: dict[str, Any], key: str) -> Any:
@@ -122,6 +126,8 @@ def verdict(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: di
         return "reject", res
     if n >= 4 and wins == 0:
         return "reject", res + " — все в минусе"
+    if n < 2 and age_days >= float(cfg_get(cfg, "scout_idle_days")):
+        return "idle", res + f" за {age_days:.0f} дн. — почти не торгует, место следующему"
     if age_days >= float(cfg_get(cfg, "scout_probation_days")):
         return "few", res + f" за {age_days:.0f} дн. — мало сделок"
     return None, res
@@ -362,9 +368,9 @@ class Scout:
             elif v == "promote":
                 await self._close(addr, "passed", why + " — свой список разведки полон", 0)
                 out.append(f"☑️ прошёл, но список полон ({cap}): <code>{addr}</code> — {esc(why)}")
-            elif v in ("reject", "few"):
+            elif v in ("reject", "few", "idle"):
                 await self._close(addr, "rejected" if v == "reject" else "few", why,
-                                  REJECT_DAYS if v == "reject" else FEW_TRADES_DAYS)
+                                  REJECT_DAYS if v == "reject" else IDLE_DAYS if v == "idle" else FEW_TRADES_DAYS)
                 self.stats["rejected"] += 1
                 if v == "reject":
                     out.append(f"❌ отсеян {esc(short(addr))} — {esc(why)}")

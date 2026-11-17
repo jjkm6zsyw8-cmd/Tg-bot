@@ -51,6 +51,8 @@ def test_verdict():
     assert verdict(4, 0, -0.04, 0.4, 0.5, {})[0] == "reject"         # 4 подряд в минусе — сразу
     assert verdict(2, 1, 0.01, 0.2, 4.1, {})[0] == "few"
     assert verdict(3, 2, 0.01, 0.3, 1.0, {})[0] is None
+    assert verdict(1, 1, 0.01, 0.1, 1.1, {})[0] == "idle"           # за сутки 1 копия — место следующему
+    assert verdict(0, 0, 0.0, 0.0, 0.5, {})[0] is None               # полдня — ещё ждём
 
 
 async def test_scout_portfolio_fixed_size_and_slots():
