@@ -43,6 +43,8 @@ MAX_TIP_LAMPORTS = 10_000_000          # 0.01 SOL — больше на чаев
 # метка Jito «не ставить эту транзакцию в середину чужой связки» (защита от сэндвича): адрес только читается
 DONT_FRONT = Pubkey.from_string("jitodontfront111111111111111111111111111111")
 
+RPC_SEND_EVERY_S = 1.1                 # отправка через обычный RPC — не чаще (лимит бесплатного Helius ~1/с)
+
 CU_LIMIT = {("pump", "buy"): 160_000, ("pump", "sell"): 120_000, ("pump-amm", "buy"): 260_000,
             ("pump-amm", "sell"): 220_000, ("close", "close"): 40_000}
 
@@ -164,6 +166,7 @@ class Chain:
         self.rpc = rpc
         self._http: aiohttp.ClientSession | None = None
         self.calls = 0
+        self._last_rpc_send = 0.0
 
     async def close(self) -> None:
         if self._http is not None:
@@ -233,7 +236,15 @@ class Chain:
             except Exception as exc:  # noqa: BLE001
                 log.warning("отправка через RPC: %s", str(exc)[:200])
 
-        await asyncio.gather(via_rpc(), *(via_url(u) for u in (urls or []) if u))
+        urls = [u for u in (urls or []) if u]
+        # бесплатный Helius принимает sendTransaction ~1 раз в секунду, а ответ 429 ставит на паузу ВСЕ запросы
+        # клиента: через RPC шлём не чаще раза в RPC_SEND_EVERY_S, повторы чаще — только через Sender
+        now = time.monotonic()
+        jobs = [via_url(u) for u in urls]
+        if not urls or now - self._last_rpc_send >= RPC_SEND_EVERY_S:
+            self._last_rpc_send = now
+            jobs.append(via_rpc())
+        await asyncio.gather(*jobs)
         return sig
 
     async def status(self, sig: str) -> tuple[str, int | None, Any]:

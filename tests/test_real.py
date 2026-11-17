@@ -257,6 +257,33 @@ async def test_confirm_reports_expired_only_after_blockhash_is_dead(monkeypatch)
     assert res.state == "failed" and res.err["InstructionError"][1]["Custom"] == 6042
 
 
+async def test_send_goes_to_sender_and_rpc_without_flooding_rpc():
+    class Rpc:
+        def __init__(self):
+            self.sent = 0
+
+        async def call(self, method, params, retries=1):
+            assert method == "sendTransaction" and params[1]["skipPreflight"] and params[1]["maxRetries"] == 0
+            self.sent += 1
+
+    kp = Keypair()
+    tx = Wallet(kp.pubkey(), kp).sign(rtx.compile_message(kp.pubkey(), rtx.budget_ixs(1_000, 0)))
+    rpc = Rpc()
+    chain = rtx.Chain(rpc)
+    posted = []
+
+    async def post(url, body):
+        posted.append((url, body["method"]))
+        return {"result": "sig"}
+    chain._post = post
+    for _ in range(3):                                    # три отправки подряд: Sender — каждая, RPC — одна
+        assert await chain.send(tx, ["https://sender.example/fast"]) == str(tx.signatures[0])
+    assert len(posted) == 3 and rpc.sent == 1 and posted[0] == ("https://sender.example/fast", "sendTransaction")
+    await chain.send(tx)                                  # без Sender — только RPC, без пропусков
+    await chain.send(tx)
+    assert rpc.sent == 3
+
+
 # ====================================================================== исполнитель: поддельная сеть + настоящая база
 @pytest.fixture
 async def db():
