@@ -2,7 +2,8 @@
 
 Так же, как это делается руками (GMGN / Axiom → «Top traders» монеты → история кошелька → в список):
 
-1. Кандидаты (раз в 15 минут):
+1. Кандидаты (раз в 15 минут; с 18.11 ещё «рядом со smart» — кто покупает те же монеты, что прибыльные smart, см.
+   discover_cobuyers):
    • свои данные: кошелёк в топ-10 по прибыли на 2+ разных монетах за 3 дня (coin_top_traders — по каждой монете,
      которую бот вёл от запуска; кластер дева, бандлы и снайперы туда не попадают);
    • GMGN (если задан GMGN_API_KEY): монеты в тренде за час → их лучшие трейдеры по реализованной прибыли.
@@ -157,6 +158,7 @@ class Scout:
         self.stats["runs"] += 1
         events: list[str] = []
         await self.discover_own()
+        await self.discover_cobuyers()
         await self.discover_gmgn()
         events += await self.decide()
         events += await self.demote()
@@ -213,6 +215,41 @@ class Scout:
             added += await self._queue(
                 r["trader"], "свои данные", f"в топе по прибыли на {r['n']} монетах за 3 дня ({r['pnl']:+.2f} SOL)",
                 score_of(None, int(r["n"]), float(r["pnl"] or 0) * sol_usd), None)
+        self.stats["found"] += added
+        return added
+
+    async def discover_cobuyers(self) -> int:
+        """Кандидаты рядом со smart: кто покупал те же монеты, что и прибыльные smart-кошельки (бумага A за неделю
+        в плюсе), в пределах 10 минут от их покупки — на 3+ разных монетах за 3 дня. 18.11: 7BNax торгует только
+        на PumpSwap монетами старше часов — там своя база сделок неполная и «топ монеты» таких не видит; сделки
+        вокруг покупок smart записываются (их монеты отслеживаются). Проверяет испытание в H — по цене блокчейна."""
+        smart = [r["w"] for r in await self.db.fetch(
+            """SELECT source_wallet w FROM paper_positions
+               WHERE portfolio = 'A' AND source_wallet IS NOT NULL AND opened_at > now() - interval '7 days'
+                 AND closed_at IS NOT NULL AND NOT suspect
+               GROUP BY 1 HAVING sum(pnl_sol) > 0 AND count(*) >= 5""")]
+        if not smart:
+            return 0
+        rows = await self.db.fetch(
+            """WITH s AS (SELECT DISTINCT ON (mint, trader) mint, trader, ts FROM trades
+                          WHERE is_buy AND ts > now() - interval '3 days' AND trader = ANY($1::text[])
+                          ORDER BY mint, trader, ts)
+               SELECT c.trader, count(DISTINCT c.mint) n, count(DISTINCT s.trader) with_smart,
+                      percentile_cont(0.5) WITHIN GROUP (ORDER BY c.sol_amount) sol
+               FROM s JOIN trades c ON c.mint = s.mint AND c.is_buy
+                    AND c.ts BETWEEN s.ts - interval '10 minutes' AND s.ts + interval '10 minutes'
+               WHERE c.trader <> ALL($1::text[]) AND c.sol_amount BETWEEN 0.3 AND 5
+               GROUP BY 1 HAVING count(DISTINCT c.mint) >= 3 ORDER BY 2 DESC LIMIT 60""", smart)
+        known = await self._known()
+        added = 0
+        for r in rows:
+            if r["trader"] in known:
+                continue
+            added += await self._queue(
+                r["trader"], "рядом со smart",
+                f"покупал те же монеты, что smart-кошельки в плюсе: {r['n']} монет за 3 дня "
+                f"(рядом с {r['with_smart']} smart), обычно {r['sol']:.2f} SOL",
+                float(r["n"]) * 10 + 5, None)
         self.stats["found"] += added
         return added
 

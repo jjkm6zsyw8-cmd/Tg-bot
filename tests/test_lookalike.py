@@ -224,7 +224,7 @@ async def test_coin_details_by_source(db):
     await db.execute("UPDATE trades SET source='pumpportal' WHERE mint=$1 AND mc_sol=560", mint)
     await db.execute(
         """INSERT INTO paper_positions(portfolio, mint, opened_at, entry_mc, max_mc, cost_sol, tokens, tokens_initial,
-               pnl_pct, exit_reason) VALUES ('A', $1, $2, 410, 560, 0.1, 1, 1, 25, 'take_profit')""",
+               pnl_pct, exit_reason) VALUES ('A', $1, $2, 410, 560, 0.1, 1, 1, 0.25, 'take_profit')""",
         mint, now - timedelta(hours=1) + timedelta(seconds=2))
     text = await LK.coin_details(db, "SWAPPER", now, 24)
     line = text.splitlines()[1]

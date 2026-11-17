@@ -141,3 +141,47 @@ async def test_scout_cycle_with_db():
         assert any("убран" in e for e in events)
     finally:
         await db.close()
+
+
+async def test_cobuyers_of_profitable_smart():
+    """Кандидаты «рядом со smart»: покупают те же монеты, что smart-кошелёк в плюсе на бумаге A, в пределах 10 минут."""
+    from datetime import datetime, timedelta, timezone
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        now = datetime.now(timezone.utc)
+        for i in range(6):                                   # BEST — smart в плюсе на бумаге A
+            await db.execute(
+                """INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol, tokens,
+                       tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet)
+                   VALUES ('A', $1, now(), now(), 300, 0.1, 1, 1, 'take_profit', 0.025, 0.25, 'BEST')""", f"P{i}")
+        n = 0
+
+        async def buy(mint, who, at, sol=1.0):
+            nonlocal n
+            n += 1
+            await db.execute("""INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol,
+                                    ts, pool) VALUES ($1, $2, $3, true, $4, 1000, 300, $5, 'pump-amm')""",
+                             f"s{n}", mint, who, sol, at)
+        for i in range(4):
+            t = now - timedelta(hours=5 * i)
+            await buy(f"C{i}", "BEST", t)
+            await buy(f"C{i}", "TWIN", t - timedelta(minutes=3))          # покупает те же монеты рядом
+            await buy(f"C{i}", "LATE", t + timedelta(minutes=30))         # слишком поздно — не в счёт
+            await buy(f"C{i}", "DUST", t + timedelta(minutes=1), 0.05)    # мелочь
+        await buy("C0", "ONCE", now)
+        eng = SimpleNamespace(db=db, cfg={}, price=SimpleNamespace(value=100.0), ext=None, scouts=set(),
+                              _load_traders=None)
+        sc = Scout(eng)  # type: ignore[arg-type]
+        assert await sc.discover_cobuyers() == 1
+        r = await db.fetchrow("SELECT * FROM scout")
+        assert r["address"] == "TWIN" and r["source"] == "рядом со smart" and "4 монет" in r["reason"]
+        await sc.discover_cobuyers()                                       # уже в очереди — та же запись
+        assert await db.fetchval("SELECT count(*) FROM scout") == 1
+    finally:
+        await db.close()

@@ -259,7 +259,7 @@ async def coin_details(db: Any, wallet: str, until: datetime, hours: float, limi
     out = ["монета | время UTC | площадка | он купил по MC (источник) | первая сделка после него | "
            "5 мин PumpPortal: сделок, первая→пик→последняя | 5 мин свой разбор: то же | бумага A: вход→макс, итог"]
     for r in rows:
-        paper = (f"{f(r['paper_entry'])}→{f(r['paper_max'])}, {r['paper_pct']:+.0f}% {r['paper_exit'] or ''}"
+        paper = (f"{f(r['paper_entry'])}→{f(r['paper_max'])}, {r['paper_pct'] * 100:+.0f}% {r['paper_exit'] or ''}"
                  if r["paper_entry"] is not None and r["paper_pct"] is not None else
                  f"{f(r['paper_entry'])}→{f(r['paper_max'])}" if r["paper_entry"] is not None else "нет")
         out.append(
