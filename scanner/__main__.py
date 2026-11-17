@@ -2,7 +2,8 @@
 
 Разовые команды: recluster, history, verify; реальный бот — real-keygen (кошелёк в .env), real-masterkey (ключ
 шифра для кошельков, создаваемых в Telegram), real-check (проверка сборки сделок на живой сети без денег),
-real-export (ключи кошельков — только на экран сервера, для переноса в Phantom)."""
+real-export (ключи кошельков — только на экран сервера, для переноса в Phantom); lookalike — поиск кошельков по
+образцу smart A (копия A на истории сделок), например: lookalike --hours 96 <кошелёк>."""
 from __future__ import annotations
 
 import asyncio
@@ -43,7 +44,7 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history", "verify", "real-check", "real-export"):
+    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -110,6 +111,18 @@ async def run_tool(cmd: str, db: Database) -> None:
         eng = SimpleNamespace(db=db, env=env, cfg=settings.effective(), price=SimpleNamespace(value=price), states={})
         text = await run(RealTrader(eng), [a for a in args if not a.startswith("-")] or None)   # type: ignore[arg-type]
         print(re.sub(r"<[^>]+>", "", text))
+    elif cmd == "lookalike":
+        # поиск по образцу smart A вручную: python -m scanner lookalike [--hours 24] [кошелёк …]
+        from datetime import datetime, timezone
+        from .analytics.lookalike import evaluate, format_cli
+        from .config import Settings, YamlConfig, load_env
+        env = load_env()
+        cfg = Settings(YamlConfig(env.config_path), await db.get_overrides()).effective()
+        hours = float(args[args.index("--hours") + 1]) if "--hours" in args else None
+        skip = {args.index("--hours") + 1} if "--hours" in args else set()
+        wallets = [a for i, a in enumerate(args) if not a.startswith("-") and i not in skip] or None
+        evals = await evaluate(db, cfg, datetime.now(timezone.utc), hours=hours, wallets=wallets)
+        print(format_cli(evals, cfg))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

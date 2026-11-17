@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..alerts.format import esc
 from ..external.base import Unavailable
+from . import lookalike as LK
 from .copytrade import linked_to_dev
 from .paper import SCOUT
 
@@ -136,6 +137,7 @@ class Scout:
         self.stats = {"found": 0, "queued": 0, "started": 0, "promoted": 0, "rejected": 0, "demoted": 0,
                       "gmgn_errors": 0, "runs": 0}
         self._token_cursor = 0
+        self.lookalike = LK.Lookalike(engine)
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -159,6 +161,10 @@ class Scout:
         events += await self.decide()
         events += await self.demote()
         events += await self.fill_slots()
+        try:
+            events += await self.lookalike.run()          # поиск по образцу smart A — раз в 6 часов
+        except Exception:  # noqa: BLE001 — тяжёлый запрос мог отмениться по времени; разведка продолжает работать
+            log.exception("разведка: поиск по образцу")
         await self.load()
         if events:
             await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
@@ -174,7 +180,7 @@ class Scout:
         rows = await self.db.fetch(
             """SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')
                UNION SELECT address FROM traders WHERE manual OR pinned
-               UNION SELECT address FROM scout WHERE status IN ('probation', 'promoted', 'passed')
+               UNION SELECT address FROM scout WHERE status IN ('probation', 'promoted', 'passed', 'lookalike')
                   OR (cooldown_until IS NOT NULL AND cooldown_until > now())""")
         return {r["address"] for r in rows}
 
@@ -373,7 +379,7 @@ async def scout_report(db: Any) -> str:
     cnt = {r["status"]: r["n"] for r in await db.fetch("SELECT status, count(*) n FROM scout GROUP BY 1")}
     names = {"queued": "в очереди", "probation": "на испытании", "promoted": "в своём списке",
              "passed": "прошли (список полон)", "rejected": "отсеяны", "few": "мало сделок", "demoted": "убраны",
-             "removed": "убраны вручную"}
+             "removed": "убраны вручную", LK.STATUS: "проверка по образцу A"}
     lines = ["🔍 <b>Разведка кошельков</b>",
              " · ".join(f"{names.get(k, k)} {v}" for k, v in sorted(cnt.items(), key=lambda kv: -kv[1])) or "пока пусто"]
     rows = await db.fetch(
@@ -396,5 +402,9 @@ async def scout_report(db: Any) -> str:
         icon = {"promoted": "✅", "passed": "☑️", "demoted": "🗑", "rejected": "❌"}
         for r in done:
             lines.append(f"{icon.get(r['status'], '•')} {esc(short(r['address']))} — {esc(r['decision'] or '')}")
+    try:
+        lines += await LK.report_lines(db)
+    except Exception:  # noqa: BLE001
+        log.exception("разведка: сводка поиска по образцу")
     lines.append("<i>Файл по всем кошелькам — /wallets, всё за день и за 30 дней одним архивом — /export</i>")
     return "\n".join(lines)
