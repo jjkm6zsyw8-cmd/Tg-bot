@@ -621,3 +621,18 @@ CREATE TABLE IF NOT EXISTS real_wallets (
 ALTER TABLE real_positions ADD COLUMN IF NOT EXISTS wallet_id bigint;
 ALTER TABLE real_orders ADD COLUMN IF NOT EXISTS wallet_id bigint;
 CREATE INDEX IF NOT EXISTS real_positions_wallet_idx ON real_positions (wallet_id, opened_at);
+
+-- Почему реальный бот не вошёл по сигналу (с 18.11): по каждой монете, чтобы «Против бумаги» назвал причину у сделок,
+-- которые бумага взяла, а бот — нет. Хранится 14 дней.
+CREATE TABLE IF NOT EXISTS real_skips (
+    id         bigserial PRIMARY KEY,
+    at         timestamptz NOT NULL DEFAULT now(),
+    wallet_id  bigint,
+    mint       text NOT NULL,
+    alert_id   bigint,
+    mode       text NOT NULL,
+    kind       text NOT NULL,
+    why        text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS real_skips_mint_idx ON real_skips (mint, at);
+CREATE INDEX IF NOT EXISTS real_skips_at_idx ON real_skips (at);

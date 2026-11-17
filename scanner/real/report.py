@@ -454,6 +454,17 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
              AND pp.exit_reason IS DISTINCT FROM 'reset' AND NOT pp.suspect
              AND NOT EXISTS (SELECT 1 FROM real_positions r WHERE r.alert_id = pp.alert_id AND r.mint = pp.mint)""",
         since)
+    # какие именно сделки бумаги бот не взял и почему (причины пишутся с 18.11 — таблица real_skips)
+    missed_rows = await db.fetch(
+        """SELECT pp.portfolio, pp.symbol, pp.opened_at, pp.pnl_pct,
+                  (SELECT CASE WHEN s.mode = 'live' THEN 'бой' ELSE 'тень' END || ': ' || s.why FROM real_skips s
+                   WHERE s.mint = pp.mint AND s.at BETWEEN pp.opened_at - interval '2 minutes'
+                                                 AND pp.opened_at + interval '2 minutes'
+                   ORDER BY (s.mode = 'live') DESC, s.at DESC LIMIT 1) why
+           FROM paper_positions pp WHERE pp.portfolio IN ('A', 'Y') AND pp.opened_at >= $1
+             AND pp.exit_reason IS DISTINCT FROM 'reset' AND NOT pp.suspect
+             AND NOT EXISTS (SELECT 1 FROM real_positions r WHERE r.alert_id = pp.alert_id AND r.mint = pp.mint)
+           ORDER BY pp.opened_at DESC LIMIT 8""", since)
     no_pair = sum(1 for _r, port, q in pairs if q is None)
     out = [f"⚖️ <b>Реальный бот против бумаги</b> · {days} дн.",
            "Сравнение с бумажным портфелем, который торгует так же: smart A — с A, «мой дев» — с Y и т. д.",
@@ -462,6 +473,14 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
     out.append(f"• Бумага A / Y вошла, а бот — нет: {int(missed or 0)} · у бота есть сделка, у бумаги — нет: {no_pair}")
     if lines:
         out += ["", f"<b>Последние {len(lines)} сделок:</b>"] + lines
+    if missed_rows:
+        out += ["", f"<b>Бумага вошла, бот — нет (последние {len(missed_rows)}):</b>"]
+        for m in missed_rows:
+            res = f"{float(m['pnl_pct']):+.0%}" if m["pnl_pct"] is not None else "открыта"
+            out.append(f"• {m['opened_at'].astimezone(tz):%d.%m %H:%M} ${esc(m['symbol'] or '?')} "
+                       f"(бумага {m['portfolio']} {res}) — "
+                       + (f"бот: {esc(m['why'])}" if m["why"] else "причина не записана (сигнал до бота не дошёл "
+                          "или это было до 18.11)"))
     out.append("Почему бот не входил — «Пропуски» на главном экране /real.")
     return "\n".join(out)
 

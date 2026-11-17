@@ -118,6 +118,17 @@ async def test_status_trades_file_and_comparison(db):
     assert "Бумага A / Y вошла, а бот — нет: 1" in cmp_text and "у бумаги — нет: 1" in cmp_text
     assert "<b>Последние 2 сделок:</b>" in cmp_text and "бумага A +30%" in cmp_text
     assert "бумага A по этому сигналу не входила" in cmp_text
+    assert "причина не записана" in cmp_text                                # paper-only: сигнал до бота не дошёл
+    # бумага вошла по монете, которую бот пропустил с причиной, — сравнение её называет
+    await tr._flush_skips()
+    assert await db.fetchval("SELECT why FROM real_skips WHERE mint=$1", str(pk("unknown"))) == "монета не найдена в сети"
+    await db.execute(
+        """INSERT INTO paper_positions(portfolio, mint, alert_id, symbol, opened_at, entry_mc, cost_sol, tokens,
+               tokens_initial, closed_at, exit_reason, pnl_sol, pnl_pct)
+           VALUES ('A', $1, 104, 'UNK', now(), 30, 0.1, 1, 1, now(), 'take_profit', 0.025, 0.25)""", str(pk("unknown")))
+    cmp2 = await report.compare_text(db, {})
+    assert "Бумага A / Y вошла, а бот — нет: 2" in cmp2
+    assert "$UNK (бумага A +25%) — бот: тень: монета не найдена в сети" in cmp2
     r = await report.on_callback(db, reloader(db), "csv")
     assert r.document and r.document[1] == "real_trades.csv" and "Сделки реального бота: 2" in r.document[2]
     assert (await report.on_callback(db, reloader(db), "trades")).text == trades

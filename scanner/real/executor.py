@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import logging
 import time
 from datetime import datetime, timezone
@@ -65,6 +66,8 @@ def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
         out.append("swing")
     return out
 MODE_ICON = {"live": "💵", "shadow": "👻"}
+# сигнал, который сейчас обрабатывается (монета, алерт): у каждой задачи свой — причина пропуска пишется к нему
+_SIGNAL: contextvars.ContextVar[tuple[str, int | None] | None] = contextvars.ContextVar("real_signal", default=None)
 EXIT_NAMES = {"take_profit": "тейк", "stop": "стоп", "trailing": "трейлинг", "time_stop": "нет роста",
               "max_hold": "время вышло", "trader_sell": "трейдер продал", "tiny_rebuy": "мелкая докупка",
               "emergency": "дев продаёт", "manual": "вручную", "sell_all": "продать всё", "gone": "токенов нет"}
@@ -106,6 +109,8 @@ class RealTrader:
         self.wid: int | None = int(profile["id"]) if profile else None
         self.name = str(profile.get("name") or "") if profile else ""
         self.accept_new = True                      # False — только доводит открытые позиции (полоса без кошелька)
+        self._skip_buf: list[tuple[Any, ...]] = []  # причины пропусков по монетам — в real_skips на каждом тике
+        self._skips_cleaned = 0.0
         self.external_poll = False                  # True — цену открытых позиций проверяет менеджер кошельков (desk)
         self._helius_key = getattr(getattr(engine, "env", None), "helius_key", "") or ""
         if wallet is not None or profile is not None or wallet_note is not None:
@@ -344,6 +349,7 @@ class RealTrader:
         """Сигнал бумаги: smart (идёт в боевой портфель M) или «мой дев» (портфель Y)."""
         if not self.accept_new:
             return
+        _SIGNAL.set((mint, alert_id))
         kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
                      and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
         if kind is None:
@@ -408,6 +414,27 @@ class RealTrader:
 
     def _skip(self, mode: str, kind: str, why: str) -> None:
         self.skips[f"{'бой' if mode == 'live' else 'тень'} · {KINDS[kind]}: {why}"] += 1
+        sig = _SIGNAL.get()
+        if sig is not None:
+            self._skip_buf.append((datetime.now(timezone.utc), self.wid, sig[0], sig[1], mode, kind, why))
+
+    async def _flush_skips(self) -> None:
+        """Причины пропусков — в базу (для «Против бумаги»); старше 14 дней — удаляются раз в час."""
+        pool = getattr(self.db, "pool", None)
+        if pool is None:
+            self._skip_buf.clear()
+            return
+        rows, self._skip_buf = self._skip_buf[:200], self._skip_buf[200:]
+        try:
+            if rows:
+                await pool.executemany(
+                    "INSERT INTO real_skips(at, wallet_id, mint, alert_id, mode, kind, why) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    rows)
+            if time.time() - self._skips_cleaned > 3600:
+                self._skips_cleaned = time.time()
+                await self.db.execute("DELETE FROM real_skips WHERE at < now() - interval '14 days'")
+        except Exception as exc:  # noqa: BLE001 — журнал пропусков не должен мешать торговле
+            log.warning("журнал пропусков: %s", str(exc)[:160])
 
     def stake_lamports(self, v_quote: int, kind: str | None = None) -> tuple[int, str | None]:
         """Ставка: своя у метода или общая у кошелька, урезанная так, чтобы своя покупка двигала цену не сильнее
@@ -1065,6 +1092,7 @@ class RealTrader:
 
     async def tick(self) -> None:
         now = time.time()
+        await self._flush_skips()
         if self.cfg.get("real_armed_at") != self._armed_seen:     # бой включили заново — общий стоп считается с нуля
             self._armed_seen = self.cfg.get("real_armed_at")
             self.live_total = await self._live_total_db()
