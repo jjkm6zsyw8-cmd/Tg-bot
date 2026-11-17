@@ -291,11 +291,7 @@ async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, i
 
 def paper_of(kind: str, rule: str, smart_filter: str = "all") -> str | None:
     """Какой бумажный портфель торгует так же (тот же вход и то же правило выхода)."""
-    if kind == "smart":
-        if smart_filter == "m":
-            return "M" if rule == "A" else None
-        return rule if rule in ("A", "B", "G") else None
-    return {("mydev", "G"): "Y", ("copy", "G"): "H", ("bigcopy", "G"): "K", ("swing", "R"): "R"}.get((kind, rule))
+    return S.paper_portfolio(kind, rule, smart_filter)
 
 
 def _stat(st: dict[str, tuple[int, int, float]], port: str | None) -> str:

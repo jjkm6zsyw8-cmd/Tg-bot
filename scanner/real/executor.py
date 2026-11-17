@@ -562,7 +562,9 @@ class RealTrader:
                 "token_program": str(st["token_program"]), "trigger_slot": trig_slot or None,
                 "trigger_mc": trig_mc or None,
                 "lag_s": round(time.time() - float(data.get("trigger_ts") or data.get("trigger_at") or t0), 3),
-                "stake": stake, "min_out": min_out, "slip": slip, "mc": st["mc"]}
+                "stake": stake, "min_out": min_out, "slip": slip, "mc": st["mc"],
+                "rule": self.get(S.SCHEME_KEYS[kind]),
+                "filter": self.get("real_smart_filter") if kind == "smart" else "all"}
         if mode == "live":
             await self._buy_live(st, mint, base, expected, bh)
         else:
@@ -731,7 +733,8 @@ class RealTrader:
             base["mode"], base["kind"], base["mint"], base["symbol"], base["trader"], base["alert_id"], base["venue"],
             base["token_program"], datetime.now(timezone.utc), base.get("trigger_slot"), base.get("trigger_mc"),
             base.get("lag_s"), entry_mc, slot, cost_sol, tokens_raw / 1e6, tokens_raw, rent_sol, sig,
-            {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9}, self.wid)
+            {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9, "rule": base.get("rule"),
+             "filter": base.get("filter")}, self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
                                    tokens_raw=tokens_raw, position_id=pid, note=note)

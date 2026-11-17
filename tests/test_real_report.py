@@ -96,18 +96,22 @@ async def test_status_trades_file_and_comparison(db):
     rows = csv_text.strip().splitlines()
     assert n == 2 and len(rows) == 3 and rows[0].startswith("режим;сигнал;монета") and str(MINT) in csv_text
     assert rows[1].split(";")[0] == "тень" and rows[1].split(";")[8] == "2"
-    # бумага по тем же сигналам: у первой +30%, у второй бумажной сделки нет; третья — только у бумаги
-    for alert, mint, pct in ((101, str(MINT), 0.30), (103, str(pk("paper-only")), 0.10)):
+    # бумага по тем же сигналам: у первой +30% (A — тот же метод; M по нему тоже входил, но сравнение — с A),
+    # у второй бумажной сделки нет; третья — только у бумаги
+    for port, alert, mint, pct in (("A", 101, str(MINT), 0.30), ("M", 101, str(MINT), 0.90),
+                                   ("A", 103, str(pk("paper-only")), 0.10)):
         await db.execute(
             """INSERT INTO paper_positions(portfolio, mint, alert_id, symbol, opened_at, entry_mc, cost_sol, tokens,
                    tokens_initial, closed_at, exit_reason, pnl_sol, pnl_pct)
-               VALUES ('M', $1, $2, 'TST', now(), 39.5, 0.1, 1, 1, now(), 'take_profit', $3, $4)""",
-            mint, alert, 0.1 * pct, pct)
+               VALUES ($5, $1, $2, 'TST', now(), 39.5, 0.1, 1, 1, now(), 'take_profit', $3, $4)""",
+            mint, alert, 0.1 * pct, pct, port)
     cmp_text = await report.compare_text(db, {})
-    assert "тень smart" in cmp_text and "бумага M, те же" in cmp_text
-    assert "на тех же 1 сигналах" in cmp_text and "бумага +30.0%" in cmp_text
+    assert "тень smart" in cmp_text and "бумага A, те же" in cmp_text
+    assert "на тех же 1 сигналах" in cmp_text and "бумага +30.0%" in cmp_text and "бот входил дороже бумаги на" in cmp_text
     assert "вход через 2 бл. после сигнала" in cmp_text
-    assert "Бумага (M, Y) вошла, а бот — нет: 1" in cmp_text and "сигналу нет: 1" in cmp_text
+    assert "Бумага A / Y вошла, а бот — нет: 1" in cmp_text and "у бумаги — нет: 1" in cmp_text
+    assert "<b>Последние 2 сделок:</b>" in cmp_text and "бумага A +30%" in cmp_text
+    assert "бумага A по этому сигналу не входила" in cmp_text
     r = await report.on_callback(db, reloader(db), "csv")
     assert r.document and r.document[1] == "real_trades.csv" and "Сделки реального бота: 2" in r.document[2]
     assert (await report.on_callback(db, reloader(db), "trades")).text == trades

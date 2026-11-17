@@ -202,3 +202,12 @@ def methods_summary(cfg: dict[str, Any]) -> str:
             stake = method_stake(cfg, kind)
             out.append(method_name(cfg, kind) + (f" ${stake:g}" if stake else ""))
     return " · ".join(out) if out else "все выключены"
+
+
+def paper_portfolio(kind: str, rule: str, smart_filter: str = "all") -> str | None:
+    """Бумажный портфель с тем же входом и тем же правилом выхода (для сравнения и для итогов на экранах)."""
+    if kind == "smart":
+        if smart_filter == "m":
+            return "M" if rule == "A" else None
+        return rule if rule in ("A", "B", "G") else None
+    return {("mydev", "G"): "Y", ("copy", "G"): "H", ("bigcopy", "G"): "K", ("swing", "R"): "R"}.get((kind, rule))

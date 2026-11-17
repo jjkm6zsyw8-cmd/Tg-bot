@@ -360,63 +360,98 @@ async def trades_csv(db: Any, cfg: dict[str, Any]) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------- сравнение с бумагой
-async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14) -> str:
-    """Те же сигналы у реального бота и у бумаги: расходится ли цена входа и результат."""
+DEFAULT_RULE = {"smart": "A", "mydev": "G", "copy": "G", "bigcopy": "G", "swing": "R"}
+
+
+def paper_target(kind: str, extra: dict[str, Any]) -> str | None:
+    """С каким бумажным портфелем сравнивать сделку бота: тот же вход и то же правило выхода (правило запомнено в
+    позиции; у старых позиций — правило по умолчанию)."""
+    rule = str(extra.get("rule") or DEFAULT_RULE.get(kind, "A"))
+    return S.paper_portfolio(kind, rule, str(extra.get("filter") or "all"))
+
+
+async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int = 12) -> str:
+    """Те же сигналы у реального бота и у бумаги: результат, цена входа, задержка — итогом и по каждой сделке."""
     rows = await db.fetch(
-        """SELECT r.mode, r.kind, r.pnl_pct, r.pnl_sol, r.entry_mc, (r.extra->>'blocks_after')::int AS blocks,
-                  p.pnl_pct AS p_pct, p.entry_mc AS p_mc
-           FROM real_positions r
-           LEFT JOIN LATERAL (
-               SELECT pp.pnl_pct, pp.entry_mc FROM paper_positions pp
-               WHERE pp.alert_id = r.alert_id AND pp.mint = r.mint AND NOT pp.suspect AND pp.closed_at IS NOT NULL
-                 AND pp.exit_reason <> 'reset' AND pp.portfolio = CASE r.kind WHEN 'smart' THEN 'M' ELSE 'Y' END
-               ORDER BY pp.id LIMIT 1) p ON true
-           WHERE r.closed_at IS NOT NULL AND r.closed_at > now() - make_interval(days => $1)""", int(days))
+        """SELECT r.id, r.mode, r.kind, r.symbol, r.mint, r.alert_id, r.pnl_pct, r.pnl_sol, r.entry_mc, r.closed_at,
+                  r.exit_reason, r.extra, (r.extra->>'blocks_after')::int AS blocks
+           FROM real_positions r WHERE r.closed_at IS NOT NULL AND r.closed_at > now() - make_interval(days => $1)
+           ORDER BY r.closed_at""", int(days))
     if not rows:
         return f"⚖️ За {days} дн. закрытых сделок реального бота нет — сравнивать нечего."
+    paper: dict[tuple[Any, str, str], Any] = {}
+    for p in await db.fetch(
+            """SELECT alert_id, mint, portfolio, pnl_pct, entry_mc, exit_reason FROM paper_positions
+               WHERE alert_id = ANY($1::bigint[]) AND NOT suspect AND closed_at IS NOT NULL
+                 AND exit_reason IS DISTINCT FROM 'reset' ORDER BY id""",
+            list({r["alert_id"] for r in rows if r["alert_id"] is not None})):
+        paper.setdefault((p["alert_id"], p["mint"], p["portfolio"]), p)
+    pairs = []                                   # (сделка бота, портфель бумаги, сделка бумаги или None)
+    for r in rows:
+        port = paper_target(r["kind"], dict(r["extra"] or {}))
+        pairs.append((r, port, paper.get((r["alert_id"], r["mint"], port)) if port else None))
     sol_usd = await sol_price(db)
     head = f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"
     table, notes = [head], []
     for mode in ("live", "shadow"):
-        for kind in ("smart", "mydev"):
-            rs = [r for r in rows if r["mode"] == mode and r["kind"] == kind]
+        for kind in ("smart", "mydev", "bigcopy", "copy", "swing"):
+            rs = [x for x in pairs if x[0]["mode"] == mode and x[0]["kind"] == kind]
             if not rs:
                 continue
             n = len(rs)
-            wins = sum(1 for r in rs if (r["pnl_sol"] or 0) > 0)
-            avg = sum(float(r["pnl_pct"] or 0) for r in rs) / n
-            total = sum(float(r["pnl_sol"] or 0) for r in rs)
+            wins = sum(1 for r, _p, _q in rs if (r["pnl_sol"] or 0) > 0)
+            avg = sum(float(r["pnl_pct"] or 0) for r, _p, _q in rs) / n
+            total = sum(float(r["pnl_sol"] or 0) for r, _p, _q in rs)
             name = f"{MODE_SHORT[mode]} {KINDS[kind]}"
             table.append(f"{name:<17}{n:>5} {wins / n:>6.0%} {avg:>+7.1%} {money(total, sol_usd):>9}")
-            both = [r for r in rs if r["p_pct"] is not None]
+            both = [(r, port, q) for r, port, q in rs if q is not None]
             if both:
-                p_avg = sum(float(r["p_pct"]) for r in both) / len(both)
-                p_wins = sum(1 for r in both if float(r["p_pct"]) > 0)
-                r_avg = sum(float(r["pnl_pct"] or 0) for r in both) / len(both)
-                table.append(f"{' бумага ' + PAPER_OF[kind] + ', те же':<17}{len(both):>5} {p_wins / len(both):>6.0%} "
+                ports = "/".join(sorted({port for _r, port, _q in both}))
+                p_avg = sum(float(q["pnl_pct"] or 0) for _r, _p, q in both) / len(both)
+                p_wins = sum(1 for _r, _p, q in both if float(q["pnl_pct"] or 0) > 0)
+                r_avg = sum(float(r["pnl_pct"] or 0) for r, _p, _q in both) / len(both)
+                table.append(f"{' бумага ' + ports + ', те же':<17}{len(both):>5} {p_wins / len(both):>6.0%} "
                              f"{p_avg:>+7.1%} {'':>9}")
-                prem = [float(r["entry_mc"]) / float(r["p_mc"]) - 1 for r in both if r["entry_mc"] and r["p_mc"]]
+                prem = [float(r["entry_mc"]) / float(q["entry_mc"]) - 1 for r, _p, q in both
+                        if r["entry_mc"] and q["entry_mc"]]
                 notes.append(f"{name}: на тех же {len(both)} сигналах бот {r_avg:+.1%} на сделку, бумага {p_avg:+.1%}"
-                             + (f"; цена входа бота против бумаги {statistics.median(prem):+.1%} (медиана)" if prem
+                             + (f"; бот входил дороже бумаги на {statistics.median(prem):+.1%} (медиана)" if prem
                                 else ""))
-            blocks = [int(r["blocks"]) for r in rs if r["blocks"] is not None]
+            blocks = [int(r["blocks"]) for r, _p, _q in rs if r["blocks"] is not None]
             if blocks:
                 notes.append(f"{name}: вход через {statistics.median(blocks):.0f} бл. после сигнала (медиана; "
                              f"от {min(blocks)} до {max(blocks)}); бумага считает 2")
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    first = await db.fetchval("SELECT min(opened_at) FROM real_positions")
-    since = max(since, first) if first else since
+    tz = tz_of(cfg)
+    lines = []
+    for r, port, q in pairs[-last:][::-1]:
+        bot = float(r["pnl_pct"] or 0)
+        if q is not None:
+            prem = (float(r["entry_mc"]) / float(q["entry_mc"]) - 1) if r["entry_mc"] and q["entry_mc"] else None
+            vs = (f"бумага {port} {float(q['pnl_pct'] or 0):+.0%}"
+                  + (f" · вход дороже на {prem:+.0%}" if prem is not None else ""))
+        elif port is None:
+            vs = "на бумаге так не торгуют"
+        else:
+            vs = f"бумага {port} по этому сигналу не входила"
+        lines.append(f"{'✅' if bot > 0 else '❌'} {r['closed_at'].astimezone(tz):%H:%M} ${esc(r['symbol'] or '?')} "
+                     f"({KINDS.get(r['kind'], r['kind'])}): бот {bot:+.0%} · {vs}")
+    first = min(r["closed_at"] for r in rows)
+    since = max(datetime.now(timezone.utc) - timedelta(days=days),
+                await db.fetchval("SELECT min(opened_at) FROM real_positions") or first)
     missed = await db.fetchval(
-        """SELECT count(*) FROM paper_positions pp WHERE pp.portfolio IN ('M', 'Y') AND pp.opened_at >= $1
+        """SELECT count(*) FROM paper_positions pp WHERE pp.portfolio IN ('A', 'Y') AND pp.opened_at >= $1
              AND pp.exit_reason IS DISTINCT FROM 'reset' AND NOT pp.suspect
              AND NOT EXISTS (SELECT 1 FROM real_positions r WHERE r.alert_id = pp.alert_id AND r.mint = pp.mint)""",
         since)
-    extra = sum(1 for r in rows if r["p_pct"] is None)
-    out = [f"⚖️ <b>Реальный бот против бумаги</b> · {days} дн.", "<pre>" + "\n".join(table) + "</pre>"]
+    no_pair = sum(1 for _r, port, q in pairs if q is None)
+    out = [f"⚖️ <b>Реальный бот против бумаги</b> · {days} дн.",
+           "Сравнение с бумажным портфелем, который торгует так же: smart A — с A, «мой дев» — с Y и т. д.",
+           "<pre>" + "\n".join(table) + "</pre>"]
     out += [f"• {esc(x)}" for x in notes]
-    out.append(f"• Бумага (M, Y) вошла, а бот — нет: {int(missed or 0)} · бот вошёл, а закрытой сделки бумаги по "
-               f"сигналу нет: {extra}")
-    out.append("Причины, по которым бот не входил, — в разделе «Пропуски» на главном экране /real.")
+    out.append(f"• Бумага A / Y вошла, а бот — нет: {int(missed or 0)} · у бота есть сделка, у бумаги — нет: {no_pair}")
+    if lines:
+        out += ["", f"<b>Последние {len(lines)} сделок:</b>"] + lines
+    out.append("Почему бот не входил — «Пропуски» на главном экране /real.")
     return "\n".join(out)
 
 
