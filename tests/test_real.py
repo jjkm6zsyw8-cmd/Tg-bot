@@ -56,7 +56,7 @@ def test_discriminators_and_program_addresses_match_the_chain():
 
 def test_real_chain_snapshots_are_parsed():
     """Настоящие счета из сети (снимок 17.11.2026): монета на кривой и монета в пуле PumpSwap."""
-    snap = json.loads((Path(__file__).parent / "data" / "real_accounts.json").read_text())
+    snap = json.loads((Path(__file__).parent / "fixtures" / "real_accounts.json").read_text())
 
     def state(name):
         mint = Pubkey.from_string(snap[name]["mint"])
