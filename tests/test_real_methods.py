@@ -186,3 +186,42 @@ async def test_methods_screen_for_wallet_and_common(db, monkeypatch):
     assert (await db.get_overrides())["real_swing"] is True and "Методы торговли: общие" in r.text
     r = await UI.on_wallet_callback(db, {}, "wms", "g:smart:+")
     assert (await db.get_overrides())["real_stake_usd_smart"] == 10
+
+
+async def test_paper_a_preset_in_one_tap(db):
+    chain = FakeChain()
+    desk = make_desk(db, chain)
+    await desk.start()
+    wid = await desk.create_wallet("Мейныч")
+    await db.execute("UPDATE real_wallets SET settings = settings || $2::jsonb WHERE id=$1", wid,
+                     {"real_mydev": True, "real_live_mydev": True, "real_swing": True, "real_stake_usd_smart": 25,
+                      "real_scheme": "G", "real_smart_filter": "m"})
+    text, kb = await UI.methods_view(db, {}, wid)
+    assert f"rl:wmp:{wid}" in [b["callback"] for row in kb for b in row] and "Как бумага A" in text
+    r = await UI.on_wallet_callback(db, {}, "wmp", str(wid))
+    st = await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
+    assert {k: st[k] for k in UI.PAPER_A_PRESET} == UI.PAPER_A_PRESET and "real_stake_usd_smart" not in st
+    assert "✅ Smart A" in r.text and r.toast == "Сохранено"
+    await desk.command({"cmd": "reload"})
+    lane = desk.lanes[wid]
+    assert lane.mode_for("mydev") == "off" and lane.mode_for("swing") == "off" and lane.get("real_stake_usd") == 10
+    assert S.methods_summary(lane.cfg) == "Smart A"
+
+
+async def test_wallet_watch_is_faster_than_coin_watch():
+    """Покупки кошельков — сразу как узел их увидел (processed), монеты — confirmed: сигнал на полсекунды раньше."""
+    import json as _json
+
+    from scanner.ingest.sources import WatchSource
+    w = WatchSource("wss://helius", {})
+    sent = []
+
+    class Ws:
+        async def send(self, raw):
+            sent.append(_json.loads(raw))
+    w.set_targets(["WALLET1"], ["COIN1"])
+    task = asyncio.create_task(w._sync(Ws()))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    subs = {m["params"][0]["mentions"][0]: m["params"][1]["commitment"] for m in sent if m["method"] == "logsSubscribe"}
+    assert subs == {"WALLET1": "processed", "COIN1": "confirmed"}

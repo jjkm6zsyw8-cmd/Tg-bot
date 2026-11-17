@@ -339,9 +339,17 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
                          f"{_stat(st, paper_of(kind, rule, filt))}")
         kb.append([{"text": f"{'✅' if on else '⬜'} {name}", "callback": f"rl:wmx:{tag}:{kind}:{'off' if on else 'on'}"},
                    {"text": "⚙️ настроить", "callback": f"rl:wmk:{tag}:{kind}"}])
-    lines += ["", "Бумага — не реальные сделки: реальный результат покажет тень и «⚖️ Против бумаги»."]
+    lines += ["", "Бумага — не реальные сделки: реальный результат покажет тень и «⚖️ Против бумаги».",
+              "«📋 Как бумага A»: только smart, все сигналы, выход A, ставка $10, до 3 позиций, дневной стоп $30, "
+              "общий стоп $50 — как бумажный портфель A, давший +$710 за 14–17.11."]
+    kb.append([{"text": "📋 Как бумага A ($10)", "callback": f"rl:wmp:{tag}"}])
     kb.append([{"text": "← Назад", "callback": back}])
     return "\n".join(lines), kb
+
+
+PAPER_A_PRESET = {"real_smart": True, "real_scheme": "A", "real_smart_filter": "all", "real_mydev": False,
+                  "real_live_mydev": False, "real_copy": False, "real_bigcopy": False, "real_swing": False,
+                  "real_stake_usd": 10, "real_max_open": 3, "real_day_stop_usd": 30, "real_total_stop_usd": 50}
 
 
 async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tuple[str, Kb]:
@@ -459,6 +467,9 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
             cur = S.method_stake(wcfg, kind) or S.get(wcfg, "real_stake_usd")
             v = cur + 5 if parts[2] == "+" else cur - 5
             patch = {key: min(S.max_stake_usd(), max(1.0, round(v)))}
+    elif action == "wmp":
+        patch = dict(PAPER_A_PRESET)
+        drop = [S.stake_key(k) for k in S.METHODS]
     elif action not in ("wme", "wmk"):
         return Reply(None, None, "Не понял кнопку")
     if patch or drop:
@@ -467,7 +478,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
             cfg = {**cfg, **patch}
             for k in drop:
                 cfg.pop(k, None)
-    if action in ("wme", "wmx"):              # список методов (с него нажимают «вкл/выкл»)
+    if action in ("wme", "wmx", "wmp"):       # список методов (с него нажимают «вкл/выкл» и «как бумага»)
         text, kb = await methods_view(db, cfg, None if tag == "g" else int(tag))
     else:                                     # экран одного метода
         text, kb = await method_view(db, cfg, tag, kind if kind in S.METHODS else "smart")
@@ -478,7 +489,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
 async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: str, rpc: Any = None) -> Reply:
     parts = rest.split(":") if rest else []
     wid = int(parts[0]) if parts and parts[0].isdigit() else None
-    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms"):
+    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms", "wmp"):
         r = await methods_callback(db, cfg, action, parts)
         if r is not None:
             return r

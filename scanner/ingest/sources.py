@@ -452,8 +452,12 @@ class WatchSource(Source):
         self.last_slot: int | None = None
         self.notifications = 0
         self.sid_addr: dict[int, str] = {}      # id подписки → адрес
-        # processed присылает одну транзакцию дважды (двойной трафик и кредиты); confirmed — один раз, +~0.5 с
+        # processed присылает одну транзакцию дважды (двойной трафик и кредиты); confirmed — один раз, +~0.5 с.
+        # Кошельки — processed: по их покупкам входят бумага и реальный бот, и каждые полсекунды — это цена входа
+        # (17.11 тень входила через 4–6 блоков после трейдера, бумага считает 2). Дубли отсекает приёмник (дедуп
+        # по подписи). Монеты — confirmed: по ним только сопровождение, там лишний трафик не нужен
         self.commitment = "confirmed"
+        self.wallet_commitment = "processed"
         # пул PumpSwap → монета через DexScreener (для покупок кошельков в уже мигрировавших монетах)
         self.resolve_pool: Callable[[str], Awaitable[str | None]] | None = None
         self.unresolved = 0
@@ -495,8 +499,9 @@ class WatchSource(Source):
             for addr in [a for a in self.want if a not in self.subs and a not in asked]:
                 rid = next(self._ids)
                 self.pending[rid] = addr
+                commitment = self.wallet_commitment if self.want.get(addr) == "wallet" else self.commitment
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsSubscribe",
-                                          "params": [{"mentions": [addr]}, {"commitment": self.commitment}]}))
+                                          "params": [{"mentions": [addr]}, {"commitment": commitment}]}))
                 await asyncio.sleep(0.02)
             for addr in [a for a in self.subs if a not in self.want]:
                 sid = self.subs.pop(addr)
