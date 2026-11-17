@@ -44,6 +44,10 @@ MAX_TIP_LAMPORTS = 10_000_000          # 0.01 SOL — больше на чаев
 DONT_FRONT = Pubkey.from_string("jitodontfront111111111111111111111111111111")
 
 RPC_SEND_EVERY_S = 1.1                 # отправка через обычный RPC — не чаще (лимит бесплатного Helius ~1/с)
+# Несколько кошельков на один сигнал спрашивают сеть об одном и том же: одинаковые запросы объединяются
+STATE_SHARE_S = 0.3                    # состояние монеты (getMultipleAccounts) — общий ответ, если ему ≤ 0.3 с
+BLOCKHASH_SHARE_S = 2.0                # блокхэш живёт ~60 с — общий на 2 с
+STATUS_BATCH_S = 0.05                  # статусы транзакций всех кошельков — одним запросом раз в 50 мс
 
 CU_LIMIT = {("pump", "buy"): 160_000, ("pump", "sell"): 120_000, ("pump-amm", "buy"): 260_000,
             ("pump-amm", "sell"): 220_000, ("close", "close"): 40_000}
@@ -179,6 +183,31 @@ class Chain:
         self._http: aiohttp.ClientSession | None = None
         self.calls = 0
         self._last_rpc_send = 0.0
+        self._inflight: dict[Any, asyncio.Future[Any]] = {}
+        self._cache: dict[Any, tuple[float, Any]] = {}
+        self._status_wait: dict[str, list[asyncio.Future[Any]]] = {}
+        self._status_task: asyncio.Future[Any] | None = None
+
+    async def _shared(self, key: Any, ttl: float, fetch: Any) -> Any:
+        """Один запрос на всех: свежий ответ (не старше ttl) — из памяти; такой же запрос уже идёт — ждём его."""
+        hit = self._cache.get(key)
+        if hit is not None and time.monotonic() - hit[0] <= ttl:
+            return hit[1]
+        fut = self._inflight.get(key)
+        if fut is None:
+            fut = asyncio.ensure_future(fetch())
+            self._inflight[key] = fut
+
+            def done(f: asyncio.Future[Any], key: Any = key) -> None:
+                self._inflight.pop(key, None)
+                if not f.cancelled() and f.exception() is None:
+                    now = time.monotonic()
+                    self._cache[key] = (now, f.result())
+                    if len(self._cache) > 256:
+                        for k in [k for k, (t, _v) in self._cache.items() if now - t > 5.0]:
+                            self._cache.pop(k, None)
+            fut.add_done_callback(done)
+        return await asyncio.shield(fut)
 
     async def close(self) -> None:
         if self._http is not None:
@@ -189,12 +218,16 @@ class Chain:
         return await self.rpc.call(method, params, retries=retries)
 
     async def accounts_at(self, keys: list[Any], commitment: str = "processed") -> tuple[int, list[Account | None]]:
-        """Счета одним запросом и номер блока, на который узел их отдал."""
-        res = await self._call("getMultipleAccounts", [[str(k) for k in keys],
-                                                        {"encoding": "base64", "commitment": commitment}])
-        res = res or {}
-        return (int((res.get("context") or {}).get("slot") or 0),
-                [_account(a) for a in res.get("value") or [None] * len(keys)])
+        """Счета одним запросом и номер блока, на который узел их отдал. Несколько кошельков, читающих одну монету
+        одновременно, получают один общий ответ (не старше STATE_SHARE_S)."""
+        names = [str(k) for k in keys]
+
+        async def fetch() -> tuple[int, list[Account | None]]:
+            res = await self._call("getMultipleAccounts", [names, {"encoding": "base64", "commitment": commitment}])
+            res = res or {}
+            return (int((res.get("context") or {}).get("slot") or 0),
+                    [_account(a) for a in res.get("value") or [None] * len(names)])
+        return await self._shared(("accounts", commitment, tuple(names)), STATE_SHARE_S, fetch)
 
     async def accounts(self, keys: list[Any], commitment: str = "processed") -> list[Account | None]:
         return (await self.accounts_at(keys, commitment))[1]
@@ -204,9 +237,11 @@ class Chain:
         return int((res or {}).get("value") or 0)
 
     async def blockhash(self) -> tuple[Hash, int]:
-        """Свежий блокхэш и высота блока, после которой транзакция с ним уже не может лечь."""
-        res = await self._call("getLatestBlockhash", [{"commitment": "confirmed"}])
-        return Hash.from_string(res["value"]["blockhash"]), int(res["value"].get("lastValidBlockHeight") or 0)
+        """Свежий блокхэш и высота блока, после которой транзакция с ним уже не может лечь (общий на 2 с)."""
+        async def fetch() -> tuple[Hash, int]:
+            res = await self._call("getLatestBlockhash", [{"commitment": "confirmed"}])
+            return Hash.from_string(res["value"]["blockhash"]), int(res["value"].get("lastValidBlockHeight") or 0)
+        return await self._shared(("blockhash",), BLOCKHASH_SHARE_S, fetch)
 
     async def block_height(self) -> int:
         return int(await self._call("getBlockHeight", [{"commitment": "confirmed"}]) or 0)
@@ -259,10 +294,8 @@ class Chain:
         await asyncio.gather(*jobs)
         return sig
 
-    async def status(self, sig: str) -> tuple[str, int | None, Any]:
-        """('landed' | 'failed' | 'pending', блок, ошибка)."""
-        res = await self._call("getSignatureStatuses", [[sig], {"searchTransactionHistory": False}])
-        st = ((res or {}).get("value") or [None])[0]
+    @staticmethod
+    def _status_of(st: Any) -> tuple[str, int | None, Any]:
         if not st:
             return "pending", None, None
         if st.get("err") is not None:
@@ -270,6 +303,37 @@ class Chain:
         if st.get("confirmationStatus") in ("confirmed", "finalized"):
             return "landed", st.get("slot"), None
         return "pending", st.get("slot"), None
+
+    async def status(self, sig: str) -> tuple[str, int | None, Any]:
+        """('landed' | 'failed' | 'pending', блок, ошибка). Статусы всех ждущих транзакций (у нескольких кошельков)
+        спрашиваются одним запросом раз в STATUS_BATCH_S."""
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._status_wait.setdefault(sig, []).append(fut)
+        if self._status_task is None or self._status_task.done():
+            self._status_task = asyncio.ensure_future(self._status_flush())
+        return await fut
+
+    async def _status_flush(self) -> None:
+        await asyncio.sleep(STATUS_BATCH_S)
+        waiters, self._status_wait = self._status_wait, {}
+        sigs = list(waiters)
+        try:
+            res = await self._call("getSignatureStatuses", [sigs, {"searchTransactionHistory": False}])
+            vals = list((res or {}).get("value") or [])
+        except Exception as exc:  # noqa: BLE001
+            for fs in waiters.values():
+                for f in fs:
+                    if not f.done():
+                        f.set_exception(exc)
+            vals = None
+        if vals is not None:
+            for i, sig in enumerate(sigs):
+                out = self._status_of(vals[i] if i < len(vals) else None)
+                for f in waiters[sig]:
+                    if not f.done():
+                        f.set_result(out)
+        if self._status_wait:                      # пока шёл запрос, появились новые — следующей пачкой
+            self._status_task = asyncio.ensure_future(self._status_flush())
 
     async def confirm(self, tx: VersionedTransaction, timeout_s: float = 20.0, resend_s: float = 1.5,
                       resend_until_s: float | None = None, urls: list[str] | None = None,

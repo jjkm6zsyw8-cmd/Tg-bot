@@ -64,6 +64,8 @@ class Pool:
             return "пул не к SOL"
         if self.cashback:
             return "кэшбэк-монета (нужны инструкции v1) — пока не торгуем"
+        if self.mayhem:
+            return "mayhem-монета — цена считается иначе, не торгуем"
         if self.base_reserve <= 0 or self.quote_effective <= 0:
             return "пул пуст"
         return None

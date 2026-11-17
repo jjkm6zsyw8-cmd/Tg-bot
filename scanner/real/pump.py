@@ -77,6 +77,10 @@ class Curve:
             return "монета в паре не к SOL"
         if self.cashback:
             return "кэшбэк-монета (нужны инструкции v2) — пока не торгуем"
+        if self.mayhem:
+            # 17.11: у mayhem-монеты (2 млрд токенов, торгует ИИ-агент pump.fun) цена в сети разошлась с расчётом
+            # по резервам кривой почти вдвое — покупка не прошла бы. На бумаге таких 2 из 284 сделок smart
+            return "mayhem-монета — цена считается иначе, не торгуем"
         if self.complete or not self.v_tokens or not self.v_quote:
             return "кривая закрыта"
         return None

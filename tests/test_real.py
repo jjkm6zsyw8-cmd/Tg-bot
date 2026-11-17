@@ -129,6 +129,7 @@ def test_curve_quotes_match_constant_product_and_fees():
     assert pump.Curve(1, 1, 1, 1, True).why_not_tradable() == "кривая закрыта"
     assert "не к SOL" in pump.Curve(1, 1, 1, 1, False, quote_mint="USDC").why_not_tradable()
     assert "кэшбэк" in pump.Curve(1, 1, 1, 1, False, cashback=True).why_not_tradable()
+    assert "mayhem" in pump.Curve(1, 1, 1, 1, False, mayhem=True).why_not_tradable()
     assert paid_mc(spend, out) == pytest.approx(c.mc_sol * (1 + net / c.v_quote), rel=1e-6)   # средняя цена покупки
 
 
@@ -282,6 +283,38 @@ async def test_send_goes_to_sender_and_rpc_without_flooding_rpc():
     await chain.send(tx)                                  # без Sender — только RPC, без пропусков
     await chain.send(tx)
     assert rpc.sent == 3
+
+
+async def test_wallets_share_requests_to_the_network():
+    """Пять кошельков на один сигнал: одно чтение монеты, один блокхэш, статусы — одним запросом."""
+    import base64 as _b64
+    calls = []
+
+    class Rpc:
+        async def call(self, method, params, retries=1):
+            calls.append((method, len(params[0]) if method in ("getMultipleAccounts", "getSignatureStatuses") else 0))
+            await asyncio.sleep(0.01)
+            if method == "getMultipleAccounts":
+                return {"context": {"slot": 7}, "value": [{"data": [_b64.b64encode(b"x").decode(), "base64"],
+                                                           "owner": "o", "lamports": 1}] * len(params[0])}
+            if method == "getLatestBlockhash":
+                return {"value": {"blockhash": "11111111111111111111111111111111", "lastValidBlockHeight": 99}}
+            if method == "getSignatureStatuses":
+                return {"value": [{"slot": 5, "err": None, "confirmationStatus": "confirmed"}] * len(params[0])}
+            raise AssertionError(method)
+    chain = rtx.Chain(Rpc())
+    keys = [pk("a"), pk("b")]
+    res = await asyncio.gather(*(chain.accounts_at(keys) for _ in range(5)), *(chain.blockhash() for _ in range(5)))
+    assert all(r[0] == 7 for r in res[:5]) and all(r[1] == 99 for r in res[5:])
+    assert [c[0] for c in calls].count("getMultipleAccounts") == 1 and [c[0] for c in calls].count("getLatestBlockhash") == 1
+    await chain.accounts_at([pk("c")])                    # другие счета — свой запрос
+    assert [c[0] for c in calls].count("getMultipleAccounts") == 2
+    calls.clear()
+    sts = await asyncio.gather(*(chain.status(f"sig{i}") for i in range(5)))
+    assert all(x[0] == "landed" for x in sts) and calls == [("getSignatureStatuses", 5)]
+    await asyncio.sleep(0.4)                              # ответ устарел — новый запрос
+    await chain.accounts_at(keys)
+    assert calls.count(("getMultipleAccounts", 2)) == 1
 
 
 # ====================================================================== исполнитель: поддельная сеть + настоящая база

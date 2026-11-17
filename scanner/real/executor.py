@@ -91,7 +91,7 @@ def make_chain(engine: Any) -> rtx.Chain | None:
     if env is None:
         return None
     from ..ingest.rpc import SolanaRpc
-    return rtx.Chain(SolanaRpc(env.rpc_endpoint, rps=40, concurrency=16, timeout=6,
+    return rtx.Chain(SolanaRpc(env.rpc_endpoint, rps=10, concurrency=8, timeout=6,
                                fallback=env.rpc_fallback_url or None))
 
 
