@@ -174,10 +174,7 @@ class RealTrader:
     def scheme_for(self, kind: str | None) -> dict[str, Any]:
         """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага): у smart и
         «мой дев» — выбранная (A / B / G), у копий, крупных копий и смарт-ракет — их портфелей H / K / R."""
-        kind = kind or "smart"
-        if kind in S.SCHEME_KEYS:
-            return SCHEMES[self.get(S.SCHEME_KEYS[kind])]
-        return SCHEMES[S.METHODS[kind][2]]
+        return SCHEMES[self.get(S.SCHEME_KEYS[kind or "smart"])]
 
     def paused(self) -> str:
         """Стоп-кран: общий (для всех кошельков) или этого кошелька."""
@@ -346,7 +343,8 @@ class RealTrader:
         """Сигнал бумаги: smart (идёт в боевой портфель M) или «мой дев» (портфель Y)."""
         if not self.accept_new:
             return
-        kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"), None)
+        kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
+                     and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
         if kind is None:
             return
         mode = self.mode_for(kind)
@@ -410,10 +408,12 @@ class RealTrader:
     def _skip(self, mode: str, kind: str, why: str) -> None:
         self.skips[f"{'бой' if mode == 'live' else 'тень'} · {KINDS[kind]}: {why}"] += 1
 
-    def stake_lamports(self, v_quote: int) -> tuple[int, str | None]:
-        """Ставка: фиксированная сумма, урезанная так, чтобы своя покупка двигала цену не сильнее лимита."""
+    def stake_lamports(self, v_quote: int, kind: str | None = None) -> tuple[int, str | None]:
+        """Ставка: своя у метода или общая у кошелька, урезанная так, чтобы своя покупка двигала цену не сильнее
+        лимита."""
         sol_usd = self.sol_usd()
-        stake = int(float(self.get("real_stake_usd")) / sol_usd * 1e9)
+        usd = S.method_stake(self.cfg, kind) or float(self.get("real_stake_usd"))
+        stake = int(usd / sol_usd * 1e9)
         cap = int(v_quote * ((1 + float(self.get("real_max_impact"))) ** 0.5 - 1))
         stake = min(stake, cap)
         if stake < float(self.get("real_min_stake_usd")) / sol_usd * 1e9:
@@ -544,7 +544,7 @@ class RealTrader:
         trig_slot = int(data.get("trigger_slot") or 0)
         if trig_slot and st["slot"] and st["slot"] - trig_slot > int(self.get("real_max_blocks")):
             return self._skip(mode, kind, "после сигнала прошло слишком много блоков")
-        stake, why = self.stake_lamports(st["v_quote"])
+        stake, why = self.stake_lamports(st["v_quote"], kind)
         if why:
             return self._skip(mode, kind, why)
         trig_mc = float(data.get("trigger_mc") or 0)

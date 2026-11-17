@@ -17,11 +17,21 @@ from typing import Any
 
 MODES = {"off": "выключен", "shadow": "тень (без денег)", "live": "бой (реальные деньги)"}
 # Правила выхода — те же, что у бумажных портфелей (scanner/analytics/paper.py, SCHEMES): решение принимает одна и
-# та же функция decide_exit. A — всё на +25%, без стопа, до 30 мин (как бумажные A и M); B — 70% на +25%, остаток
-# трейлинг 15%; G — всё на +25%, стоп −8%, 5 мин на +10% (как бумажные G и Y «мой дев»).
-SCHEMES = ("A", "B", "G")
-SCHEME_KEYS = {"smart": "real_scheme", "mydev": "real_scheme_mydev"}
-DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "G"}
+# та же функция decide_exit. Любое правило можно поставить любому методу:
+#   A — всё на +25%, без стопа, до 30 мин (как бумажные A и M);
+#   B — 70% на +25%, остаток трейлинг 15%, без стопа, до 30 мин;
+#   G — всё на +25%, стоп −8%, нет +10% за 5 мин — выход, до 30 мин (как бумажные G, Y, H, K);
+#   R — трейлинг 35% после +30%, стоп −50%, до суток (как бумажный R, «смарт-ракеты»).
+SCHEMES = ("A", "B", "G", "R")
+SCHEME_KEYS = {"smart": "real_scheme", "mydev": "real_scheme_mydev", "bigcopy": "real_scheme_bigcopy",
+               "copy": "real_scheme_copy", "swing": "real_scheme_swing"}
+DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "G", "real_scheme_bigcopy": "G", "real_scheme_copy": "G",
+                   "real_scheme_swing": "R"}
+SCHEME_TEXT = {"A": "всё на +25%, без стопа, до 30 мин", "B": "70% на +25%, остаток трейлинг 15%, до 30 мин",
+               "G": "всё на +25%, стоп −8%, нет +10% за 5 мин — выход", "R": "трейлинг 35% после +30%, стоп −50%, до суток"}
+# Вход smart: «all» — все smart-сигналы (как бумажные A / B / G), «m» — только те, что бумага пустила в боевой
+# портфель M (автофильтр по истории сделок трейдеров и правила отбора M). M = вход «m» + правило A + до 3 позиций.
+SMART_FILTERS = {"all": "все smart-сигналы", "m": "только отобранные, как у M"}
 
 # вид: usd | sol | pct | num | sec | bool | choice
 SETTINGS: dict[str, tuple[str, Any, float, float, float, str, str]] = {
@@ -98,7 +108,42 @@ def get(cfg: dict[str, Any], key: str) -> Any:
     if key in DEFAULT_SCHEMES:
         s = str(cfg.get(key) or DEFAULT_SCHEMES[key])
         return s if s in SCHEMES else DEFAULT_SCHEMES[key]
+    if key == "real_smart_filter":
+        v = str(cfg.get(key) or "all")
+        return v if v in SMART_FILTERS else "all"
     raise KeyError(key)
+
+
+def stake_key(kind: str) -> str:
+    return f"real_stake_usd_{kind}"
+
+
+def method_stake(cfg: dict[str, Any], kind: str | None) -> float | None:
+    """Своя ставка метода, $ (None — как у кошелька). Не выше потолка сервера."""
+    if not kind:
+        return None
+    try:
+        v = float(cfg.get(stake_key(kind)) or 0)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    return min(max(1.0, v), max_stake_usd(), SETTINGS["real_stake_usd"][4])
+
+
+def method_name(cfg: dict[str, Any], kind: str) -> str:
+    """«Smart M», «Smart A», «Smart (как M) → G», «Мой дев G (только тень)», «Копии → A»…"""
+    rule = get(cfg, SCHEME_KEYS[kind])
+    if kind == "smart":
+        if get(cfg, "real_smart_filter") == "m":
+            return "Smart M" if rule == "A" else f"Smart (отбор M) → {rule}"
+        return f"Smart {rule}"
+    base = {"mydev": "Мой дев", "bigcopy": "Крупные копии", "copy": "Копии", "swing": "Смарт-ракеты"}[kind]
+    default = DEFAULT_SCHEMES[SCHEME_KEYS[kind]]
+    out = f"{base} {rule}" if kind == "mydev" else (base if rule == default else f"{base} → {rule}")
+    if kind == "mydev" and not get(cfg, "real_live_mydev"):
+        out += " (только тень)"
+    return out
 
 
 def step(cfg: dict[str, Any], key: str, sign: str) -> float:
@@ -150,13 +195,10 @@ KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", 
 
 
 def methods_summary(cfg: dict[str, Any]) -> str:
-    """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»."""
+    """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»; своя ставка — в скобках."""
     out = []
-    if get(cfg, "real_smart"):
-        out.append(f"Smart {get(cfg, 'real_scheme')}")
-    if get(cfg, "real_mydev"):
-        out.append(f"Мой дев {get(cfg, 'real_scheme_mydev')}" + ("" if get(cfg, "real_live_mydev") else " (только тень)"))
-    for kind in ("copy", "bigcopy", "swing"):
+    for kind in ("smart", "mydev", "bigcopy", "copy", "swing"):
         if get(cfg, METHODS[kind][1]):
-            out.append(METHODS[kind][0])
+            stake = method_stake(cfg, kind)
+            out.append(method_name(cfg, kind) + (f" ${stake:g}" if stake else ""))
     return " · ".join(out) if out else "все выключены"

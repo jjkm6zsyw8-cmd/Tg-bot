@@ -291,17 +291,17 @@ def settings_view(cfg: dict[str, Any], wid: int | None = None, name: str = "") -
                    {"text": f"{label[:22]}: {shown}", "callback": back if one else "rl:set"},
                    {"text": "+", "callback": f"{pre}{key}:+"}])
     lines.append("")
+    method_keys = {m[1] for m in S.METHODS.values()} | {"real_live_mydev"}
     for key, (label, _default, desc) in S.TOGGLES.items():
+        if key in method_keys:
+            continue                                 # методы и их правила — на экране «🎯 Методы»
         on = S.get(cfg, key)
         lines.append(f"• {label}: <b>{'да' if on else 'нет'}</b>" + (f" — {desc}" if desc and not one else ""))
         kb.append([{"text": f"{'✅' if on else '⬜'} {label[:40]}",
                     "callback": f"rl:wt:{wid}:{key}" if one else f"rl:t:{key}"}])
-    lines.append("")
-    for kind, key in S.SCHEME_KEYS.items():
-        cur = S.get(cfg, key)
-        lines.append(f"• Правила выхода, {KINDS[kind]}: <b>{cur}</b> — {scheme_text(cur)}")
-        kb.append([{"text": ("● " if cur == s else "") + f"{KINDS[kind]}: {s}",
-                    "callback": f"rl:wsc:{wid}:{kind}:{s}" if one else f"rl:sc:{kind}:{s}"} for s in S.SCHEMES])
+    lines.append(f"\n🎯 Методы торговли ({S.methods_summary(cfg)}) — правила выхода, отбор и ставка у каждого "
+                 "метода свои: кнопка «🎯 Методы».")
+    kb.append([{"text": "🎯 Методы", "callback": f"rl:wme:{wid if one else 'g'}"}])
     lines.append(f"\nПотолок ставки на сервере: ${S.max_stake_usd():g} (REAL_MAX_STAKE_USD в .env).")
     kb.append([{"text": "← Назад", "callback": back}])
     return "\n".join(lines), kb

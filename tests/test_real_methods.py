@@ -28,13 +28,41 @@ def test_kinds_of_signal_by_paper_route():
 def test_exit_rules_per_method():
     tr = ex.RealTrader(engine(None), chain=None, wallet=None, wallet_note="тест")
     assert tr.scheme_for("smart") is pp.SCHEMES["A"] and tr.scheme_for("mydev") is pp.SCHEMES["G"]
-    assert tr.scheme_for("copy") is pp.SCHEMES["H"] and tr.scheme_for("bigcopy") is pp.SCHEMES["K"]
+    assert tr.scheme_for("copy") is pp.SCHEMES["G"] and tr.scheme_for("bigcopy") is pp.SCHEMES["G"]
     assert tr.scheme_for("swing") is pp.SCHEMES["R"] and pp.SCHEMES["R"]["max_hold_s"] == 24 * 3600
-    tr.e.cfg.update(real_scheme="B", real_scheme_mydev="A")
-    assert tr.scheme_for("smart") is pp.SCHEMES["B"] and tr.scheme_for("mydev") is pp.SCHEMES["A"]
+    # любое правило — любому методу
+    tr.e.cfg.update(real_scheme="R", real_scheme_mydev="A", real_scheme_copy="B", real_scheme_swing="G")
+    assert tr.scheme_for("smart") is pp.SCHEMES["R"] and tr.scheme_for("mydev") is pp.SCHEMES["A"]
+    assert tr.scheme_for("copy") is pp.SCHEMES["B"] and tr.scheme_for("swing") is pp.SCHEMES["G"]
     assert S.methods_summary({}) == "Smart A · Мой дев G (только тень)"
-    assert S.methods_summary({"real_smart": False, "real_mydev": False, "real_swing": True}) == "Смарт-ракеты (держатели)"
+    assert S.methods_summary({"real_smart": False, "real_mydev": False, "real_swing": True}) == "Смарт-ракеты"
     assert S.methods_summary({"real_smart": False, "real_mydev": False}) == "все выключены"
+    assert S.methods_summary({"real_smart_filter": "m", "real_live_mydev": True, "real_stake_usd_smart": 30,
+                              "real_copy": True, "real_scheme_copy": "A"}) == "Smart M $30 · Мой дев G · Копии → A"
+    assert S.method_name({"real_smart_filter": "m", "real_scheme": "G"}, "smart") == "Smart (отбор M) → G"
+    assert S.method_stake({"real_stake_usd_smart": 500}, "smart") == 30.0       # не выше потолка сервера
+    assert S.method_stake({"real_stake_usd_smart": 0}, "smart") is None and S.method_stake({}, None) is None
+
+
+async def test_smart_filter_m_and_method_stakes(db):
+    chain = FakeChain()
+    m1, m2, m3 = pk("only-a"), pk("in-m"), pk("dev-coin")
+    for m in (m1, m2):
+        chain.add_curve(m, 40.0)
+    chain.add_curve(m3, 30.0)
+    tr = shadow(db, chain, real_max_open=10, real_smart_filter="m", real_stake_usd_smart=15)
+
+    async def send(mint, modes, targets):
+        data = {"modes": modes, "symbol": "T", "trigger_at": time.time(), "trigger_slot": chain.slot - 2,
+                "trigger_mc": chain.mc(mint), "trigger_create": "mydev" in modes}
+        await tr.on_signal(str(mint), "normal", 1, data, "TRADER", targets)
+    await tr.start()
+    await send(m1, ["smart"], {"A", "B", "G"})                 # M этот сигнал отсеял — при отборе M не берём
+    await send(m2, ["smart"], {"M", "A", "B", "G"})            # M взял — берём
+    await send(m3, ["mydev"], {"Y"})
+    assert {p.mint for p in tr.positions.values()} == {str(m2), str(m3)}
+    stakes = {r["mint"]: round(r["stake_sol"] * 150, 2) for r in await db.fetch("SELECT mint, stake_sol FROM real_orders")}
+    assert stakes == {str(m2): 15.0, str(m3): 5.0}             # у smart своя ставка, у дева — как у кошелька
 
 
 async def test_new_methods_trade_only_when_enabled(db):
@@ -95,39 +123,66 @@ async def test_paper_sends_all_method_signals_to_real_bot(monkeypatch):
     assert got == [["H"], ["H", "K"], ["R"], ["Y"], ["A", "M"]]           # лотерея D — не реальному боту
 
 
-async def test_methods_screen_for_wallet_and_common(db):
+async def test_methods_screen_for_wallet_and_common(db, monkeypatch):
     chain = FakeChain()
     desk = make_desk(db, chain)
     await desk.start()
     wid = await desk.create_wallet("Основной")
-    # бумага: A — две сделки (+30%, −10%), H — одна (+5%), ⚠ и «оценка» не считаются
+    # бумага: A — две сделки (+30%, −10%), M — одна (+20%), H — одна (+5%); ⚠ и «оценка» не считаются
     rows = [("A", 0.30, False, "блок +2 (блокчейн)"), ("A", -0.10, False, "блок +2 (блокчейн)"),
             ("A", 5.0, True, "блок +2 (блокчейн)"), ("A", 1.0, False, "оценка: цена трейдера +2%"),
-            ("H", 0.05, False, "блок +2 (блокчейн)")]
+            ("M", 0.20, False, "блок +2 (блокчейн)"), ("H", 0.05, False, "блок +2 (блокчейн)")]
     for port, pct, sus, src in rows:
         await db.execute(
             """INSERT INTO paper_positions(portfolio, mint, opened_at, entry_mc, cost_sol, tokens, tokens_initial,
                    closed_at, exit_reason, pnl_sol, pnl_pct, suspect, entry_src)
                VALUES ($1, 'X', now(), 30, 0.1, 1, 1, now(), 'take_profit', 0, $2, $3, $4)""", port, pct, sus, src)
+    t = f"{wid}"
     text, kb = await UI.methods_view(db, {}, wid)
-    assert "Методы торговли: Основной" in text and "● A: всё на +25%, без стопа — бумага: 2 сд., в плюс 50%, +$2" in text
-    assert "Копии своего списка и разведки</b> — выкл" in text and "бумага: 1 сд., в плюс 100%, +$0" in text
+    assert "Методы торговли: Основной" in text and "✅ Smart A" in text and "бумага A: 2 сд., в плюс 50%, +$2" in text
+    assert "Копии своего списка и разведки</b> — ⬜ выкл" in text
     cbs = [b["callback"] for row in kb for b in row]
-    assert f"rl:wmx:{wid}:smart:G" in cbs and f"rl:wmx:{wid}:copy:1" in cbs and all(len(c.encode()) <= 64 for c in cbs)
-    jobs_before = await db.fetchval("SELECT count(*) FROM jobs")
-    r = await UI.on_wallet_callback(db, {}, "wmx", f"{wid}:smart:G")
-    await UI.on_wallet_callback(db, {}, "wmx", f"{wid}:copy:1")
-    await UI.on_wallet_callback(db, {}, "wmx", f"{wid}:mydev:off")
-    await UI.on_wallet_callback(db, {}, "wmx", f"{wid}:swing:bad")             # мусор — без изменений
-    st = await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
-    assert st["real_smart"] is True and st["real_scheme"] == "G" and st["real_copy"] is True and st["real_mydev"] is False
-    assert "real_swing" not in st and r.toast == "Сохранено"
-    assert await db.fetchval("SELECT count(*) FROM jobs") > jobs_before            # аналитика перечитает настройки
+    assert f"rl:wmk:{t}:smart" in cbs and f"rl:wmx:{t}:copy:on" in cbs and all(len(c.encode()) <= 64 for c in cbs)
+
+    async def press(action, rest):
+        r = await UI.on_wallet_callback(db, {}, action, rest)
+        return r, await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
+    # экран метода smart: правила A/B/G/R с итогом бумаги, отбор, ставка
+    r, _ = await press("wmk", f"{t}:smart")
+    assert "● <b>A</b> — всё на +25%, без стопа" in r.text and "бумага A: 2 сд." in r.text
+    assert "○ <b>R</b>" in r.text and "на бумаге так не торговали" in r.text
+    assert "только отобранные, как у M" in r.text and "бумага M: 1 сд., в плюс 100%, +$2" in r.text
+    assert all(len(c.encode()) <= 64 for c in [b["callback"] for row in r.kb for b in row])
+    r, st = await press("wmf", f"{t}:M")                       # «сделать как M»
+    assert st["real_smart_filter"] == "m" and st["real_scheme"] == "A" and st["real_smart"] is True
+    assert "Smart M" in r.text or "только отобранные, как у M" in r.text
+    r, st = await press("wmr", f"{t}:smart:G")
+    assert st["real_scheme"] == "G" and "● <b>G</b>" in r.text
+    monkeypatch.setenv("REAL_MAX_STAKE_USD", "30")
+    for _ in range(7):
+        r, st = await press("wms", f"{t}:smart:+")
+    assert st["real_stake_usd_smart"] == 30 and "$30 (своя ставка метода)" in r.text   # 5 → 30, не выше потолка
+    r, st = await press("wms", f"{t}:smart:0")
+    assert "real_stake_usd_smart" not in st and "как у кошелька" in r.text
+    # мой дев: правило A, в бою; копии: включить с экрана метода, правило R
+    r, st = await press("wmr", f"{t}:mydev:A")
+    r, st = await press("wmo", f"{t}:devlive:1")
+    assert st["real_scheme_mydev"] == "A" and st["real_live_mydev"] is True and "Мой дев" in r.text
+    r, st = await press("wmo", f"{t}:copy:on")
+    assert st["real_copy"] is True and "✅ включён" in r.text
+    r, st = await press("wmr", f"{t}:copy:R")
+    r, st = await press("wmx", f"{t}:swing:on")                 # с экрана списка — возвращает список
+    assert st["real_scheme_copy"] == "R" and st["real_swing"] is True and "Методы торговли" in r.text
+    r, _ = await press("wmx", f"{t}:swing:мусор")
+    assert r.toast == "Не понял кнопку"
     await desk.command({"cmd": "reload"})
     lane = desk.lanes[wid]
-    assert lane.mode_for("copy") == "shadow" and lane.mode_for("mydev") == "off" and lane.scheme_for("smart") is pp.SCHEMES["G"]
+    assert lane.scheme_for("copy") is pp.SCHEMES["R"] and lane.scheme_for("mydev") is pp.SCHEMES["A"]
+    assert lane.get("real_smart_filter") == "m" and lane.mode_for("swing") == "shadow"
     text, _kb = await UI.wallet_view(db, {}, wid)
-    assert "Методы: Smart G · Копии своего списка и разведки" in text
+    assert "Методы: Smart (отбор M) → G · Мой дев A · Копии → R · Смарт-ракеты" in text
     # общие методы (без кошелька) — в общих настройках
-    r = await UI.on_wallet_callback(db, {}, "wmx", "g:swing:1")
+    r = await UI.on_wallet_callback(db, {}, "wmx", "g:swing:on")
     assert (await db.get_overrides())["real_swing"] is True and "Методы торговли: общие" in r.text
+    r = await UI.on_wallet_callback(db, {}, "wms", "g:smart:+")
+    assert (await db.get_overrides())["real_stake_usd_smart"] == 10
