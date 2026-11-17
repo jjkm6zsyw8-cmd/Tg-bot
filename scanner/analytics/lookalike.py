@@ -38,6 +38,7 @@ DEFAULTS: dict[str, Any] = {
     "lk_every_h": 6.0,                  # как часто пересчитывать
     "lk_hours": 24.0,                   # за сколько часов брать покупки
     "lk_min_sol": 0.3, "lk_max_sol": 5.0,
+    "lk_max_age_min": 25,               # покупки в первые N минут монеты (дальше данные о цене неполные)
     "lk_min_coins": 10, "lk_max_coins": 300,
     "lk_traders": 400,                  # сколько активных кошельков проверять за раз
     "lk_sample": 40,                    # последних покупок на кошелёк
@@ -132,22 +133,30 @@ def hit_ratio(cfg: dict[str, Any]) -> float:
     return (1 + float(cfg_get(cfg, "lk_tp"))) / (1 - float(cfg_get(cfg, "lk_fee")))
 
 
-BUYS = """
+def buys_sql(max_age_min: float) -> str:
+    """Покупки на кривой pump.fun в первые max_age_min минут монеты: сделки всех монет хранятся первые 30 минут,
+    дальше — только у отслеживаемых и растущих (там выборка смещена к победителям)."""
+    return f"""
     SELECT t.trader, t.mint, t.ts, t.slot
     FROM trades t JOIN tokens k ON k.mint = t.mint
     WHERE t.ts >= $1 AND t.ts < $2 AND t.is_buy AND t.pool = 'pump'
       AND t.sol_amount BETWEEN $3 AND $4
-      AND t.ts > k.created_at + interval '5 seconds' AND t.ts < k.created_at + interval '25 minutes'
+      AND t.ts > k.created_at + interval '5 seconds'
+      AND t.ts < k.created_at + make_interval(mins => {int(max_age_min)})
       AND t.trader <> k.deployer"""
 
-ACTIVE = f"""
-    SELECT trader, count(DISTINCT mint) coins FROM ({BUYS}) b
+
+def active_sql(max_age_min: float) -> str:
+    return f"""
+    SELECT trader, count(DISTINCT mint) coins FROM ({buys_sql(max_age_min)}) b
     GROUP BY 1 HAVING count(DISTINCT mint) BETWEEN $5 AND $6
     ORDER BY 2 DESC LIMIT $7"""
 
-COPIES = f"""
+
+def copies_sql(max_age_min: float) -> str:
+    return f"""
     WITH f AS (
-        SELECT DISTINCT ON (trader, mint) * FROM ({BUYS} AND t.trader = ANY($5::text[])) b
+        SELECT DISTINCT ON (trader, mint) * FROM ({buys_sql(max_age_min)} AND t.trader = ANY($5::text[])) b
         ORDER BY trader, mint, ts),
     b AS (SELECT *, row_number() OVER (PARTITION BY trader ORDER BY ts DESC) rn FROM f)
     SELECT b.trader, b.mint, e.mc entry, extract(epoch FROM e.ts) entry_ts,
@@ -176,6 +185,38 @@ COPIES = f"""
     WHERE b.rn <= $6 AND e.mc > 0"""
 
 
+DIAG = """
+    SELECT count(*) FILTER (WHERE t.is_buy) buys, count(*) FILTER (WHERE NOT t.is_buy) sells,
+           count(*) FILTER (WHERE t.is_buy AND t.pool = 'pump') curve,
+           count(*) FILTER (WHERE t.is_buy AND t.sol_amount BETWEEN $4 AND $5) sized,
+           count(*) FILTER (WHERE t.is_buy AND k.mint IS NOT NULL) known,
+           count(DISTINCT t.mint) FILTER (WHERE t.is_buy) coins,
+           percentile_disc(ARRAY[0.1, 0.25, 0.5, 0.75, 0.9]) WITHIN GROUP (
+               ORDER BY extract(epoch FROM t.ts - k.created_at) / 60) FILTER (WHERE t.is_buy AND k.mint IS NOT NULL) age,
+           percentile_disc(ARRAY[0.1, 0.5, 0.9]) WITHIN GROUP (ORDER BY t.sol_amount) FILTER (WHERE t.is_buy) size,
+           min(t.ts) FILTER (WHERE t.is_buy) first_buy, max(t.ts) FILTER (WHERE t.is_buy) last_buy,
+           string_agg(DISTINCT t.pool, ', ') pools
+    FROM trades t LEFT JOIN tokens k ON k.mint = t.mint
+    WHERE t.trader = $1 AND t.ts >= $2 AND t.ts < $3"""
+
+
+async def diagnose(db: Any, cfg: dict[str, Any], wallet: str, until: datetime, hours: float) -> str:
+    """Почему у кошелька мало покупок для проверки: что о нём есть в базе сделок."""
+    r = await db.fetchrow(DIAG, wallet, until - timedelta(hours=hours), until,
+                          float(cfg_get(cfg, "lk_min_sol")), float(cfg_get(cfg, "lk_max_sol")))
+    if not r or not (r["buys"] or r["sells"]):
+        return f"{wallet}: в базе сделок за {hours:g} ч нет ни одной его сделки"
+    age = ", ".join(f"{a:.0f}" for a in (r["age"] or [])) or "—"
+    size = ", ".join(f"{a:.2f}" for a in (r["size"] or [])) or "—"
+    fmt = lambda ts: ts.strftime("%d.%m %H:%M") if ts else "—"  # noqa: E731
+    return (f"{wallet}: покупок {r['buys']} (монет {r['coins']}), продаж {r['sells']}; на кривой pump {r['curve']}; "
+            f"размер {cfg_get(cfg, 'lk_min_sol')}–{cfg_get(cfg, 'lk_max_sol')} SOL: {r['sized']}; монета в базе: "
+            f"{r['known']}\n  возраст монеты при покупке, мин (10/25/50/75/90%): {age}\n"
+            f"  размер покупки, SOL (10/50/90%): {size}\n  первая покупка {fmt(r['first_buy'])} UTC, последняя "
+            f"{fmt(r['last_buy'])} UTC; площадки: {r['pools']}\n  в проверку идут покупки в первые "
+            f"{cfg_get(cfg, 'lk_max_age_min')} мин монеты (--age N — шире)")
+
+
 async def _fetch(db: Any, q: str, *a: Any, timeout_s: float = 120) -> list[Any]:
     """Тяжёлый запрос — с ограничением времени: при перегрузке базы отменится сам, а не будет мешать торговле."""
     async with db.p.acquire() as conn:
@@ -193,14 +234,15 @@ async def evaluate(db: Any, cfg: dict[str, Any], until: datetime, hours: float |
     t_from = until - timedelta(hours=hours)
     lo, hi = float(cfg_get(cfg, "lk_min_sol")), float(cfg_get(cfg, "lk_max_sol"))
     timeout = float(cfg_get(cfg, "lk_timeout_s"))
+    age = float(cfg_get(cfg, "lk_max_age_min"))
     if wallets is None:
-        rows = await _fetch(db, ACTIVE, t_from, t_to, lo, hi, int(cfg_get(cfg, "lk_min_coins")),
+        rows = await _fetch(db, active_sql(age), t_from, t_to, lo, hi, int(cfg_get(cfg, "lk_min_coins")),
                             int(cfg_get(cfg, "lk_max_coins")), int(cfg_get(cfg, "lk_traders")), timeout_s=timeout)
         wallets = [r["trader"] for r in rows]
     out: dict[str, Eval] = {w: Eval(w) for w in wallets}
     ratio = hit_ratio(cfg)
     for i in range(0, len(wallets), 100):
-        rows = await _fetch(db, COPIES, t_from, t_to, lo, hi, wallets[i:i + 100], int(cfg_get(cfg, "lk_sample")),
+        rows = await _fetch(db, copies_sql(age), t_from, t_to, lo, hi, wallets[i:i + 100], int(cfg_get(cfg, "lk_sample")),
                             horizon, ENTRY_MAX_S, ratio, timeout_s=timeout)
         for r in rows:
             e0 = float(r["entry_ts"])

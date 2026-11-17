@@ -114,15 +114,20 @@ async def run_tool(cmd: str, db: Database) -> None:
     elif cmd == "lookalike":
         # поиск по образцу smart A вручную: python -m scanner lookalike [--hours 24] [кошелёк …]
         from datetime import datetime, timezone
-        from .analytics.lookalike import evaluate, format_cli
+        from .analytics.lookalike import cfg_get, diagnose, evaluate, format_cli
         from .config import Settings, YamlConfig, load_env
         env = load_env()
-        cfg = Settings(YamlConfig(env.config_path), await db.get_overrides()).effective()
-        hours = float(args[args.index("--hours") + 1]) if "--hours" in args else None
-        skip = {args.index("--hours") + 1} if "--hours" in args else set()
+        cfg = dict(Settings(YamlConfig(env.config_path), await db.get_overrides()).effective())
+        opt = {k: float(args[args.index(k) + 1]) for k in ("--hours", "--age") if k in args}
+        skip = {args.index(k) + 1 for k in opt}
+        if "--age" in opt:
+            cfg["lk_max_age_min"] = opt["--age"]
         wallets = [a for i, a in enumerate(args) if not a.startswith("-") and i not in skip] or None
-        evals = await evaluate(db, cfg, datetime.now(timezone.utc), hours=hours, wallets=wallets)
+        now = datetime.now(timezone.utc)
+        evals = await evaluate(db, cfg, now, hours=opt.get("--hours"), wallets=wallets)
         print(format_cli(evals, cfg))
+        for w in wallets or []:
+            print("\n" + await diagnose(db, cfg, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

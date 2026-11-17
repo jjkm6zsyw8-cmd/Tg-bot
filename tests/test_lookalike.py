@@ -153,3 +153,16 @@ async def test_cli_format(db):
     text = LK.format_cli(evals, {})
     assert "Проверено кошельков: 2; подходят под образец: 1" in text and "GOOD | 12 | 100%" in text
     assert "NOBODY | 0" in text
+
+
+async def test_diagnose_and_age_window(db):
+    """18.11: у 7BNax на сервере 0 покупок в проверке — разбор показывает, что о кошельке есть в базе."""
+    now = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    await history(db, now, "OLDBUYER", ["pump"] * 12)
+    await db.execute("UPDATE tokens SET created_at = created_at - interval '2 hours'")    # покупает монеты постарше
+    assert (await LK.evaluate(db, {}, now, wallets=["OLDBUYER"]))["OLDBUYER"].n == 0
+    assert (await LK.evaluate(db, {"lk_max_age_min": 180}, now, wallets=["OLDBUYER"]))["OLDBUYER"].n == 12
+    text = await LK.diagnose(db, {}, "OLDBUYER", now, 24)
+    assert "покупок 12 (монет 12)" in text and "на кривой pump 12" in text and "возраст монеты" in text
+    assert "121" in text                                                       # купил через 121 мин после запуска
+    assert "нет ни одной его сделки" in await LK.diagnose(db, {}, "NOBODY", now, 24)
