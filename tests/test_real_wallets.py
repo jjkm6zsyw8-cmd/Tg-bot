@@ -321,3 +321,22 @@ async def test_wallet_screens_flow(db, monkeypatch):
         assert not await db.fetchval("SELECT archived FROM real_wallets WHERE id=$1", wid)
     finally:
         runner.cancel()
+
+
+async def test_trades_in_dollars_use_real_sol_price_with_wallets(db):
+    """17.11: при кошельках список сделок брал курс из пустого общего состояния и считал по $150 вместо $74."""
+    from scanner.real import report
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    desk = make_desk(db, chain)
+    await desk.start()
+    await desk.create_wallet("Мейныч")
+    await db.kv_set("sol_usd", {"price": 74.0})
+    await fire(desk, chain)
+    chain.set_mc(MINT, 54.0)
+    await trade(desk, chain)
+    row = await db.fetchrow("SELECT pnl_sol FROM real_positions")
+    text = await report.trades_text(db, {})
+    assert f"+${row['pnl_sol'] * 74:.2f}" in text and f"+${row['pnl_sol'] * 150:.2f}" not in text
+    view, _kb = await report.status_view(db, {})
+    assert f"+${row['pnl_sol'] * 74:.2f}" in view

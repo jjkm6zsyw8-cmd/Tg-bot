@@ -13,7 +13,7 @@ from typing import Any
 from ..alerts.format import esc
 from . import settings as S
 from .report import (KINDS, MODE_ICON, MODE_SHORT, STALE_S, Kb, Reply, day_start, lane_status, load_desk, money,
-                     settings_view, totals, trades_text, wallet_rows)
+                     settings_view, sol_price, totals, trades_text, wallet_rows)
 
 CREATE_WAIT_S = 8.0
 MASTERKEY_CMD = ("cd /opt/tg-bot &amp;&amp; echo &gt;&gt; .env &amp;&amp; docker compose run --rm --no-deps -T analytics "
@@ -26,8 +26,6 @@ def short(addr: str) -> str:
     return f"{addr[:4]}…{addr[-4:]}" if addr and len(addr) > 10 else addr
 
 
-async def sol_price(db: Any) -> float:
-    return float((await db.kv_get("sol_usd", {}) or {}).get("price") or 150)
 
 
 async def live_balance(rpc: Any, pubkey: str) -> float | None:

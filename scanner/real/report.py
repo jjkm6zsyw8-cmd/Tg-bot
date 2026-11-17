@@ -63,6 +63,13 @@ def scheme_text(name: str) -> str:
     return str(PAPER_SCHEMES[name]["name"]).split(": ", 1)[-1].replace("smart — ", "")
 
 
+async def sol_price(db: Any, st: dict[str, Any] | None = None) -> float:
+    """Курс SOL, $: тот же, что публикует аналитика (kv «sol_usd»); запасной — из состояния исполнителя.
+    17.11: при кошельках общего состояния нет, и список сделок считал по $150 вместо $74 — доллары вдвое больше."""
+    price = (await db.kv_get("sol_usd", {}) or {}).get("price")
+    return float(price or (st or {}).get("sol_usd") or 150)
+
+
 async def load_status(db: Any) -> tuple[dict[str, Any], float | None]:
     """Состояние исполнителя и его возраст в секундах (None — исполнитель ещё не запускался)."""
     st = await db.kv_get(STATUS_KEY) or {}
@@ -137,7 +144,7 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     wallets = await wallet_rows(db)
     if desk:
         age = desk_age
-    sol_usd = float(st.get("sol_usd") or (await db.kv_get("sol_usd", {}) or {}).get("price") or 150)
+    sol_usd = await sol_price(db, st)
     want = S.get(cfg, "real_mode")
     fresh = age is not None and age < STALE_S
     mode = st.get("mode") if fresh and st else None
@@ -241,7 +248,7 @@ def _since(iso: str | None, cfg: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------- включение боя
 async def live_confirm_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     st, age = await load_status(db)
-    sol_usd = float(st.get("sol_usd") or 150)
+    sol_usd = await sol_price(db, st)
     fresh = age is not None and age < STALE_S
     allowed, can_sign = bool(st.get("live_allowed")) and fresh, bool(st.get("can_sign")) and fresh
     bal = st.get("balance_sol") if fresh else None
@@ -315,7 +322,7 @@ async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20, wallet: Any
                           limit, every, None if every else wallet)
     if not rows:
         return "📋 Закрытых сделок реального бота пока нет."
-    sol_usd = float((await db.kv_get(STATUS_KEY) or {}).get("sol_usd") or 150)
+    sol_usd = await sol_price(db)
     tz = tz_of(cfg)
     lines = [f"📋 <b>Последние сделки реального бота</b> ({len(rows)})"]
     for r in rows:
@@ -367,7 +374,7 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14) -> str:
            WHERE r.closed_at IS NOT NULL AND r.closed_at > now() - make_interval(days => $1)""", int(days))
     if not rows:
         return f"⚖️ За {days} дн. закрытых сделок реального бота нет — сравнивать нечего."
-    sol_usd = float((await db.kv_get(STATUS_KEY) or {}).get("sol_usd") or 150)
+    sol_usd = await sol_price(db)
     head = f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"
     table, notes = [head], []
     for mode in ("live", "shadow"):
