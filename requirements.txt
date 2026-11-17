@@ -6,3 +6,4 @@ PyYAML==6.0.3
 pydantic==2.13.5
 pydantic-settings==2.16.2
 base58==2.1.1
+solders==0.29.0

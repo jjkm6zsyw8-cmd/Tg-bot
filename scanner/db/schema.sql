@@ -542,3 +542,65 @@ ON CONFLICT (address) DO NOTHING;
 UPDATE paper_positions SET suspect = true, price_check = 'entry'
  WHERE portfolio = 'Y' AND NOT suspect AND entry_mc BETWEEN 27.958 AND 27.960
    AND opened_at >= '2026-11-13 20:00:00+00' AND opened_at < '2026-11-16 00:00:00+00';
+
+-- Реальный бот (scanner/real): позиции и журнал всех заявок. mode: shadow — «тень» (без денег), live — «бой».
+CREATE TABLE IF NOT EXISTS real_positions (
+    id            bigserial PRIMARY KEY,
+    mode          text NOT NULL,                 -- shadow | live
+    kind          text NOT NULL,                 -- smart | mydev
+    mint          text NOT NULL,
+    symbol        text,
+    trader        text,                          -- кошелёк-источник сигнала (выход за ним)
+    alert_id      bigint,                        -- тот же алерт, что у бумаги: для сравнения с ней
+    venue         text,                          -- pump (кривая) | pump-amm (PumpSwap)
+    token_program text,
+    opened_at     timestamptz NOT NULL DEFAULT now(),
+    closed_at     timestamptz,
+    trigger_slot  bigint,                        -- блок покупки трейдера / создания монеты
+    trigger_mc    double precision,              -- цена сигнала, MC в SOL
+    lag_s         double precision,              -- через сколько секунд после сигнала отправлена покупка
+    entry_mc      double precision,              -- цена входа, MC в SOL
+    entry_slot    bigint,                        -- блок, в который легла покупка (бой)
+    cost_sol      double precision NOT NULL,     -- потрачено: ставка + комиссии сети (без возвратного залога)
+    tokens        double precision NOT NULL,
+    tokens_raw    bigint NOT NULL DEFAULT 0,
+    rent_sol      double precision NOT NULL DEFAULT 0,   -- залог счёта токена (возвращается при закрытии счёта)
+    buy_sig       text,
+    exit_reason   text,
+    exit_mc       double precision,
+    proceeds_sol  double precision NOT NULL DEFAULT 0,
+    sell_sig      text,
+    pnl_sol       double precision,
+    pnl_pct       double precision,
+    max_mc        double precision,
+    tp_done       boolean NOT NULL DEFAULT false,
+    extra         jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS real_positions_open_idx ON real_positions (mint) WHERE closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS real_positions_opened_idx ON real_positions (opened_at);
+
+CREATE TABLE IF NOT EXISTS real_orders (
+    id          bigserial PRIMARY KEY,
+    position_id bigint,
+    mode        text NOT NULL,
+    side        text NOT NULL,                   -- buy | sell | close (закрытие пустых счетов)
+    mint        text,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    stake_sol   double precision,
+    tokens_raw  bigint,
+    min_out     bigint,                          -- лимит: минимум токенов (покупка) или лампортов (продажа)
+    slippage    double precision,
+    signature   text,                            -- подпись транзакции: проверяется на solscan.io/tx/<подпись>
+    status      text NOT NULL,                   -- simulated | sent | landed | failed | expired
+    error       text,
+    slot        bigint,
+    wait_ms     integer,                         -- от отправки до подтверждения
+    cu          integer,
+    fee_sol     double precision,
+    attempt     integer NOT NULL DEFAULT 1,
+    note        text,
+    base        jsonb NOT NULL DEFAULT '{}'::jsonb   -- параметры заявки на покупку: по ним позиция восстанавливается
+);                                                    -- после перезапуска, если покупка легла без бота
+ALTER TABLE real_orders ADD COLUMN IF NOT EXISTS base jsonb NOT NULL DEFAULT '{}'::jsonb;
+CREATE INDEX IF NOT EXISTS real_orders_created_idx ON real_orders (created_at);
+CREATE INDEX IF NOT EXISTS real_orders_position_idx ON real_orders (position_id);

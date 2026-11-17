@@ -40,8 +40,13 @@ def trigger_of(r: Any) -> dict[str, Any]:
     """Покупка трейдера, по которой входит бумага (блок, подпись, MC после неё, когда увидели)."""
     if not r["slot"] or not r["signature"] or not r["mc_sol"]:
         return {}
-    return {"trigger_slot": int(r["slot"]), "trigger_sig": r["signature"], "trigger_mc": float(r["mc_sol"]),
-            "trigger_at": time.time()}
+    out = {"trigger_slot": int(r["slot"]), "trigger_sig": r["signature"], "trigger_mc": float(r["mc_sol"]),
+           "trigger_at": time.time()}
+    try:
+        out["trigger_ts"] = r["ts"].timestamp()        # время блока покупки: от него реальный бот меряет задержку
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 @dataclass
@@ -122,6 +127,12 @@ class Engine:
         self.new_eval_at: dict[str, float] = {}
         self.trends = Trends(self)
         self.paper = PaperTrader(self)
+        self.real: Any = None
+        try:        # реальный бот (scanner/real) — отдельный модуль: если он не поднялся, остальной бот работает
+            from ..real.executor import RealTrader
+            self.real = RealTrader(self)
+        except Exception:  # noqa: BLE001
+            log.exception("реальный бот не запущен")
         from .pricecheck import PriceCheck
         self.pricecheck = PriceCheck(self)
         from .autofilter import AutoFilter
@@ -202,6 +213,12 @@ class Engine:
         await self._load_references()
         await self.paper.start()
         await self.paper.reconcile()          # баланс бумаги без сделок ⚠ (иначе фальшивая прибыль раздувает ставки)
+        if self.real is not None:
+            try:
+                await self.real.start()
+            except Exception:  # noqa: BLE001
+                log.exception("реальный бот: запуск")
+                self.real = None
         await self.copyguard.load()
         for p in self.paper.positions.values():   # монеты открытых бумажных позиций держим в памяти
             if p.mint not in self.states:
@@ -231,6 +248,8 @@ class Engine:
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
                  self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.paper.tick_loop(),
                  self.pricecheck.loop(), self.scout.loop(), self.ratings.loop(), self.filter.loop()]
+        if self.real is not None:
+            tasks.append(self.real.loop())
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
 
     # ------------------------------------------------------------------ поток событий
@@ -463,6 +482,11 @@ class Engine:
         await self._maybe_new_coin(st)
         if eff is not None and self.paper.positions:
             await self.paper.on_trade(st, eff, trader, r["is_buy"], r["slot"], r["sol_amount"])
+        if eff is not None and self.real is not None and self.real.positions:
+            try:
+                await self.real.on_trade(st, eff, trader, r["is_buy"], r["slot"], r["sol_amount"])
+            except Exception:  # noqa: BLE001
+                log.exception("реальный бот: сделка монеты")
         entry = self.alerts.get(mint)
         if entry and eff is not None and time.monotonic() < entry.follow_until:
             await self._follow(st, entry, eff, r)
@@ -650,6 +674,10 @@ class Engine:
             # у RPC сама — без задержки алерта)
             data.update(trigger_slot=int(slot0 or 0), trigger_sig=sig0, trigger_mc=float(st.mc or 0) or 1.0,
                         trigger_at=time.time(), trigger_create=True)
+            try:
+                data["trigger_ts"] = rec["created_at"].timestamp()     # время блока создания монеты
+            except Exception:  # noqa: BLE001
+                pass
         await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev",
                                   trader=dev_addr)
 

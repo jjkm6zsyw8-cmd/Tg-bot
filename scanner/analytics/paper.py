@@ -585,6 +585,10 @@ class PaperTrader:
         if not targets:
             self.skipped["*"] = why
             return
+        real = getattr(self.e, "real", None)
+        if real is not None and targets & {MAIN, MYDEV}:
+            # реальный бот получает сигнал одновременно с бумагой и сам решает, входить ли (scanner/real)
+            asyncio.create_task(real.on_signal(mint, level, alert_id, dict(data), trader, set(targets)))
         if self.realtime(data):
             await self._enter_realtime(mint, level, alert_id, data, trader, targets)
             return

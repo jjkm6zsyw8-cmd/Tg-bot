@@ -1,11 +1,15 @@
 # Приёмник, аналитика, бот, страница перехода и база — отдельные сервисы с автоперезапуском.
+x-env: &env
+  DATABASE_URL: postgresql://scanner:${POSTGRES_PASSWORD:-scanner}@db:5432/scanner
+  LOG_DIR: /app/logs
+
 x-app: &app
   build: .
   restart: unless-stopped
   env_file: .env
   environment:
-    DATABASE_URL: postgresql://scanner:${POSTGRES_PASSWORD:-scanner}@db:5432/scanner
-    LOG_DIR: /app/logs
+    <<: *env
+    REAL_PRIVATE_KEY: ""               # ключ кошелька реального бота получает только сервис analytics (ниже)
   volumes:
     - ./config:/app/config:ro          # пороги и шаблоны ссылок меняются без пересборки
     - ./logs:/app/logs
@@ -38,6 +42,7 @@ services:
 
   analytics:
     <<: *app
+    environment: *env                  # единственный сервис, которому виден REAL_PRIVATE_KEY из .env
     command: ["analytics"]
 
   bot:

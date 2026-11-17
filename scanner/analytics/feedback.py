@@ -70,6 +70,10 @@ class Feedback:
             from .walletcheck import import_report
             # история ~150 транзакций на кошелёк — минуты; в фоне, чтобы не держать другие задачи
             asyncio.create_task(import_report(self.e, p.get("wallets") or []))
+        elif kind == "real":
+            real = getattr(self.e, "real", None)
+            if real is not None:
+                await real.command(p)
         elif kind == "reload":
             await self.e._load_traders()
             await self.e._load_references()
