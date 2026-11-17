@@ -162,7 +162,7 @@ class Scout:
         events += await self.demote()
         events += await self.fill_slots()
         try:
-            events += await self.lookalike.run()          # поиск по образцу smart A — раз в 6 часов
+            events += await self.lookalike.run()          # по образцу smart A: поиск раз в 3 ч, проверка раз в час
         except Exception:  # noqa: BLE001 — тяжёлый запрос мог отмениться по времени; разведка продолжает работать
             log.exception("разведка: поиск по образцу")
         await self.load()

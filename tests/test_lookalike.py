@@ -166,3 +166,18 @@ async def test_diagnose_and_age_window(db):
     assert "покупок 12 (монет 12)" in text and "на кривой pump 12" in text and "возраст монеты" in text
     assert "121" in text                                                       # купил через 121 мин после запуска
     assert "нет ни одной его сделки" in await LK.diagnose(db, {}, "NOBODY", now, 24)
+
+
+async def test_confirms_as_soon_as_ten_new_buys(db):
+    """Решение не через сутки, а как только кошелёк набрал 10 новых покупок после находки (не раньше 3 ч)."""
+    now = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    await history(db, now, "FAST", ["pump"] * 12)
+    lk = LK.Lookalike(SimpleNamespace(db=db, cfg={}))
+    await lk.run(now=now)
+    assert await db.fetchval("SELECT status FROM scout WHERE address='FAST'") == LK.STATUS
+    for i in range(11):                                                         # новые покупки — за первый час
+        await coin(db, "FAST", now + timedelta(minutes=5 * i), "pump")
+    assert await lk.run(now=now + timedelta(hours=2)) == []                     # раньше 3 часов не решает
+    events = await lk.run(now=now + timedelta(hours=3, minutes=5))
+    assert await db.fetchval("SELECT status FROM scout WHERE address='FAST'") == "promoted"
+    assert any("✅" in e for e in events)

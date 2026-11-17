@@ -12,10 +12,11 @@
    дальше 5 минут: цена дошла до +25% чистыми — тейк; он продал раньше — выход по его продаже; иначе — по цене
    через 5 минут. Комиссии — как у бумаги.
 3. Кандидат: 10+ покупок, тейк в 60%+, в среднем +10%+ на копию, быстрых сбросов (продал за 20 с) не больше 30%.
-4. Проверка вперёд: через сутки — заново, уже на новых сделках. Подтвердился — в smart (как кошельки разведки:
-   метка 🧬, чистка по итогу копий в G); нет — отсев на 7 дней. Ни одной покупки за 3 дня — отсев.
+4. Проверка вперёд — только на его покупках после находки: каждый час; как только набралось 10 новых (не раньше
+   чем через 3 часа) — решение. Подтвердился — в smart (как кошельки разведки: метка 🧬, чистка по итогу копий
+   в G); нет — отсев на 7 дней. За 3 дня не набрал 10 покупок — отсев.
 
-Считается раз в 6 часов, с ограничением времени запросов, чтобы не мешать остальному боту.
+Поиск — раз в 3 часа, проверка найденных — раз в час, с ограничением времени запросов.
 """
 from __future__ import annotations
 
@@ -35,7 +36,8 @@ SOURCE = "образец smart A"
 STATUS = "lookalike"                    # статус в таблице scout на время проверки вперёд
 DEFAULTS: dict[str, Any] = {
     "lk_enabled": True,
-    "lk_every_h": 6.0,                  # как часто пересчитывать
+    "lk_every_h": 3.0,                  # как часто искать новых
+    "lk_confirm_every_h": 1.0,          # как часто проверять найденных на новых сделках
     "lk_hours": 24.0,                   # за сколько часов брать покупки
     "lk_min_sol": 0.3, "lk_max_sol": 5.0,
     "lk_max_age_min": 25,               # покупки в первые N минут монеты (дальше данные о цене неполные)
@@ -46,7 +48,7 @@ DEFAULTS: dict[str, Any] = {
     "lk_fee": 0.03,                     # комиссии площадки и сети туда-обратно (доля)
     "lk_horizon_s": 300,
     "lk_min_n": 10, "lk_min_hit": 0.60, "lk_min_avg": 0.10, "lk_max_quick": 0.30,
-    "lk_confirm_h": 20.0,               # через сколько часов проверять вперёд
+    "lk_confirm_min_h": 3.0,            # решение — как только наберёт lk_min_n новых покупок, но не раньше
     "lk_max_promoted": 5,               # сколько кошельков «по образцу» держать в smart
     "lk_timeout_s": 120,
 }
@@ -255,7 +257,8 @@ async def evaluate(db: Any, cfg: dict[str, Any], until: datetime, hours: float |
 
 
 class Lookalike:
-    """Раз в lk_every_h: ищет кандидатов, через сутки проверяет их на новых сделках, подтвердившихся — в smart."""
+    """Раз в 3 часа ищет кандидатов; каждый час проверяет найденных на их новых сделках (после находки): набрали
+    10 покупок и цифры повторились — в smart, не повторились — отсев."""
 
     def __init__(self, engine: Any):
         self.e = engine
@@ -296,15 +299,27 @@ class Lookalike:
                 out.add(w)
         return out
 
+    async def confirm_due(self, now: datetime) -> bool:
+        if not cfg_get(self.cfg, "lk_enabled"):
+            return False
+        at = await self.db.kv_get("lookalike:confirm_at")
+        try:
+            return (now - datetime.fromisoformat(at)).total_seconds() >= \
+                float(cfg_get(self.cfg, "lk_confirm_every_h")) * 3600
+        except Exception:  # noqa: BLE001
+            return True
+
     async def run(self, now: datetime | None = None, force: bool = False) -> list[str]:
         now = now or datetime.now(timezone.utc)
+        events: list[str] = []
+        if force or await self.confirm_due(now):          # найденные — каждый час, как только набрали покупок
+            await self.db.kv_set("lookalike:confirm_at", now.isoformat())
+            events += await self._confirm(now)
         if not force and not await self.due(now):
-            return []
+            return events
         t0 = time.monotonic()
         self.last = {}
-        events: list[str] = []
         try:
-            events += await self._confirm(now)
             events += await self._discover(now)
         except Exception as exc:
             self.last["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
@@ -358,7 +373,8 @@ class Lookalike:
 
     async def _confirm(self, now: datetime) -> list[str]:
         rows = await self.db.fetch("SELECT address, found_at FROM scout WHERE status=$1", STATUS)
-        due = [r for r in rows if (now - r["found_at"]).total_seconds() >= float(cfg_get(self.cfg, "lk_confirm_h")) * 3600]
+        due = [r for r in rows
+               if (now - r["found_at"]).total_seconds() >= float(cfg_get(self.cfg, "lk_confirm_min_h")) * 3600]
         if not due:
             return []
         out: list[str] = []
@@ -410,15 +426,17 @@ async def report_lines(db: Any) -> list[str]:
     rows = await db.fetch("SELECT address, reason, found_at FROM scout WHERE status=$1 ORDER BY score DESC", STATUS)
     lines = ["\n<b>🧬 Поиск по образцу smart A</b> (как 7BNax: после его покупки цена сразу растёт)"]
     if last.get("at"):
-        lines.append(f"Последний пересчёт: {esc(str(last['at'])[:16].replace('T', ' '))} UTC · проверено кошельков "
-                     f"{last.get('checked', 0)}, подходят {last.get('found', 0)}")
+        lines.append(f"Последний поиск: {esc(str(last['at'])[:16].replace('T', ' '))} UTC за {last.get('took_s', '?')} с"
+                     f" · проверено кошельков {last.get('checked', 0)}, подходят {last.get('found', 0)}")
     else:
-        lines.append("Ещё не считался (раз в 6 часов).")
+        lines.append("Ещё не считался (раз в 3 часа).")
     if last.get("error"):
         lines.append(f"⚠️ Последний пересчёт не удался: {esc(last['error'])}")
+    if rows:
+        lines.append("На проверке (решение — когда наберёт 10 новых покупок, не раньше чем через 3 ч):")
     for r in rows[:8]:
-        lines.append(f"• {esc(short(r['address']))} — {esc(r['reason'] or '')} · проверка вперёд после "
-                     f"{(r['found_at'] + timedelta(hours=DEFAULTS['lk_confirm_h'])).strftime('%d.%m %H:%M')} UTC")
+        lines.append(f"• {esc(short(r['address']))} — {esc(r['reason'] or '')} · найден "
+                     f"{r['found_at'].strftime('%d.%m %H:%M')} UTC")
     ref = last.get("reference") or []
     if ref:
         lines.append("Те же цифры у кошельков smart (за сутки):")
