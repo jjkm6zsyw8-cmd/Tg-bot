@@ -66,6 +66,11 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
     "real_mydev": ("Сигналы «мой дев»", True, ""),
     "real_live_mydev": ("«Мой дев» в бою (иначе только в тени)", False,
                         "Пока выключено, запуски девов исполняются только в тени, даже когда включён бой."),
+    "real_copy": ("Копии своего списка и разведки (как бумага H)", False,
+                  "Покупки кошельков из вашего списка и кандидатов разведки; выход как G."),
+    "real_bigcopy": ("Крупные копии — трейдер зашёл от 5 SOL (как K)", False, "Выход как G."),
+    "real_swing": ("Смарт-ракеты — покупки держателей (как R)", False,
+                   "Трейлинг 35% после +30%, стоп −50%, держит до суток — занимает место позиции надолго."),
     "real_mev_protect": ("Обходить валидаторов-«сэндвичеров»", True, "Параметр mev-protect у Helius Sender."),
     "real_close_ata": ("Закрывать пустые счета токенов (возврат залога)", True, "≈0.0015 SOL с каждой монеты."),
     "real_notify_shadow": ("Сообщения о сделках тени", False, ""),
@@ -129,3 +134,29 @@ def fmt(key: str, v: Any) -> str:
     if kind == "sec":
         return f"{v:g} с"
     return f"{v:g}"
+
+
+# Методы торговли: вид сигнала → (название, выключатель, бумажный портфель с тем же входом и выходом).
+# У smart и «мой дев» правило выхода выбирается (A / B / G), у остальных — как у их бумажного портфеля.
+METHODS: dict[str, tuple[str, str, str]] = {
+    "smart": ("Smart", "real_smart", "A"),
+    "mydev": ("Мой дев", "real_mydev", "Y"),
+    "copy": ("Копии своего списка и разведки", "real_copy", "H"),
+    "bigcopy": ("Крупные копии (от 5 SOL)", "real_bigcopy", "K"),
+    "swing": ("Смарт-ракеты (держатели)", "real_swing", "R"),
+}
+KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", "bigcopy": "крупная копия",
+              "swing": "смарт-ракета"}
+
+
+def methods_summary(cfg: dict[str, Any]) -> str:
+    """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»."""
+    out = []
+    if get(cfg, "real_smart"):
+        out.append(f"Smart {get(cfg, 'real_scheme')}")
+    if get(cfg, "real_mydev"):
+        out.append(f"Мой дев {get(cfg, 'real_scheme_mydev')}" + ("" if get(cfg, "real_live_mydev") else " (только тень)"))
+    for kind in ("copy", "bigcopy", "swing"):
+        if get(cfg, METHODS[kind][1]):
+            out.append(METHODS[kind][0])
+    return " · ".join(out) if out else "все выключены"

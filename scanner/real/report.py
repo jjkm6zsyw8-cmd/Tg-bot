@@ -23,7 +23,7 @@ from . import settings as S
 
 STATUS_KEY = "real:status"
 STALE_S = 90.0
-KINDS = {"smart": "smart", "mydev": "мой дев"}
+KINDS = S.KIND_NAMES
 MODE_ICON = {"off": "⚪", "shadow": "👻", "live": "💵"}
 MODE_SHORT = {"off": "выкл", "shadow": "тень", "live": "бой"}
 EXIT_NAMES = {"take_profit": "тейк", "stop": "стоп", "trailing": "трейлинг", "time_stop": "нет роста",
@@ -193,13 +193,7 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
                     + ("…" if m == "live" and want != "live" else ""), "callback": f"rl:mode:{m}"}
                    for m in ("off", "shadow", "live")])
         kb.append([{"text": "👛 Кошельки: создать и пополнить", "callback": "rl:wl"}])
-    kinds = []
-    if S.get(cfg, "real_smart"):
-        kinds.append(f"smart — {S.get(cfg, 'real_scheme')} ({scheme_text(S.get(cfg, 'real_scheme'))})")
-    if S.get(cfg, "real_mydev"):
-        kinds.append(f"мой дев — {S.get(cfg, 'real_scheme_mydev')} ({scheme_text(S.get(cfg, 'real_scheme_mydev'))})"
-                     + ("" if S.get(cfg, "real_live_mydev") else " — в бою не участвует, только тень"))
-    lines.append("Сигналы и выход: " + ("; ".join(kinds) if kinds else "все выключены"))
+    lines.append(("Методы по умолчанию: " if wallets else "Методы: ") + S.methods_summary(cfg))
     opened = [(name, o) for name, x in statuses for o in (x.get("open") or [])]
     if opened:
         lines.append(f"\n<b>Открыто: {len(opened)}</b>")
@@ -232,7 +226,8 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
                {"text": "💰 Продать всё…", "callback": "rl:sellall"}])
     kb.append([{"text": "📋 Сделки", "callback": "rl:trades"}, {"text": "⚖️ Против бумаги", "callback": "rl:cmp"},
                {"text": "📄 Файл", "callback": "rl:csv"}])
-    kb.append([{"text": "⚙️ Настройки", "callback": "rl:set"}, {"text": "🧪 Проверка на сети", "callback": "rl:check"}])
+    kb.append([{"text": "🎯 Методы", "callback": "rl:wme:g"}, {"text": "⚙️ Настройки", "callback": "rl:set"},
+               {"text": "🧪 Проверка", "callback": "rl:check"}])
     return "\n".join(lines), kb
 
 

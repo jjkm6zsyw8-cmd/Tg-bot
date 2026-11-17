@@ -111,10 +111,7 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
              "Баланс: " + (f"<b>{bal:.4f} SOL</b> (${bal * sol_usd:.2f})" if bal is not None else "неизвестен"),
              f"Режим: {MODE_ICON.get(mode, '')} <b>{S.MODES.get(mode, mode)}</b> · ставка "
              f"{S.fmt('real_stake_usd', S.get(wcfg, 'real_stake_usd'))} · позиций до {S.get(wcfg, 'real_max_open')}",
-             f"Сигналы: smart {'✅' if S.get(wcfg, 'real_smart') else '❌'} · мой дев "
-             f"{'✅' if S.get(wcfg, 'real_mydev') else '❌'}"
-             + ("" if S.get(wcfg, "real_live_mydev") else " (в бою — нет)")
-             + f" · выход: {S.get(wcfg, 'real_scheme')} / {S.get(wcfg, 'real_scheme_mydev')}",
+             f"Методы: {S.methods_summary(wcfg)}",
              f"Стопы: день {S.fmt('real_day_stop_usd', S.get(wcfg, 'real_day_stop_usd'))}, всего "
              f"{S.fmt('real_total_stop_usd', S.get(wcfg, 'real_total_stop_usd'))} · {esc(key)}"]
     if want == "live" and fresh and mode != "live":
@@ -139,7 +136,8 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
         [{"text": ("● " if want == m else "") + f"{MODE_ICON[m]} {MODE_SHORT[m].capitalize()}"
           + ("…" if m == "live" and want != "live" else ""), "callback": f"rl:wm:{wid}:{m}"}
          for m in ("off", "shadow", "live")],
-        [{"text": "⚙️ Настройки", "callback": f"rl:wsg:{wid}"}, {"text": "📋 Сделки", "callback": f"rl:wtr:{wid}"}],
+        [{"text": "🎯 Методы", "callback": f"rl:wme:{wid}"}, {"text": "⚙️ Настройки", "callback": f"rl:wsg:{wid}"},
+         {"text": "📋 Сделки", "callback": f"rl:wtr:{wid}"}],
         [{"text": "▶️ Продолжить входы", "callback": f"rl:wr:{wid}"} if own_pause else
          {"text": "⛔ Стоп входов", "callback": f"rl:wp:{wid}"},
          {"text": "💰 Продать всё…", "callback": f"rl:wx:{wid}"}],
@@ -275,10 +273,101 @@ async def create_and_wait(db: Any, cfg: dict[str, Any], name: str, rpc: Any = No
                  [[{"text": "👛 Кошельки", "callback": "rl:wl"}]])
 
 
+# ---------------------------------------------------------------------- методы торговли
+PAPER_DAYS = 7
+SCHEME_SHORT = {"A": "всё на +25%, без стопа", "B": "70% на +25%, остаток трейлинг 15%",
+                "G": "всё на +25%, стоп −8%, 5 мин на +10%"}
+METHOD_RULES = {"copy": "выход как G", "bigcopy": "выход как G",
+                "swing": "трейлинг 35% после +30%, стоп −50%, держит до суток"}
+
+
+async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float]]:
+    """Бумага по портфелям за days дней: (сделок, в плюс, итог в $ при $10 на сделку). Только честные входы
+    (цена блока +2 из блокчейна) и без сделок ⚠."""
+    rows = await db.fetch(
+        """SELECT portfolio, count(*) n, count(*) FILTER (WHERE pnl_pct > 0) w, COALESCE(sum(pnl_pct), 0) s
+           FROM paper_positions WHERE closed_at > now() - make_interval(days => $1) AND NOT suspect
+             AND exit_reason IS DISTINCT FROM 'reset' AND entry_src LIKE 'блок%' GROUP BY portfolio""", int(days))
+    return {r["portfolio"]: (int(r["n"]), int(r["w"]), float(r["s"]) * 10) for r in rows}
+
+
+def _stat(st: dict[str, tuple[int, int, float]], port: str) -> str:
+    n, w, usd = st.get(port, (0, 0, 0.0))
+    if not n:
+        return "бумага: сделок нет"
+    return f"бумага: {n} сд., в плюс {w / n:.0%}, {'+' if usd >= 0 else '−'}${abs(usd):.0f}"
+
+
+async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[str, Kb]:
+    """Какими методами торгует кошелёк (wid) или общая полоса (None): включить / выключить, правило выхода."""
+    if wid is not None:
+        w = await wallet_row(db, wid)
+        if w is None:
+            return "Кошелёк не найден (удалён).", [[{"text": "← Кошельки", "callback": "rl:wl"}]]
+        wcfg, title, back, tag = {**cfg, **(w["settings"] or {})}, esc(w["name"]), f"rl:w:{wid}", str(wid)
+    else:
+        wcfg, title, back, tag = cfg, "общие (без кошелька и по умолчанию)", "rl:view", "g"
+    st = await paper_stats(db)
+    on = lambda key: S.get(wcfg, key)  # noqa: E731
+    lines = [f"🎯 <b>Методы торговли: {title}</b>",
+             f"Рядом — что метод дал на бумаге за {PAPER_DAYS} дн. при $10 на сделку (только честные входы, без ⚠). "
+             "На один сигнал — одна позиция: если сигнал подходит под несколько методов, берётся первый по списку.", ""]
+    kb: Kb = []
+    smart, sch = on("real_smart"), S.get(wcfg, "real_scheme")
+    lines.append(f"<b>1. Smart</b> — {'вкл, правило ' + sch if smart else 'выкл'}")
+    lines += [f"   {'●' if smart and sch == x else '○'} {x}: {SCHEME_SHORT[x]} — {_stat(st, x)}" for x in S.SCHEMES]
+    kb.append([{"text": ("● " if not smart else "") + "Smart: выкл", "callback": f"rl:wmx:{tag}:smart:off"}]
+              + [{"text": ("● " if smart and sch == x else "") + x, "callback": f"rl:wmx:{tag}:smart:{x}"}
+                 for x in S.SCHEMES])
+    dev, dsch, dlive = on("real_mydev"), S.get(wcfg, "real_scheme_mydev"), on("real_live_mydev")
+    lines.append(f"<b>2. Мой дев</b> — {'вкл, правило ' + dsch if dev else 'выкл'}"
+                 + (" · в бою: " + ("да" if dlive else "нет, только тень") if dev else "") + f" — {_stat(st, 'Y')} (G)")
+    kb.append([{"text": ("● " if not dev else "") + "Мой дев: выкл", "callback": f"rl:wmx:{tag}:mydev:off"}]
+              + [{"text": ("● " if dev and dsch == x else "") + x, "callback": f"rl:wmx:{tag}:mydev:{x}"}
+                 for x in S.SCHEMES])
+    kb.append([{"text": f"{'✅' if dlive else '⬜'} Мой дев и в бою", "callback": f"rl:wmx:{tag}:devlive:{0 if dlive else 1}"}])
+    for i, kind in enumerate(("bigcopy", "copy", "swing"), 3):
+        name, key, port = S.METHODS[kind]
+        lines.append(f"<b>{i}. {name}</b> — {'вкл' if on(key) else 'выкл'} · {METHOD_RULES[kind]} — {_stat(st, port)}")
+        kb.append([{"text": f"{'✅' if on(key) else '⬜'} {name}", "callback": f"rl:wmx:{tag}:{kind}:{0 if on(key) else 1}"}])
+    lines.append("")
+    lines.append("Бумага — не реальные сделки: реальный результат покажет тень и «⚖️ Против бумаги».")
+    kb.append([{"text": "← Назад", "callback": back}])
+    return "\n".join(lines), kb
+
+
+def method_patch(method: str, value: str) -> dict[str, Any] | None:
+    """Нажатие на экране методов → какие настройки записать."""
+    if method in ("smart", "mydev"):
+        on_key, scheme_key = S.METHODS[method][1], S.SCHEME_KEYS[method]
+        if value == "off":
+            return {on_key: False}
+        if value in S.SCHEMES:
+            return {on_key: True, scheme_key: value}
+        return None
+    if method == "devlive" and value in ("0", "1"):
+        return {"real_live_mydev": value == "1"}
+    if method in ("copy", "bigcopy", "swing") and value in ("0", "1"):
+        return {S.METHODS[method][1]: value == "1"}
+    return None
+
+
 # ---------------------------------------------------------------------- нажатия
 async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: str, rpc: Any = None) -> Reply:
     parts = rest.split(":") if rest else []
     wid = int(parts[0]) if parts and parts[0].isdigit() else None
+    if action in ("wme", "wmx") and parts and (parts[0] == "g" or wid is not None):
+        if action == "wmx" and len(parts) == 3:
+            patch = method_patch(parts[1], parts[2])
+            if patch is not None:
+                if wid is None:
+                    for k, v in patch.items():
+                        await db.set_override(k, v)
+                    cfg = {**cfg, **patch}
+                else:
+                    await set_wallet(db, wid, patch)
+        text, kb = await methods_view(db, cfg, wid)
+        return Reply(text, kb, "Сохранено" if action == "wmx" else "", True)
 
     async def card(toast: str = "") -> Reply:
         text, kb = await wallet_view(db, cfg, wid, rpc) if wid else await wallets_view(db, cfg)

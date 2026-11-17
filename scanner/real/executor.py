@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING, Any
 from solders.pubkey import Pubkey
 
 from ..alerts import format as fmt
-from ..analytics.paper import MAIN, MYDEV, SCHEMES, TINY_REBUY_SOL, Position, decide_exit, sell_fill
+from ..analytics.paper import (BIGCOPY, MAIN, MYDEV, SCHEMES, SCOUT, SMART_SET, SWING, TINY_REBUY_SOL, Position,
+                               decide_exit, sell_fill)
 from . import pump, pumpswap, settings as S, tx as rtx
 from .keys import Wallet, load_wallet
 
@@ -44,7 +45,25 @@ STATUS_KEY = "real:status"
 TOPIC = "real"                        # отдельная тема Telegram «Реальный бот»
 BASE_FEE = 5_000                      # лампортов за подпись
 SIM_RESERVE = 6_000_000               # лампортов оставляем кошельку при симуляции (залоги счетов и комиссия)
-KINDS = {"smart": "smart", "mydev": "мой дев"}
+KINDS = S.KIND_NAMES
+SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
+
+
+def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
+    """Какими методами можно торговать этот сигнал — по порядку приоритета (одна позиция на монету)."""
+    modes = set(data.get("modes") or [])
+    out = []
+    if targets & SMART_TARGETS and "smart" in modes:
+        out.append("smart")
+    if MYDEV in targets and "mydev" in modes:
+        out.append("mydev")
+    if BIGCOPY in targets:
+        out.append("bigcopy")
+    if SCOUT in targets and modes & {"copy", "scout"}:
+        out.append("copy")
+    if SWING in targets and "swing" in modes:
+        out.append("swing")
+    return out
 MODE_ICON = {"live": "💵", "shadow": "👻"}
 EXIT_NAMES = {"take_profit": "тейк", "stop": "стоп", "trailing": "трейлинг", "time_stop": "нет роста",
               "max_hold": "время вышло", "trader_sell": "трейдер продал", "tiny_rebuy": "мелкая докупка",
@@ -146,15 +165,19 @@ class RealTrader:
 
     def mode_for(self, kind: str) -> str:
         m = self.mode()
-        if m == "off" or not self.get("real_smart" if kind == "smart" else "real_mydev"):
+        if m == "off" or kind not in S.METHODS or not self.get(S.METHODS[kind][1]):
             return "off"
         if m == "live" and kind == "mydev" and not self.get("real_live_mydev"):
             return "shadow"                          # запуски девов в бою — только по отдельному разрешению
         return m
 
     def scheme_for(self, kind: str | None) -> dict[str, Any]:
-        """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага)."""
-        return SCHEMES[self.get(S.SCHEME_KEYS.get(kind or "smart", "real_scheme"))]
+        """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага): у smart и
+        «мой дев» — выбранная (A / B / G), у копий, крупных копий и смарт-ракет — их портфелей H / K / R."""
+        kind = kind or "smart"
+        if kind in S.SCHEME_KEYS:
+            return SCHEMES[self.get(S.SCHEME_KEYS[kind])]
+        return SCHEMES[S.METHODS[kind][2]]
 
     def paused(self) -> str:
         """Стоп-кран: общий (для всех кошельков) или этого кошелька."""
@@ -323,14 +346,10 @@ class RealTrader:
         """Сигнал бумаги: smart (идёт в боевой портфель M) или «мой дев» (портфель Y)."""
         if not self.accept_new:
             return
-        modes = set(data.get("modes") or [])
-        kind = "smart" if MAIN in targets and "smart" in modes else \
-            "mydev" if MYDEV in targets and "mydev" in modes else None
+        kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"), None)
         if kind is None:
             return
         mode = self.mode_for(kind)
-        if mode == "off":
-            return
         why = self.entry_block(mint, kind, mode, data)
         if why:
             return self._skip(mode, kind, why)

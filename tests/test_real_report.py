@@ -51,10 +51,10 @@ async def test_status_before_first_start(db):
     text, kb = await report.status_view(db, {})
     assert "Исполнитель ещё не запускался" in text and "тень (без денег)" in text
     assert "Ставка <b>$5</b>" in text and "общий стоп $30" in text
-    assert "smart — A" in text and "мой дев — G" in text and "только тень" in text
+    assert "Методы: Smart A · Мой дев G (только тень)" in text
     cbs = callbacks(kb)
     for c in ("rl:view", "rl:mode:off", "rl:mode:shadow", "rl:mode:live", "rl:pause", "rl:sellall", "rl:trades",
-              "rl:cmp", "rl:csv", "rl:set", "rl:check"):
+              "rl:cmp", "rl:csv", "rl:set", "rl:check", "rl:wme:g", "rl:wl"):
         assert c in cbs
     assert all(len(c.encode()) <= 64 for c in cbs)                      # ограничение Telegram на данные кнопки
     assert "пока нет" in await report.trades_text(db, {})
