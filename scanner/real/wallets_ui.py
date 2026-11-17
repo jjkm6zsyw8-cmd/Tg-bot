@@ -53,6 +53,17 @@ async def set_wallet(db: Any, wid: int, patch: dict[str, Any] | None = None, dro
     await db.job("real", {"cmd": "reload"})
 
 
+async def wait_lane(db: Any, wid: int, want: str, timeout_s: float = 3.0) -> None:
+    """Подождать (до timeout_s), пока исполнитель кошелька перечитает настройки, — чтобы карточка сразу показала
+    новый режим, а не прошлый."""
+    end = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < end:
+        ws, age = await lane_status(db, wid)
+        if age is None or age >= STALE_S or ws.get("want") == want:
+            return
+        await asyncio.sleep(0.3)
+
+
 # ---------------------------------------------------------------------- список
 async def wallets_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     desk, age = await load_desk(db)
@@ -113,7 +124,11 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
              f"Стопы: день {S.fmt('real_day_stop_usd', S.get(wcfg, 'real_day_stop_usd'))}, всего "
              f"{S.fmt('real_total_stop_usd', S.get(wcfg, 'real_total_stop_usd'))} · {esc(key)}"]
     if want == "live" and fresh and mode != "live":
-        lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(ws.get('why_not_live') or 'нет разрешения на сервере')}.")
+        if ws.get("want") != "live" or not ws.get("why_not_live"):
+            # исполнитель ещё не перечитал настройки (нажали секунду назад) — это не отказ
+            lines.append("⏳ Бой включается — нажмите 🔄 Обновить через пару секунд.")
+        else:
+            lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(ws['why_not_live'])}.")
     if not fresh:
         lines.append("⚠️ Исполнитель не отвечает — состояние может быть устаревшим.")
     own_pause = str((w["settings"] or {}).get("real_paused") or "")
@@ -537,6 +552,7 @@ async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: st
             if not can:
                 return Reply(text, kb, "Бой не включён: условия не выполнены", True)
             await set_wallet(db, wid, {"real_mode": "live", "real_armed_at": datetime.now(timezone.utc).isoformat()})
+            await wait_lane(db, wid, "live")
             return await card("Бой включён")
     if action == "wsg":
         w = await wallet_row(db, wid)

@@ -182,7 +182,10 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
         shown = mode or want
         lines.append(f"Режим: {MODE_ICON[shown]} <b>{S.MODES[shown]}</b>")
         if want == "live" and mode and mode != "live":
-            lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(st.get('why_not_live') or 'нет разрешения на сервере')}.")
+            if st.get("want") != "live" or not st.get("why_not_live"):
+                lines.append("⏳ Бой включается — нажмите 🔄 Обновить через пару секунд.")
+            else:
+                lines.append(f"⚠️ «Бой» выбран, но не включён: {esc(st['why_not_live'])}.")
         if paused:
             lines.append(f"⛔ Новые входы остановлены: {esc(paused)}")
         if st.get("wallet"):

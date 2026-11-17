@@ -367,3 +367,27 @@ async def test_desk_checks_price_of_shadow_positions_from_chain(db):
     reasons = {r["exit_reason"] for r in await db.fetch("SELECT exit_reason FROM real_positions WHERE closed_at IS NOT NULL")}
     assert reasons == {"take_profit"}
     assert desk.lanes[w1].external_poll and desk.lanes[w2].external_poll
+
+
+async def test_card_right_after_live_does_not_claim_server_refused(db, monkeypatch):
+    """18.11: сразу после «Да, включить бой» карточка писала «нет разрешения на сервере», хотя исполнитель просто
+    ещё не перечитал настройки. Теперь: «включается», а настоящая причина — только если исполнитель её назвал."""
+    chain = FakeChain()
+    desk = make_desk(db, chain)
+    await desk.start()
+    await desk.create_wallet("Мейныч")
+    wid = next(iter(w for w in desk.lanes if w is not None))
+    lane = desk.lanes[wid]
+    await lane.publish_status()                                     # исполнитель: тень, бой ещё не выбран
+    await db.execute("UPDATE real_wallets SET settings = settings || '{\"real_mode\": \"live\"}'::jsonb WHERE id=$1",
+                     wid)
+    text, _kb = await UI.wallet_view(db, {}, wid)
+    assert "⏳ Бой включается" in text and "нет разрешения" not in text
+    await desk.reload()                                             # перечитал; REAL_LIVE на сервере не задан
+    await lane.publish_status()
+    text, _kb = await UI.wallet_view(db, {}, wid)
+    assert "не включён: на сервере не задан REAL_LIVE=1" in text and "⏳" not in text
+    monkeypatch.setenv("REAL_LIVE", "1")
+    await lane.publish_status()
+    text, _kb = await UI.wallet_view(db, {}, wid)
+    assert "💵" in text and "не включён" not in text and "⏳" not in text
