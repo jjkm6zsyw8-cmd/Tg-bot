@@ -1,8 +1,8 @@
-"""Поиск кошельков по ВСЕМУ PumpSwap через Dune (бесплатный ключ DUNE_API_KEY, раз в сутки).
+"""Поиск кошельков по ВСЕМУ PumpSwap через Dune (ключ DUNE_API_KEY, платный тариф Dune; раз в сутки).
 
 Зачем: 7BNax торговал только на PumpSwap монетами старше часов, а своя база бота видит PumpSwap только по монетам,
-за которыми уже следит. У Dune есть все сделки (таблица dex_solana.trades). GMGN просит $100 на балансе за ключ,
-Dune — бесплатно (кредиты в месяц; запрос раз в сутки).
+за которыми уже следит. У Dune есть все сделки (таблица dex_solana.trades). GMGN просит $100 на балансе за ключ.
+18.11 проверено на настоящем API: на бесплатном плане 0 кредитов в месяц — запросы только на платном тарифе.
 
 Что считается (то же, что делает боевой бот, — копия по правилу A): за последние сутки для каждого кошелька, который
 купил 10+ разных монет на PumpSwap по 0.3–5 SOL, по каждой его первой покупке монеты:
@@ -211,8 +211,8 @@ class DuneScout:
 async def report_lines(db: Any) -> list[str]:
     last = await db.kv_get("dunescout:last") or {}
     if not last and not os.environ.get("DUNE_API_KEY"):
-        return ["\n<b>🌐 Весь PumpSwap (Dune)</b>: выключен — нет ключа DUNE_API_KEY (бесплатный, dune.com → "
-                "Settings → API)."]
+        return ["\n<b>🌐 Весь PumpSwap (Dune)</b>: выключен — нет ключа DUNE_API_KEY (запросы через API у Dune "
+                "платные: на бесплатном плане 0 кредитов)."]
     if not last:
         return ["\n<b>🌐 Весь PumpSwap (Dune)</b>: ещё не считался (раз в сутки)."]
     lines = [f"\n<b>🌐 Весь PumpSwap (Dune)</b>: {esc(str(last.get('at', ''))[:16].replace('T', ' '))} UTC, "
