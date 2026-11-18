@@ -84,7 +84,8 @@ class Dune:
             return data
 
     async def run_sql(self, http: aiohttp.ClientSession, sql: str, page: int = 10_000) -> list[dict[str, Any]]:
-        ex = await self._req(http, "POST", "/sql/execute", json={"sql": sql, "performance": "medium"})
+        # 18.11: Dune отвечает «Invalid performance tier» на "performance": "medium" — без него (тариф по умолчанию)
+        ex = await self._req(http, "POST", "/sql/execute", json={"sql": sql})
         eid = ex.get("execution_id")
         if not eid:
             raise DuneError(f"нет execution_id: {ex}")
