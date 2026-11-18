@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..alerts.format import esc
 from ..external.base import Unavailable
+from . import family as FAM
 from . import lookalike as LK
 from .copytrade import linked_to_dev
 from .paper import SCOUT
@@ -145,6 +146,7 @@ class Scout:
                       "gmgn_errors": 0, "runs": 0}
         self._token_cursor = 0
         self.lookalike = LK.Lookalike(engine)
+        self.family = FAM.Family(engine, self)
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -173,6 +175,12 @@ class Scout:
             events += await self.lookalike.run()          # по образцу smart A: поиск раз в 3 ч, проверка раз в час
         except Exception:  # noqa: BLE001 — тяжёлый запрос мог отмениться по времени; разведка продолжает работать
             log.exception("разведка: поиск по образцу")
+        try:
+            events += await self.family.run()             # семья лучших: копилки → обменники → кошельки владельца
+        except Exception:  # noqa: BLE001 — узел мог не ответить; в следующий раз продолжит с того же места
+            log.exception("разведка: семья лучших кошельков")
+        if any("👪" in e for e in events):
+            events += await self.fill_slots()             # кандидат «семья» — на испытание сразу, а не через 15 минут
         await self.load()
         if events:
             await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
@@ -446,8 +454,9 @@ async def scout_report(db: Any) -> str:
         for r in done:
             lines.append(f"{icon.get(r['status'], '•')} {esc(short(r['address']))} — {esc(r['decision'] or '')}")
     try:
+        lines += await FAM.report_lines(db)
         lines += await LK.report_lines(db)
     except Exception:  # noqa: BLE001
-        log.exception("разведка: сводка поиска по образцу")
+        log.exception("разведка: сводка семьи и поиска по образцу")
     lines.append("<i>Файл по всем кошелькам — /wallets, всё за день и за 30 дней одним архивом — /export</i>")
     return "\n".join(lines)

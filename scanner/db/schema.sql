@@ -636,3 +636,16 @@ CREATE TABLE IF NOT EXISTS real_skips (
 );
 CREATE INDEX IF NOT EXISTS real_skips_mint_idx ON real_skips (mint, at);
 CREATE INDEX IF NOT EXISTS real_skips_at_idx ON real_skips (at);
+
+-- Семья лучших кошельков (analytics/family.py, с 18.11): копилки, обменники и найденные по деньгам кошельки
+-- того же владельца. root — лучший кошелёк, от которого начата цепочка.
+CREATE TABLE IF NOT EXISTS wallet_family (
+    address    text PRIMARY KEY,
+    role       text NOT NULL,              -- stash | cashout | child
+    parent     text,
+    root       text,
+    note       text,
+    found_at   timestamptz NOT NULL DEFAULT now(),
+    last_sig   text,
+    checked_at timestamptz
+);
