@@ -302,6 +302,8 @@ class RealDesk:
             await lane.say_raw(f"📤 Выводить нечего: на кошельке {balance / 1e9:.6f} SOL.")
             return "нечего выводить"
         if what == "all":
+            await lane.set_setting("real_mode_at", datetime.now(timezone.utc).isoformat())
+            await lane.set_setting("real_mode_by", "вывод всех денег с кошелька")
             await lane.set_setting("real_mode", "off")        # пустой кошелёк не должен пытаться торговать
         user = lane.wallet.pubkey
         ixs = rtx.budget_ixs(1_000, WITHDRAW_PRIORITY) + [rtx.transfer_ix(user, dest, amount)]

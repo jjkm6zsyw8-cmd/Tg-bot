@@ -66,6 +66,7 @@ def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
         out.append("swing")
     return out
 MODE_ICON = {"live": "💵", "shadow": "👻"}
+MODE_SHORT_RU = {"live": "💵 бой", "shadow": "👻 тень", "off": "выкл"}
 # сигнал, который сейчас обрабатывается (монета, алерт): у каждой задачи свой — причина пропуска пишется к нему
 _SIGNAL: contextvars.ContextVar[tuple[str, int | None] | None] = contextvars.ContextVar("real_signal", default=None)
 EXIT_NAMES = {"take_profit": "тейк", "stop": "стоп", "trailing": "трейлинг", "time_stop": "нет роста",
@@ -136,6 +137,7 @@ class RealTrader:
         self._last_poll = 0.0
         self._last_status = 0.0
         self._warned_live = False
+        self._want_seen: str | None = None          # выбранный режим на прошлом тике — смена режима сообщением
         self.since = datetime.now(timezone.utc)
 
     # ------------------------------------------------------------------ окружение
@@ -1035,6 +1037,8 @@ class RealTrader:
     async def _check_stops(self) -> None:
         sol_usd = self.sol_usd()
         if -self.live_total * sol_usd >= float(self.get("real_total_stop_usd")) and self.get("real_mode") == "live":
+            await self.set_setting("real_mode_at", datetime.now(timezone.utc).isoformat())
+            await self.set_setting("real_mode_by", f"общий стоп: убыток боя {self.live_total * sol_usd:+.2f}$")
             await self.set_setting("real_mode", "shadow")
             await self._say(f"🛑 💵 Общий стоп: убыток боя {self.live_total * sol_usd:+.2f}$ дошёл до лимита "
                             f"${self.get('real_total_stop_usd'):g}. Бой выключен, бот в режиме «тень». "
@@ -1097,7 +1101,14 @@ class RealTrader:
             self._armed_seen = self.cfg.get("real_armed_at")
             self.live_total = await self._live_total_db()
         mode = self.mode()
-        if self.get("real_mode") != "live":
+        want = self.get("real_mode")
+        if self._want_seen is not None and want != self._want_seen:
+            # 18.11: бой «пропал» (сигналы smart пошли в тень), а почему — не было видно. Любая смена режима — сообщением
+            by = str(self.cfg.get("real_mode_by") or "настройка кошелька изменена")
+            await self._say(f"🔀 Режим: {MODE_SHORT_RU.get(self._want_seen, self._want_seen)} → "
+                            f"<b>{MODE_SHORT_RU.get(want, want)}</b> ({fmt.esc(by)})")
+        self._want_seen = want
+        if want != "live":
             self._warned_live = False
         elif mode != "live" and not self._warned_live:
             self._warned_live = True

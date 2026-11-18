@@ -13,7 +13,7 @@ from typing import Any
 from ..alerts.format import esc
 from . import settings as S
 from .report import (KINDS, MODE_ICON, MODE_SHORT, STALE_S, Kb, Reply, day_start, lane_status, load_desk, money,
-                     settings_view, sol_price, totals, trades_text, wallet_rows)
+                     settings_view, sol_price, totals, trades_text, tz_of, wallet_rows)
 
 CREATE_WAIT_S = 8.0
 MASTERKEY_CMD = ("cd /opt/tg-bot &amp;&amp; echo &gt;&gt; .env &amp;&amp; docker compose run --rm --no-deps -T analytics "
@@ -123,6 +123,13 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
              f"Методы: {S.methods_summary(wcfg)}",
              f"Стопы: день {S.fmt('real_day_stop_usd', S.get(wcfg, 'real_day_stop_usd'))}, всего "
              f"{S.fmt('real_total_stop_usd', S.get(wcfg, 'real_total_stop_usd'))} · {esc(key)}"]
+    changed = (w["settings"] or {}).get("real_mode_at")
+    if changed:
+        try:
+            at = datetime.fromisoformat(str(changed)).astimezone(tz_of(cfg)).strftime("%d.%m %H:%M")
+        except Exception:  # noqa: BLE001
+            at = str(changed)[:16]
+        lines.append(f"Режим выбран {at}: {esc(str((w['settings'] or {}).get('real_mode_by') or ''))}")
     if want == "live" and fresh and mode != "live":
         if ws.get("want") != "live" or not ws.get("why_not_live"):
             # исполнитель ещё не перечитал настройки (нажали секунду назад) — это не отказ
@@ -542,7 +549,8 @@ async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: st
     if action == "wm" and len(parts) == 2:
         m = parts[1]
         if m in ("off", "shadow"):
-            await set_wallet(db, wid, {"real_mode": m})
+            await set_wallet(db, wid, {"real_mode": m, "real_mode_at": datetime.now(timezone.utc).isoformat(),
+                                       "real_mode_by": f"кнопка «{'Выкл' if m == 'off' else 'Тень'}» в Telegram"})
             return await card(f"Режим: {S.MODES[m]}")
         if m == "live":
             text, kb, _can = await live_confirm(db, cfg, wid, rpc)
@@ -551,7 +559,9 @@ async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: st
             text, kb, can = await live_confirm(db, cfg, wid, rpc)
             if not can:
                 return Reply(text, kb, "Бой не включён: условия не выполнены", True)
-            await set_wallet(db, wid, {"real_mode": "live", "real_armed_at": datetime.now(timezone.utc).isoformat()})
+            now = datetime.now(timezone.utc).isoformat()
+            await set_wallet(db, wid, {"real_mode": "live", "real_armed_at": now, "real_mode_at": now,
+                                       "real_mode_by": "кнопка «Да, включить бой» в Telegram"})
             await wait_lane(db, wid, "live")
             return await card("Бой включён")
     if action == "wsg":

@@ -391,3 +391,31 @@ async def test_card_right_after_live_does_not_claim_server_refused(db, monkeypat
     await lane.publish_status()
     text, _kb = await UI.wallet_view(db, {}, wid)
     assert "💵" in text and "не включён" not in text and "⏳" not in text
+
+
+async def test_mode_change_is_announced_with_its_source(db, monkeypatch):
+    """18.11: бой у «Мейныча» пропал — сигналы smart пошли в тень, а почему, не было видно ни в карточке, ни в теме.
+    Теперь любая смена режима — сообщение «🔀 Режим: бой → тень (кнопка …)», а в карточке — когда и чем выбран."""
+    monkeypatch.setenv("REAL_LIVE", "1")
+    chain = FakeChain()
+    desk = make_desk(db, chain, targets=())
+    await desk.start()
+    wid = await desk.create_wallet("Мейныч")
+    lane = desk.lanes[wid]
+    chain.fund(lane.wallet.pubkey, 1.0)
+    await lane.refresh_balance(force=True)
+    await desk.publish_status()
+    await lane.publish_status()
+    await lane.tick()                                              # первый тик — только запоминает режим
+    r = await UI.on_wallet_callback(db, {}, "wm", f"{wid}:live!")  # бой можно включить: REAL_LIVE, ключ, SOL есть
+    assert r.toast == "Бой включён"
+    await desk.reload()
+    await lane.tick()
+    r = await UI.on_wallet_callback(db, {}, "wm", f"{wid}:shadow")
+    assert "Режим выбран" in r.text and "кнопка «Тень» в Telegram" in r.text
+    await desk.reload()
+    await lane.tick()
+    texts = [x["payload"]["text"] for x in await db.fetch("SELECT payload FROM outbox ORDER BY id")]
+    assert any("🔀 Режим: 👻 тень → <b>💵 бой</b> (кнопка «Да, включить бой» в Telegram)" in t for t in texts)
+    assert any("🔀 Режим: 💵 бой → <b>👻 тень</b> (кнопка «Тень» в Telegram)" in t for t in texts)
+    assert all("Мейныч" in t for t in texts if "🔀" in t)
