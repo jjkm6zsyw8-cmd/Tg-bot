@@ -59,6 +59,16 @@ def test_verdict_by_bot_rule():
     assert verdict_a(3, 2, 0.01, 0.3, 4.1, {})[0] == "few"
 
 
+def test_demote_scout_wallets_trading_real_money():
+    from scanner.analytics.scout import demote_reason
+    assert demote_reason([], 0.0) is None
+    assert demote_reason([0.25, -0.3, 0.13, -0.32], -0.02) is None                 # 4 копии — ещё рано
+    assert "в плюсе 2 (33%)" in demote_reason([0.25, -0.3, 0.13, -0.32, -0.1, -0.05], -0.03)
+    assert demote_reason([0.25, 0.25, -0.3, 0.13, 0.25, -0.05], 0.05) is None        # 67% и в плюсе — держим
+    assert "3 копии в A в минусе" in demote_reason([-0.7, -0.33, -0.1, 0.25], -0.1)  # три подряд, в среднем −38%
+    assert demote_reason([-0.05, -0.02, -0.1, 0.25], 0.0) is None                     # мелкие минусы — не повод
+
+
 def test_verdict():
     assert verdict(6, 4, 0.05, 0.6, 1.0, {})[0] == "promote"
     assert verdict(6, 1, 0.05, 0.6, 1.0, {})[0] == "reject"          # плюс за счёт одной монеты, в плюсе 1 из 6

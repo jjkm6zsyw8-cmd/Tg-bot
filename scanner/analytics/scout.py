@@ -18,8 +18,8 @@
 3. Решение: 6+ закрытых копий, итог в плюсе и прибыльных ≥ 40% → в свой список (копируется как свои кошельки,
    метка «🔍»). Иначе — отсев на 14 дней. 4 копии подряд в минусе — отсев сразу. 4 дня и меньше 6 копий — «мало
    сделок», отсев на 7 дней.
-4. Чистка: кошелёк разведки в своём списке — последние 10 его копий в A (как боевой бот) в сумме в минусе →
-   убирается (14 дней).
+4. Чистка: кошелёк разведки в smart — по последним копиям в A (как боевой бот): от 6 копий и в плюсе меньше половины
+   или итог в минусе, либо 3 последние в минусе в среднем −20% и хуже → убирается (14 дней).
 С 18.11 решение испытания — по копиям в S (правило боевого бота A): 8+ копий, в плюсе 65%+, в среднем +5%+ → в smart;
 иначе — отсев. H (правило G) остаётся для сравнения.
    Кошельки, добавленные вручную, бот не трогает: в /wallets и в сводке они помечаются «шлак — убрать».
@@ -163,6 +163,22 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float,
     if age_days >= float(cfg_get(cfg, "scout_probation_days")):
         return "few", res + f" за {age_days:.0f} дн. — мало сделок"
     return None, res
+
+
+def demote_reason(pcts: list[float], pnl_sol: float) -> str | None:
+    """Кошелёк разведки в smart (бот торгует его за деньги): когда убрать. pcts — итоги последних копий в A, новые
+    первыми. 18.11: кошельки, пущенные в smart по старому мягкому правилу (6 копий, 40% в плюсе), за утро дали в бою
+    −$14.76 (DKvR −$4.46 за 4 сделки, 46Xr −$6.95, yWyq −$3.35), а старое правило ждало 8 копий в минусе."""
+    n = len(pcts)
+    if not n:
+        return None
+    wins = sum(1 for p in pcts if p > 0)
+    res = f"последние {n} копий в A (как бот): в плюсе {wins} ({wins / n:.0%}), в среднем {sum(pcts) / n:+.0%}"
+    if n >= 6 and (wins / n < 0.5 or pnl_sol < 0):
+        return res
+    if n >= 3 and all(p <= 0 for p in pcts[:3]) and sum(pcts[:3]) / 3 <= -0.2:
+        return f"последние 3 копии в A в минусе, в среднем {sum(pcts[:3]) / 3:+.0%}"
+    return None
 
 
 def short(addr: str) -> str:
@@ -454,18 +470,18 @@ class Scout:
                 await self._close(addr, "removed", "убран вручную", REJECT_DAYS)
                 continue
             last = await self.db.fetch(
-                """SELECT pnl_sol FROM paper_positions p JOIN scout s ON s.address = p.source_wallet
+                """SELECT pnl_sol, pnl_pct FROM paper_positions p JOIN scout s ON s.address = p.source_wallet
                    WHERE p.portfolio='A' AND p.source_wallet=$1 AND p.closed_at IS NOT NULL
                      AND p.exit_reason <> 'reset' AND NOT p.suspect AND p.opened_at >= s.decided_at
                    ORDER BY p.closed_at DESC LIMIT 10""", addr)
-            pnl = sum(float(x["pnl_sol"] or 0) for x in last)
-            if len(last) >= 8 and pnl < 0:
+            why = demote_reason([float(x["pnl_pct"] or 0) for x in last], sum(float(x["pnl_sol"] or 0) for x in last))
+            if why:
                 await self.db.execute("UPDATE traders SET active=false, manual=false, pinned=false WHERE address=$1",
                                       addr)
-                await self._close(addr, "demoted", f"последние {len(last)} копий в A: {pnl:+.3f} SOL", REJECT_DAYS)
+                await self._close(addr, "demoted", why, REJECT_DAYS)
                 self.stats["demoted"] += 1
                 changed = True
-                out.append(f"🗑 убран из списка {esc(short(addr))} — последние {len(last)} копий {pnl:+.3f} SOL")
+                out.append(f"🗑 убран из smart {esc(short(addr))} — {esc(why)}")
         if changed:
             await self.e._load_traders()
         return out
