@@ -67,7 +67,8 @@ def test_verdict():
     assert verdict(2, 1, 0.01, 0.2, 4.1, {})[0] == "few"
     assert verdict(3, 2, 0.01, 0.3, 1.0, {})[0] is None
     assert verdict(1, 1, 0.01, 0.1, 1.1, {})[0] == "idle"           # за сутки 1 копия — место следующему
-    assert verdict(0, 0, 0.0, 0.0, 0.5, {})[0] is None               # полдня — ещё ждём
+    assert verdict(0, 0, 0.0, 0.0, 0.2, {})[0] is None               # меньше 6 часов — ещё ждём
+    assert verdict(1, 0, 0.0, 0.1, 0.3, {})[0] == "idle"             # 6+ часов и 1 копия — место следующему
 
 
 async def test_scout_portfolio_fixed_size_and_slots():
