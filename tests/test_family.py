@@ -116,7 +116,7 @@ async def test_family_chain_finds_the_owners_active_wallet():
 
         events = await fam.run(force=True)        # копилки 2 и 3: первый разбор — свежая прибыль от SIBLING
         r = await db.fetchrow("SELECT * FROM scout WHERE address=$1", SIBLING)
-        assert r is not None and r["status"] == "queued" and r["score"] == FAM.SCORE
+        assert r is not None and r["status"] == "queued" and r["score"] == pytest.approx(FAM.SCORE + 12 * 0.25 * 100)
         assert r["source"] == f"семья {FAM.short(BEST)}" and "копилку F6Dx…smGc" in r["reason"]
         assert await db.fetchval("SELECT count(*) FROM scout") == 1        # OLD_BOT давно молчит, двойники — нет
         assert any("👪" in e and SIBLING in e for e in events)
@@ -135,5 +135,48 @@ async def test_family_chain_finds_the_owners_active_wallet():
         # сводка /scout показывает семью
         from scanner.analytics.scout import scout_report
         assert "Семья лучших кошельков" in await scout_report(db)
+    finally:
+        await db.close()
+
+
+async def test_shared_address_is_not_a_stash_and_strongest_family_goes_first():
+    """18.11: у GZVS «копилка» 94zb… получала прибыль от 5+ разных кошельков — это общий адрес, а не личная копилка:
+    за ней не следим, её кандидатов убираем из очереди. Семья сильнейшего владельца (7BNax) — первой в очереди."""
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        await db.execute("INSERT INTO wallet_family(address, role, parent, root) VALUES ('SHARED', 'stash', 'GZVS', 'GZVS')")
+        await db.execute("INSERT INTO wallet_family(address, role, parent, root) VALUES ('F6Dx', 'stash', 'EnvMK', $1)", BEST)
+        for i in range(5):
+            await db.execute("INSERT INTO wallet_family(address, role, parent, root) VALUES ($1, 'child', 'SHARED', 'GZVS')",
+                             f"U{i}")
+            await db.execute("INSERT INTO scout(address, status, source, score) VALUES ($1, $2, 'семья GZVS', 10000)",
+                             f"U{i}", "probation" if i == 0 else "queued")
+        await db.execute("INSERT INTO wallet_family(address, role, parent, root) VALUES ($1, 'child', 'F6Dx', $2)",
+                         SIBLING, BEST)
+        await db.execute("INSERT INTO scout(address, status, source, score) VALUES ($1, 'queued', 'семья 7BNa', 10000)",
+                         SIBLING)
+        for i in range(20):                                   # 7BNax: 20 сделок бумаги A по +28%
+            await db.execute(
+                """INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol, tokens,
+                       tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet)
+                   VALUES ('A', $1, now(), now(), 300, 0.1, 1, 1, 'take_profit', 0.028, 0.28, $2)""", f"M{i}", BEST)
+        eng = SimpleNamespace(db=db, cfg={}, price=SimpleNamespace(value=100.0), ext=None, scouts=set(),
+                              _load_traders=None, rpc=FakeRpc(), settings=None)
+        fam = Scout(eng).family  # type: ignore[arg-type]
+        events = await fam.check_services()
+        assert await db.fetchval("SELECT role FROM wallet_family WHERE address='SHARED'") == "service"
+        assert await db.fetchval("SELECT role FROM wallet_family WHERE address='F6Dx'") == "stash"    # 1 кошелёк — личная
+        left = {r["address"]: r["status"] for r in await db.fetch("SELECT address, status FROM scout")}
+        assert left == {"U0": "probation", SIBLING: "queued"}       # на испытании — доиспытывается
+        assert any("общий адрес" in e and "убрано 4" in e for e in events)
+        await fam.reprioritize()
+        assert await db.fetchval("SELECT score FROM scout WHERE address=$1", SIBLING) == pytest.approx(10000 + 560)
+        assert "⚠️ общий адрес SHAR" in "\n".join(await FAM.report_lines(db)).replace("SHARED", "SHAR")
     finally:
         await db.close()

@@ -41,7 +41,9 @@ RECENT_S = 3 * 86400         # при первом разборе копилки
 PARENT_TXS = 30
 FIRST_TXS = {"stash": 300, "cashout": 40}
 NEXT_TXS = 20
-SCORE = 10_000.0             # первым в очереди на испытание
+SCORE = 10_000.0             # первым в очереди на испытание (плюс сила владельца — см. _strength)
+SERVICE_STASH = 4            # в «копилку» шлют прибыль 4+ разных кошелька — это общий адрес (сервис, биржа), не личный
+SERVICE_CASHOUT = 6          # в «обменник» сливают 6+ разных копилок — тоже общий адрес
 
 
 def short(addr: str | None) -> str:
@@ -98,7 +100,38 @@ class Family:
         events = await self.check_parents()
         events += await self.check_stashes()
         events += await self.check_cashouts()
+        events += await self.check_services()
+        await self.reprioritize()
         return events
+
+    async def check_services(self) -> list[str]:
+        """«Копилка», в которую шлют прибыль много разных кошельков, — общий адрес (сервис, биржа): её «кошельки» —
+        разные люди. 18.11: у GZVS «копилка» 94zb… получала от 5+ кошельков. Перестаём за ней следить, её кандидатов
+        из очереди убираем (те, что уже на испытании, доиспытываются)."""
+        out: list[str] = []
+        for role, limit, kids in (("stash", SERVICE_STASH, "child"), ("cashout", SERVICE_CASHOUT, "stash")):
+            for r in await self.db.fetch(
+                    """SELECT f.address, f.root, count(c.*) n FROM wallet_family f
+                       JOIN wallet_family c ON c.parent = f.address AND c.role = $2
+                       WHERE f.role = $1 GROUP BY 1, 2 HAVING count(c.*) >= $3""", role, kids, limit):
+                await self.db.execute("UPDATE wallet_family SET role='service', note=$2 WHERE address=$1", r["address"],
+                                      f"общий адрес: {r['n']} разных кошельков — не личная копилка, не следим")
+                dropped = await self.db.execute(
+                    """DELETE FROM scout WHERE status = 'queued'
+                         AND address IN (SELECT address FROM wallet_family WHERE parent = $1)""", r["address"])
+                out.append(f"⚠️ {esc(short(r['address']))} — общий адрес ({r['n']} разных кошельков), а не копилка "
+                           f"владельца {esc(short(r['root']))}: не слежу, из очереди убрано {dropped.split()[-1]}.")
+        return out
+
+    async def reprioritize(self) -> None:
+        """Очередь: семья сильнейшего владельца — первой (у кандидатов, найденных раньше, — та же сила)."""
+        for r in await self.db.fetch(
+                """SELECT DISTINCT f.root FROM wallet_family f JOIN scout s ON s.address = f.address
+                   WHERE f.role = 'child' AND s.status = 'queued' AND f.root IS NOT NULL"""):
+            await self.db.execute(
+                """UPDATE scout s SET score = $2 FROM wallet_family f
+                   WHERE f.address = s.address AND f.role = 'child' AND f.root = $1 AND s.status = 'queued'""",
+                r["root"], await self._strength(r["root"]))
 
     async def _rows(self, role: str | None = None) -> list[Any]:
         if role is None:
@@ -114,10 +147,20 @@ class Family:
     def _skip(self, other: str, *near: str) -> bool:
         return not other or other in self.exchanges() or any(twin(other, x) for x in near if x)
 
+    async def _strength(self, root: str | None) -> float:
+        """Сила владельца: сумма процентов его копий на бумаге A за 14 дней (7BNax — сотни сделок по +28%). Семья
+        сильнейшего — первой в очереди на испытание."""
+        if not root:
+            return SCORE
+        v = await self.db.fetchval(
+            """SELECT COALESCE(sum(pnl_pct), 0) FROM paper_positions WHERE portfolio = 'A' AND source_wallet = $1
+                 AND opened_at > now() - interval '14 days' AND closed_at IS NOT NULL AND NOT suspect""", root)
+        return SCORE + max(0.0, float(v or 0)) * 100
+
     async def _candidate(self, addr: str, stash: Any, reason: str) -> str:
-        await self._add(addr, "child", stash["address"], stash["root"] or stash["parent"], reason)
-        queued = await self.scout._queue(addr, f"{SOURCE} {short(stash['root'] or stash['parent'])}", reason, SCORE,
-                                         None)
+        root = stash["root"] or stash["parent"]
+        await self._add(addr, "child", stash["address"], root, reason)
+        queued = await self.scout._queue(addr, f"{SOURCE} {short(root)}", reason, await self._strength(root), None)
         return (f"👪 {esc(reason)} → <code>{addr}</code>"
                 + (" — первым на испытание" if queued else " — уже проверялся (в отсеве или в списке)"))
 
@@ -225,7 +268,7 @@ async def report_lines(db: Any) -> list[str]:
     rows = await db.fetch("SELECT * FROM wallet_family ORDER BY found_at DESC LIMIT 15")
     if not rows:
         return []
-    icon = {"stash": "🏦 копилка", "cashout": "🔁 обменник", "child": "👪 кошелёк"}
+    icon = {"stash": "🏦 копилка", "cashout": "🔁 обменник", "child": "👪 кошелёк", "service": "⚠️ общий адрес"}
     lines = ["\n<b>👪 Семья лучших кошельков</b> (копилки, обменники и кошельки того же владельца)"]
     for r in rows:
         lines.append(f"• {icon.get(r['role'], r['role'])} {esc(short(r['address']))} · владелец "
