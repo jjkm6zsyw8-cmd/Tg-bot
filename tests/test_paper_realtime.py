@@ -671,3 +671,67 @@ async def test_mark_non_sol_voids_past_trades(monkeypatch):
         assert await tr.mark_non_sol() == 0                                  # повторно — ничего
     finally:
         db.pool.terminate()
+
+
+class UntilRpc(FakeRpc):
+    """Узел как в жизни: новые первыми, until — до этой подписи (не включая); порядок внутри блока — какой отдал."""
+
+    def __init__(self, sigs):
+        super().__init__(sigs)
+        self.asked = []
+
+    async def signatures_for(self, address, limit=100, before=None, until=None):
+        self.asked.append(until)
+        out = []
+        for x in self.sigs:
+            if x["signature"] == until:
+                break
+            out.append(x)
+        return out[:limit]
+
+
+async def test_block_mc_sees_same_block_buys_whatever_node_order(monkeypatch):
+    """19.11, по блокчейну: монеты «моего дева» 29yF/2F6p 17.11 — в блоке создания сразу за девом покупает его связка
+    (2 кошелька по 2.5–3.3 SOL). Узел отдавал подписи блока в другом порядке: создание «новее» покупок связки, и
+    until=создание их отрезал — бумага входила по цене сразу после дева (34.2 SOL вместо ~48.6), сверка — так же."""
+    import scanner.ingest.pump_parser as parser
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+    prices = {"CREATE": (33.22, 970.7e6), "B1": (36.4, 886.2e6), "B2": (39.5, 813.2e6)}
+
+    def parse(tx, sig, slot, src, stats, pool_map=None):
+        if sig not in prices:
+            return []
+        v_sol, v_tok = prices[sig]
+        return [Trade(signature=sig, mint="M", trader=sig, is_buy=True, sol_amount=3, token_amount=1, v_sol=v_sol,
+                      v_tokens=v_tok)]
+    monkeypatch.setattr(parser, "parse_transaction", parse)
+    rpc = UntilRpc([{"signature": "tiny", "slot": 101}, {"signature": "CREATE", "slot": 100},
+                    {"signature": "B1", "slot": 100}, {"signature": "B2", "slot": 100}])
+    tr.e.rpc = rpc
+    mc = await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True)
+    assert mc == pytest.approx(mc_sol(39.5, 813.2e6)) and mc == pytest.approx(48.6, abs=0.1)   # после связки
+    assert rpc.asked == [None]                                     # без until — порядок узла не важен
+    # в блоке запуска 25 сделок без покупок — создание всё равно разбирается (первым), цена — после дева
+    rpc.sigs = [{"signature": f"x{i}", "slot": 100} for i in range(25)] + [{"signature": "CREATE", "slot": 100}]
+    assert await tr.block_mc("M", "CREATE", 100, 102, None, with_trigger=True) == pytest.approx(mc_sol(33.22, 970.7e6))
+
+
+async def test_block_mc_signal_block_is_never_cheaper_than_after_trader(monkeypatch):
+    """Копия: сделок в блоках +1, +2 нет — цена блока сигнала. Теперь видно и сделки ДО трейдера (они дешевле) —
+    вход не дешевле цены после него; сделка того же блока после него дороже — берётся она."""
+    import scanner.ingest.pump_parser as parser
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+    prices = {"BEFORE": 20.0, "AFTER": 45.0}             # MC 25 (дешевле, чем после трейдера) и 56
+
+    def parse(tx, sig, slot, src, stats, pool_map=None):
+        return [Trade(signature=sig, mint="M", trader="Z", is_buy=True, sol_amount=1, token_amount=1,
+                      v_sol=prices[sig], v_tokens=8e8)] if sig in prices else []
+    monkeypatch.setattr(parser, "parse_transaction", parse)
+    after_mc = mc_sol(45.0, 8e8)
+    tr.e.rpc = UntilRpc([{"signature": "TRIG", "slot": 100}, {"signature": "AFTER", "slot": 100},
+                         {"signature": "BEFORE", "slot": 100}, {"signature": "old", "slot": 90}])
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == pytest.approx(after_mc)
+    tr.e.rpc = UntilRpc([{"signature": "TRIG", "slot": 100}, {"signature": "BEFORE", "slot": 100}])
+    assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == 30.0

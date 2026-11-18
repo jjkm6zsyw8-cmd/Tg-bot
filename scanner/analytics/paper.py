@@ -693,25 +693,31 @@ class PaperTrader:
             # Счёт кривой в сети говорит валюту пары сразу
             return self._why(mint, trig_sig, "монета в паре не к SOL")
         try:
-            sigs = list(await rpc.signatures_for(mint, limit=1000, until=trig_sig) or [])
+            # 19.11: без until=триггер. Порядок подписей ВНУТРИ блока узел отдаёт по-разному, и until отрезал сделки
+            # того же блока, шедшие после триггера. По блокчейну (17.11, монеты 29yF и 2F6p): в блоке создания сразу
+            # за девом покупает его связка (2 кошелька по 2.5–3.3 SOL), а бумага входила по цене сразу после дева —
+            # 33.8–34.2 SOL вместо ~45–49 (с другими покупателями блока — до ~71). Сверка через 30 с спрашивала так
+            # же и не ловила. «Мой дев» 13–17.11 на бумаге +$251 — на таких входах. Теперь берём все сделки блоков
+            # сигнала…+2, а в блоке сигнала цена не ниже цены после трейдера.
+            page = list(await rpc.signatures_for(mint, limit=1000) or [])
             self._entry_rpc_add()
-            for _ in range(3):                   # горячая монета: 1000 транзакций новее — листаем до блока +2
-                if len(sigs) < 1000 or sigs[-1].get("slot") is None or int(sigs[-1]["slot"]) <= target:
+            sigs = list(page)
+            for _ in range(3):                   # горячая монета: листаем, пока не дойдём до блока сигнала
+                if len(page) < 1000 or page[-1].get("slot") is None or int(page[-1]["slot"]) < s0:
                     break
-                more = list(await rpc.signatures_for(mint, limit=1000, before=sigs[-1]["signature"],
-                                                     until=trig_sig) or [])
+                page = list(await rpc.signatures_for(mint, limit=1000, before=page[-1]["signature"]) or [])
                 self._entry_rpc_add()
-                if not more:
-                    break
-                sigs += more
+                sigs += page
         except Exception as exc:  # noqa: BLE001
             return self._why(mint, trig_sig, "RPC отвечает 429 (лимит)" if "rate limited" in str(exc)
                              else "ошибка RPC")
         # ответ — от новых к старым; сортировка устойчивая: внутри блока порядок сохраняется
-        cand = sorted((x for x in sigs if not x.get("err") and x.get("slot") is not None
-                       and s0 <= int(x["slot"]) <= target), key=lambda x: -int(x["slot"]))
+        uniq = {x.get("signature"): x for x in reversed(sigs)}       # при листании подписи могут повториться
+        cand = sorted((x for x in reversed(list(uniq.values())) if not x.get("err") and x.get("slot") is not None
+                       and s0 <= int(x["slot"]) <= target and x.get("signature") != trig_sig),
+                      key=lambda x: -int(x["slot"]))
         if with_trigger:
-            cand.append({"signature": trig_sig, "slot": s0})     # самая старая — сама транзакция создания
+            cand.append({"signature": trig_sig, "slot": s0})     # сама транзакция создания
         if not cand:
             # сделок до блока +2 нет — или узел их ещё не отдал: пустой ответ верен, только если узел уже дальше
             if not any(x.get("slot") is not None and int(x["slot"]) > target for x in sigs) and hasattr(rpc, "call"):
@@ -735,6 +741,9 @@ class PaperTrader:
         blocks: dict[int, list[dict[str, Any]]] = {}
         for x in cand:
             blocks.setdefault(int(x["slot"]), []).append(x)
+        if with_trigger and s0 in blocks:
+            # создание — первым в своём блоке: лимит BLOCK_TX_MAX его не отрежет (в блоке запуска бывает 30+ сделок)
+            blocks[s0].sort(key=lambda x: x["signature"] != trig_sig)
         parsed: dict[str, list[Any]] = {}
 
         async def events(x: dict[str, Any]) -> list[Any] | None:
@@ -778,6 +787,9 @@ class PaperTrader:
                 if created is not None and created.quote_mint:
                     return self._why(mint, trig_sig, "монета в паре не к SOL")
                 mcs += [mc_sol(ev.v_sol, ev.v_tokens) for ev in all_evs if isinstance(ev, Trade) and ev.mint == mint]
+            if slot == s0 and trig_mc and not with_trigger:
+                # блок сигнала: сделки до трейдера (их теперь тоже видно) дешевле — вход не дешевле цены после него
+                mcs.append(float(trig_mc))
             mcs = [m for m in mcs if m > 0]
             if mcs:
                 # порядок транзакций внутри блока узел отдаёт по-разному, а на запуске монеты цена внутри блока
