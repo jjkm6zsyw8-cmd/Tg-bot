@@ -26,7 +26,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from ..real.report import EXIT_NAMES, KINDS, MODE_SHORT, paper_target, sol_price
+from ..real.report import EXIT_NAMES, KINDS, MODE_SHORT, paper_target, skip_text, sol_price
 
 PCT, USD, SOL, NUM, DT = "0.0%", '#,##0.00 "$"', "0.0000", "0", "dd.mm.yyyy hh:mm:ss"
 HEAD = Font(bold=True, color="FFFFFF")
@@ -246,7 +246,7 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
     if since is not None:
         for m in await db.fetch(
                 """SELECT pp.portfolio, pp.symbol, pp.mint, pp.source_wallet, pp.opened_at, pp.pnl_pct,
-                          (SELECT CASE WHEN s.mode = 'live' THEN 'бой' ELSE 'тень' END || ': ' || s.why
+                          (SELECT s.mode || '|' || s.kind || '|' || s.why
                            FROM real_skips s WHERE s.mint = pp.mint
                              AND s.at BETWEEN pp.opened_at - interval '2 minutes' AND pp.opened_at + interval '2 minutes'
                            ORDER BY (s.mode = 'live') DESC, s.at DESC LIMIT 1) why
@@ -256,7 +256,8 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
                    ORDER BY pp.opened_at""", since):
             rows.append([m["opened_at"], m["portfolio"], m["symbol"] or "", m["mint"],
                          labels.get(m["source_wallet"]) or m["source_wallet"] or "", _f(m["pnl_pct"]),
-                         m["why"] or "причина не записана (сигнал до бота не дошёл или это было до 18.11)"])
+                         skip_text(m["why"]) if m["why"] else
+                         "причина не записана (сигнал до бота не дошёл или это было до 18.11)"])
     s.table([("Бумага вошла", DT), ("Портфель", None), ("Монета", None), ("Адрес монеты", None), ("Чей сигнал", None),
              ("Итог бумаги, %", PCT), ("Почему бот не вошёл", None)], rows, freeze=True, color_col=5)
 

@@ -128,7 +128,7 @@ async def test_status_trades_file_and_comparison(db):
            VALUES ('A', $1, 104, 'UNK', now(), 30, 0.1, 1, 1, now(), 'take_profit', 0.025, 0.25)""", str(pk("unknown")))
     cmp2 = await report.compare_text(db, {})
     assert "Бумага A / Y вошла, а бот — нет: 2" in cmp2
-    assert "$UNK (бумага A +25%) — бот: тень: монета не найдена в сети" in cmp2
+    assert "$UNK (бумага A +25%) — бот: тень · smart: монета не найдена в сети" in cmp2
     # вся отчётность одним Excel: листы, строки, числа — числами
     import io
 
@@ -146,7 +146,7 @@ async def test_status_trades_file_and_comparison(db):
     pct = trades_ws.cell(2, head.index("Итог, %") + 1)
     assert isinstance(pct.value, float) and pct.number_format == "0.0%"
     missed = [[c.value for c in row] for row in wb["Бумага без бота"].iter_rows(min_row=2)]
-    assert any(r[2] == "UNK" and r[6] == "тень: монета не найдена в сети" for r in missed)
+    assert any(r[2] == "UNK" and r[6] == "тень · smart: монета не найдена в сети" for r in missed)
     assert any("причина не записана" in str(r[6]) for r in missed)
     vs = [[c.value for c in row] for row in wb["Бот против бумаги"].iter_rows(min_row=2)]
     assert any(r[6] == "A" and r[7] == pytest.approx(0.30) for r in vs)

@@ -341,6 +341,16 @@ async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20, wallet: Any
     return "\n".join(lines)
 
 
+def skip_text(raw: str) -> str:
+    """«live|smart|причина» → «бой · smart: причина» — у какого метода пропуск (18.11: «тень: дневной стоп» у сделок
+    бумаги A выглядел как пропуск smart, а был у «мой дев» в тени по той же монете)."""
+    mode, _, rest = (raw or "").partition("|")
+    kind, _, why = rest.partition("|")
+    if not why:
+        return raw
+    return f"{'бой' if mode == 'live' else 'тень'} · {KINDS.get(kind, kind)}: {why}"
+
+
 def trader_name(addr: str, label: str | None) -> str:
     """Чей сигнал: метка из списка (🔍 / 🧬 — найден разведкой) или начало и конец адреса."""
     short = f"{addr[:4]}…{addr[-4:]}" if len(addr) > 10 else addr
@@ -457,7 +467,7 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
     # какие именно сделки бумаги бот не взял и почему (причины пишутся с 18.11 — таблица real_skips)
     missed_rows = await db.fetch(
         """SELECT pp.portfolio, pp.symbol, pp.opened_at, pp.pnl_pct,
-                  (SELECT CASE WHEN s.mode = 'live' THEN 'бой' ELSE 'тень' END || ': ' || s.why FROM real_skips s
+                  (SELECT s.mode || '|' || s.kind || '|' || s.why FROM real_skips s
                    WHERE s.mint = pp.mint AND s.at BETWEEN pp.opened_at - interval '2 minutes'
                                                  AND pp.opened_at + interval '2 minutes'
                    ORDER BY (s.mode = 'live') DESC, s.at DESC LIMIT 1) why
@@ -479,7 +489,7 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
             res = f"{float(m['pnl_pct']):+.0%}" if m["pnl_pct"] is not None else "открыта"
             out.append(f"• {m['opened_at'].astimezone(tz):%d.%m %H:%M} ${esc(m['symbol'] or '?')} "
                        f"(бумага {m['portfolio']} {res}) — "
-                       + (f"бот: {esc(m['why'])}" if m["why"] else "причина не записана (сигнал до бота не дошёл "
+                       + (f"бот: {esc(skip_text(m['why']))}" if m["why"] else "причина не записана (сигнал до бота не дошёл "
                           "или это было до 18.11)"))
     out.append("Почему бот не входил — «Пропуски» на главном экране /real.")
     return "\n".join(out)
