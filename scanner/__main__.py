@@ -44,7 +44,7 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout"):
+    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -134,6 +134,38 @@ async def run_tool(cmd: str, db: Database) -> None:
             print("\n" + await diagnose(db, cfg, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
             if "--coins" in args:                   # по монетам: цена в базе по источникам против бумаги A
                 print("\n" + await coin_details(db, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
+    elif cmd == "cobuyers":
+        # соседи лучшего кошелька по блокчейну: python -m scanner cobuyers [кошелёк] [--coins 60] [--queue]
+        from types import SimpleNamespace
+        from .analytics.cobuy import best_wallet, neighbours, queue_leaders, report
+        from .analytics.scout import Scout
+        from .config import Settings, YamlConfig, load_env
+        from .ingest.rpc import SolanaRpc
+        env = load_env()
+        settings = Settings(YamlConfig(env.config_path), await db.get_overrides())
+        coins = int(args[args.index("--coins") + 1]) if "--coins" in args else 60
+        skip = {args.index("--coins") + 1} if "--coins" in args else set()
+        named = [a for i, a in enumerate(args) if not a.startswith("-") and i not in skip]
+        wallet = named[0] if named else await best_wallet(db)
+        if not wallet:
+            raise SystemExit("Не нашёл кошелёк: укажите адрес")
+        rpc = SolanaRpc(env.rpc_endpoint, rps=env.rpc_rps, fallback=env.rpc_fallback_url or None)
+        print(f"Кошелёк {wallet}, монет до {coins}: окно −90…+40 с вокруг каждой его покупки, по блокчейну…",
+              flush=True)
+        try:
+            res = await neighbours(db, rpc, wallet, coins, settings.exchanges(),
+                                   progress=lambda r: print(f"  монета {r.coins}: найдено {r.found}, соседей "
+                                                            f"{len(r.near)}, запросов {r.calls}", flush=True))
+        finally:
+            await rpc.close()
+        print("\n" + report(res))
+        if "--queue" in args:
+            eng = SimpleNamespace(db=db, cfg=settings.effective(), price=SimpleNamespace(value=150.0), ext=None,
+                                  scouts=set(), _load_traders=None)
+            queued = await queue_leaders(Scout(eng), res)  # type: ignore[arg-type]
+            print("\nНа испытание (первыми в очереди):" if queued else "\nНовых кандидатов для испытания нет.")
+            for q in queued:
+                print("  " + q)
     elif cmd == "dune-scout":
         # весь PumpSwap через Dune вручную: python -m scanner dune-scout [--queue] (с --queue — найденных в разведку)
         from types import SimpleNamespace
