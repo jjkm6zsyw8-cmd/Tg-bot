@@ -18,10 +18,10 @@
 3. Решение: 6+ закрытых копий, итог в плюсе и прибыльных ≥ 40% → в свой список (копируется как свои кошельки,
    метка «🔍»). Иначе — отсев на 14 дней. 4 копии подряд в минусе — отсев сразу. 4 дня и меньше 6 копий — «мало
    сделок», отсев на 7 дней.
-4. Чистка: кошелёк разведки в smart — по последним копиям в A (как боевой бот): от 6 копий и в плюсе меньше половины
-   или итог в минусе, либо 3 последние в минусе в среднем −20% и хуже → убирается (14 дней).
-С 18.11 решение испытания — по копиям в S (правило боевого бота A): 8+ копий, в плюсе 65%+, в среднем +5%+ → в smart;
-иначе — отсев. H (правило G) остаётся для сравнения.
+4. Чистка: кошелёк разведки в smart — по последним копиям в A (как боевой бот): от 6 копий и итог в минусе, либо
+   3 последние в минусе в среднем −20% и хуже → убирается (14 дней). Винрейт сам по себе — не повод (с 19.11).
+С 18.11 решение испытания — по копиям в S (правило боевого бота A), H (правило G) — для сравнения. С 19.11 (решение
+владельца: «пох какой винрейт у кошеля, главное чтоб бот не терял бабки») в smart два пути — см. verdict_a.
    Кошельки, добавленные вручную, бот не трогает: в /wallets и в сводке они помечаются «шлак — убрать».
 
 Всё, что разведка нашла и решила, лежит в таблице scout; файл — /wallets, сводка — /scout.
@@ -61,9 +61,16 @@ DEFAULTS: dict[str, Any] = {
                                        # испытании 34 за несколько часов не сделали ни одной покупки)
     # с 18.11 решение — по копиям в S (как торгует боевой бот: вход через 2 блока, всё на +25%, выход за трейдером):
     # владельцу нужны кошельки, на которых зарабатывает именно копия (у 7BNax копия — 81% в плюс, +28% на сделку)
-    "scout_a_min_copies": 8,
+    "scout_a_min_copies": 8,           # путь 1 «часто в плюсе»: 8+ копий, 65%+ в плюсе, в среднем +5%+
     "scout_a_min_winrate": 0.65,
     "scout_a_min_avg": 0.05,           # в среднем на копию, доля
+    # путь 2 «в среднем» (с 19.11): винрейт любой, 10+ копий, в среднем +8%+ и без самой удачной копии — в плюсе
+    # (одна случайная ракета не считается). +8%, а не +5%: в бою вход позже — 18.11 те же 20 сделок бой −0.6% в
+    # среднем, бумага A +2.3%
+    "scout_a_avg_copies": 10,
+    "scout_a_avg_min": 0.08,
+    "scout_a_max_copies": 20,          # столько копий и ни один путь не прошёл — отсев
+    "scout_a_min_usd_day": 10,         # за сутки копии по $10 дали меньше $10 — торгует редко/мало, место следующему
     "scout_min_winrate": 0.40,         # доля прибыльных копий
     "scout_min_profit_usd": 300,       # GMGN: прибыль на монете, $
     "scout_gmgn_min_winrate": 0.45,    # GMGN 7 дней
@@ -146,22 +153,38 @@ def verdict(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: di
     return None, res
 
 
-def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float,
-              cfg: dict[str, Any]) -> tuple[str | None, str]:
-    """Итог испытания по копиям в S (правило боевого бота A). pnl/cost — SOL по закрытым копиям."""
-    need = int(cfg_get(cfg, "scout_a_min_copies"))
+def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: dict[str, Any],
+              best: float = 0.0) -> tuple[str | None, str]:
+    """Итог испытания по копиям в S (правило боевого бота A: вход через 2 блока, всё на +25%, выход за трейдером).
+    pnl/cost — SOL по закрытым копиям, best — SOL самой удачной копии.
+
+    В smart (с 19.11 — два пути, решение владельца: важен заработок копии, а не винрейт кошелька):
+      1) «часто в плюсе»: 8+ копий, 65%+ в плюсе, в среднем +5%+;
+      2) «в среднем»: 10+ копий, в среднем +8%+ и без самой удачной копии — в плюсе; винрейт любой.
+    Отсев (14 дней): 4 копии и ни одной в плюсе; 6+ копий и в среднем минус; 20 копий и ни один путь не прошёл.
+    Место следующему (вернуться через 2 дня): за 6 ч меньше 2 копий; за сутки копии по $10 дали меньше $10."""
     avg = pnl / cost if cost else 0.0
-    res = (f"копия как у бота (A): {n} сделок, в плюсе {wins} ({wins / n:.0%}), в среднем {avg:+.1%}" if n
-           else "копий ещё нет")
-    if n >= need:
-        if wins / n >= float(cfg_get(cfg, "scout_a_min_winrate")) and avg >= float(cfg_get(cfg, "scout_a_min_avg")):
-            return "promote", res
-        return "reject", res
-    if (n >= 4 and wins == 0) or (n >= 5 and wins / n < 0.3) or (n >= 6 and (wins / n < 0.5 or avg < 0)):
+    wo = (pnl - best) / (cost * (n - 1) / n) if n >= 2 and cost else avg      # без самой удачной копии
+    res = (f"копия как у бота (A): {n} сделок, в плюсе {wins} ({wins / n:.0%}), в среднем {avg:+.1%}"
+           + (f", без лучшей {wo:+.1%}" if n >= 2 else "") if n else "копий ещё нет")
+    if (n >= int(cfg_get(cfg, "scout_a_min_copies")) and wins / n >= float(cfg_get(cfg, "scout_a_min_winrate"))
+            and avg >= float(cfg_get(cfg, "scout_a_min_avg"))):
+        return "promote", res + " — часто в плюсе"
+    if n >= int(cfg_get(cfg, "scout_a_avg_copies")) and avg >= float(cfg_get(cfg, "scout_a_avg_min")) and wo > 0:
+        return "promote", res + " — в среднем хорошо, винрейт не важен"
+    if n >= int(cfg_get(cfg, "scout_a_max_copies")):
+        return "reject", res + " — ни 65% в плюсе с +5% в среднем, ни +8% в среднем"
+    if (n >= 4 and wins == 0) or (n >= 6 and avg < 0):
         # слабых — сразу: место на испытании нужно следующему кандидату (в очереди их десятки)
-        return "reject", res + " — копия не зарабатывает"
+        return "reject", res + " — копия теряет деньги"
     if n < 2 and age_days >= float(cfg_get(cfg, "scout_idle_days")):
-        return "idle", res + f" за {age_days:.0f} дн. — почти не торгует, место следующему"
+        return "idle", res + f" за {age_days * 24:.0f} ч — почти не торгует, место следующему"
+    per_day = float(cfg_get(cfg, "scout_a_min_usd_day"))
+    if per_day > 0 and age_days >= 1:
+        usd = avg * n * float(cfg.get("paper_scout_usd") or 10)
+        if usd / age_days < per_day:
+            return "idle", res + (f"; за {age_days:.1f} сут. копии по $10 дали {usd:+.1f}$ — меньше ${per_day:g} в "
+                                  "сутки, место следующему")
     if age_days >= float(cfg_get(cfg, "scout_probation_days")):
         return "few", res + f" за {age_days:.0f} дн. — мало сделок"
     return None, res
@@ -170,14 +193,15 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float,
 def demote_reason(pcts: list[float], pnl_sol: float) -> str | None:
     """Кошелёк разведки в smart (бот торгует его за деньги): когда убрать. pcts — итоги последних копий в A, новые
     первыми. 18.11: кошельки, пущенные в smart по старому мягкому правилу (6 копий, 40% в плюсе), за утро дали в бою
-    −$14.76 (DKvR −$4.46 за 4 сделки, 46Xr −$6.95, yWyq −$3.35), а старое правило ждало 8 копий в минусе."""
+    −$14.76 (DKvR −$4.46 за 4 сделки, 46Xr −$6.95, yWyq −$3.35), а старое правило ждало 8 копий в минусе.
+    С 19.11 — по деньгам, а не по винрейту: в smart теперь пускают и кошельки с редкими, но крупными плюсами."""
     n = len(pcts)
     if not n:
         return None
     wins = sum(1 for p in pcts if p > 0)
     res = f"последние {n} копий в A (как бот): в плюсе {wins} ({wins / n:.0%}), в среднем {sum(pcts) / n:+.0%}"
-    if n >= 6 and (wins / n < 0.5 or pnl_sol < 0):
-        return res
+    if n >= 6 and pnl_sol < 0:
+        return res + " — копия теряет деньги"
     if n >= 3 and all(p <= 0 for p in pcts[:3]) and sum(pcts[:3]) / 3 <= -0.2:
         return f"последние 3 копии в A в минусе, в среднем {sum(pcts[:3]) / 3:+.0%}"
     return None
@@ -413,7 +437,8 @@ class Scout:
             return {}
         rows = await self.db.fetch(
             f"""SELECT p.source_wallet w, count(*) n, count(*) FILTER (WHERE p.pnl_sol > 0) wins,
-                       COALESCE(sum(p.pnl_sol), 0) pnl, COALESCE(sum(p.cost_sol), 0) cost
+                       COALESCE(sum(p.pnl_sol), 0) pnl, COALESCE(sum(p.cost_sol), 0) cost,
+                       COALESCE(max(p.pnl_sol), 0) best
                 FROM paper_positions p JOIN scout s ON s.address = p.source_wallet
                 WHERE p.portfolio = $1 AND p.source_wallet = ANY($2::text[]) AND p.closed_at IS NOT NULL
                   AND p.exit_reason <> 'reset' AND NOT p.suspect AND p.opened_at >= s.{since_col}
@@ -428,9 +453,10 @@ class Scout:
         cap = int(cfg_get(self.cfg, "scout_max_auto"))
         out: list[str] = []
         for r in rows:
-            x = res.get(r["address"], {"n": 0, "wins": 0, "pnl": 0.0, "cost": 0.0})
+            x = res.get(r["address"], {"n": 0, "wins": 0, "pnl": 0.0, "cost": 0.0, "best": 0.0})
             age = (now - r["started_at"]).total_seconds() / 86400 if r["started_at"] else 0.0
-            v, why = verdict_a(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg)
+            v, why = verdict_a(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg,
+                               float(x["best"]))
             addr = r["address"]
             if v == "promote" and auto < cap:
                 await self._promote(addr)
@@ -507,9 +533,13 @@ async def scout_report(db: Any) -> str:
             WHERE s.status = 'probation' GROUP BY 1, 2, 3 ORDER BY pnl DESC""")
     if rows:
         lines.append("\n<b>На испытании</b> (копия как у боевого бота — правило A, портфель S, по $10; в smart — "
-                     "от 8 копий, в плюсе 65%+, в среднем +5%+)")
+                     "8+ копий, 65%+ в плюсе и +5% в среднем, или 10+ копий и +8% в среднем при любом винрейте; "
+                     "за сутки меньше $10 — место следующему)")
+        now = datetime.now(timezone.utc)
         for r in rows:
             res = f"{r['n']} копий, в плюсе {r['wins']}, {r['pnl'] / r['cost']:+.0%}" if r["cost"] else "копий ещё нет"
+            if r["started_at"]:
+                res += f" · за {(now - r['started_at']).total_seconds() / 3600:.0f} ч"
             lines.append(f"• {esc(short(r['address']))} ({esc(r['source'] or '')}) · {res}")
     done = await db.fetch(
         """SELECT address, status, decision FROM scout WHERE decided_at > now() - interval '2 days'
