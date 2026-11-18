@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..alerts.format import esc
 from ..external.base import Unavailable
+from . import dunescout as DS
 from . import family as FAM
 from . import lookalike as LK
 from .copytrade import linked_to_dev
@@ -176,6 +177,8 @@ class Scout:
         self._token_cursor = 0
         self.lookalike = LK.Lookalike(engine)
         self.family = FAM.Family(engine, self)
+        self.dune = DS.DuneScout(engine, self)
+        self._dune_task: asyncio.Task[None] | None = None
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -210,10 +213,21 @@ class Scout:
             log.exception("разведка: семья лучших кошельков")
         if any("👪" in e for e in events):
             events += await self.fill_slots()             # кандидат «семья» — на испытание сразу, а не через 15 минут
+        if self.dune.key and (self._dune_task is None or self._dune_task.done()):
+            self._dune_task = asyncio.create_task(self._dune_bg())   # весь PumpSwap через Dune — раз в сутки, в фоне
         await self.load()
         if events:
             await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
         return events
+
+    async def _dune_bg(self) -> None:
+        """Запрос к Dune идёт минуты — в фоне, чтобы разведка не ждала; найденные — в очередь и сообщение."""
+        try:
+            events = await self.dune.run()
+            if events:
+                await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
+        except Exception:  # noqa: BLE001 — нет ключа, лимит кредитов, другая таблица — пишем в /scout, не падаем
+            log.exception("разведка: весь PumpSwap через Dune")
 
     async def load(self) -> None:
         """Кошельки на испытании — движку (копии в H) и приёму (подписка на их сделки)."""
@@ -485,6 +499,7 @@ async def scout_report(db: Any) -> str:
             lines.append(f"{icon.get(r['status'], '•')} {esc(short(r['address']))} — {esc(r['decision'] or '')}")
     try:
         lines += await FAM.report_lines(db)
+        lines += await DS.report_lines(db)
         lines += await LK.report_lines(db)
     except Exception:  # noqa: BLE001
         log.exception("разведка: сводка семьи и поиска по образцу")

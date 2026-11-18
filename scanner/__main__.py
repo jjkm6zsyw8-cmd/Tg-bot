@@ -44,7 +44,7 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike"):
+    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -134,6 +134,27 @@ async def run_tool(cmd: str, db: Database) -> None:
             print("\n" + await diagnose(db, cfg, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
             if "--coins" in args:                   # по монетам: цена в базе по источникам против бумаги A
                 print("\n" + await coin_details(db, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
+    elif cmd == "dune-scout":
+        # весь PumpSwap через Dune вручную: python -m scanner dune-scout [--queue] (с --queue — найденных в разведку)
+        from types import SimpleNamespace
+        from .analytics.dunescout import DuneScout, describe, good
+        from .analytics.scout import Scout
+        from .config import Settings, YamlConfig, load_env
+        env = load_env()
+        cfg = dict(Settings(YamlConfig(env.config_path), await db.get_overrides()).effective())
+        if not os.environ.get("DUNE_API_KEY"):
+            raise SystemExit("Нужен DUNE_API_KEY в .env (бесплатно: dune.com → Settings → API)")
+        eng = SimpleNamespace(db=db, cfg=cfg, price=SimpleNamespace(value=150.0), ext=None, scouts=set(),
+                              _load_traders=None)
+        sc = Scout(eng)  # type: ignore[arg-type]
+        events = await sc.dune.run(force=True, queue="--queue" in args)
+        last = await db.kv_get("dunescout:last") or {}
+        print(f"Кошельков в выборке: {last.get('checked', 0)}, подходят: {last.get('found', 0)}, "
+              f"запрос {last.get('took_s')} с")
+        for r in last.get("top") or []:
+            print(f"{r.get('trader')} | {describe(r)} | {'подходит' if good(r, cfg) else 'нет'}")
+        for e in events:
+            print(e)
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault
