@@ -203,14 +203,21 @@ async def test_cobuyers_of_profitable_smart():
             await buy(f"C{i}", "TWIN", t - timedelta(minutes=3))          # покупает те же монеты рядом
             await buy(f"C{i}", "LATE", t + timedelta(minutes=30))         # слишком поздно — не в счёт
             await buy(f"C{i}", "DUST", t + timedelta(minutes=1), 0.05)    # мелочь
-        await buy("C0", "ONCE", now)
+        await buy("C0", "ONCE", now)                                     # одна монета — мало
+        await buy("C1", "PAIR", now - timedelta(hours=5) + timedelta(minutes=2))   # две монеты рядом со smart
+        await buy("C2", "PAIR", now - timedelta(hours=10) - timedelta(minutes=2))
+        await buy("C1", "SLEEPY", now - timedelta(hours=5) + timedelta(minutes=1))  # две монеты, но давно
+        await buy("C3", "SLEEPY", now - timedelta(hours=15))
+        await db.execute("UPDATE trades SET ts = ts - interval '30 hours' WHERE trader = 'SLEEPY'")
         eng = SimpleNamespace(db=db, cfg={}, price=SimpleNamespace(value=100.0), ext=None, scouts=set(),
                               _load_traders=None)
         sc = Scout(eng)  # type: ignore[arg-type]
-        assert await sc.discover_cobuyers() == 1
-        r = await db.fetchrow("SELECT * FROM scout")
-        assert r["address"] == "TWIN" and r["source"] == "рядом со smart" and "4 монет" in r["reason"]
-        await sc.discover_cobuyers()                                       # уже в очереди — та же запись
-        assert await db.fetchval("SELECT count(*) FROM scout") == 1
+        assert await sc.discover_cobuyers() == 2
+        found = {r["address"]: r for r in await db.fetch("SELECT * FROM scout")}
+        assert set(found) == {"TWIN", "PAIR"}                             # SLEEPY давно не покупал, ONCE — 1 монета
+        r = found["TWIN"]
+        assert r["source"] == "рядом со smart" and "4 монет" in r["reason"] and r["score"] > found["PAIR"]["score"]
+        await sc.discover_cobuyers()                                       # уже в очереди — те же записи
+        assert await db.fetchval("SELECT count(*) FROM scout") == 2
     finally:
         await db.close()

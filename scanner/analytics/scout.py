@@ -55,6 +55,8 @@ DEFAULTS: dict[str, Any] = {
     "scout_max_auto": 15,              # сколько кошельков разведки держать в своём списке (0 — не добавлять)
     "scout_min_copies": 6,             # копий на испытании для решения
     "scout_probation_days": 4,
+    "scout_cobuy_min_coins": 2,        # «рядом со smart»: столько разных монет вместе с прибыльным smart за 3 дня
+    "scout_cobuy_active_h": 24,        # …и покупал за последние N часов (18.11: при 3 монетах и 6 ч кандидаты кончились)
     "scout_idle_days": 0.25,           # за 6 часов меньше 2 копий — неактивен, место следующему (18.11: из 40 на
                                        # испытании 34 за несколько часов не сделали ни одной покупки)
     # с 18.11 решение — по копиям в S (как торгует боевой бот: вход через 2 блока, всё на +25%, выход за трейдером):
@@ -294,8 +296,8 @@ class Scout:
 
     async def discover_cobuyers(self) -> int:
         """Кандидаты рядом со smart: кто покупал те же монеты, что и прибыльные smart-кошельки (бумага A за неделю
-        в плюсе), в пределах 10 минут от их покупки — на 3+ разных монетах за 3 дня. 18.11: 7BNax торгует только
-        на PumpSwap монетами старше часов — там своя база сделок неполная и «топ монеты» таких не видит; сделки
+        в плюсе), в пределах 10 минут от их покупки — на 2+ разных монетах за 3 дня, покупал за последние сутки.
+        18.11: 7BNax торгует только на PumpSwap монетами старше часов — там своя база сделок неполная и «топ монеты» таких не видит; сделки
         вокруг покупок smart записываются (их монеты отслеживаются). Проверяет испытание в H — по цене блокчейна."""
         smart = [r["w"] for r in await self.db.fetch(
             """SELECT source_wallet w FROM paper_positions
@@ -313,9 +315,10 @@ class Scout:
                FROM s JOIN trades c ON c.mint = s.mint AND c.is_buy
                     AND c.ts BETWEEN s.ts - interval '10 minutes' AND s.ts + interval '10 minutes'
                WHERE c.trader <> ALL($1::text[]) AND c.sol_amount BETWEEN 0.3 AND 5
-               GROUP BY 1 HAVING count(DISTINCT c.mint) >= 3
-                  AND max(c.ts) > now() - interval '6 hours'          -- торгует сейчас, а не три дня назад
-               ORDER BY 2 DESC LIMIT 60""", smart)
+               GROUP BY 1 HAVING count(DISTINCT c.mint) >= $2
+                  AND max(c.ts) > now() - make_interval(hours => $3)   -- торгует сейчас, а не три дня назад
+               ORDER BY 2 DESC, max(c.ts) DESC LIMIT 80""", smart, int(cfg_get(self.cfg, "scout_cobuy_min_coins")),
+            int(cfg_get(self.cfg, "scout_cobuy_active_h")))
         known = await self._known()
         added = 0
         for r in rows:
