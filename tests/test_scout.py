@@ -52,6 +52,9 @@ def test_verdict_by_bot_rule():
     assert verdict_a(8, 7, 0.02, 0.8, 0.2, {})[0] == "reject"           # 88%, но в среднем +2.5%
     assert verdict_a(5, 1, -0.02, 0.5, 0.1, {})[0] == "reject"          # 20% уже по 5 — дальше не ждём
     assert verdict_a(5, 3, 0.02, 0.5, 0.1, {})[0] is None               # ждём 8
+    assert verdict_a(6, 2, 0.01, 0.6, 0.1, {})[0] == "reject"           # 6 копий, 33% — дальше не ждём
+    assert verdict_a(6, 4, -0.01, 0.6, 0.1, {})[0] == "reject"          # 67%, но в минусе
+    assert verdict_a(6, 4, 0.03, 0.6, 0.1, {})[0] is None               # 67% и в плюсе — ждём 8
     assert verdict_a(1, 1, 0.01, 0.1, 1.2, {})[0] == "idle"
     assert verdict_a(3, 2, 0.01, 0.3, 4.1, {})[0] == "few"
 

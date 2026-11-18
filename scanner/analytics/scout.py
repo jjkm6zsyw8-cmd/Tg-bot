@@ -153,7 +153,8 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float,
         if wins / n >= float(cfg_get(cfg, "scout_a_min_winrate")) and avg >= float(cfg_get(cfg, "scout_a_min_avg")):
             return "promote", res
         return "reject", res
-    if (n >= 4 and wins == 0) or (n >= 5 and wins / n < 0.3):
+    if (n >= 4 and wins == 0) or (n >= 5 and wins / n < 0.3) or (n >= 6 and (wins / n < 0.5 or avg < 0)):
+        # слабых — сразу: место на испытании нужно следующему кандидату (в очереди их десятки)
         return "reject", res + " — копия не зарабатывает"
     if n < 2 and age_days >= float(cfg_get(cfg, "scout_idle_days")):
         return "idle", res + f" за {age_days:.0f} дн. — почти не торгует, место следующему"
