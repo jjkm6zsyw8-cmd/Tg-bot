@@ -85,7 +85,12 @@ MYDEV = "Y"
 BIGCOPY = "K"
 BIGCOPY_SOL = 5.0
 # наблюдательные портфели: фиксированно $10 на сделку, старт ×10, до 40 открытых
-OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY)
+# S — испытание кандидатов разведки так, как торгует боевой бот (с 18.11): правило A (всё на +25% без стопа, выход
+# за трейдером, до 30 мин), вход через 2 блока по цене блокчейна, по $10. В H те же кандидаты идут по правилу G
+# (стоп −8%) — это другой выход, а владельцу нужно ровно то, на чём зарабатывает бот: копия 7BNax по A давала 81%
+# в плюс при его собственных 51%. Решение разведки — по S.
+TRIAL = "S"
+OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY, TRIAL)
 OBSERVE_USD = 10.0
 # 12.11: трейдер после нашего входа мелко докупил (≤0.06 SOL ≈ $5) — выходим сразу. По неделе (копии, 88 сделок):
 # цена через 5 мин после такой докупки −13% (медиана); «выйти сразу» +$71 против «держать» +$21
@@ -179,6 +184,8 @@ SCHEMES: dict[str, dict[str, Any]] = {
             "stop": 0.50, "tp_net": None, "tp_share": 0.0, "trail": 0.35, "trail_after_net": 0.30, "target": False,
             "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 24 * 3600},
 }
+SCHEMES[TRIAL] = {**SCHEMES["A"], "name": "S: испытание кандидатов разведки как боевой бот — правило A (всё на +25% "
+                                         "без стопа, выход за трейдером, до 30 мин), по $10"}
 LEGEND = ("с 12.11 — только smart (по факту недели копии в минусе при любой тактике): "
           "A всё на +25% без стопа · B 70% на +25%, 30% трейл 15%, без стопа · G всё на +25%, стоп −8% · "
           "M — боевая (как A, позиция ≤30%, дневной стоп −25%) · H — наблюдение: кандидаты разведки и копии своего "
@@ -1129,7 +1136,7 @@ class PaperTrader:
             self.skipped[name] = "уже есть позиция по этой монете"
             return None
         lottery = self.is_lottery(name)
-        max_open = LOTTERY_MAX_OPEN if lottery else SCOUT_MAX_OPEN if name == SCOUT else \
+        max_open = LOTTERY_MAX_OPEN if lottery else SCOUT_MAX_OPEN if name in (SCOUT, TRIAL) else \
             SWING_MAX_OPEN if name in OBSERVE else MAX_OPEN
         kind = self.kind_of(data) if name == MAIN else None
         if kind:
@@ -1173,7 +1180,7 @@ class PaperTrader:
         wallet = data.get("copy_wallet") or data.get("source_wallet")
         if wallet and not lottery and name not in OBSERVE:
             size *= float(self.wallet_rating(wallet).get("mult", 1.0))   # рейтинг кошелька: топ ×1.5 … слабый ×0.5
-        if name == SCOUT:
+        if name in (SCOUT, TRIAL):
             # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
             size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
         if name in (SWING, MYDEV, BIGCOPY):
@@ -1495,7 +1502,7 @@ class PaperTrader:
         if not modes:
             return set(SCHEMES) - set(OBSERVE) - set(str(self.cfg.get("paper_off_set", OFF_SET))), ""
         if "scout" in modes:
-            return {SCOUT}, ""                       # кандидат разведки — только испытательный портфель
+            return {SCOUT, TRIAL}, ""                # кандидат разведки — только испытательные портфели (H — G, S — A)
         if "swing" in modes:
             return {SWING}, ""                       # держатель купил новую монету — смарт-ракеты
         wallet = data.get("copy_wallet") or data.get("source_wallet")
@@ -1505,7 +1512,7 @@ class PaperTrader:
             self.skipped["*"] = "кошелёк на паузе по рейтингу — копия только в теневой H"
             return {SCOUT}, ""
         lottery = {n for n in SCHEMES if self.is_lottery(n)}
-        smart_set = set(str(self.cfg.get("paper_smart_set", SMART_SET))) & set(SCHEMES) - {SCOUT, MAIN}
+        smart_set = set(str(self.cfg.get("paper_smart_set", SMART_SET))) & set(SCHEMES) - {SCOUT, MAIN, TRIAL}
         out: set[str] = set()
         why = ""
         if "copy" in modes:
@@ -1707,7 +1714,7 @@ class PaperTrader:
                    or saved.get("*") or next((v for v in saved.values()), ""))
             lines.append(f"⏸ сделок нет · алертов за период: {parts or '0'}" + (f" · бумага не вошла: {why}" if why else ""))
         # таблица: портфель · за период · всего · баланс · сделки (доля прибыльных); ★ — лидер по «всего»
-        leader = max((n for n in SCHEMES if n != SCOUT), key=lambda n: tot[n]["equity"] / tot[n]["port"]["start_sol"])
+        leader = max((n for n in SCHEMES if n not in (SCOUT, TRIAL)), key=lambda n: tot[n]["equity"] / tot[n]["port"]["start_sol"])
         head = ("    " + (f"{'период':>7}" if hours is not None else "") + f"{'всего':>7}{'баланс':>8}  сделки")
         rows = [head]
         for n in SCHEMES:

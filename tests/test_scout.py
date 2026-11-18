@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner.analytics import paper as pp
-from scanner.analytics.scout import Scout, score_of, trader_ok, verdict, wallet_ok
+from scanner.analytics.scout import Scout, score_of, trader_ok, verdict, verdict_a, wallet_ok
 from scanner.external.adapters import parse_gmgn_trader, parse_gmgn_wallet
 from tests.test_paper import bare_trader
 
@@ -42,6 +42,18 @@ def test_candidate_filters():
     assert "сливает" in wallet_ok({**good, "big_losses": 20}, {})[1]
     assert "запускает" in wallet_ok({**good, "created_tokens": 5}, {})[1]
     assert score_of(good, 2, 0) > score_of(good, 1, 0)
+
+
+def test_verdict_by_bot_rule():
+    """С 18.11 испытание решает копия как у боевого бота (S, правило A): 8+ копий, 65%+ в плюсе, в среднем +5%+."""
+    assert verdict_a(8, 6, 0.10, 0.8, 0.2, {})[0] == "promote"          # 75%, +12.5%
+    assert "в плюсе 6 (75%)" in verdict_a(8, 6, 0.10, 0.8, 0.2, {})[1]
+    assert verdict_a(8, 5, 0.10, 0.8, 0.2, {})[0] == "reject"           # 62% — ниже планки
+    assert verdict_a(8, 7, 0.02, 0.8, 0.2, {})[0] == "reject"           # 88%, но в среднем +2.5%
+    assert verdict_a(5, 1, -0.02, 0.5, 0.1, {})[0] == "reject"          # 20% уже по 5 — дальше не ждём
+    assert verdict_a(5, 3, 0.02, 0.5, 0.1, {})[0] is None               # ждём 8
+    assert verdict_a(1, 1, 0.01, 0.1, 1.2, {})[0] == "idle"
+    assert verdict_a(3, 2, 0.01, 0.3, 4.1, {})[0] == "few"
 
 
 def test_verdict():
@@ -113,9 +125,10 @@ async def test_scout_cycle_with_db():
                            tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet)
                        VALUES ($1, $2, now(), now(), 30, 0.1, 1, 1, 'take_profit', $3, $4, $5)""",
                     port, f"{w}{port}{i}{pnl}", pnl, pnl / 0.1, w)
-        await copy("H", "W", 0.02, 4)
-        await copy("H", "W", -0.01, 2)
-        await copy("H", "X", -0.01, 4)
+        await copy("H", "W", 0.02, 4)                            # H (правило G) — только для сравнения
+        await copy("S", "W", 0.02, 6)                            # решение — по S (как боевой бот, правило A)
+        await copy("S", "W", -0.01, 2)
+        await copy("S", "X", -0.01, 4)
         events = await sc.decide()
         st = {r["address"]: r for r in await db.fetch("SELECT * FROM scout")}
         assert st["W"]["status"] == "promoted" and st["X"]["status"] == "rejected" and st["X"]["cooldown_until"]
@@ -136,7 +149,7 @@ async def test_scout_cycle_with_db():
         assert "кошельков 2" in caption
 
         # кошелёк разведки в своём списке: последние 8 копий в G в минусе — убирается
-        await copy("G", "W", -0.01, 8)
+        await copy("A", "W", -0.01, 8)
         events = await sc.demote()
         assert (await db.fetchval("SELECT status FROM scout WHERE address='W'")) == "demoted"
         assert not await db.fetchval("SELECT active FROM traders WHERE address='W'")

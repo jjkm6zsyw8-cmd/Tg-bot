@@ -622,7 +622,7 @@ def test_route_signals_to_portfolios():
     assert tr.route({"modes": ["mydev"]}, "normal")[0] == {"Y"}                # мой дев — портфель Y
     assert tr.route({"modes": ["copy"], "copy_sol": 6.0, "traders": [{}]}, "normal")[0] == {"H", "K"}   # крупная копия
     assert "новые монеты" in tr.route({"modes": ["new"]}, "strong")[1]
-    assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H"}
+    assert tr.route({"modes": ["scout"]}, "normal")[0] == {"H", "S"}           # кандидат: H (G) и S (как бот, A)
     assert not tr.route({}, "normal")[0] & set("CDEF")                    # закрытые портфели новых сделок не берут
     tr.e.cfg = {"paper_realtime_only": False, "paper_mydev": False}
     assert "Мой дев" in tr.route({"modes": ["mydev"]}, "normal")[1]

@@ -18,7 +18,10 @@
 3. Решение: 6+ закрытых копий, итог в плюсе и прибыльных ≥ 40% → в свой список (копируется как свои кошельки,
    метка «🔍»). Иначе — отсев на 14 дней. 4 копии подряд в минусе — отсев сразу. 4 дня и меньше 6 копий — «мало
    сделок», отсев на 7 дней.
-4. Чистка: кошелёк разведки в своём списке — последние 10 его копий в G в сумме в минусе → убирается (14 дней).
+4. Чистка: кошелёк разведки в своём списке — последние 10 его копий в A (как боевой бот) в сумме в минусе →
+   убирается (14 дней).
+С 18.11 решение испытания — по копиям в S (правило боевого бота A): 8+ копий, в плюсе 65%+, в среднем +5%+ → в smart;
+иначе — отсев. H (правило G) остаётся для сравнения.
    Кошельки, добавленные вручную, бот не трогает: в /wallets и в сводке они помечаются «шлак — убрать».
 
 Всё, что разведка нашла и решила, лежит в таблице scout; файл — /wallets, сводка — /scout.
@@ -36,7 +39,7 @@ from ..external.base import Unavailable
 from . import family as FAM
 from . import lookalike as LK
 from .copytrade import linked_to_dev
-from .paper import SCOUT
+from .paper import SCOUT, TRIAL
 
 if TYPE_CHECKING:
     from .engine import Engine
@@ -52,6 +55,11 @@ DEFAULTS: dict[str, Any] = {
     "scout_min_copies": 6,             # копий на испытании для решения
     "scout_probation_days": 4,
     "scout_idle_days": 1.0,            # за сутки меньше 2 копий — неактивен, место отдаётся следующему
+    # с 18.11 решение — по копиям в S (как торгует боевой бот: вход через 2 блока, всё на +25%, выход за трейдером):
+    # владельцу нужны кошельки, на которых зарабатывает именно копия (у 7BNax копия — 81% в плюс, +28% на сделку)
+    "scout_a_min_copies": 8,
+    "scout_a_min_winrate": 0.65,
+    "scout_a_min_avg": 0.05,           # в среднем на копию, доля
     "scout_min_winrate": 0.40,         # доля прибыльных копий
     "scout_min_profit_usd": 300,       # GMGN: прибыль на монете, $
     "scout_gmgn_min_winrate": 0.45,    # GMGN 7 дней
@@ -127,6 +135,26 @@ def verdict(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: di
         return "reject", res
     if n >= 4 and wins == 0:
         return "reject", res + " — все в минусе"
+    if n < 2 and age_days >= float(cfg_get(cfg, "scout_idle_days")):
+        return "idle", res + f" за {age_days:.0f} дн. — почти не торгует, место следующему"
+    if age_days >= float(cfg_get(cfg, "scout_probation_days")):
+        return "few", res + f" за {age_days:.0f} дн. — мало сделок"
+    return None, res
+
+
+def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float,
+              cfg: dict[str, Any]) -> tuple[str | None, str]:
+    """Итог испытания по копиям в S (правило боевого бота A). pnl/cost — SOL по закрытым копиям."""
+    need = int(cfg_get(cfg, "scout_a_min_copies"))
+    avg = pnl / cost if cost else 0.0
+    res = (f"копия как у бота (A): {n} сделок, в плюсе {wins} ({wins / n:.0%}), в среднем {avg:+.1%}" if n
+           else "копий ещё нет")
+    if n >= need:
+        if wins / n >= float(cfg_get(cfg, "scout_a_min_winrate")) and avg >= float(cfg_get(cfg, "scout_a_min_avg")):
+            return "promote", res
+        return "reject", res
+    if (n >= 4 and wins == 0) or (n >= 5 and wins / n < 0.3):
+        return "reject", res + " — копия не зарабатывает"
     if n < 2 and age_days >= float(cfg_get(cfg, "scout_idle_days")):
         return "idle", res + f" за {age_days:.0f} дн. — почти не торгует, место следующему"
     if age_days >= float(cfg_get(cfg, "scout_probation_days")):
@@ -357,7 +385,7 @@ class Scout:
 
     async def decide(self) -> list[str]:
         rows = await self.db.fetch("SELECT * FROM scout WHERE status='probation'")
-        res = await self.results(SCOUT, [r["address"] for r in rows], "started_at")
+        res = await self.results(TRIAL, [r["address"] for r in rows], "started_at")
         now = datetime.now(timezone.utc)
         auto = int(await self.db.fetchval("SELECT count(*) FROM scout WHERE status='promoted'") or 0)
         cap = int(cfg_get(self.cfg, "scout_max_auto"))
@@ -365,7 +393,7 @@ class Scout:
         for r in rows:
             x = res.get(r["address"], {"n": 0, "wins": 0, "pnl": 0.0, "cost": 0.0})
             age = (now - r["started_at"]).total_seconds() / 86400 if r["started_at"] else 0.0
-            v, why = verdict(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg)
+            v, why = verdict_a(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg)
             addr = r["address"]
             if v == "promote" and auto < cap:
                 await self._promote(addr)
@@ -409,14 +437,14 @@ class Scout:
                 continue
             last = await self.db.fetch(
                 """SELECT pnl_sol FROM paper_positions p JOIN scout s ON s.address = p.source_wallet
-                   WHERE p.portfolio='G' AND p.source_wallet=$1 AND p.closed_at IS NOT NULL
+                   WHERE p.portfolio='A' AND p.source_wallet=$1 AND p.closed_at IS NOT NULL
                      AND p.exit_reason <> 'reset' AND NOT p.suspect AND p.opened_at >= s.decided_at
                    ORDER BY p.closed_at DESC LIMIT 10""", addr)
             pnl = sum(float(x["pnl_sol"] or 0) for x in last)
             if len(last) >= 8 and pnl < 0:
                 await self.db.execute("UPDATE traders SET active=false, manual=false, pinned=false WHERE address=$1",
                                       addr)
-                await self._close(addr, "demoted", f"последние {len(last)} копий в G: {pnl:+.3f} SOL", REJECT_DAYS)
+                await self._close(addr, "demoted", f"последние {len(last)} копий в A: {pnl:+.3f} SOL", REJECT_DAYS)
                 self.stats["demoted"] += 1
                 changed = True
                 out.append(f"🗑 убран из списка {esc(short(addr))} — последние {len(last)} копий {pnl:+.3f} SOL")
@@ -437,11 +465,12 @@ async def scout_report(db: Any) -> str:
         f"""SELECT s.address, s.source, s.started_at, count(p.id) FILTER (WHERE p.closed_at IS NOT NULL) n,
                    count(p.id) FILTER (WHERE p.pnl_sol > 0) wins, COALESCE(sum(p.pnl_sol), 0) pnl,
                    COALESCE(sum(p.cost_sol) FILTER (WHERE p.closed_at IS NOT NULL), 0) cost
-            FROM scout s LEFT JOIN paper_positions p ON p.source_wallet = s.address AND p.portfolio = '{SCOUT}'
+            FROM scout s LEFT JOIN paper_positions p ON p.source_wallet = s.address AND p.portfolio = '{TRIAL}'
                  AND p.opened_at >= s.started_at AND NOT p.suspect AND p.exit_reason IS DISTINCT FROM 'reset'
             WHERE s.status = 'probation' GROUP BY 1, 2, 3 ORDER BY pnl DESC""")
     if rows:
-        lines.append("\n<b>На испытании</b> (копии в H по $10)")
+        lines.append("\n<b>На испытании</b> (копия как у боевого бота — правило A, портфель S, по $10; в smart — "
+                     "от 8 копий, в плюсе 65%+, в среднем +5%+)")
         for r in rows:
             res = f"{r['n']} копий, в плюсе {r['wins']}, {r['pnl'] / r['cost']:+.0%}" if r["cost"] else "копий ещё нет"
             lines.append(f"• {esc(short(r['address']))} ({esc(r['source'] or '')}) · {res}")

@@ -329,20 +329,20 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
     rows = []
     for r in await db.fetch(
             """SELECT s.*, (SELECT count(*) FROM paper_positions p WHERE p.source_wallet = s.address
-                              AND p.portfolio = 'H' AND p.closed_at IS NOT NULL AND NOT p.suspect
+                              AND p.portfolio = 'S' AND p.closed_at IS NOT NULL AND NOT p.suspect
                               AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) n,
                            (SELECT count(*) FILTER (WHERE p.pnl_sol > 0) FROM paper_positions p
-                            WHERE p.source_wallet = s.address AND p.portfolio = 'H' AND p.closed_at IS NOT NULL
+                            WHERE p.source_wallet = s.address AND p.portfolio = 'S' AND p.closed_at IS NOT NULL
                               AND NOT p.suspect AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) wins,
                            (SELECT sum(p.pnl_pct) FROM paper_positions p WHERE p.source_wallet = s.address
-                              AND p.portfolio = 'H' AND p.closed_at IS NOT NULL AND NOT p.suspect
+                              AND p.portfolio = 'S' AND p.closed_at IS NOT NULL AND NOT p.suspect
                               AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) s_pct
                FROM scout s ORDER BY s.found_at DESC"""):
         rows.append([r["address"], r["status"], r["source"] or "", r["reason"] or "", r["found_at"], r["started_at"],
                      int(r["n"] or 0), int(r["wins"] or 0), round(float(r["s_pct"] or 0) * 10, 2) if r["n"] else None,
                      r["decided_at"], r["decision"] or "", r["cooldown_until"]])
     s.table([("Адрес", None), ("Статус", None), ("Откуда", None), ("Почему попал", None), ("Найден", DT),
-             ("Начало испытания", DT), ("Копий в H", NUM), ("В плюсе", NUM), ("Итог копий при $10, $", USD),
+             ("Начало испытания", DT), ("Копий в S (как бот)", NUM), ("В плюсе", NUM), ("Итог копий при $10, $", USD),
              ("Решение", DT), ("Что решено", None), ("Вернуть не раньше", DT)], rows, freeze=True, color_col=8)
 
     buf = io.BytesIO()
