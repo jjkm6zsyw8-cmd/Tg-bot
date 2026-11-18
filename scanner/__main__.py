@@ -135,7 +135,7 @@ async def run_tool(cmd: str, db: Database) -> None:
             if "--coins" in args:                   # по монетам: цена в базе по источникам против бумаги A
                 print("\n" + await coin_details(db, w, now, opt.get("--hours") or float(cfg_get(cfg, "lk_hours"))))
     elif cmd == "cobuyers":
-        # соседи лучшего кошелька по блокчейну: python -m scanner cobuyers [кошелёк] [--coins 60] [--queue]
+        # соседи лучшего кошелька по блокчейну: python -m scanner cobuyers [кошелёк] [--coins 60] [--rps 4] [--queue]
         from types import SimpleNamespace
         from .analytics.cobuy import best_wallet, neighbours, queue_leaders, report
         from .analytics.scout import Scout
@@ -143,13 +143,18 @@ async def run_tool(cmd: str, db: Database) -> None:
         from .ingest.rpc import SolanaRpc
         env = load_env()
         settings = Settings(YamlConfig(env.config_path), await db.get_overrides())
-        coins = int(args[args.index("--coins") + 1]) if "--coins" in args else 60
-        skip = {args.index("--coins") + 1} if "--coins" in args else set()
+        opt = {k: float(args[args.index(k) + 1]) for k in ("--coins", "--rps") if k in args}
+        coins = int(opt.get("--coins", 60))
+        skip = {args.index(k) + 1 for k in opt}
         named = [a for i, a in enumerate(args) if not a.startswith("-") and i not in skip]
         wallet = named[0] if named else await best_wallet(db)
         if not wallet:
             raise SystemExit("Не нашёл кошелёк: укажите адрес")
-        rpc = SolanaRpc(env.rpc_endpoint, rps=env.rpc_rps, fallback=env.rpc_fallback_url or None)
+        # 18.11: на полной скорости поиск делил с работающим ботом лимит Helius (~10 запросов/с на ключ) — сотни
+        # «429: пауза». По умолчанию 4 запроса/с: боту остаётся запас; предупреждения о паузах — не в вывод
+        logging.getLogger("scanner.ingest.rpc").setLevel(logging.ERROR)
+        rpc = SolanaRpc(env.rpc_endpoint, rps=opt.get("--rps", min(4.0, float(env.rpc_rps))), concurrency=4,
+                        fallback=env.rpc_fallback_url or None)
         print(f"Кошелёк {wallet}, монет до {coins}: окно −90…+40 с вокруг каждой его покупки, по блокчейну…",
               flush=True)
         try:
@@ -158,7 +163,7 @@ async def run_tool(cmd: str, db: Database) -> None:
                                                             f"{len(r.near)}, запросов {r.calls}", flush=True))
         finally:
             await rpc.close()
-        print("\n" + report(res))
+        print("\n" + report(res) + f"\n\nПауз из-за лимита узла (429): {rpc.rate_limited}")
         if "--queue" in args:
             eng = SimpleNamespace(db=db, cfg=settings.effective(), price=SimpleNamespace(value=150.0), ext=None,
                                   scouts=set(), _load_traders=None)
