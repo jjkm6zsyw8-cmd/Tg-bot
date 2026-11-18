@@ -177,6 +177,7 @@ async def test_shared_address_is_not_a_stash_and_strongest_family_goes_first():
         assert any("общий адрес" in e and "убрано 4" in e for e in events)
         await fam.reprioritize()
         assert await db.fetchval("SELECT score FROM scout WHERE address=$1", SIBLING) == pytest.approx(10000 + 560)
-        assert "⚠️ общий адрес SHAR" in "\n".join(await FAM.report_lines(db)).replace("SHARED", "SHAR")
+        text = "\n".join(await FAM.report_lines(db))
+        assert "⚠️ общий адрес SHAR" in text.replace("SHARED", "SHAR") and "кошелёк U1" not in text   # не семья
     finally:
         await db.close()

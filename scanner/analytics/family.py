@@ -265,7 +265,10 @@ class Family:
 
 
 async def report_lines(db: Any) -> list[str]:
-    rows = await db.fetch("SELECT * FROM wallet_family ORDER BY found_at DESC LIMIT 15")
+    # кошельки общего адреса (не личной копилки) не показываем — это разные люди, а не семья
+    rows = await db.fetch(
+        """SELECT f.* FROM wallet_family f LEFT JOIN wallet_family p ON p.address = f.parent
+           WHERE p.role IS DISTINCT FROM 'service' ORDER BY f.found_at DESC LIMIT 15""")
     if not rows:
         return []
     icon = {"stash": "🏦 копилка", "cashout": "🔁 обменник", "child": "👪 кошелёк", "service": "⚠️ общий адрес"}
