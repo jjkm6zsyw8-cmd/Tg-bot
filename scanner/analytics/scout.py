@@ -78,6 +78,9 @@ DEFAULTS: dict[str, Any] = {
     "scout_patient_min_trades": 15,    # и сделок за 30 дней не меньше
     "scout_patient_idle_days": 2.0,
     "scout_patient_probation_days": 10,
+    # 20.11: в smart — только при устойчивом плюсе копий на испытании (среднее / (разброс / √n) ≥ 1.645): 8–10
+    # удачных копий подряд бывают и случайно
+    "scout_min_t": 1.645,
     "scout_min_winrate": 0.40,         # доля прибыльных копий
     "scout_min_profit_usd": 300,       # GMGN: прибыль на монете, $
     "scout_gmgn_min_winrate": 0.45,    # GMGN 7 дней
@@ -161,7 +164,7 @@ def verdict(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: di
 
 
 def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: dict[str, Any],
-              best: float = 0.0, patient: bool = False) -> tuple[str | None, str]:
+              best: float = 0.0, patient: bool = False, t: float | None = None) -> tuple[str | None, str]:
     """Итог испытания по копиям в S (правило боевого бота A: вход через 2 блока, всё на +25%, выход за трейдером).
     pnl/cost — SOL по закрытым копиям, best — SOL самой удачной копии.
 
@@ -176,11 +179,18 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: 
     wo = (pnl - best) / (cost * (n - 1) / n) if n >= 2 and cost else avg      # без самой удачной копии
     res = (f"копия как у бота (A): {n} сделок, в плюсе {wins} ({wins / n:.0%}), в среднем {avg:+.1%}"
            + (f", без лучшей {wo:+.1%}" if n >= 2 else "") if n else "копий ещё нет")
-    if (n >= int(cfg_get(cfg, "scout_a_min_copies")) and wins / n >= float(cfg_get(cfg, "scout_a_min_winrate"))
-            and avg >= float(cfg_get(cfg, "scout_a_min_avg"))):
+    if t is not None and n:
+        res += f", устойчивость t={t:.2f}"
+    steady = t is None or t >= float(cfg_get(cfg, "scout_min_t"))
+    path1 = (n >= int(cfg_get(cfg, "scout_a_min_copies")) and wins / n >= float(cfg_get(cfg, "scout_a_min_winrate"))
+             and avg >= float(cfg_get(cfg, "scout_a_min_avg")))
+    path2 = n >= int(cfg_get(cfg, "scout_a_avg_copies")) and avg >= float(cfg_get(cfg, "scout_a_avg_min")) and wo > 0
+    if path1 and steady:
         return "promote", res + " — часто в плюсе"
-    if n >= int(cfg_get(cfg, "scout_a_avg_copies")) and avg >= float(cfg_get(cfg, "scout_a_avg_min")) and wo > 0:
+    if path2 and steady:
         return "promote", res + " — в среднем хорошо, винрейт не важен"
+    if (path1 or path2) and n < int(cfg_get(cfg, "scout_a_max_copies")):
+        return None, res + f" — плюс пока не устойчивый (нужно t ≥ {float(cfg_get(cfg, 'scout_min_t')):g}), ждём копий"
     if n >= int(cfg_get(cfg, "scout_a_max_copies")):
         return "reject", res + " — ни 65% в плюсе с +5% в среднем, ни +8% в среднем"
     if (n >= 4 and wins == 0) or (n >= 6 and avg < 0):
@@ -199,6 +209,17 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: 
     if age_days >= float(cfg_get(cfg, "scout_patient_probation_days" if patient else "scout_probation_days")):
         return "few", res + f" за {age_days:.0f} дн. — мало сделок"
     return None, res
+
+
+def trial_t(x: dict[str, Any]) -> float | None:
+    """Устойчивость плюса копий на испытании: среднее / (разброс / √n); меньше 3 копий — не считаем."""
+    n = int(x.get("n") or 0)
+    sd, avg = x.get("sd"), x.get("apct")
+    if n < 3 or avg is None or sd is None:
+        return None
+    if float(sd) <= 0:
+        return 99.0 if float(avg) > 0 else 0.0
+    return float(avg) / (float(sd) / n ** 0.5)
 
 
 def demote_reason(pcts: list[float], pnl_sol: float) -> str | None:
@@ -452,7 +473,7 @@ class Scout:
         rows = await self.db.fetch(
             f"""SELECT p.source_wallet w, count(*) n, count(*) FILTER (WHERE p.pnl_sol > 0) wins,
                        COALESCE(sum(p.pnl_sol), 0) pnl, COALESCE(sum(p.cost_sol), 0) cost,
-                       COALESCE(max(p.pnl_sol), 0) best
+                       COALESCE(max(p.pnl_sol), 0) best, avg(p.pnl_pct) apct, stddev_samp(p.pnl_pct) sd
                 FROM paper_positions p JOIN scout s ON s.address = p.source_wallet
                 WHERE p.portfolio = $1 AND p.source_wallet = ANY($2::text[]) AND p.closed_at IS NOT NULL
                   AND p.exit_reason <> 'reset' AND NOT p.suspect AND p.opened_at >= s.{since_col}
@@ -465,7 +486,8 @@ class Scout:
             return set()
         return {r["address"] for r in await self.db.fetch(
             """SELECT address FROM traders WHERE address = ANY($1::text[]) AND copy_30d >= $2 AND trades_30d >= $3""",
-            addrs, float(cfg_get(self.cfg, "scout_patient_min_copy")), int(cfg_get(self.cfg, "scout_patient_min_trades")))}
+            addrs, float(cfg_get(self.cfg, "scout_patient_min_copy")),
+            int(cfg_get(self.cfg, "scout_patient_min_trades")))}
 
     async def requeue_patient(self) -> list[str]:
         """Разово (19.11): вернуть в очередь редких, но копируемых, которых раньше сняли за неактивность через 6 ч или
@@ -505,7 +527,7 @@ class Scout:
             x = res.get(r["address"], {"n": 0, "wins": 0, "pnl": 0.0, "cost": 0.0, "best": 0.0})
             age = (now - r["started_at"]).total_seconds() / 86400 if r["started_at"] else 0.0
             v, why = verdict_a(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg,
-                               float(x["best"]), patient=r["address"] in patient)
+                               float(x["best"]), patient=r["address"] in patient, t=trial_t(x))
             addr = r["address"]
             if v == "promote" and open_n.get(addr):
                 continue                     # в smart — только когда закрылись все его копии (не дольше 30 мин)

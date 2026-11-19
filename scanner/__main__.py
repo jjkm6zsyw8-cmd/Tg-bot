@@ -45,7 +45,7 @@ async def main(cmd: str) -> None:
         await db.close()
         return
     if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-               "patterns", "dips", "whynot"):
+               "patterns", "dips", "whynot", "migration"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -206,6 +206,12 @@ async def run_tool(cmd: str, db: Database) -> None:
         days = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
         print(await dips_run(db, days=days, send="--no-send" not in args,
                              progress=lambda m: print(m, file=sys.stderr, flush=True)))
+    elif cmd == "migration":
+        # покупка вокруг миграции на PumpSwap: python -m scanner migration [--days 3] [--no-send] — итог и Excel
+        from .analytics.migration import run as migration_run
+        days = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
+        print(await migration_run(db, days=days, send="--no-send" not in args,
+                                  progress=lambda m: print(m, file=sys.stderr, flush=True)))
     elif cmd == "whynot":
         # почему лучшие кошельки не копируются: python -m scanner whynot [--days 7] [--no-send] — итог в Telegram
         from .analytics.whynot import run as whynot_run

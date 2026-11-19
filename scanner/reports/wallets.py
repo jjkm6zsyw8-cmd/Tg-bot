@@ -21,7 +21,7 @@ HEAD = ["тип", "статус", "рейтинг", "оценка копии %",
         "средняя копия %", "лучшая %", "худшая %", "копий на испытании (H)", "итог испытания %",
         "GMGN винрейт 7д %", "GMGN прибыль 7д $", "GMGN монет 7д", "GMGN удержание, с", "GMGN сливов хуже −50%",
         "сделок 30д (своя база)", "копируемость 30д %", "винрейт 30д %", "медиана удержания, с",
-        "последняя активность", "GMGN"]
+        "последняя активность", "GMGN", "устойчивость плюса копий (t, от 1.645 — не случайность)"]
 
 
 def _pct(v: Any) -> Any:
@@ -110,6 +110,7 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
             _num(g.get("avg_hold_s"), 0), g.get("big_losses") if g.get("big_losses") is not None else "",
             t.get("trades_30d") or "", _pct(t.get("copy_30d")), _pct(t.get("win_rate")),
             _num(t.get("median_hold_s"), 0), when(t.get("last_active")), f"https://gmgn.ai/sol/address/{addr}",
+            _num(t.get("copy_t_30d"), 2),
         ]))
     for _, row in sorted(rows, key=lambda x: x[0]):          # сначала худшие (по копиям на равную сумму) — их убирать
         wr.writerow(row)

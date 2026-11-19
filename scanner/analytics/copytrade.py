@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from statistics import median
@@ -50,6 +51,7 @@ class TraderStats:
     avg_entry_mc: float
     snipe_share: float
     last_active: float | None
+    copy_t: float = 0.0         # устойчивость плюса копий: среднее / (разброс / √n)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -92,6 +94,22 @@ def round_trips(trades: list[dict[str, Any]], create_slots: dict[str, int | None
     return out
 
 
+MIN_COPY_T = 1.645      # t ≥ 1.645: плюс копий вряд ли случайность (95%, односторонняя проверка)
+
+
+def t_stat(values: list[float]) -> float:
+    """Устойчивость среднего результата: среднее / (разброс / √n). Чем больше сделок и ровнее результат, тем выше.
+    Пример: 10 копий по +5% ± 30% — t≈0.5 (может быть везение); 200 таких — t≈2.4 (устойчиво)."""
+    n = len(values)
+    if n < 3:
+        return 0.0
+    m = sum(values) / n
+    var = sum((v - m) ** 2 for v in values) / (n - 1)
+    if var <= 0:
+        return 99.0 if m > 0 else 0.0
+    return m / math.sqrt(var / n)
+
+
 def stats_from_trips(trips: list[RoundTrip], position_sol: float, costs: Costs) -> TraderStats:
     if not trips:
         return TraderStats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None)
@@ -106,6 +124,7 @@ def stats_from_trips(trips: list[RoundTrip], position_sol: float, costs: Costs) 
         avg_entry_mc=sum(t.entry_mc for t in trips) / len(trips),
         snipe_share=sum(1 for t in trips if t.sniped) / len(trips),
         last_active=max(t.exit_ts for t in trips),
+        copy_t=t_stat(copies),
     )
 
 
@@ -184,8 +203,12 @@ def smart_like(t: Any, cfg: dict[str, Any] | None = None) -> bool:
     get = t.get if hasattr(t, "get") else (lambda k, d=None: d)
     hold, copy = get("median_hold_s"), get("copy_30d")
     need = float((cfg or {}).get("own_smart_min_hold_s", OWN_SMART_MIN_HOLD_S))
+    # 20.11: плюс копий должен быть устойчивым (t ≥ 1.645), а не удачей на нескольких сделках; пока t не посчитан
+    # ночным пересчётом — как раньше
+    t = get("copy_t_30d")
+    steady = t is None or float(t) >= float((cfg or {}).get("own_smart_min_copy_t", MIN_COPY_T))
     return hold is not None and float(hold) >= need and copy is not None and float(copy) > 0 \
-        and not get("linked_to_dev")
+        and not get("linked_to_dev") and steady
 
 
 SWING_MIN_HOLD_S = 1800.0
@@ -223,9 +246,9 @@ async def save_trader(db: Database, address: str, s7: TraderStats, s30: TraderSt
     await db.execute(
         """INSERT INTO traders(address, label, tier, manual, active, qualified, qualified_at, pnl_7d, pnl_30d,
                copy_7d, copy_30d, win_rate, trades_30d, median_hold_s, avg_entry_mc, snipe_share, linked_to_dev,
-               last_active, updated_at)
+               last_active, copy_t_30d, updated_at)
            VALUES ($1, $2, $3, COALESCE($4, false), $5, $5, CASE WHEN $5 THEN now() END, $6, $7, $8, $9, $10, $11,
-                   $12, $13, $14, $15, to_timestamp($16), now())
+                   $12, $13, $14, $15, to_timestamp($16), $17, now())
            ON CONFLICT (address) DO UPDATE SET
                label = COALESCE(EXCLUDED.label, traders.label),
                tier = EXCLUDED.tier,
@@ -240,10 +263,10 @@ async def save_trader(db: Database, address: str, s7: TraderStats, s30: TraderSt
                copy_30d = EXCLUDED.copy_30d, win_rate = EXCLUDED.win_rate, trades_30d = EXCLUDED.trades_30d,
                median_hold_s = EXCLUDED.median_hold_s, avg_entry_mc = EXCLUDED.avg_entry_mc,
                snipe_share = EXCLUDED.snipe_share, linked_to_dev = EXCLUDED.linked_to_dev,
-               last_active = EXCLUDED.last_active, updated_at = now()""",
+               last_active = EXCLUDED.last_active, copy_t_30d = EXCLUDED.copy_t_30d, updated_at = now()""",
         address, label, tier(s30), manual, ok, s7.pnl_sol, s30.pnl_sol, s7.copyability, s30.copyability,
         s30.win_rate, s30.trades, s30.median_hold_s, s30.avg_entry_mc, s30.snipe_share, linked,
-        s30.last_active or 0,
+        s30.last_active or 0, s30.copy_t,
     )
 
 

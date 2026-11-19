@@ -68,7 +68,7 @@ def classify(buy: dict[str, Any], w: dict[str, Any], cfg: dict[str, Any], copied
 async def candidates(db: Any, min_trades: int = MIN_TRADES, top: int = TOP) -> list[dict[str, Any]]:
     """Кошельки с копируемостью за 30 дней в плюсе: свои, smart-money и кандидаты разведки — лучшие первыми."""
     rows = await db.fetch(
-        """SELECT t.address, t.copy_30d, t.trades_30d, t.median_hold_s, t.active,
+        """SELECT t.address, t.copy_30d, t.copy_t_30d, t.trades_30d, t.median_hold_s, t.active,
                   (t.manual OR w.address IS NOT NULL) AS manual, w.created_at AS listed_at, t.qualified_at,
                   s.status AS scout_status, s.started_at, s.decided_at
            FROM traders t
@@ -134,8 +134,9 @@ async def run(db: Any, cfg: dict[str, Any], days: float = 7.0, send: bool = True
         n_buys += a["buys"]
         n_copied += a["copied"]
         total.update(a["why"])
-        head = (f"• <code>{short(w['address'])}</code> · {kind_of(w)} · копируемость {float(w['copy_30d']):+.0%}, "
-                f"держит {hold_text(w.get('median_hold_s'))}: покупок {a['buys']}, скопировано {a['copied']}")
+        steady = (f", устойчивость t={float(w['copy_t_30d']):.1f}" if w.get("copy_t_30d") is not None else "")
+        head = (f"• <code>{short(w['address'])}</code> · {kind_of(w)} · копируемость {float(w['copy_30d']):+.0%}"
+                f"{steady}, держит {hold_text(w.get('median_hold_s'))}: покупок {a['buys']}, скопировано {a['copied']}")
         if a["why"]:
             head += ". Почему нет: " + "; ".join(f"{k} — {v}" for k, v in a["why"].most_common(4))
         lines.append(head)

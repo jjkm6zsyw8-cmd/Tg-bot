@@ -58,7 +58,7 @@ def make_engine(traders, monkeypatch, **cfg):
     async def fresh(st):
         return None
     eng.compose, eng.paper, eng._fresh_share = compose, SimpleNamespace(on_alert=on_alert), fresh
-    for name in ("_on_smart_trade", "_smart_gate", "_smart_fallback", "_on_swing_buy"):
+    for name in ("_on_smart_trade", "_smart_gate", "_steady_gate", "_smart_fallback", "_on_swing_buy"):
         setattr(eng, name, types.MethodType(getattr(E.Engine, name), eng))
     eng._stage = E.Engine._stage
     return eng
@@ -233,3 +233,36 @@ async def test_requeue_rare_copyable_candidates_once(db):
     assert rows["BOJC"]["score"] > 9000 and rows["WEAK"]["status"] == "few"
     assert await sc.requeue_patient() == []                               # разово
     assert await sc.patient_set(["BOJC", "WEAK"]) == {"BOJC"}
+
+
+def test_steadiness_t_stat():
+    from scanner.analytics.copytrade import smart_like, t_stat
+    from scanner.analytics.scout import trial_t
+    assert t_stat([0.25] * 8 + [-0.85]) == pytest.approx(1.046, abs=0.01)      # 8 тейков и раг — ещё не устойчиво
+    assert t_stat([0.05, 0.3, -0.2] * 70) > 1.645                               # 210 сделок, в среднем +5% — устойчиво
+    assert t_stat([0.05, 0.3, -0.2] * 3) < 1.645                                # 9 таких же — может быть везение
+    assert t_stat([0.1, 0.1]) == 0.0                                            # меньше 3 — не считаем
+    assert trial_t({"n": 9, "apct": 1.15 / 9, "sd": 0.3667}) == pytest.approx(1.046, abs=0.01)
+    assert trial_t({"n": 2, "apct": 0.2, "sd": 0.1}) is None
+    # разведка: путь в smart пройден, но плюс не устойчивый — ждём ещё копий; устойчивый — в smart
+    v, why = verdict_a(9, 8, 0.115, 0.9, 0.2, {}, t=1.05)
+    assert v is None and "не устойчивый" in why and "t=1.05" in why
+    assert verdict_a(9, 8, 0.115, 0.9, 0.2, {}, t=2.0)[0] == "promote"
+    assert verdict_a(20, 12, 0.2, 2.0, 0.5, {}, t=1.0)[0] == "reject"         # 20 копий и всё ещё не устойчиво
+    # свой кошелёк: держит минутами, копируемость в плюсе, но t низкий — не как smart (копии своего списка, H)
+    base = {"median_hold_s": 600, "copy_30d": 0.05}
+    assert smart_like(base) and smart_like({**base, "copy_t_30d": 2.1})
+    assert not smart_like({**base, "copy_t_30d": 0.8})
+
+
+async def test_unsteady_smart_money_goes_to_paper_only(monkeypatch):
+    eng = make_engine({"S": {"label": "smart", "manual": False, "copy_30d": 0.03, "copy_t_30d": 0.7},
+                       "P": {"label": "из разведки", "manual": False, "pinned": True, "copy_30d": 0.02,
+                             "copy_t_30d": 0.4}}, monkeypatch)
+    await eng._on_smart_trade(coin(100.0), buy("S", 1.0, 100.0))
+    await asyncio.sleep(0)
+    assert not eng.composed and eng.papered[-1]["paper_only"]               # не в smart и не на деньги — на бумагу
+    assert "плюс копий не устойчивый: t=0.70" in eng.db.log[-1]["reason"]
+    await eng._on_smart_trade(coin(100.0), buy("P", 1.0, 100.0))
+    await asyncio.sleep(0)
+    assert [m for m, _ in eng.composed] == ["smart"]                         # прошедший испытание — решает испытание

@@ -288,8 +288,10 @@ async def test_promotion_waits_for_open_copies_and_full_trial_can_demote():
 
         async def load_traders():
             loads.append(1)
-        sc = Scout(SimpleNamespace(db=db, cfg={}, price=SimpleNamespace(value=100.0), ext=None, scouts=set(),
-                                   _load_traders=load_traders))  # type: ignore[arg-type]
+        # порог устойчивости ниже обычного: здесь проверяется ожидание открытых копий и снятие (8 по +25% и раг
+        # −85% — t≈1.05, при обычном пороге 1.645 бот ждал бы ещё копий: см. test_whynot)
+        sc = Scout(SimpleNamespace(db=db, cfg={"scout_min_t": 0.5}, price=SimpleNamespace(value=100.0), ext=None,
+                                   scouts=set(), _load_traders=load_traders))  # type: ignore[arg-type]
         assert await sc.decide() == [] and await db.fetchval("SELECT status FROM scout WHERE address='W'") == "probation"
         await db.execute("""UPDATE paper_positions SET closed_at=now(), exit_reason='max_hold', pnl_sol=-0.085,
                                 pnl_pct=-0.85 WHERE closed_at IS NULL""")

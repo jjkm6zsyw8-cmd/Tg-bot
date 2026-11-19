@@ -649,3 +649,6 @@ CREATE TABLE IF NOT EXISTS wallet_family (
     last_sig   text,
     checked_at timestamptz
 );
+
+-- 20.11: устойчивость плюса копий трейдера за 30 дней (среднее / (разброс / √n)); ≥1.645 — не случайность
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS copy_t_30d double precision;

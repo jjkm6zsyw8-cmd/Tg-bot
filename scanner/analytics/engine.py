@@ -19,7 +19,7 @@ from ..config import Env, Settings
 from ..db.pool import Database
 from ..ingest.rpc import RpcError, SolanaRpc
 from . import clusters as cl
-from .copytrade import TIER_NAMES, refresh_traders_adaptive, smart_like, swing_like
+from .copytrade import MIN_COPY_T, TIER_NAMES, refresh_traders_adaptive, smart_like, swing_like
 from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_profit
 from .features import launch_summary
 from .filters import check as check_filters
@@ -834,7 +834,11 @@ class Engine:
         blacklisted = bool(self.info.get(st.mint) and self.info[st.mint].cluster_row
                            and self.info[st.mint].cluster_row["blacklisted"])
         if not own:
-            why = self._smart_gate(st, r, now)
+            # smart-money с неустойчивым плюсом копий — не в smart-портфели и не на деньги, а на бумагу H (меряем)
+            why = self._steady_gate(trader)
+            fallback_ok = watch or why is not None
+            if why is None:
+                why = self._smart_gate(st, r, now)
             if why is None:
                 fresh = await self._fresh_share(st)
                 metrics = st.metrics(fresh)
@@ -842,7 +846,7 @@ class Engine:
                 if not filt.passed:
                     why = "фильтры безопасности smart: " + ", ".join(filt.violations)
             if why is not None:
-                if watch:
+                if fallback_ok:
                     # свой кошелёк, который бот ведёт как smart, или smart-money с хорошей копируемостью: раньше их
                     # покупки вне рамок smart пропадали молча — 19.11 у 32FE (копируемость +52%) 0 копий за неделю
                     await self._smart_fallback(st, r, why, blacklisted)
@@ -901,6 +905,17 @@ class Engine:
         e = self.alerts.get(st.mint)
         if e:
             e.trigger_traders[r["trader"]] = e.trigger_traders.get(r["trader"], 0.0) + r["token_amount"]
+
+    def _steady_gate(self, trader: Any) -> str | None:
+        """Плюс копий кошелька за 30 дней устойчивый (t ≥ порога)? Не посчитан, свой кошелёк или прошедший испытание
+        разведки (pinned) — пропускаем: у своих это решает smart_like, у разведки — испытание."""
+        t = trader.get("copy_t_30d")
+        if t is None or trader.get("manual") or trader.get("pinned"):
+            return None
+        need = float(self.cfg.get("trader_min_copy_t", MIN_COPY_T))
+        if float(t) < need:
+            return f"плюс копий не устойчивый: t={float(t):.2f} < {need:g}"
+        return None
 
     def _smart_gate(self, st: TokenState, r: Any, now: float) -> str | None:
         """Рамки smart, которые видны по самой покупке и монете: размер покупки, капитализация, рост за минуту.
