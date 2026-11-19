@@ -75,6 +75,9 @@ OFF_SET = "CDEF"
 # пика после +30%, вслед за трейдером, аварийный стоп −50%. Дневной сброс R не трогает (позиции живут сутки).
 SWING = "R"
 SWING_MAX_OPEN = 40
+# 19.11: бумага — замер, денег в ней нет: лимит 3 позиций и дневные стопы (копия правил боя) прятали сигналы.
+# В режиме замера (paper_measure, по умолчанию) каждый портфель берёт все сигналы — до 40 позиций, без дневного стопа
+MEASURE_MAX_OPEN = 40
 SWING_USD = 10.0
 # Y — «мой дев» (с 12.11, наблюдение): запуск монеты девом из своего списка, вход через 2 блока после создания по цене
 # блокчейна, схема G, по $10. Проверка по сделкам 10–12.11: 144 запуска, G +$194, все 54 варианта трейлинга в плюсе
@@ -1174,10 +1177,13 @@ class PaperTrader:
             lottery = kind == "lottery"
             max_open = M_MAX_OPEN.get(kind, MAX_OPEN)
             open_here = [p for p in open_here if (p.rule or "copy") == kind]
+        measure = bool(self.cfg.get("paper_measure", True))
+        if measure:
+            max_open = max(max_open, MEASURE_MAX_OPEN)
         if len(open_here) >= max_open:
             self.skipped[name] = f"лимит {max_open} открытых позиций" + (f" ({kind})" if kind else "")
             return None
-        if self.day_stopped(name):
+        if not measure and self.day_stopped(name):
             self.skipped[name] = f"дневной стоп: за сегодня −${self.day_stop_usd(name):g} — новых входов нет до 00:00"
             return None
         if mint in self.rugged:

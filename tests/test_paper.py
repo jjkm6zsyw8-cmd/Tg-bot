@@ -634,6 +634,7 @@ def test_route_signals_to_portfolios():
 
 async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
     tr = bare_trader({})
+    tr.e.cfg["paper_measure"] = False                           # правила боя: лимиты и стоп
     tr.balance = {"D": 0.30, "A": 0.30}
     tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
     tr.priority = lambda: 0.0005
@@ -662,7 +663,8 @@ async def test_lottery_ticket_slots_and_day_stop(monkeypatch):
     assert await tr._open("D", "M10", "watch", None, {}, None, 30.0)
     assert await tr._open("A", "M10", "normal", None, {}, None, 30.0)
     tr.positions.clear()
-    tr.e.cfg = {"paper_realtime_only": False, "paper_lottery_day_stop_usd": 35, "paper_day_stop_pct": 0.25}   # включены в /settings
+    tr.e.cfg = {"paper_realtime_only": False, "paper_lottery_day_stop_usd": 35, "paper_day_stop_pct": 0.25,
+                "paper_measure": False}                          # стопы включены в /settings, замер выключен
     tr.day_pnl["D"] = -0.36                                      # −$36 при SOL $100 (стоп $35)
     assert await tr._open("D", "M10", "watch", None, {}, None, 30.0) is None
     assert "дневной стоп" in tr.skipped["D"]
@@ -819,7 +821,8 @@ async def test_main_portfolio_m():
     tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
     tr.priority = lambda: 0.0005
     tr.fee_bps = lambda: 125
-    tr.e.cfg = {"paper_realtime_only": False, "paper_position_share": 0.2, "paper_size_by_level": False}
+    tr.e.cfg = {"paper_realtime_only": False, "paper_position_share": 0.2, "paper_size_by_level": False,
+                "paper_measure": False}                     # правила боя: лимиты и стоп
     ids = []
 
     class DB:
@@ -903,3 +906,31 @@ async def test_m_enters_faster(monkeypatch):
     await tr.on_alert("M1", "strong", None, strong, "W")
     # без данных о покупке трейдера (запасной путь): M — через 1 с, G — через 5 с, поправка по замеру +2%
     assert ("M", pytest.approx(30.0 * 1.02)) in entered and ("G", pytest.approx(36.0 * 1.02)) in entered
+
+
+async def test_paper_measure_takes_every_signal():
+    """19.11: в бумаге денег нет — в режиме замера (по умолчанию) портфель не упирается в лимит 3 позиций и дневной
+    стоп: таблица по методам считается по всем сигналам."""
+    tr = bare_trader({})
+    tr.e.cfg["paper_day_stop_pct"] = 0.05
+    tr.balance = {"A": 10.0}
+    tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
+    tr.priority = lambda: 0.0005
+    tr.fee_bps = lambda: 125
+    ids = []
+
+    class DB:
+        async def fetchval(self, *a):
+            ids.append(a)
+            return len(ids)
+
+        async def execute(self, *a):
+            return None
+    tr.db = DB()
+    data = {"modes": ["smart"], "source_wallet": "W"}
+    for i in range(6):
+        assert await tr._open("A", f"M{i}", "normal", None, data, "W", 30.0)              # больше 3 позиций
+    tr.day_pnl["A"] = -1.0                                                                # стоп −5% — давно
+    assert await tr._open("A", "MX", "normal", None, data, "W", 30.0)
+    tr.e.cfg["paper_measure"] = False                                                     # правила боя
+    assert await tr._open("A", "MY", "normal", None, data, "W", 30.0) is None and "лимит 3" in tr.skipped["A"]
