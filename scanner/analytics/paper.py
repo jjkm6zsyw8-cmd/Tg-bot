@@ -716,6 +716,7 @@ class PaperTrader:
         cand = sorted((x for x in reversed(list(uniq.values())) if not x.get("err") and x.get("slot") is not None
                        and s0 <= int(x["slot"]) <= target and x.get("signature") != trig_sig),
                       key=lambda x: -int(x["slot"]))
+        others = bool(cand)                                    # сделки после трейдера до блока +2 (кроме триггера)
         if with_trigger:
             cand.append({"signature": trig_sig, "slot": s0})     # сама транзакция создания
         if not cand:
@@ -728,7 +729,10 @@ class PaperTrader:
                     cur = None
                 if cur is None or int(cur) < target:
                     return self._why(mint, trig_sig, "узел ещё не дошёл до блока +2")
-            return trig_mc                       # между покупкой трейдера и нашим блоком сделок не было
+            # между покупкой трейдера и нашим блоком сделок не было — цена после трейдера: из его же транзакции
+            # своим разбором (19.11: MC из базы у сделок PumpSwap бывает от PumpPortal — без виртуальных резервов
+            # пула, на 4–26% ниже: 7BNax 17.11 — вход 201.7 вместо 253.7)
+            cand = []
         pool_map: dict[str, str] = {}
         try:
             amm = await self.db.fetchval("SELECT amm_pool FROM tokens WHERE mint=$1", mint)
@@ -744,6 +748,8 @@ class PaperTrader:
         if with_trigger and s0 in blocks:
             # создание — первым в своём блоке: лимит BLOCK_TX_MAX его не отрежет (в блоке запуска бывает 30+ сделок)
             blocks[s0].sort(key=lambda x: x["signature"] != trig_sig)
+        if not with_trigger:
+            blocks.setdefault(s0, [])                # блок сигнала — всегда: цена после трейдера из его транзакции
         parsed: dict[str, list[Any]] = {}
 
         async def events(x: dict[str, Any]) -> list[Any] | None:
@@ -787,9 +793,22 @@ class PaperTrader:
                 if created is not None and created.quote_mint:
                     return self._why(mint, trig_sig, "монета в паре не к SOL")
                 mcs += [mc_sol(ev.v_sol, ev.v_tokens) for ev in all_evs if isinstance(ev, Trade) and ev.mint == mint]
-            if slot == s0 and trig_mc and not with_trigger:
-                # блок сигнала: сделки до трейдера (их теперь тоже видно) дешевле — вход не дешевле цены после него
-                mcs.append(float(trig_mc))
+            if slot == s0 and not with_trigger:
+                # блок сигнала: цена после трейдера — из его транзакции своим разбором (та же шкала, что у выходов);
+                # не разобралась — из базы. Сделки блока до трейдера дешевле — вход не дешевле цены после него
+                trig_mcs: list[float] = []
+                try:
+                    evs = await events({"signature": trig_sig, "slot": s0}) or []
+                    trig_mcs = [mc_sol(ev.v_sol, ev.v_tokens) for ev in evs if isinstance(ev, Trade) and ev.mint == mint]
+                except Exception:  # noqa: BLE001 — узел не отдал транзакцию трейдера: остаётся цена из базы
+                    trig_mcs = []
+                trig_mcs = [m for m in trig_mcs if m > 0]
+                if trig_mcs:
+                    mcs += trig_mcs
+                elif trig_mc and (mcs or not others):
+                    # из базы — только как нижняя граница к сделкам блока или когда сделок после трейдера не было
+                    # (сделки были, но не к SOL — не входим, как раньше)
+                    mcs.append(float(trig_mc))
             mcs = [m for m in mcs if m > 0]
             if mcs:
                 # порядок транзакций внутри блока узел отдаёт по-разному, а на запуске монеты цена внутри блока

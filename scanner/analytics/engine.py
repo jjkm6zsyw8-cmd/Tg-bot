@@ -43,6 +43,13 @@ def trigger_of(r: Any) -> dict[str, Any]:
     out = {"trigger_slot": int(r["slot"]), "trigger_sig": r["signature"], "trigger_mc": float(r["mc_sol"]),
            "trigger_at": time.time()}
     try:
+        if r["source"] == "pumpportal" and r["pool"] == "pump-amm":
+            # 19.11: MC от PumpPortal на PumpSwap — без виртуальных резервов пула (на 4–26% ниже настоящей): как цену
+            # не берём (бумага считает цену после трейдера по его транзакции, бой не сравнивает с ней рост цены)
+            out["trigger_mc_rough"] = True
+    except (KeyError, IndexError, TypeError):
+        pass
+    try:
         out["trigger_ts"] = r["ts"].timestamp()        # время блока покупки: от него реальный бот меряет задержку
     except Exception:  # noqa: BLE001
         pass

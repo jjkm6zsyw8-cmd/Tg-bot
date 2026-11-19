@@ -28,13 +28,21 @@ class TradeRow:
     signature: str = ""
     new_balance: float | None = None
     real_tokens: float | None = None
+    price_ok: bool = True               # False — MC сделки неверный, цену монеты по нему не двигаем
 
     @classmethod
     def from_record(cls, r: Any) -> "TradeRow":
+        try:
+            # 19.11: PumpPortal на PumpSwap присылает MC по настоящим резервам пула, без виртуальных (у новых пулов
+            # ≈6–17 SOL) — на 4–26% ниже настоящей цены. Свой разбор блоков считает с ними. Смесь двух шкал давала
+            # бумаге вход по заниженной цене и «тейк» через секунды (7BNax 17.11: вход 201.7 при цене 253.7–264.9)
+            price_ok = not (r["source"] == "pumpportal" and r["pool"] == "pump-amm")
+        except (KeyError, IndexError, TypeError):
+            price_ok = True
         return cls(
             ts=r["ts"].timestamp(), slot=r["slot"], trader=r["trader"], is_buy=r["is_buy"],
             sol=r["sol_amount"], tokens=r["token_amount"], mc=r["mc_sol"], signature=r["signature"],
-            new_balance=r["new_balance"], real_tokens=r["real_tokens"],
+            new_balance=r["new_balance"], real_tokens=r["real_tokens"], price_ok=price_ok,
         )
 
 
@@ -132,6 +140,8 @@ class TokenState:
 
     def _apply(self, t: TradeRow) -> TradeEffects:
         eff = TradeEffects(mc_before=self.mc)
+        if not t.price_ok:
+            t.mc = self.mc                  # балансы и продажи — по сделке, цена — прежняя (из своего разбора)
         cw = self.cluster_wallets()
         # покупка в слоте создания — часть кластера по определению ТЗ
         if (t.is_buy and self.created_slot is not None and t.slot == self.created_slot

@@ -382,6 +382,17 @@ class Receiver:
                                v_sol, v_tokens, real_tokens, new_balance, fee_sol, pool, slot, ts, received_at, source)
                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                            ON CONFLICT (signature, mint, trader, is_buy) DO UPDATE SET
+                               -- 19.11: та же сделка PumpSwap пришла и из PumpPortal (MC без виртуальных резервов
+                               -- пула), и из своего разбора — цена берётся из своего разбора
+                               mc_sol = CASE WHEN trades.source = 'pumpportal' AND trades.pool = 'pump-amm'
+                                             AND EXCLUDED.source <> 'pumpportal' THEN EXCLUDED.mc_sol ELSE trades.mc_sol END,
+                               v_sol = CASE WHEN trades.source = 'pumpportal' AND trades.pool = 'pump-amm'
+                                            AND EXCLUDED.source <> 'pumpportal' THEN EXCLUDED.v_sol ELSE trades.v_sol END,
+                               v_tokens = CASE WHEN trades.source = 'pumpportal' AND trades.pool = 'pump-amm'
+                                               AND EXCLUDED.source <> 'pumpportal' THEN EXCLUDED.v_tokens
+                                               ELSE trades.v_tokens END,
+                               source = CASE WHEN trades.source = 'pumpportal' AND trades.pool = 'pump-amm'
+                                             AND EXCLUDED.source <> 'pumpportal' THEN EXCLUDED.source ELSE trades.source END,
                                slot = COALESCE(trades.slot, EXCLUDED.slot),
                                fee_sol = COALESCE(trades.fee_sol, EXCLUDED.fee_sol),
                                real_tokens = COALESCE(EXCLUDED.real_tokens, trades.real_tokens),

@@ -248,3 +248,36 @@ async def test_end_to_end(monkeypatch):
     finally:
         await engine.rpc.close() if "engine" in locals() else None
         await db.close()
+
+
+async def test_pumpswap_trade_price_from_own_parse_wins_over_pumpportal():
+    """19.11: одна и та же сделка PumpSwap пришла сначала из PumpPortal (MC без виртуальных резервов пула — ниже
+    настоящей), потом из своего разбора блоков — в базе остаётся цена своего разбора. Обратный порядок — тоже."""
+    db = await _db()
+    if db is None:
+        pytest.skip("PostgreSQL недоступен (TEST_DATABASE_URL)")
+    try:
+        env = Env(database_url=DSN, redirect_base="https://bot.example", rpc_url="http://127.0.0.1:9",
+                  allowed_user_ids="111", bot_token="x", helius_api_key="")
+        rec = Receiver(env, Settings(YamlConfig("config/config.yaml")), db)
+        mint, who, t0 = rand_addr(), rand_addr(), datetime.now(timezone.utc)
+        rec.tracked_wallets.add(who)                          # сделки отслеживаемого кошелька хранятся всегда
+
+        def trade(sig, source, v_sol, slot=None):
+            return Trade(signature=sig, mint=mint, trader=who, is_buy=True, sol_amount=1.8, token_amount=1e6,
+                         v_sol=v_sol, v_tokens=1e9 if source == "pumpportal" else 266.5e6, pool="pump-amm",
+                         slot=slot, ts=t0, source=source)
+        await rec.sink(trade("pp-first", "pumpportal", 200.6))
+        await rec.flush()
+        await rec.sink(trade("pp-first", "blocks", 67.6, slot=100))
+        await rec.flush()
+        r = await db.fetchrow("SELECT * FROM trades WHERE signature='pp-first'")
+        assert r["mc_sol"] == pytest.approx(253.7, abs=0.1) and r["source"] == "blocks" and r["slot"] == 100
+        await rec.sink(trade("own-first", "blocks", 67.6, slot=101))
+        await rec.flush()
+        await rec.sink(trade("own-first", "pumpportal", 200.6))
+        await rec.flush()
+        r = await db.fetchrow("SELECT * FROM trades WHERE signature='own-first'")
+        assert r["mc_sol"] == pytest.approx(253.7, abs=0.1) and r["source"] == "blocks"
+    finally:
+        await db.close()

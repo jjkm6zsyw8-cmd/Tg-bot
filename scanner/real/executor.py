@@ -580,6 +580,10 @@ class RealTrader:
         trig_mc = float(data.get("trigger_mc") or 0)
         if data.get("trigger_create"):
             trig_mc = 0.0                             # у запуска цена сигнала — не цена монеты
+        if data.get("trigger_mc_rough"):
+            # 19.11: цена сигнала от PumpPortal на PumpSwap ниже настоящей на 4–26% (без виртуальных резервов пула) —
+            # сравнение с ней давало ложное «цена уже убежала»; от переплаты защищает проскальзывание покупки
+            trig_mc = 0.0
         if trig_mc > 0 and st["mc"] > trig_mc * (1 + float(self.get("real_max_runup"))):
             return self._skip(mode, kind, "цена уже убежала от цены сигнала")
         slip = float(self.get("real_buy_slippage"))

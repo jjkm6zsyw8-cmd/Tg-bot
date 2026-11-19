@@ -457,3 +457,24 @@ def test_pump_link_without_and_with_redirect_page():
     m = addr("pl")
     assert fmt.pump_url(links, m, "https://example.com") == f"https://pump.fun/coin/{m}"     # своей страницы нет
     assert fmt.pump_url(links, m, "https://u.github.io/Tg-bot") == f"https://u.github.io/Tg-bot/p/{m}"
+
+
+def test_pumpportal_pumpswap_mc_does_not_move_price():
+    """19.11: PumpPortal на PumpSwap даёт MC без виртуальных резервов пула (на 4–26% ниже настоящей) — цену монеты
+    двигает только свой разбор; балансы по такой сделке считаются как обычно."""
+    from types import SimpleNamespace  # noqa: F401
+    now = datetime.now(timezone.utc)
+
+    def rec(sig, trader, mc, source, pool="pump-amm", is_buy=True):
+        return {"ts": now, "slot": 5, "trader": trader, "is_buy": is_buy, "sol_amount": 1.0, "token_amount": 100.0,
+                "mc_sol": mc, "signature": sig, "new_balance": None, "real_tokens": None, "source": source,
+                "pool": pool}
+    st = TokenState(mint=addr("mintPP"), deployer=addr("dev"), created_ts=now.timestamp() - 3600, initial_mc=27.96)
+    st.add_trade(TradeRow.from_record(rec("a", addr("x"), 253.7, "blocks")))
+    eff = st.add_trade(TradeRow.from_record(rec("b", addr("y"), 200.6, "pumpportal")))
+    assert st.mc == pytest.approx(253.7) and st.trades[-1].mc == pytest.approx(253.7) and eff is not None
+    assert st.balances[addr("y")] == pytest.approx(100.0)
+    st.add_trade(TradeRow.from_record(rec("c", addr("z"), 264.9, "pumpportal", pool="pump")))   # кривая — как есть
+    assert st.mc == pytest.approx(264.9)
+    assert TradeRow.from_record({k: v for k, v in rec("d", addr("w"), 1.0, "x").items()
+                                 if k not in ("source", "pool")}).price_ok          # старые выборки без полей

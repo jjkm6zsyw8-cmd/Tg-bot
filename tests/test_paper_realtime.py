@@ -735,3 +735,33 @@ async def test_block_mc_signal_block_is_never_cheaper_than_after_trader(monkeypa
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == pytest.approx(after_mc)
     tr.e.rpc = UntilRpc([{"signature": "TRIG", "slot": 100}, {"signature": "BEFORE", "slot": 100}])
     assert await tr.block_mc("M", "TRIG", 100, 102, 30.0) == 30.0
+
+
+async def test_block_mc_price_after_trader_comes_from_his_tx_not_db(monkeypatch):
+    """19.11, по блокчейну: 7BNax 17.11 (AKyrm7) — MC в базе от PumpPortal 200.6 (без виртуальных резервов пула), а по
+    его транзакции своим разбором — 253.7; выходы бумага считала своим разбором — вход по 200.6 давал «тейк» сразу.
+    Сделок после него до блока +2 нет — цена из его транзакции."""
+    import scanner.ingest.pump_parser as parser
+    tr = bare_trader({})
+    tr.db = SimpleNamespace(fetchval=lambda *a: asyncio.sleep(0, result=None))
+
+    def parse(tx, sig, slot, src, stats, pool_map=None):
+        return [Trade(signature=sig, mint="M", trader="7BNax", is_buy=True, sol_amount=1.8, token_amount=1,
+                      v_sol=67.6, v_tokens=266.5e6, pool="pump-amm")] if sig == "TRIG" else []
+    monkeypatch.setattr(parser, "parse_transaction", parse)
+    rpc = UntilRpc([{"signature": "later", "slot": 110}, {"signature": "TRIG", "slot": 100}])
+    tr.e.rpc = rpc
+    mc = await tr.block_mc("M", "TRIG", 100, 102, 200.6)
+    assert mc == pytest.approx(mc_sol(67.6, 266.5e6)) and mc == pytest.approx(253.7, abs=0.1)
+    assert rpc.tx_calls == ["TRIG"]
+
+
+def test_trigger_marks_pumpportal_pumpswap_price_as_rough():
+    from datetime import datetime, timezone
+
+    from scanner.analytics.engine import trigger_of
+    base = {"slot": 5, "signature": "S", "mc_sol": 200.6, "ts": datetime.now(timezone.utc)}
+    assert trigger_of({**base, "source": "pumpportal", "pool": "pump-amm"})["trigger_mc_rough"] is True
+    assert "trigger_mc_rough" not in trigger_of({**base, "source": "blocks", "pool": "pump-amm"})
+    assert "trigger_mc_rough" not in trigger_of({**base, "source": "pumpportal", "pool": "pump"})
+    assert "trigger_mc_rough" not in trigger_of(base)                      # старые выборки без полей

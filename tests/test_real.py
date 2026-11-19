@@ -953,3 +953,14 @@ async def test_shadow_position_price_is_polled_from_chain(db):
     await tr.tick()
     await asyncio.sleep(0.2)
     assert not tr.positions and await db.fetchval("SELECT exit_reason FROM real_positions") == "take_profit"
+
+
+async def test_rough_signal_price_is_not_a_runup(db):
+    """19.11: цена сигнала от PumpPortal на PumpSwap — без виртуальных резервов пула (на 4–26% ниже настоящей);
+    с ней рост цены не сравниваем, иначе бот ложно пишет «цена уже убежала» и пропускает сделку."""
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain)
+    await tr.start()
+    await fire(tr, chain, trigger_mc=chain.mc(MINT) / 1.3, trigger_mc_rough=True)
+    assert not skipped(tr, "цена уже убежала") and str(MINT) in {p.mint for p in tr.positions.values()}
