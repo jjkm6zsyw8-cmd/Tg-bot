@@ -478,3 +478,28 @@ def test_pumpportal_pumpswap_mc_does_not_move_price():
     assert st.mc == pytest.approx(264.9)
     assert TradeRow.from_record({k: v for k, v in rec("d", addr("w"), 1.0, "x").items()
                                  if k not in ("source", "pool")}).price_ok          # старые выборки без полей
+
+
+async def test_send_doc_waits_longer_and_retries_once(monkeypatch):
+    """19.11: отчёт Excel не успевал уйти за 60 с — «Request timeout error». Файлы: до 5 минут и один повтор."""
+    from types import SimpleNamespace
+
+    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.methods import SendDocument
+
+    from scanner.bot import handlers
+    calls = []
+
+    class Bot:
+        async def send_document(self, chat_id, doc, caption=None, message_thread_id=None, request_timeout=None):
+            calls.append((chat_id, doc.filename, message_thread_id, request_timeout))
+            if len(calls) == 1:
+                raise TelegramNetworkError(SendDocument(chat_id=chat_id, document=doc), "Request timeout error")
+    msg = SimpleNamespace(bot=Bot(), chat=SimpleNamespace(id=7), message_thread_id=5, is_topic_message=True)
+    monkeypatch.setattr(handlers.asyncio, "sleep", _no_sleep)       # восстановится после теста
+    await handlers.send_doc(msg, b"x", "report.xlsx", "c")
+    assert calls == [(7, "report.xlsx", 5, 300), (7, "report.xlsx", 5, 300)]
+
+
+async def _no_sleep(*_a):
+    return None

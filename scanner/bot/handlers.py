@@ -72,6 +72,25 @@ HELP = """<b>Pump.fun Dev Scanner</b>
 /quiet 01:00-08:00 · /tz Europe/Moscow · /dailytime 21:00 · /mywallet &lt;адрес&gt;"""
 
 
+DOC_TIMEOUT_S = 300          # 19.11: отчёт Excel ~0.7 МБ не успевал уйти за 60 с по умолчанию — «Request timeout error»
+
+
+async def send_doc(msg: Message, data: bytes, filename: str, caption: str | None = None) -> None:
+    """Файл в тот же чат и тему, с ожиданием до 5 минут и одной повторной попыткой при сбое сети до Telegram."""
+    from aiogram.exceptions import TelegramNetworkError
+    thread = msg.message_thread_id if msg.is_topic_message else None
+    for attempt in (1, 2):
+        try:
+            await msg.bot.send_document(msg.chat.id, BufferedInputFile(data, filename=filename), caption=caption,
+                                        message_thread_id=thread, request_timeout=DOC_TIMEOUT_S)
+            return
+        except TelegramNetworkError:
+            if attempt == 2:
+                raise
+            log.warning("файл %s: сеть до Telegram, повтор через 5 с", filename)
+            await asyncio.sleep(5)
+
+
 TOGGLES_ON_BY_DEFAULT = {"smart_filtered", "paper_size_by_level", "trend_autotune", "trend_wait_pullback",
                          "paper_daily_reset"}
 
@@ -565,7 +584,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         cfg = await reload()
         text, csv_bytes, kb = await build_daily(db, settings, today_in(cfg.get("timezone", "UTC")))
         await reply(m, text, kb)
-        await m.answer_document(BufferedInputFile(csv_bytes, filename="today.csv"))
+        await send_doc(m, csv_bytes, "today.csv")
 
     @router.message(Command("backtest"))
     async def cmd_backtest(m: Message, command: CommandObject) -> None:
@@ -661,8 +680,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         if cmd == "csv":
             data = await tr.trades_csv(None)
             n = max(0, data.count("\n") - 1)
-            await target.answer_document(BufferedInputFile(data.encode("utf-8-sig"), filename="paper_trades.csv"),
-                                         caption=f"📄 Все сделки с последнего сброса: {n}. Открывается в Numbers / Excel.")
+            await send_doc(target, data.encode("utf-8-sig"), "paper_trades.csv",
+                           f"📄 Все сделки с последнего сброса: {n}. Открывается в Numbers / Excel.")
             return
         if cmd == "trades":
             parts = await tr.trades_text(hours or 24)
@@ -821,8 +840,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         cfg = await reload()
         sol = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
         data, n = await wallets_csv(db, sol, str(cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
-        await m.answer_document(BufferedInputFile(data.encode("utf-8-sig"), filename="wallets.csv"),
-                                caption=f"👛 Кошельков: {n}, сначала худшие. Вердикт — по итогу копий в бумаге.")
+        await send_doc(m, data.encode("utf-8-sig"), "wallets.csv",
+                       f"👛 Кошельков: {n}, сначала худшие. Вердикт — по итогу копий в бумаге.")
 
     @router.message(Command("export"))
     async def cmd_export(m: Message) -> None:
@@ -835,7 +854,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         cfg = await reload()
         data, caption = await build_xlsx(db, cfg)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
-        await m.answer_document(BufferedInputFile(data, filename=f"report_{stamp}.xlsx"), caption=caption)
+        await send_doc(m, data, f"report_{stamp}.xlsx", caption)
 
     async def send_export(m: Message) -> None:
         """Всё для разбора одним архивом: сделки за сутки и 30 дней, кошельки, журнал копитрейда."""
@@ -843,7 +862,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         tr = await paper_view()
         data, caption = await build_export(db, tr)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        await m.answer_document(BufferedInputFile(data, filename=f"scanner_{stamp}.zip"), caption="📦 " + caption)
+        await send_doc(m, data, f"scanner_{stamp}.zip", "📦 " + caption)
 
     @router.message(Command("calib"))
     async def cmd_calib(m: Message, command: CommandObject) -> None:
@@ -909,7 +928,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return
         if r.document is not None:
             data, name, caption = r.document
-            await c.message.answer_document(BufferedInputFile(data, filename=name), caption=caption)
+            await send_doc(c.message, data, name, caption)
         elif r.text and r.edit and len(r.text) <= 4000:
             try:
                 await c.message.edit_text(r.text, parse_mode="HTML", reply_markup=build(r.kb),

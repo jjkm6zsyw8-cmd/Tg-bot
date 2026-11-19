@@ -293,18 +293,20 @@ class Sender:
                 self.limiter.take()
                 await self.bot.send_document(
                     chat, BufferedInputFile(p["csv"].encode("utf-8"), filename=p.get("filename", "day.csv")),
-                    message_thread_id=self.thread("daily"), disable_notification=True)
+                    message_thread_id=self.thread("daily"), disable_notification=True, request_timeout=300)
         elif kind == "file":
             self.limiter.take()
             await self.bot.send_document(
                 self.chat_id, BufferedInputFile(p["csv"].encode("utf-8-sig"),   # BOM — Excel видит кириллицу
                                                 filename=p.get("filename", "data.csv")),
-                caption=p.get("caption"), message_thread_id=self.thread(p.get("topic")), disable_notification=True)
+                caption=p.get("caption"), message_thread_id=self.thread(p.get("topic")), disable_notification=True,
+                request_timeout=300)
         elif kind == "zip":                  # архив выгрузки (reports/export.py), в очереди — base64
             import base64
             self.limiter.take()
             await self.bot.send_document(
                 self.chat_id, BufferedInputFile(base64.b64decode(p["b64"]), filename=p.get("filename", "export.zip")),
-                caption=p.get("caption"), message_thread_id=self.thread(p.get("topic")), disable_notification=True)
+                caption=p.get("caption"), message_thread_id=self.thread(p.get("topic")), disable_notification=True,
+                request_timeout=300)
         else:
             log.warning("неизвестный тип сообщения %s", kind)
