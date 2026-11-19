@@ -13,8 +13,9 @@
 Правила (одно-два условия) ищутся на первых 2/3 монет по времени и проверяются на последней трети: иначе находится
 случайность, которая завтра не повторится.
 
-Сервер: docker compose run --rm bot patterns [--days 3] [--at 30,60] [--no-send] — итог печатается и приходит
-в Telegram вместе с zip (CSV: признаки и итог сделки по каждой монете).
+Сервер: docker compose run --rm bot patterns [--days 3] [--at 30,60] [--slots] [--no-send] — итог печатается и приходит
+в Telegram вместе с zip (CSV: признаки и итог сделки по каждой монете). --slots — только монеты с известными
+номерами блоков (создание и 80%+ сделок): у остальных снайперы и связка не видны (19.11 — у 0.2–0.6% монет).
 """
 from __future__ import annotations
 
@@ -137,7 +138,10 @@ def study_coin(tok: dict[str, Any], rows: Iterable[Any], at: list[float]) -> lis
             j += 1
         feats = snapshot(st, tok)
         net, why, peak = simulate([(t.ts, t.mc) for t in trades[j:]], created + at_s, st.mc)
-        out.append({"at": at_s, **feats, "net": net, "exit": why, "peak": peak})
+        # блоки известны: создание и 80%+ сделок к моменту решения — только у таких монет снайперы и связка видны
+        known = sum(1 for t in st.trades if t.slot is not None) / len(st.trades) if st.trades else 0.0
+        slots = 1.0 if st.created_slot is not None and known >= 0.8 else 0.0
+        out.append({"at": at_s, **feats, "net": net, "exit": why, "peak": peak, "slots": slots})
     return out
 
 
@@ -150,6 +154,7 @@ class Columns:
     net: array = field(default_factory=lambda: array("d"))
     peak: array = field(default_factory=lambda: array("d"))
     exits: list[str] = field(default_factory=list)
+    slots: array = field(default_factory=lambda: array("d"))       # 1 — блоки известны (снайперы и связка видны)
 
     def add(self, tok: dict[str, Any], r: dict[str, Any]) -> None:
         self.mints.append(tok["mint"])
@@ -159,6 +164,7 @@ class Columns:
         self.net.append(float(r["net"]))
         self.peak.append(float(r["peak"]))
         self.exits.append(str(r["exit"]))
+        self.slots.append(float(r.get("slots", 0.0)))
 
     def __len__(self) -> int:
         return len(self.net)
@@ -320,12 +326,13 @@ def report(cols: dict[float, Columns], days: float, min_n: int = MIN_N) -> str:
 def to_csv_zip(cols: dict[float, Columns]) -> bytes:
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
-    w.writerow(["монета", "создана", "решение, с", *[k for k, _ in FEATURES], "итог", "выход", "пик от входа, ×"])
+    w.writerow(["монета", "создана", "решение, с", *[k for k, _ in FEATURES], "итог", "выход", "пик от входа, ×",
+                "блоки известны"])
     for at_s, c in sorted(cols.items()):
         for i in range(len(c)):
             w.writerow([c.mints[i], datetime.fromtimestamp(c.created[i], timezone.utc).astimezone(TZ).strftime(
                 "%d.%m %H:%M:%S"), f"{at_s:g}", *[f"{c.feats[k][i]:.4g}" for k, _ in FEATURES],
-                f"{c.net[i]:.4f}", c.exits[i], f"{c.peak[i]:.3f}"])
+                f"{c.net[i]:.4f}", c.exits[i], f"{c.peak[i]:.3f}", f"{c.slots[i]:g}"])
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("patterns.csv", buf.getvalue().encode("utf-8-sig"))
@@ -345,7 +352,8 @@ def split(text: str, limit: int = 3800) -> list[str]:
 
 
 async def run(db: Any, days: float = 3.0, at: Iterable[float] = (30.0, 60.0), send: bool = True,
-              progress: Callable[[str], Any] | None = None, now: datetime | None = None, min_n: int = MIN_N) -> str:
+              progress: Callable[[str], Any] | None = None, now: datetime | None = None, min_n: int = MIN_N,
+              slots_only: bool = False) -> str:
     now = now or datetime.now(timezone.utc)
     until = now - timedelta(seconds=WINDOW_S + 300)          # у монет до этого времени окно в 30 минут закрыто
     since = until - timedelta(days=days)
@@ -357,6 +365,8 @@ async def run(db: Any, days: float = 3.0, at: Iterable[float] = (30.0, 60.0), se
         trades = await load_trades(db, [c["mint"] for c in chunk])
         for c in chunk:
             for r in study_coin(c, trades.get(c["mint"], []), at):
+                if slots_only and not r["slots"]:
+                    continue                 # --slots: только монеты с известными блоками (снайперы и связка видны)
                 cols[r["at"]].add(c, r)
         if progress is not None and (k // BATCH) % 25 == 0:
             progress(f"монет {min(k + BATCH, len(coins))} из {len(coins)}")

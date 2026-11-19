@@ -111,6 +111,12 @@ class Receiver:
         self.buf_transfers: list[SolTransfer] = []
         self.buf_source_creates: list[tuple[str, str]] = []
         self.slot_queue: dict[str, float] = {}   # подпись → когда поставлена в очередь
+        # 19.11: номера блоков для разбора «снайперы / связка» — у сделок первой минуты монеты и у её создания.
+        # Поток блоков (logs) подключён, но сделки новых монет из PumpPortal приходили без блока: снайперы нашлись
+        # у 0.2% монет, связка — у 0.6%. Не срочно: пачками до 256 подписей раз в slot_research_every_s
+        self.slot_research: dict[str, float] = {}
+        self.slot_research_s = float(rel.get("slot_research_s", 60))
+        self.slot_research_every_s = float(rel.get("slot_research_every_s", 20))
         self.meta_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=20_000)
         self.last_signature: str | None = None
         self.hour_counts: dict[tuple[str, datetime], list[int]] = {}
@@ -194,8 +200,8 @@ class Receiver:
             self.buf_tokens.append(ev)
             self.created_mono[ev.mint] = time.monotonic()
             self.known_mints[ev.mint] = time.time()
-            if ev.slot is None and not self.logs_alive():
-                self.slot_queue[ev.signature] = time.monotonic()
+            if ev.slot is None:
+                (self.slot_queue if not self.logs_alive() else self.slot_research)[ev.signature] = time.monotonic()
             if ev.uri:
                 try:
                     self.meta_queue.put_nowait((ev.mint, ev.uri))
@@ -215,8 +221,12 @@ class Receiver:
             self._track_mc(ev)
             self.buf_trades.append(ev)
             born = self.created_mono.get(ev.mint)
-            if ev.slot is None and born and time.monotonic() - born < 15 and not self.logs_alive():
-                self.slot_queue[ev.signature] = time.monotonic()
+            if ev.slot is None and born:
+                age = time.monotonic() - born
+                if age < 15 and not self.logs_alive():
+                    self.slot_queue[ev.signature] = time.monotonic()
+                elif age < self.slot_research_s:
+                    self.slot_research[ev.signature] = time.monotonic()
         elif isinstance(ev, Migration):
             self.buf_migr.append(ev)
             if ev.pool:
@@ -454,14 +464,45 @@ class Receiver:
                 if sig in slots or now - self.slot_queue.get(sig, now) > 20:
                     self.slot_queue.pop(sig, None)
             if slots:
-                rows = list(slots.items())
-                await self.db.p.executemany("UPDATE trades SET slot=$2 WHERE signature=$1 AND slot IS NULL", rows)
-                await self.db.p.executemany(
-                    "UPDATE tokens SET created_slot=$2 WHERE signature=$1 AND created_slot IS NULL", rows)
-                await self.db.execute("SELECT pg_notify('slots', '')")
+                await self._save_slots(slots)
             cutoff = now - 120
             for m in [m for m, t in self.created_mono.items() if t < cutoff]:
                 self.created_mono.pop(m, None)
+
+    async def _save_slots(self, slots: dict[str, int]) -> None:
+        rows = list(slots.items())
+        await self.db.p.executemany("UPDATE trades SET slot=$2 WHERE signature=$1 AND slot IS NULL", rows)
+        await self.db.p.executemany(
+            "UPDATE tokens SET created_slot=$2 WHERE signature=$1 AND created_slot IS NULL", rows)
+        await self.db.execute("SELECT pg_notify('slots', '')")
+
+    async def research_slots_once(self) -> int:
+        """Номера блоков для сделок первой минуты новых монет и их создания (разбор «снайперы / связка»): пачками
+        до 256 подписей. Узел помнит статусы последних ~2 минут — не нашлось за 90 с, подпись выбрасываем."""
+        now = time.monotonic()
+        sigs = list(self.slot_research)
+        found: dict[str, int] = {}
+        for i in range(0, len(sigs), 256):
+            try:
+                found.update(await self.rpc.signature_slots(sigs[i:i + 256]))
+            except RpcError as exc:
+                log.debug("слоты для разбора: %s", exc)
+                break
+        for sig in sigs:
+            if sig in found or now - self.slot_research.get(sig, now) > 90:
+                self.slot_research.pop(sig, None)
+        if found:
+            await self._save_slots(found)
+        return len(found)
+
+    async def slot_research_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.slot_research_every_s)
+            if self.slot_research:
+                try:
+                    await self.research_slots_once()
+                except Exception:  # noqa: BLE001 — разбор не срочный: не вышло сейчас — попробуем через 20 с
+                    log.exception("слоты для разбора")
 
     # ------------------------------------------------------------------ метаданные
     async def meta_worker(self) -> None:
@@ -689,7 +730,8 @@ class Receiver:
                 "helius_mode": self.env.helius_stream if self.helius else "off",
                 "queue": self.queue.qsize(), "dropped": self.dropped, "extended": len(self.extended),
                 "tracked_mints": len(self.tracked_mints), "backfill_queue": self.backfill_q.qsize(),
-                "slot_queue": len(self.slot_queue), "meta_queue": self.meta_queue.qsize(),
+                "slot_queue": len(self.slot_queue), "slot_research": len(self.slot_research),
+                "meta_queue": self.meta_queue.qsize(),
                 "rpc_calls": self.rpc.calls, "rpc_429": self.rpc.rate_limited,
                 "watch": None if self.watch is None else {
                     "connected": self.watch.connected, **self.watch.counts(), "events": self.watch.events,
@@ -731,7 +773,7 @@ class Receiver:
         if self.watch is not None:
             tasks.append(asyncio.create_task(self.watch.run(self.enqueue), name="watch"))
         tasks += [asyncio.create_task(c()) for c in (
-            self.worker, self.flush_loop, self.slot_loop, self.watchdog_loop, self.coverage_loop,
+            self.worker, self.flush_loop, self.slot_loop, self.slot_research_loop, self.watchdog_loop, self.coverage_loop,
             self.accounts_loop, self.health_loop, self.retention_loop, self.extend_loop, self.backfill_worker)]
         tasks += [asyncio.create_task(self.meta_worker()) for _ in range(4)]
         asyncio.create_task(self.backfill())  # досбор после рестарта

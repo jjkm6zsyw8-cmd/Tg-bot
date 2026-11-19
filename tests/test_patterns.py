@@ -45,6 +45,9 @@ def test_study_coin_sees_only_the_past():
     assert r30["growth"] == pytest.approx(42 / 34) and r30["socials"] == 1 and r30["dev_coins_7d"] == 3
     assert r30["exit"] == "тейк" and r30["net"] == P.TP                       # с 42 до 66 — тейк
     assert r60["buyers"] == 6 and r60["exit"] == "время"                      # после 60 с сделок нет
+    assert r30["slots"] == 1                                                  # блоки известны — снайперы видны
+    no_slots = [{**r, "slot": None} for r in rows]
+    assert P.study_coin({**tok, "created_slot": None}, no_slots, [30])[0]["slots"] == 0
     # пара не к SOL (цена в другой валюте) — не наша кривая
     assert P.study_coin(tok, [tr(0, dev, True, 2.0, 4000.0, s0)], [30]) == []
 

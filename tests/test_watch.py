@@ -385,3 +385,44 @@ async def test_receiver_resolve_pool_checks_quote():
     rec._http = Http({"pairs": [{"pairAddress": "P2", "baseToken": {"address": "MINT"},
                                  "quoteToken": {"address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"}}]})
     assert await rec.resolve_pool("P2") is None and "P2" in rec.non_sol_pools
+
+
+async def test_receiver_backfills_blocks_of_early_trades_for_patterns():
+    """19.11: поток блоков подключён, но сделки новых монет из PumpPortal приходили без номера блока — снайперы
+    нашлись у 0.2% монет. Теперь блоки сделок первой минуты и создания дособираются пачкой (не срочно)."""
+    from scanner.config import Env, Settings, YamlConfig
+    from scanner.ingest.receiver import Receiver
+    from scanner.models import TokenCreated, Trade
+    saved = []
+
+    class Db:
+        class P:
+            async def executemany(self, sql, rows):
+                saved.append((sql.split()[1], rows))
+        p = P()
+
+        async def execute(self, *a):
+            return None
+    rec = Receiver(Env(helius_api_key="K"), Settings(YamlConfig("config/config.yaml")), Db())
+    rec.logs_alive = lambda: True                                      # поток блоков есть — срочной очереди нет
+    mint = addr("pmint")
+    await rec.sink(TokenCreated(signature="c1", mint=mint, deployer=A, creator=A, name="n", symbol="S", uri="",
+                                bonding_curve="", v_sol=30, v_tokens=1.073e9, real_tokens=7.931e8,
+                                initial_buy_tokens=0, initial_buy_sol=0, source="pumpportal"))
+    await rec.sink(Trade(signature="t1", mint=mint, trader=B, is_buy=True, sol_amount=0.3, token_amount=1e6,
+                         v_sol=31, v_tokens=1.06e9, source="pumpportal"))
+    assert not rec.slot_queue and set(rec.slot_research) == {"c1", "t1"}
+    rec.created_mono[mint] -= 120                                       # сделки после первой минуты — не нужны
+    await rec.sink(Trade(signature="t2", mint=mint, trader=C, is_buy=True, sol_amount=0.3, token_amount=1e6,
+                         v_sol=32, v_tokens=1.05e9, source="pumpportal"))
+    assert "t2" not in rec.slot_research
+
+    async def slots(sigs):
+        return {s: 500 for s in sigs if s != "t1"}                      # t1 узел ещё не знает
+    rec.rpc.signature_slots = slots
+    assert await rec.research_slots_once() == 1
+    assert [t for t, _ in saved] == ["trades", "tokens"] and saved[0][1] == [("c1", 500)]
+    assert set(rec.slot_research) == {"t1"}                             # не нашлась — ждёт следующей пачки
+    rec.slot_research["t1"] -= 100                                      # 90+ с — выбрасываем
+    await rec.research_slots_once()
+    assert not rec.slot_research

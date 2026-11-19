@@ -194,11 +194,11 @@ async def run_tool(cmd: str, db: Database) -> None:
         for e in events:
             print(e)
     elif cmd == "patterns":
-        # паттерны монет: python -m scanner patterns [--days 3] [--at 30,60] [--no-send] — итог и CSV в Telegram
+        # паттерны монет: python -m scanner patterns [--days 3] [--at 30,60] [--slots] [--no-send] — итог и CSV в Telegram
         from .analytics.patterns import run as patterns_run
         days = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
         at = [float(x) for x in args[args.index("--at") + 1].split(",")] if "--at" in args else [30.0, 60.0]
-        print(await patterns_run(db, days=days, at=at, send="--no-send" not in args,
+        print(await patterns_run(db, days=days, at=at, send="--no-send" not in args, slots_only="--slots" in args,
                                  progress=lambda m: print(m, file=sys.stderr, flush=True)))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
