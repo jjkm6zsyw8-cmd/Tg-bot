@@ -204,7 +204,10 @@ async def test_paper_a_preset_in_one_tap(db):
     assert "✅ Smart A" in r.text and r.toast == "Сохранено"
     await desk.command({"cmd": "reload"})
     lane = desk.lanes[wid]
-    assert lane.mode_for("mydev") == "off" and lane.mode_for("swing") == "off" and lane.get("real_stake_usd") == 10
+    # на деньги — только Smart A; выключенные методы идут в тень для замера (19.11), не в бой
+    assert not lane.get("real_mydev") and not lane.get("real_swing") and lane.get("real_stake_usd") == 10
+    want = "shadow" if lane.get("real_shadow_all") and lane.mode() != "off" else "off"
+    assert lane.mode_for("mydev") == want and lane.mode_for("swing") == want
     assert S.methods_summary(lane.cfg) == "Smart A"
 
 

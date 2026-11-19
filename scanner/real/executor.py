@@ -46,6 +46,7 @@ STATUS_KEY = "real:status"
 TOPIC = "real"                        # отдельная тема Telegram «Реальный бот»
 BASE_FEE = 5_000                      # лампортов за подпись
 SIM_RESERVE = 6_000_000               # лампортов оставляем кошельку при симуляции (залоги счетов и комиссия)
+SHADOW_MAX_OPEN = 30                  # тень-замер: столько позиций одновременно (это только симуляция)
 KINDS = S.KIND_NAMES
 SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
 
@@ -173,8 +174,11 @@ class RealTrader:
 
     def mode_for(self, kind: str) -> str:
         m = self.mode()
-        if m == "off" or kind not in S.METHODS or not self.get(S.METHODS[kind][1]):
+        if m == "off" or kind not in S.METHODS:
             return "off"
+        measure = bool(self.get("real_shadow_all"))      # выключенный метод — в тень для замера, не на деньги
+        if not self.get(S.METHODS[kind][1]):
+            return "shadow" if measure else "off"
         if m == "live" and kind == "mydev" and not self.get("real_live_mydev"):
             return "shadow"                          # запуски девов в бою — только по отдельному разрешению
         return m
@@ -384,11 +388,12 @@ class RealTrader:
             return "уже есть позиция по монете"
         taken = sum(1 for p in self.positions.values() if p.extra.get("mode") == mode) \
             + sum(1 for m in self._busy.values() if m == mode)
-        if taken >= int(self.get("real_max_open")):
+        free = mode == "shadow" and bool(self.get("real_shadow_free"))   # тень — замер: все сигналы, без стопа
+        if taken >= (SHADOW_MAX_OPEN if free else int(self.get("real_max_open"))):
             return "лимит открытых позиций"
         self._roll_day()
         sol_usd = self.sol_usd()
-        if -self.day_pnl.get(mode, 0.0) * sol_usd >= float(self.get("real_day_stop_usd")):
+        if not free and -self.day_pnl.get(mode, 0.0) * sol_usd >= float(self.get("real_day_stop_usd")):
             return "дневной стоп"
         hours = float(self.get("real_reentry_h"))
         if hours > 0 and time.time() - self.lost.get(mint, 0) < hours * 3600:

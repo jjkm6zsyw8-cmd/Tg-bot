@@ -342,6 +342,8 @@ def _fast(monkeypatch):
 def engine(db, **cfg):
     paper = SimpleNamespace(rugged={}, rug_devs=set(), day_key=lambda: datetime.now(timezone.utc).date().isoformat(),
                             reset_tz=lambda: timezone.utc)
+    # замер тенью (все методы, без стопа и лимита) — в своих тестах; здесь — правила как у боя
+    cfg = {"real_shadow_all": False, "real_shadow_free": False, **cfg}
     return SimpleNamespace(db=db, cfg={"real_land_s": 0.0, **cfg}, price=SimpleNamespace(value=150.0), states={},
                            my_devs={}, paper=paper)
 
@@ -964,3 +966,24 @@ async def test_rough_signal_price_is_not_a_runup(db):
     await tr.start()
     await fire(tr, chain, trigger_mc=chain.mc(MINT) / 1.3, trigger_mc_rough=True)
     assert not skipped(tr, "цена уже убежала") and str(MINT) in {p.mint for p in tr.positions.values()}
+
+
+async def test_shadow_measures_every_method_without_stops(db, monkeypatch):
+    """19.11: честные цифры по методам даёт тень — она считает и выключенные методы, без дневного стопа и лимита
+    позиций (только симуляция). На деньги выключенный метод не идёт никогда."""
+    chain = FakeChain()
+    coins = [pk(f"measure-{i}") for i in range(3)]
+    for c in coins:
+        chain.add_curve(c, 40.0)
+    tr = shadow(db, chain, real_shadow_all=True, real_shadow_free=True, real_smart=False, real_max_open=1,
+                real_day_stop_usd=5.0)
+    await tr.start()
+    assert tr.mode_for("smart") == "shadow" and tr.mode_for("copy") == "shadow"
+    await fire(tr, chain, coins[0])
+    await fire(tr, chain, coins[1])                                  # лимит 1 позиция — тени не мешает
+    tr.day_pnl["shadow"] = -20 / 150                                 # дневной стоп $5 — тоже
+    await fire(tr, chain, coins[2])
+    assert {p.mint for p in tr.positions.values()} == {str(c) for c in coins}
+    assert not skipped(tr, "лимит открытых позиций") and not skipped(tr, "дневной стоп")
+    lv = live(db, FakeChain(), monkeypatch, real_shadow_all=True, real_smart=False, real_copy=True)
+    assert lv.mode_for("smart") == "shadow" and lv.mode_for("copy") == "live"   # выключенный — не на деньги
