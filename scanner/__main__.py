@@ -44,7 +44,8 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers"):
+    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
+               "patterns"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -192,6 +193,13 @@ async def run_tool(cmd: str, db: Database) -> None:
             print(f"{r.get('trader')} | {describe(r)} | {'подходит' if good(r, cfg) else 'нет'}")
         for e in events:
             print(e)
+    elif cmd == "patterns":
+        # паттерны монет: python -m scanner patterns [--days 3] [--at 30,60] [--no-send] — итог и CSV в Telegram
+        from .analytics.patterns import run as patterns_run
+        days = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
+        at = [float(x) for x in args[args.index("--at") + 1].split(",")] if "--at" in args else [30.0, 60.0]
+        print(await patterns_run(db, days=days, at=at, send="--no-send" not in args,
+                                 progress=lambda m: print(m, file=sys.stderr, flush=True)))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault
