@@ -339,6 +339,54 @@ def to_csv_zip(cols: dict[float, Columns]) -> bytes:
     return out.getvalue()
 
 
+XLSX_COLS: list[tuple[str, str, str]] = [   # (признак, заголовок, формат ячейки)
+    ("dev_buy", "Покупка дева, SOL", "0.00"), ("snipers", "Снайперов", "0"), ("bundle_share", "Доля связки", "0%"),
+    ("cluster_share", "Доля кластера дева", "0%"), ("dev_share", "Доля дева", "0%"), ("dev_sold", "Дев продавал", "0"),
+    ("buyers", "Покупателей", "0"), ("sells", "Продаж", "0"), ("buy_sol", "Куплено, SOL", "0.00"),
+    ("growth", "Рост с создания, ×", "0.00"), ("from_peak", "Цена от пика, ×", "0.00"), ("top10", "Топ-10 держат", "0%"),
+    ("socials", "Ссылок на соцсети", "0"), ("dev_coins_7d", "Монет у дева за 7 дн.", "0"), ("hour", "Час", "0"),
+]
+
+
+def to_xlsx(cols: dict[float, Columns], text: str) -> bytes:
+    """Таблица для телефона (zip с CSV на iPhone в Telegram не открывается): лист «Итог» — текст отчёта, по листу на
+    момент решения — только монеты, где кроме дева хоть кто-то купил (остальные — пустые запуски), новые первыми."""
+    import re
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Итог"
+    for ln in re.sub(r"</?b>", "", text).split("\n"):
+        ws.append([ln])
+    ws.column_dimensions["A"].width = 140
+    green, red = PatternFill("solid", fgColor="E6F4EA"), PatternFill("solid", fgColor="FCE8E6")
+    for at_s, c in sorted(cols.items()):
+        sh = wb.create_sheet(f"Вход на {at_s:g} с")
+        head = ["Монета", "Создана", *[h for _k, h, _f in XLSX_COLS], "Итог сделки бота", "Выход", "Пик от входа, ×",
+                "Блоки известны"]
+        sh.append(head)
+        for cell in sh[1]:
+            cell.font = Font(bold=True)
+        rows = [i for i in range(len(c)) if c.feats["buyers"][i] >= 1]
+        for i in sorted(rows, key=lambda i: -c.created[i]):
+            sh.append([c.mints[i], datetime.fromtimestamp(c.created[i], timezone.utc).astimezone(TZ).replace(tzinfo=None),
+                       *[c.feats[k][i] for k, _h, _f in XLSX_COLS], c.net[i], c.exits[i], c.peak[i],
+                       "да" if c.slots[i] else "нет"])
+        fmts = ["@", "DD.MM HH:MM:SS", *[f for _k, _h, f in XLSX_COLS], "+0.0%;-0.0%", "@", "0.00", "@"]
+        for row in sh.iter_rows(min_row=2):
+            for cell, f in zip(row, fmts):
+                cell.number_format = f
+            row[len(XLSX_COLS) + 2].fill = green if (row[len(XLSX_COLS) + 2].value or 0) > 0 else red
+        sh.freeze_panes = "C2"
+        sh.column_dimensions["A"].width = 46
+        sh.column_dimensions["B"].width = 15
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
 def split(text: str, limit: int = 3800) -> list[str]:
     parts, cur = [], ""
     for ln in text.split("\n"):
@@ -376,9 +424,14 @@ async def run(db: Any, days: float = 3.0, at: Iterable[float] = (30.0, 60.0), se
         for part in split(text):
             await db.system(part)
         if cols and len(next(iter(cols.values()))):
+            # Excel — открывается на телефоне (монеты, где кто-то купил); zip с CSV по всем монетам — для разбора
+            await db.enqueue("zip", {"topic": "system", "b64": base64.b64encode(to_xlsx(cols, text)).decode(),
+                                     "filename": f"patterns_{now:%Y%m%d_%H%M}.xlsx",
+                                     "caption": "Паттерны монет: Excel — монеты, где кроме дева кто-то купил"},
+                             priority=3)
             data = to_csv_zip(cols)
             await db.enqueue("zip", {"topic": "system", "b64": base64.b64encode(data).decode(),
                                      "filename": f"patterns_{now:%Y%m%d_%H%M}.zip",
-                                     "caption": "Паттерны монет: признаки и итог сделки бота по каждой монете (CSV)"},
+                                     "caption": "Все монеты (CSV) — для разбора, на телефоне не откроется"},
                              priority=3)
     return text

@@ -86,6 +86,15 @@ async def test_run_report_and_rules():
         assert "• ссылок на соцсети: 0: 466 · 0% · -31% | 1: 234 · 100% · +25%" in text
         out = await db.fetch("SELECT kind, payload FROM outbox ORDER BY id")
         assert out[-1]["kind"] == "zip" and out[-1]["payload"]["filename"].startswith("patterns_")
+        xlsx = next(o for o in out if o["kind"] == "zip" and o["payload"]["filename"].endswith(".xlsx"))
+        import base64
+        import io
+
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(base64.b64decode(xlsx["payload"]["b64"])))
+        assert wb.sheetnames == ["Итог", "Вход на 30 с", "Вход на 60 с"]
+        sh = wb["Вход на 30 с"]
+        assert sh.max_row == 701 and sh.cell(1, 3).value == "Покупка дева, SOL"      # 700 монет + заголовок
         assert any(o["kind"] == "system" and "Паттерны монет" in o["payload"]["text"] for o in out)
     finally:
         await db.close()
