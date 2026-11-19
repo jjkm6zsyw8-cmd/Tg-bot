@@ -453,6 +453,12 @@ class Scout:
         now = datetime.now(timezone.utc)
         auto = int(await self.db.fetchval("SELECT count(*) FROM scout WHERE status='promoted'") or 0)
         cap = int(cfg_get(self.cfg, "scout_max_auto"))
+        # открытые копии в S: 19.11 FfW5 пущен в smart по 11 закрытым копиям (73% в плюсе, +5.3%), а 6 открытых в
+        # это время уже были в −45…−86% (раги, правило A без стопа держит до 30 мин) — после закрытия −7.9% на копию
+        open_n = {x["w"]: int(x["n"]) for x in await self.db.fetch(
+            """SELECT source_wallet w, count(*) n FROM paper_positions
+               WHERE portfolio = $1 AND closed_at IS NULL AND source_wallet = ANY($2::text[]) GROUP BY 1""",
+            TRIAL, [r["address"] for r in rows])}
         out: list[str] = []
         for r in rows:
             x = res.get(r["address"], {"n": 0, "wins": 0, "pnl": 0.0, "cost": 0.0, "best": 0.0})
@@ -460,6 +466,8 @@ class Scout:
             v, why = verdict_a(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg,
                                float(x["best"]))
             addr = r["address"]
+            if v == "promote" and open_n.get(addr):
+                continue                     # в smart — только когда закрылись все его копии (не дольше 30 мин)
             if v == "promote" and auto < cap:
                 await self._promote(addr)
                 await self._close(addr, "promoted", why, 0)
@@ -506,6 +514,12 @@ class Scout:
                      AND p.exit_reason <> 'reset' AND NOT p.suspect AND p.opened_at >= s.decided_at
                    ORDER BY p.closed_at DESC LIMIT 10""", addr)
             why = demote_reason([float(x["pnl_pct"] or 0) for x in last], sum(float(x["pnl_sol"] or 0) for x in last))
+            if not why:
+                # испытание целиком — с копиями, закрывшимися уже после решения: ушло в минус — пущен зря
+                t = (await self.results(TRIAL, [addr], "started_at")).get(addr)
+                if t and int(t["n"]) >= 6 and float(t["pnl"]) < 0 and float(t["cost"]) > 0:
+                    why = (f"испытание целиком (с копиями, закрытыми после решения): {int(t['n'])} копий, в плюсе "
+                           f"{int(t['wins'])}, в среднем {float(t['pnl']) / float(t['cost']):+.1%}")
             if why:
                 await self.db.execute("UPDATE traders SET active=false, manual=false, pinned=false WHERE address=$1",
                                       addr)

@@ -251,3 +251,56 @@ async def test_cobuyers_of_profitable_smart():
         assert {r["address"] for r in await db.fetch("SELECT address FROM scout")} == {"TWIN", "PAIR", "NEAR"}
     finally:
         await db.close()
+
+
+async def test_promotion_waits_for_open_copies_and_full_trial_can_demote():
+    """19.11 FfW5: пущен в smart по 11 закрытым копиям (+5.3%), а 6 открытых в это время были в −45…−86% (раги);
+    после закрытия испытание −7.9% на копию. Теперь: пока есть открытые копии — решения «в smart» нет; пущенный,
+    у которого испытание целиком ушло в минус, убирается."""
+    from datetime import datetime, timedelta, timezone
+
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        start = datetime.now(timezone.utc) - timedelta(hours=3)
+        await db.execute("""INSERT INTO scout(address, status, source, score, started_at)
+                            VALUES ('W', 'probation', 'рядом со smart', 1, $1)""", start)
+        n = 0
+
+        async def copy(pnl, closed=True):
+            nonlocal n
+            n += 1
+            await db.execute(
+                """INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol, tokens,
+                       tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet)
+                   VALUES ('S', $1, $2, $3, 30, 0.1, 1, 1, $4, $5, $6, 'W')""",
+                f"M{n}", start + timedelta(minutes=n), start + timedelta(minutes=n + 1) if closed else None,
+                "take_profit" if closed else None, pnl if closed else None, pnl / 0.1 if closed else None)
+        for _ in range(8):
+            await copy(0.025)                                       # 8 копий по +25%
+        await copy(0.0, closed=False)                              # и одна ещё открыта (раг)
+        loads = []
+
+        async def load_traders():
+            loads.append(1)
+        sc = Scout(SimpleNamespace(db=db, cfg={}, price=SimpleNamespace(value=100.0), ext=None, scouts=set(),
+                                   _load_traders=load_traders))  # type: ignore[arg-type]
+        assert await sc.decide() == [] and await db.fetchval("SELECT status FROM scout WHERE address='W'") == "probation"
+        await db.execute("""UPDATE paper_positions SET closed_at=now(), exit_reason='max_hold', pnl_sol=-0.085,
+                                pnl_pct=-0.85 WHERE closed_at IS NULL""")
+        events = await sc.decide()                                 # 9 копий: 89% в плюсе, в среднем +12.8% — в smart
+        assert await db.fetchval("SELECT status FROM scout WHERE address='W'") == "promoted" and events
+        assert await sc.demote() == []
+        for _ in range(3):                                         # ещё три рага, закрылись после решения
+            await copy(-0.09)
+        events = await sc.demote()
+        assert await db.fetchval("SELECT status FROM scout WHERE address='W'") == "demoted"
+        assert any("испытание целиком" in e for e in events)
+        assert not await db.fetchval("SELECT active FROM traders WHERE address='W'")
+    finally:
+        await db.close()
