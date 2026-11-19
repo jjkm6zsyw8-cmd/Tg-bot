@@ -45,7 +45,7 @@ async def main(cmd: str) -> None:
         await db.close()
         return
     if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-               "patterns"):
+               "patterns", "dips"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -200,6 +200,12 @@ async def run_tool(cmd: str, db: Database) -> None:
         at = [float(x) for x in args[args.index("--at") + 1].split(",")] if "--at" in args else [30.0, 60.0]
         print(await patterns_run(db, days=days, at=at, send="--no-send" not in args, slots_only="--slots" in args,
                                  progress=lambda m: print(m, file=sys.stderr, flush=True)))
+    elif cmd == "dips":
+        # вход после падения: python -m scanner dips [--days 3] [--no-send] — итог и Excel со всеми правилами в Telegram
+        from .analytics.dips import run as dips_run
+        days = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
+        print(await dips_run(db, days=days, send="--no-send" not in args,
+                             progress=lambda m: print(m, file=sys.stderr, flush=True)))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault
