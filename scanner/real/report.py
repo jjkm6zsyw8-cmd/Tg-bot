@@ -391,15 +391,9 @@ def paper_target(kind: str, extra: dict[str, Any]) -> str | None:
     return S.paper_portfolio(kind, rule, str(extra.get("filter") or "all"))
 
 
-async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int = 12) -> str:
-    """Те же сигналы у реального бота и у бумаги: результат, цена входа, задержка — итогом и по каждой сделке."""
-    rows = await db.fetch(
-        """SELECT r.id, r.mode, r.kind, r.symbol, r.mint, r.alert_id, r.pnl_pct, r.pnl_sol, r.entry_mc, r.closed_at,
-                  r.exit_reason, r.extra, (r.extra->>'blocks_after')::int AS blocks
-           FROM real_positions r WHERE r.closed_at IS NOT NULL AND r.closed_at > now() - make_interval(days => $1)
-           ORDER BY r.closed_at""", int(days))
-    if not rows:
-        return f"⚖️ За {days} дн. закрытых сделок реального бота нет — сравнивать нечего."
+async def paper_pairs(db: Any, rows: list[Any], days: int) -> list[tuple[Any, str | None, Any]]:
+    """(сделка бота, портфель бумаги, сделка бумаги или None). По алерту; копии и кандидаты разведки идут без алерта
+    (19.11: у всех копий было «бумага не входила») — их пару ищем по монете, портфелю, кошельку и времени (±2 мин)."""
     paper: dict[tuple[Any, str, str], Any] = {}
     for p in await db.fetch(
             """SELECT alert_id, mint, portfolio, pnl_pct, entry_mc, exit_reason FROM paper_positions
@@ -407,10 +401,44 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
                  AND exit_reason IS DISTINCT FROM 'reset' ORDER BY id""",
             list({r["alert_id"] for r in rows if r["alert_id"] is not None})):
         paper.setdefault((p["alert_id"], p["mint"], p["portfolio"]), p)
-    pairs = []                                   # (сделка бота, портфель бумаги, сделка бумаги или None)
+    loose: dict[tuple[str, str], list[Any]] = {}
+    no_alert = [r for r in rows if r["alert_id"] is None]
+    if no_alert:
+        for p in await db.fetch(
+                """SELECT mint, portfolio, source_wallet, opened_at, pnl_pct, entry_mc, exit_reason FROM paper_positions
+                   WHERE mint = ANY($1::text[]) AND NOT suspect AND closed_at IS NOT NULL
+                     AND exit_reason IS DISTINCT FROM 'reset' AND opened_at > now() - make_interval(days => $2)
+                   ORDER BY id""", list({r["mint"] for r in no_alert}), int(days) + 1):
+            loose.setdefault((p["mint"], p["portfolio"]), []).append(p)
+
+    def match(r: Any, port: str) -> Any:
+        if r["alert_id"] is not None:
+            return paper.get((r["alert_id"], r["mint"], port))
+        best = None
+        for p in loose.get((r["mint"], port), []):
+            if r["trader"] and p["source_wallet"] and p["source_wallet"] != r["trader"]:
+                continue
+            gap = abs((p["opened_at"] - r["opened_at"]).total_seconds()) if r["opened_at"] and p["opened_at"] else 1e9
+            if gap <= 120 and (best is None or gap < best[0]):
+                best = (gap, p)
+        return best[1] if best else None
+    out = []
     for r in rows:
         port = paper_target(r["kind"], dict(r["extra"] or {}))
-        pairs.append((r, port, paper.get((r["alert_id"], r["mint"], port)) if port else None))
+        out.append((r, port, match(r, port) if port else None))
+    return out
+
+
+async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int = 12) -> str:
+    """Те же сигналы у реального бота и у бумаги: результат, цена входа, задержка — итогом и по каждой сделке."""
+    rows = await db.fetch(
+        """SELECT r.id, r.mode, r.kind, r.symbol, r.mint, r.alert_id, r.pnl_pct, r.pnl_sol, r.entry_mc, r.closed_at,
+                  r.exit_reason, r.extra, (r.extra->>'blocks_after')::int AS blocks, r.opened_at, r.trader
+           FROM real_positions r WHERE r.closed_at IS NOT NULL AND r.closed_at > now() - make_interval(days => $1)
+           ORDER BY r.closed_at""", int(days))
+    if not rows:
+        return f"⚖️ За {days} дн. закрытых сделок реального бота нет — сравнивать нечего."
+    pairs = await paper_pairs(db, rows, days)
     sol_usd = await sol_price(db)
     head = f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"
     table, notes = [head], []

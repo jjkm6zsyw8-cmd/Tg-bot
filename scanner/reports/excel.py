@@ -26,7 +26,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from ..real.report import EXIT_NAMES, KINDS, MODE_SHORT, paper_target, skip_text, sol_price
+from ..real.report import EXIT_NAMES, KINDS, MODE_SHORT, paper_pairs, skip_text, sol_price
 
 PCT, USD, SOL, NUM, DT = "0.0%", '#,##0.00 "$"', "0.0000", "0", "dd.mm.yyyy hh:mm:ss"
 HEAD = Font(bold=True, color="FFFFFF")
@@ -218,17 +218,8 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
     # ------------------------------------------------------------------ Бот против бумаги
     s = Sheet(wb, "Бот против бумаги", tz)
     closed = [r for r in real if r["closed_at"] is not None]
-    pp: dict[tuple[Any, str, str], Any] = {}
-    for p in await db.fetch(
-            """SELECT alert_id, mint, portfolio, pnl_pct, entry_mc, exit_reason FROM paper_positions
-               WHERE alert_id = ANY($1::bigint[]) AND NOT suspect AND closed_at IS NOT NULL
-                 AND exit_reason IS DISTINCT FROM 'reset' ORDER BY id""",
-            list({r["alert_id"] for r in closed if r["alert_id"] is not None})):
-        pp.setdefault((p["alert_id"], p["mint"], p["portfolio"]), p)
     rows = []
-    for r in closed:
-        port = paper_target(r["kind"], dict(r["extra"] or {}))
-        q = pp.get((r["alert_id"], r["mint"], port)) if port else None
+    for r, port, q in await paper_pairs(db, closed, REAL_DAYS):
         prem = (float(r["entry_mc"]) / float(q["entry_mc"]) - 1) if q is not None and r["entry_mc"] and q["entry_mc"] \
             else None
         rows.append([r["closed_at"], wname(r["wallet_id"]), MODE_SHORT.get(r["mode"], r["mode"]),

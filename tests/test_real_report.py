@@ -259,3 +259,28 @@ def test_setting_formats():
     assert S.fmt("real_stake_usd", 5.0) == "$5" and S.fmt("real_land_s", 0.8) == "0.8 с"
     kp = Keypair()
     assert str(kp.pubkey()) not in S.fmt("real_max_open", 3)
+
+
+async def test_compare_matches_copies_without_alert(db):
+    """19.11: копии и кандидаты разведки идут без алерта — пара на бумаге ищется по монете, портфелю, кошельку и
+    времени входа (раньше у всех копий было «бумага H по этому сигналу не входила»)."""
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain, real_copy=True)
+    await tr.start()
+    data = {"modes": ["copy"], "symbol": "TST", "trigger_at": time.time(), "trigger_ts": time.time() - 0.8,
+            "trigger_slot": chain.slot - 2, "trigger_mc": chain.mc(MINT), "trigger_sig": "sig"}
+    await tr.on_signal(str(MINT), "normal", None, data, "COPYW", {"H"})
+    assert tr.positions, tr.skips
+    chain.set_mc(MINT, 54.0)
+    await trade(tr, chain)
+    assert not tr.positions
+    for wallet, pct in (("OTHER", -0.5), ("COPYW", 0.2)):
+        await db.execute(
+            """INSERT INTO paper_positions(portfolio, mint, symbol, opened_at, entry_mc, cost_sol, tokens,
+                   tokens_initial, closed_at, exit_reason, pnl_sol, pnl_pct, source_wallet)
+               VALUES ('H', $1, 'TST', now(), 39.5, 0.1, 1, 1, now(), 'take_profit', $2, $3, $4)""",
+            str(MINT), 0.1 * pct, pct, wallet)
+    text = await report.compare_text(db, {})
+    assert "тень копия" in text and "бумага H, те же" in text and "бумага H +20%" in text
+    assert "не входила" not in text
