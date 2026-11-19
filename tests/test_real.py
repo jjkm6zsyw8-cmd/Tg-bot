@@ -978,7 +978,8 @@ async def test_shadow_measures_every_method_without_stops(db, monkeypatch):
     tr = shadow(db, chain, real_shadow_all=True, real_shadow_free=True, real_smart=False, real_max_open=1,
                 real_day_stop_usd=5.0)
     await tr.start()
-    assert tr.mode_for("smart") == "shadow" and tr.mode_for("copy") == "shadow"
+    assert tr.mode_for("smart") == "shadow" and tr.mode_for("bigcopy") == "shadow"
+    assert tr.mode_for("copy") == "off"                              # копии меряет бумага H — тень их не тратит
     await fire(tr, chain, coins[0])
     await fire(tr, chain, coins[1])                                  # лимит 1 позиция — тени не мешает
     tr.day_pnl["shadow"] = -20 / 150                                 # дневной стоп $5 — тоже

@@ -47,6 +47,10 @@ TOPIC = "real"                        # отдельная тема Telegram «�
 BASE_FEE = 5_000                      # лампортов за подпись
 SIM_RESERVE = 6_000_000               # лампортов оставляем кошельку при симуляции (залоги счетов и комиссия)
 SHADOW_MAX_OPEN = 30                  # тень-замер: столько позиций одновременно (это только симуляция)
+# копии своего списка и кандидатов разведки в замер тени не идут (если метод выключен): 19.11 за 2.5 ч — 183 сделки,
+# в среднем −6.7%, а бумага H на тех же сигналах −7.6% (вход дороже лишь на +0.3%) — бумага их меряет так же, а
+# тень тратила на них ~1700 симуляций в сутки из бесплатных запросов Helius
+SHADOW_SKIP = {"copy"}
 KINDS = S.KIND_NAMES
 SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
 
@@ -176,7 +180,7 @@ class RealTrader:
         m = self.mode()
         if m == "off" or kind not in S.METHODS:
             return "off"
-        measure = bool(self.get("real_shadow_all"))      # выключенный метод — в тень для замера, не на деньги
+        measure = bool(self.get("real_shadow_all")) and kind not in SHADOW_SKIP   # выключенный метод — в тень, не на деньги
         if not self.get(S.METHODS[kind][1]):
             return "shadow" if measure else "off"
         if m == "live" and kind == "mydev" and not self.get("real_live_mydev"):
