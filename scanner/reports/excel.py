@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -34,6 +34,9 @@ HEAD_FILL = PatternFill("solid", fgColor="305496")
 TITLE = Font(bold=True, size=13)
 GREEN, RED = Font(color="008000"), Font(color="C00000")
 PAPER_DAYS = 7
+# 19.11: бумага берёт все сигналы — H и S по ~450 сделок в сутки; файл рос, и Telegram не дожидался загрузки
+# (Gateway Timeout). Построчно их сделки — за 2 дня, остальные портфели — за PAPER_DAYS
+BULK, BULK_DAYS = ("H", "S"), 2
 REAL_DAYS = 30
 
 
@@ -285,7 +288,10 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
     # ------------------------------------------------------------------ Сделки бумаги
     s = Sheet(wb, "Сделки бумаги", tz)
     rows = []
+    bulk_since = now - timedelta(days=BULK_DAYS)
     for p in paper_rows:
+        if p["portfolio"] in BULK and p["opened_at"] < bulk_since:
+            continue      # испытание и копии — сотни сделок в сутки: построчно 2 дня (по дням — лист «Бумага по дням»)
         pct = _f(p["pnl_pct"])
         rows.append([p["portfolio"], p["symbol"] or "", p["mint"], labels.get(p["source_wallet"]) or "",
                      p["source_wallet"] or "", p["opened_at"], p["closed_at"], _f(p["entry_mc"]), _f(p["max_mc"]),

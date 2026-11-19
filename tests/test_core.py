@@ -480,25 +480,38 @@ def test_pumpportal_pumpswap_mc_does_not_move_price():
                                  if k not in ("source", "pool")}).price_ok          # старые выборки без полей
 
 
-async def test_send_doc_waits_longer_and_retries_once(monkeypatch):
-    """19.11: отчёт Excel не успевал уйти за 60 с — «Request timeout error». Файлы: до 5 минут и один повтор."""
+async def test_send_doc_waits_longer_and_retries_once(monkeypatch, tmp_path):
+    """19.11: файлы не уходили с сервера («Request timeout», потом «Gateway Timeout» от Telegram), текст — уходил.
+    Файлы: до 5 минут, повторы; не ушёл с трёх раз — остаётся на сервере, бот пишет, где лежит."""
     from types import SimpleNamespace
 
-    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.exceptions import TelegramNetworkError, TelegramServerError
     from aiogram.methods import SendDocument
 
     from scanner.bot import handlers
-    calls = []
+    calls, answers, fail = [], [], {"n": 1}
 
     class Bot:
         async def send_document(self, chat_id, doc, caption=None, message_thread_id=None, request_timeout=None):
             calls.append((chat_id, doc.filename, message_thread_id, request_timeout))
-            if len(calls) == 1:
-                raise TelegramNetworkError(SendDocument(chat_id=chat_id, document=doc), "Request timeout error")
-    msg = SimpleNamespace(bot=Bot(), chat=SimpleNamespace(id=7), message_thread_id=5, is_topic_message=True)
+            if len(calls) <= fail["n"]:
+                m = SendDocument(chat_id=chat_id, document=doc)
+                raise (TelegramNetworkError(m, "Request timeout error") if len(calls) % 2
+                       else TelegramServerError(m, "Gateway Timeout"))
+
+    async def answer(text, parse_mode=None):
+        answers.append(text)
+    msg = SimpleNamespace(bot=Bot(), chat=SimpleNamespace(id=7), message_thread_id=5, is_topic_message=True,
+                          answer=answer)
     monkeypatch.setattr(handlers.asyncio, "sleep", _no_sleep)       # восстановится после теста
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
     await handlers.send_doc(msg, b"x", "report.xlsx", "c")
-    assert calls == [(7, "report.xlsx", 5, 300), (7, "report.xlsx", 5, 300)]
+    assert calls == [(7, "report.xlsx", 5, 300), (7, "report.xlsx", 5, 300)] and not answers
+    calls.clear()
+    fail["n"] = 3                                                    # не принял ни разу
+    await handlers.send_doc(msg, b"data", "report2.xlsx")
+    assert len(calls) == 3 and (tmp_path / "report2.xlsx").read_bytes() == b"data"
+    assert "/opt/tg-bot/logs/report2.xlsx" in answers[0]
 
 
 async def _no_sleep(*_a):

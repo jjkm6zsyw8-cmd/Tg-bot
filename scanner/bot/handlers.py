@@ -76,19 +76,33 @@ DOC_TIMEOUT_S = 300          # 19.11: отчёт Excel ~0.7 МБ не успев
 
 
 async def send_doc(msg: Message, data: bytes, filename: str, caption: str | None = None) -> None:
-    """Файл в тот же чат и тему, с ожиданием до 5 минут и одной повторной попыткой при сбое сети до Telegram."""
-    from aiogram.exceptions import TelegramNetworkError
+    """Файл в тот же чат и тему: до 5 минут на отправку, повтор при сбое сети или «Gateway Timeout» Telegram
+    (19.11: файлы не уходили с сервера, текст — уходил). Не ушёл и с третьего раза — файл остаётся на сервере
+    в logs/, бот пишет, где он лежит (скачать — через SFTP в Termius)."""
+    from aiogram.exceptions import TelegramNetworkError, TelegramServerError
     thread = msg.message_thread_id if msg.is_topic_message else None
-    for attempt in (1, 2):
+    err: Exception | None = None
+    for attempt, pause in enumerate((10, 30, 0), 1):
         try:
             await msg.bot.send_document(msg.chat.id, BufferedInputFile(data, filename=filename), caption=caption,
                                         message_thread_id=thread, request_timeout=DOC_TIMEOUT_S)
             return
-        except TelegramNetworkError:
-            if attempt == 2:
-                raise
-            log.warning("файл %s: сеть до Telegram, повтор через 5 с", filename)
-            await asyncio.sleep(5)
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            err = exc
+            log.warning("файл %s (%d КБ): попытка %d — %s", filename, len(data) // 1024, attempt, exc)
+            if pause:
+                await asyncio.sleep(pause)
+    import os
+    folder = os.environ.get("LOG_DIR", "logs")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, filename), "wb") as f:
+            f.write(data)
+        where = f"он сохранён на сервере: <code>/opt/tg-bot/logs/{filename}</code> (скачать — SFTP в Termius)"
+    except OSError as exc:
+        where = f"и сохранить на сервере не вышло ({exc})"
+    await msg.answer(f"⚠️ Файл {filename} ({len(data) // 1024} КБ) Telegram не принял с трёх попыток "
+                     f"({type(err).__name__}: {err}) — {where}.", parse_mode="HTML")
 
 
 TOGGLES_ON_BY_DEFAULT = {"smart_filtered", "paper_size_by_level", "trend_autotune", "trend_wait_pullback",
