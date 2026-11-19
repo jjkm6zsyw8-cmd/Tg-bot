@@ -71,6 +71,13 @@ DEFAULTS: dict[str, Any] = {
     "scout_a_avg_min": 0.08,
     "scout_a_max_copies": 20,          # столько копий и ни один путь не прошёл — отсев
     "scout_a_min_usd_day": 10,         # за сутки копии по $10 дали меньше $10 — торгует редко/мало, место следующему
+    # редкий, но копируемый кошелёк (19.11): BojC — копируемость +52% за 30 дней по своей базе, сделка раз в сутки,
+    # держит ~45 мин — снят через 6 ч как «почти не торгует», 32 сделки за месяц так и не скопированы. Таким — дольше:
+    # «почти не торгует» не раньше 2 суток, без правила «$10 в сутки», испытание до 10 дней
+    "scout_patient_min_copy": 0.10,    # копируемость за 30 дней (своя база) не ниже
+    "scout_patient_min_trades": 15,    # и сделок за 30 дней не меньше
+    "scout_patient_idle_days": 2.0,
+    "scout_patient_probation_days": 10,
     "scout_min_winrate": 0.40,         # доля прибыльных копий
     "scout_min_profit_usd": 300,       # GMGN: прибыль на монете, $
     "scout_gmgn_min_winrate": 0.45,    # GMGN 7 дней
@@ -154,7 +161,7 @@ def verdict(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: di
 
 
 def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: dict[str, Any],
-              best: float = 0.0) -> tuple[str | None, str]:
+              best: float = 0.0, patient: bool = False) -> tuple[str | None, str]:
     """Итог испытания по копиям в S (правило боевого бота A: вход через 2 блока, всё на +25%, выход за трейдером).
     pnl/cost — SOL по закрытым копиям, best — SOL самой удачной копии.
 
@@ -162,7 +169,9 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: 
       1) «часто в плюсе»: 8+ копий, 65%+ в плюсе, в среднем +5%+;
       2) «в среднем»: 10+ копий, в среднем +8%+ и без самой удачной копии — в плюсе; винрейт любой.
     Отсев (14 дней): 4 копии и ни одной в плюсе; 6+ копий и в среднем минус; 20 копий и ни один путь не прошёл.
-    Место следующему (вернуться через 2 дня): за 6 ч меньше 2 копий; за сутки копии по $10 дали меньше $10."""
+    Место следующему (вернуться через 2 дня): за 6 ч меньше 2 копий; за сутки копии по $10 дали меньше $10.
+    patient — редкий, но копируемый (копируемость за 30 дней ≥ 10%, 15+ сделок): «почти не торгует» не раньше 2 суток,
+    без правила «$10 в сутки», испытание до 10 дней."""
     avg = pnl / cost if cost else 0.0
     wo = (pnl - best) / (cost * (n - 1) / n) if n >= 2 and cost else avg      # без самой удачной копии
     res = (f"копия как у бота (A): {n} сделок, в плюсе {wins} ({wins / n:.0%}), в среднем {avg:+.1%}"
@@ -177,15 +186,17 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: 
     if (n >= 4 and wins == 0) or (n >= 6 and avg < 0):
         # слабых — сразу: место на испытании нужно следующему кандидату (в очереди их десятки)
         return "reject", res + " — копия теряет деньги"
-    if n < 2 and age_days >= float(cfg_get(cfg, "scout_idle_days")):
-        return "idle", res + f" за {age_days * 24:.0f} ч — почти не торгует, место следующему"
+    idle = float(cfg_get(cfg, "scout_patient_idle_days" if patient else "scout_idle_days"))
+    if n < 2 and age_days >= idle:
+        return "idle", res + f" за {age_days * 24:.0f} ч — почти не торгует, место следующему" + (
+            " (редкий, но копируемый — ждали дольше)" if patient else "")
     per_day = float(cfg_get(cfg, "scout_a_min_usd_day"))
-    if per_day > 0 and age_days >= 1:
+    if per_day > 0 and age_days >= 1 and not patient:
         usd = avg * n * float(cfg.get("paper_scout_usd") or 10)
         if usd / age_days < per_day:
             return "idle", res + (f"; за {age_days:.1f} сут. копии по $10 дали {usd:+.1f}$ — меньше ${per_day:g} в "
                                   "сутки, место следующему")
-    if age_days >= float(cfg_get(cfg, "scout_probation_days")):
+    if age_days >= float(cfg_get(cfg, "scout_patient_probation_days" if patient else "scout_probation_days")):
         return "few", res + f" за {age_days:.0f} дн. — мало сделок"
     return None, res
 
@@ -245,6 +256,7 @@ class Scout:
         await self.discover_gmgn()
         events += await self.decide()
         events += await self.demote()
+        events += await self.requeue_patient()
         events += await self.fill_slots()
         try:
             events += await self.lookalike.run()          # по образцу smart A: поиск раз в 3 ч, проверка раз в час
@@ -447,9 +459,38 @@ class Scout:
                 GROUP BY 1""", portfolio, addrs)
         return {r["w"]: dict(r) for r in rows}
 
+    async def patient_set(self, addrs: list[str]) -> set[str]:
+        """Редкие, но копируемые: копируемость за 30 дней по своей базе ≥ порога и сделок достаточно."""
+        if not addrs:
+            return set()
+        return {r["address"] for r in await self.db.fetch(
+            """SELECT address FROM traders WHERE address = ANY($1::text[]) AND copy_30d >= $2 AND trades_30d >= $3""",
+            addrs, float(cfg_get(self.cfg, "scout_patient_min_copy")), int(cfg_get(self.cfg, "scout_patient_min_trades")))}
+
+    async def requeue_patient(self) -> list[str]:
+        """Разово (19.11): вернуть в очередь редких, но копируемых, которых раньше сняли за неактивность через 6 ч или
+        за «мало сделок» за 4 дня, — теперь у них испытание дольше. Первыми в очереди (по копируемости)."""
+        if await self.db.kv_get("scout:patient_requeue_v1"):
+            return []
+        rows = await self.db.fetch(
+            """UPDATE scout s SET status='queued', cooldown_until=NULL, decided_at=NULL, decision=NULL, started_at=NULL,
+                   found_at=now(), score=GREATEST(COALESCE(s.score, 0), 9000) + t.copy_30d * 100
+               FROM traders t
+               WHERE t.address = s.address AND s.status = 'few' AND s.decided_at > now() - interval '14 days'
+                 AND t.copy_30d >= $1 AND t.trades_30d >= $2
+               RETURNING s.address, t.copy_30d""",
+            float(cfg_get(self.cfg, "scout_patient_min_copy")), int(cfg_get(self.cfg, "scout_patient_min_trades")))
+        await self.db.kv_set("scout:patient_requeue_v1", True)
+        if not rows:
+            return []
+        names = ", ".join(f"{esc(short(r['address']))} ({float(r['copy_30d']):+.0%})" for r in rows[:10])
+        return [f"🔁 снова в очередь {len(rows)} редких, но копируемых (раньше сняты за неактивность слишком рано, "
+                f"теперь испытание до 10 дней): {names}"]
+
     async def decide(self) -> list[str]:
         rows = await self.db.fetch("SELECT * FROM scout WHERE status='probation'")
         res = await self.results(TRIAL, [r["address"] for r in rows], "started_at")
+        patient = await self.patient_set([r["address"] for r in rows])
         now = datetime.now(timezone.utc)
         auto = int(await self.db.fetchval("SELECT count(*) FROM scout WHERE status='promoted'") or 0)
         cap = int(cfg_get(self.cfg, "scout_max_auto"))
@@ -464,7 +505,7 @@ class Scout:
             x = res.get(r["address"], {"n": 0, "wins": 0, "pnl": 0.0, "cost": 0.0, "best": 0.0})
             age = (now - r["started_at"]).total_seconds() / 86400 if r["started_at"] else 0.0
             v, why = verdict_a(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg,
-                               float(x["best"]))
+                               float(x["best"]), patient=r["address"] in patient)
             addr = r["address"]
             if v == "promote" and open_n.get(addr):
                 continue                     # в smart — только когда закрылись все его копии (не дольше 30 мин)

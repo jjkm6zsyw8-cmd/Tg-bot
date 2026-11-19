@@ -45,7 +45,7 @@ async def main(cmd: str) -> None:
         await db.close()
         return
     if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-               "patterns", "dips"):
+               "patterns", "dips", "whynot"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -206,6 +206,13 @@ async def run_tool(cmd: str, db: Database) -> None:
         days = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
         print(await dips_run(db, days=days, send="--no-send" not in args,
                              progress=lambda m: print(m, file=sys.stderr, flush=True)))
+    elif cmd == "whynot":
+        # почему лучшие кошельки не копируются: python -m scanner whynot [--days 7] [--no-send] — итог в Telegram
+        from .analytics.whynot import run as whynot_run
+        settings = Settings(YamlConfig(load_env().config_path))
+        settings.overrides = await db.get_overrides()
+        days = float(args[args.index("--days") + 1]) if "--days" in args else 7.0
+        print(await whynot_run(db, settings.effective(), days=days, send="--no-send" not in args))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

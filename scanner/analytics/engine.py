@@ -784,7 +784,11 @@ class Engine:
         trader = self.traders[r["trader"]]
         # свой список → раздел «Копитрейд» (наблюдение); кошелёк, который держит монету минутами и в плюсе по
         # копируемости, бот ведёт как smart — с фильтрами smart и в smart-портфели (analytics/copytrade.smart_like)
-        own = bool(trader.get("manual")) and not smart_like(trader, cfg)
+        manual = bool(trader.get("manual"))
+        own = manual and not smart_like(trader, cfg)
+        # чьи покупки разбирать вслух (журнал копий) и копировать на бумагу H, если smart не взял: свои кошельки и
+        # smart-money с копируемостью за 30 дней от порога (19.11: у BojC +52%, у CDXG +38% — ни одной копии)
+        watch = manual or float(trader.get("copy_30d") or 0) >= float(cfg.get("smart_fallback_min_copy", 0.10))
         if r["is_buy"] and cfg.get("paper_swing", True) and swing_like(trader, cfg):
             self._on_swing_buy(st, r)
         if not cfg.get("modes", {}).get("copy" if own else "smart", True):
@@ -796,7 +800,7 @@ class Engine:
         entry = self.alerts.get(st.mint)
         g = self.copyguard
         ts = r["ts"].timestamp()
-        if own and r["trader"] != st.deployer:
+        if manual and r["trader"] != st.deployer:
             if r["is_buy"]:
                 g.on_buy(r["trader"], st.mint, ts)
             else:
@@ -821,37 +825,42 @@ class Engine:
         self.smart_buys[st.mint] = buys
         # свой список (импорт из Axiom, /addwallet) — раздел «Копитрейд»: копируем и небольшие покупки,
         # без рамок MC и роста за минуту (вы сами выбрали этих трейдеров)
-        if own and r["trader"] == st.deployer:
+        if manual and r["trader"] == st.deployer:
             return                       # дев покупает свою монету при запуске — это алерт «мой дев», не копия
 
         async def skip(reason: str) -> None:
-            if own:
+            if watch:
                 await g.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"], "skipped", reason)
-        if own:
+        blacklisted = bool(self.info.get(st.mint) and self.info[st.mint].cluster_row
+                           and self.info[st.mint].cluster_row["blacklisted"])
+        if not own:
+            why = self._smart_gate(st, r, now)
+            if why is None:
+                fresh = await self._fresh_share(st)
+                metrics = st.metrics(fresh)
+                filt = check_filters(metrics, self.settings.filters(), "smart", blacklisted)
+                if not filt.passed:
+                    why = "фильтры безопасности smart: " + ", ".join(filt.violations)
+            if why is not None:
+                if watch:
+                    # свой кошелёк, который бот ведёт как smart, или smart-money с хорошей копируемостью: раньше их
+                    # покупки вне рамок smart пропадали молча — 19.11 у 32FE (копируемость +52%) 0 копий за неделю
+                    await self._smart_fallback(st, r, why, blacklisted)
+                return
+        else:
             why = g.pause_reason(r["trader"]) or g.delta_reason(r["trader"])
             if why:
                 return await skip(why)
-        min_buy = float(cfg.get("copy_min_buy_sol", 0.1)) if own else float(cfg.get("smart_min_buy_sol", 0.5))
-        if r["sol_amount"] < min_buy:
-            return await skip(f"мелкая покупка {r['sol_amount']:.3f} SOL < {min_buy:g}")
-        if not own and not (float(cfg.get("smart_mc_min_sol", 0)) <= st.mc <= float(cfg.get("smart_mc_max_sol", 1e9))):
-            return
-        if not own and st.growth(now) > float(cfg.get("smart_max_growth_1m", 1.0)):
-            return
-        blacklisted = bool(self.info.get(st.mint) and self.info[st.mint].cluster_row
-                           and self.info[st.mint].cluster_row["blacklisted"])
-        if own:
+            min_buy = float(cfg.get("copy_min_buy_sol", 0.1))
+            if r["sol_amount"] < min_buy:
+                return await skip(f"мелкая покупка {r['sol_amount']:.3f} SOL < {min_buy:g}")
             # свой список: по монете мы видим только сделки своих кошельков — доли холдеров, свежих кошельков,
             # бандлов по таким данным ложные (твинк = «100% свежих»). Отсекаем только чёрный список;
             # мусор и раги ловят внешние проверки (RugCheck: mint/freeze, раг) перед алертом
             metrics = st.metrics(None)
             filt = check_filters({}, self.settings.filters(), "smart", blacklisted)
-        else:
-            fresh = await self._fresh_share(st)
-            metrics = st.metrics(fresh)
-            filt = check_filters(metrics, self.settings.filters(), "smart", blacklisted)
-        if not filt.passed:
-            return await skip("фильтры безопасности: " + ", ".join(filt.violations))
+            if not filt.passed:
+                return await skip("фильтры безопасности: " + ", ".join(filt.violations))
         distinct = {b[1] for b in buys}
         signal, level = "single", "normal"
         if len(distinct) >= 2:
@@ -885,10 +894,56 @@ class Engine:
             data.update(copy_wallet=r["trader"], copy_sol=r["sol_amount"], copy_ref_mc=r["mc_sol"])
             await g.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"], "copied",
                         "консенсус: второй кошелёк" if signal == "consensus" else None, ref_mc=r["mc_sol"])
+        elif watch:
+            await g.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"], "copied",
+                        "как smart: портфели smart (A/B/G/M)")
         await self.compose("copy" if own else "smart", st.mint, level, data, signal=signal, trader=r["trader"])
         e = self.alerts.get(st.mint)
         if e:
             e.trigger_traders[r["trader"]] = e.trigger_traders.get(r["trader"], 0.0) + r["token_amount"]
+
+    def _smart_gate(self, st: TokenState, r: Any, now: float) -> str | None:
+        """Рамки smart, которые видны по самой покупке и монете: размер покупки, капитализация, рост за минуту.
+        None — проходит; иначе — причина словами (для журнала копий своих кошельков)."""
+        cfg = self.cfg
+        min_buy = float(cfg.get("smart_min_buy_sol", 0.5))
+        if r["sol_amount"] < min_buy:
+            return f"покупка {r['sol_amount']:.2f} SOL меньше порога smart {min_buy:g}"
+        lo, hi = float(cfg.get("smart_mc_min_sol", 0)), float(cfg.get("smart_mc_max_sol", 1e9))
+        if not lo <= st.mc <= hi:
+            return f"капитализация {st.mc:.0f} SOL вне рамки smart {lo:g}–{hi:g}"
+        cap = float(cfg.get("smart_max_growth_1m", 1.0))
+        g1 = st.growth(now)
+        if g1 > cap:
+            return f"рост за минуту {g1:+.0%} больше {cap:.0%}"
+        return None
+
+    async def _smart_fallback(self, st: TokenState, r: Any, why: str, blacklisted: bool) -> None:
+        """Свой кошелёк, которого бот ведёт как smart (или smart-money с копируемостью от порога), купил вне рамок
+        smart: копия только на бумагу H (наблюдение: вход через 2 блока, выход как у копий) — без алерта в чат и без
+        реального бота (paper_only). Так видно, как торгуется кошелёк целиком, а не только его покупки, прошедшие рамки
+        smart. Всё — в журнал копий с причиной."""
+        cfg, g = self.cfg, self.copyguard
+
+        async def note(action: str, reason: str) -> None:
+            await g.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"], action, reason,
+                        ref_mc=r["mc_sol"] if action == "copied" else None)
+        if not cfg.get("own_smart_fallback", True) or not cfg.get("modes", {}).get("copy", True):
+            return await note("skipped", f"smart не взял: {why}")
+        block = g.pause_reason(r["trader"]) or g.delta_reason(r["trader"])
+        min_buy = float(cfg.get("copy_min_buy_sol", 0.1))
+        if block is None and r["sol_amount"] < min_buy:
+            block = f"мелкая покупка {r['sol_amount']:.3f} SOL < {min_buy:g}"
+        if block is None and blacklisted:
+            block = "чёрный список"
+        if block is not None:
+            return await note("skipped", f"smart не взял ({why}); копия: {block}")
+        await note("copied", f"только бумага H: smart не взял — {why}")
+        data = {"modes": ["copy"], "symbol": st.symbol, "mc": st.mc, "signal": "single", "trader": r["trader"],
+                "source_wallet": r["trader"], "copy_wallet": r["trader"], "copy_sol": r["sol_amount"],
+                "copy_ref_mc": r["mc_sol"], "paper_only": True, "note": f"только бумага: smart не взял — {why}",
+                **trigger_of(r)}
+        asyncio.create_task(self.paper.on_alert(st.mint, "normal", None, data, r["trader"]))
 
     async def _fresh_share(self, st: TokenState, top: int = 15) -> float | None:
         """Доля холдеров (из топа), созданных за последние 24 часа."""

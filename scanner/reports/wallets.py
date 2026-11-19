@@ -32,12 +32,15 @@ def _num(v: Any, nd: int = 4) -> Any:
     return "" if v is None else round(float(v), nd)
 
 
-def verdict_of(kind: str, n: int, wins: int, pnl: float) -> str:
+def verdict_of(kind: str, n: int, wins: int, avg: float) -> str:
+    """По средней копии — как если бы каждая копия была на одинаковую сумму ($10). Не по сумме SOL: размер копии
+    в бумаге — доля покупки цели, и одна крупная неудачная копия перевешивала десяток удачных (19.11: 2pUza9 — 23 копии,
+    13 в плюсе, в среднем +16.2%, а по сумме SOL −0.32 → «шлак»; в бою по нему +13%)."""
     if n < 5:
         return "мало копий — ждём"
-    if pnl > 0 and wins / n >= 0.4:
+    if avg > 0 and wins / n >= 0.4:
         return "✅ держать"
-    if pnl > 0:
+    if avg > 0:
         return "🟡 в плюсе за счёт редких иксов"
     return "❌ шлак — убрать" if kind == "свой" else "❌ в минусе"
 
@@ -93,9 +96,10 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
         g = w.get("gmgn") or {}
         kind = w.get("kind") or "кандидат"
         rt = rating.get(addr) or {}
-        rows.append((pnl, [
+        avg = float(p.get("avg") or 0)
+        rows.append((avg * n, [
             kind, w.get("status") or "", TIERS.get(rt.get("tier") or "", "") + (" ✋" if rt.get("manual_tier") else ""),
-            _pct(rt.get("score")), verdict_of(kind, n, wins, pnl) if kind != "кандидат" else "",
+            _pct(rt.get("score")), verdict_of(kind, n, wins, avg) if kind != "кандидат" else "",
             w.get("label") or "", addr, org.get(addr) or w.get("source") or ("вручную, источник не помечен"
                                                                             if kind.startswith("свой") else "автоотбор"),
             pk.get(addr, ""), w.get("reason") or "", when(w.get("found")), w.get("decision") or "",
@@ -107,6 +111,6 @@ async def wallets_csv(db: Any, sol_usd: float, tz: str = "Asia/Tbilisi") -> tupl
             t.get("trades_30d") or "", _pct(t.get("copy_30d")), _pct(t.get("win_rate")),
             _num(t.get("median_hold_s"), 0), when(t.get("last_active")), f"https://gmgn.ai/sol/address/{addr}",
         ]))
-    for _, row in sorted(rows, key=lambda x: x[0]):          # сначала худшие — их убирать
+    for _, row in sorted(rows, key=lambda x: x[0]):          # сначала худшие (по копиям на равную сумму) — их убирать
         wr.writerow(row)
     return out.getvalue(), len(rows)

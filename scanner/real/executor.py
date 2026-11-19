@@ -357,8 +357,8 @@ class RealTrader:
     async def on_signal(self, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
                         trader: str | None, targets: set[str]) -> None:
         """Сигнал бумаги: smart (идёт в боевой портфель M) или «мой дев» (портфель Y)."""
-        if not self.accept_new:
-            return
+        if not self.accept_new or data.get("paper_only"):
+            return                       # paper_only — копия только на бумагу (свой кошелёк вне рамок smart), не деньги
         _SIGNAL.set((mint, alert_id))
         kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
                      and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
