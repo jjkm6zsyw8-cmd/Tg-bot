@@ -323,11 +323,13 @@ class Scout:
         в плюсе), в пределах 10 минут от их покупки — на 2+ разных монетах за 3 дня, покупал за последние сутки.
         18.11: 7BNax торгует только на PumpSwap монетами старше часов — там своя база сделок неполная и «топ монеты» таких не видит; сделки
         вокруг покупок smart записываются (их монеты отслеживаются). Проверяет испытание в H — по цене блокчейна."""
+        # 19.11: опора — не только smart в плюсе на A, но и кандидаты в плюсе на испытании S: поиск расходится от
+        # любого кошелька, на котором копия бота зарабатывает (иначе без прибыльного smart он стоит)
         smart = [r["w"] for r in await self.db.fetch(
             """SELECT source_wallet w FROM paper_positions
-               WHERE portfolio = 'A' AND source_wallet IS NOT NULL AND opened_at > now() - interval '7 days'
+               WHERE portfolio = ANY($1::text[]) AND source_wallet IS NOT NULL AND opened_at > now() - interval '7 days'
                  AND closed_at IS NOT NULL AND NOT suspect
-               GROUP BY 1 HAVING sum(pnl_sol) > 0 AND count(*) >= 5""")]
+               GROUP BY 1 HAVING sum(pnl_sol) > 0 AND count(*) >= 5""", ["A", TRIAL])]
         if not smart:
             return 0
         rows = await self.db.fetch(
@@ -350,8 +352,8 @@ class Scout:
                 continue
             added += await self._queue(
                 r["trader"], "рядом со smart",
-                f"покупал те же монеты, что smart-кошельки в плюсе: {r['n']} монет за 3 дня "
-                f"(рядом с {r['with_smart']} smart), обычно {r['sol']:.2f} SOL",
+                f"покупал те же монеты, что кошельки в плюсе (smart и испытание): {r['n']} монет за 3 дня "
+                f"(рядом с {r['with_smart']}), обычно {r['sol']:.2f} SOL",
                 float(r["n"]) * 10 + 5, None)
         self.stats["found"] += added
         return added

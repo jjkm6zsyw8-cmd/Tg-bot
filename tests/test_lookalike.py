@@ -110,7 +110,7 @@ async def test_finds_confirms_and_promotes(db):
 
     async def load_traders():
         loads.append(1)
-    eng = SimpleNamespace(db=db, cfg={}, _load_traders=load_traders)
+    eng = SimpleNamespace(db=db, cfg={"lk_to_trial": False}, _load_traders=load_traders)
     lk = LK.Lookalike(eng)
     events = await lk.run(now=now)
     st = {r["address"]: r for r in await db.fetch("SELECT * FROM scout")}
@@ -136,7 +136,7 @@ async def test_finds_confirms_and_promotes(db):
 async def test_not_confirmed_goes_to_cooldown(db):
     now = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
     await history(db, now, "LUCKY", ["pump"] * 12)
-    lk = LK.Lookalike(SimpleNamespace(db=db, cfg={}))
+    lk = LK.Lookalike(SimpleNamespace(db=db, cfg={"lk_to_trial": False}))
     await lk.run(now=now)
     later = now + timedelta(hours=21)
     await history(db, later, "LUCKY", ["dump"] * 12)                            # на новых сделках не повторил
@@ -173,7 +173,7 @@ async def test_confirms_as_soon_as_ten_new_buys(db):
     """Решение не через сутки, а как только кошелёк набрал 10 новых покупок после находки (не раньше 3 ч)."""
     now = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
     await history(db, now, "FAST", ["pump"] * 12)
-    lk = LK.Lookalike(SimpleNamespace(db=db, cfg={}))
+    lk = LK.Lookalike(SimpleNamespace(db=db, cfg={"lk_to_trial": False}))
     await lk.run(now=now)
     assert await db.fetchval("SELECT status FROM scout WHERE address='FAST'") == LK.STATUS
     for i in range(11):                                                         # новые покупки — за первый час
@@ -230,3 +230,17 @@ async def test_coin_details_by_source(db):
     line = text.splitlines()[1]
     assert line.startswith(mint[:6]) and "pump-amm" in line and "| 1: 560→560→560 |" in line
     assert "410→560, +25% take_profit" in line
+
+
+async def test_found_go_to_trial_queue(db):
+    """19.11: найденные «по образцу» — сразу в очередь на испытание S (правило бота, честная цена): там решается,
+    пускать ли в smart. Планка поиска ниже: тейк от 45%, в среднем от +5%."""
+    now = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    await history(db, now, "HALF", ["pump"] * 9 + ["dump"] * 5)                  # в среднем ~+6% — раньше нужно +10%
+    ev = (await LK.evaluate(db, {}, now, wallets=["HALF"]))["HALF"]
+    assert 0.05 <= ev.avg < 0.10 and ev.good({}) and not ev.good({"lk_min_avg": 0.10})
+    lk = LK.Lookalike(SimpleNamespace(db=db, cfg={}))
+    events = await lk.run(now=now)
+    r = await db.fetchrow("SELECT * FROM scout WHERE address='HALF'")
+    assert r["status"] == "queued" and r["source"] == LK.SOURCE and r["score"] > 9500
+    assert any("испытание S" in e for e in events)

@@ -51,7 +51,9 @@ DEFAULTS: dict[str, Any] = {
     "lk_tp": 0.25,                      # тейк чистыми, как у A
     "lk_fee": 0.03,                     # комиссии площадки и сети туда-обратно (доля)
     "lk_horizon_s": 300,
-    "lk_min_n": 10, "lk_min_hit": 0.60, "lk_min_avg": 0.10, "lk_max_quick": 0.30,
+    # 19.11: планка ниже (было тейк 60%, +10%) — найденные идут на испытание S (честная цена, правило бота), оно решает
+    "lk_min_n": 10, "lk_min_hit": 0.45, "lk_min_avg": 0.05, "lk_max_quick": 0.30,
+    "lk_to_trial": True,                # найденных — в очередь на испытание S (иначе — своя проверка вперёд)
     "lk_confirm_min_h": 3.0,            # решение — как только наберёт lk_min_n новых покупок, но не раньше
     "lk_max_promoted": 5,               # сколько кошельков «по образцу» держать в smart
     "lk_timeout_s": 120,
@@ -414,7 +416,9 @@ class Lookalike:
                              if ev.n >= int(cfg_get(self.cfg, "lk_min_n"))][:10],
                      "reference": ref}
         events = []
+        to_trial = bool(cfg_get(self.cfg, "lk_to_trial"))
         for ev in found[:20]:
+            status, score = ("queued", 9500 + round(ev.avg * 100, 2)) if to_trial else (STATUS, round(ev.avg * 100, 2))
             res = await self.db.execute(
                 """INSERT INTO scout(address, status, source, reason, score, stats, found_at)
                    VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -423,10 +427,11 @@ class Lookalike:
                        started_at=NULL, decided_at=NULL, decision=NULL, cooldown_until=NULL
                    WHERE scout.status IN ('queued', 'rejected', 'few', 'demoted', 'removed')
                      AND (scout.cooldown_until IS NULL OR scout.cooldown_until <= now())""",
-                ev.trader, STATUS, SOURCE, ev.text(), round(ev.avg * 100, 2), {"found": ev.stats()}, now)
+                ev.trader, status, SOURCE, ev.text(), score, {"found": ev.stats()}, now)
             if res.endswith("1"):
                 events.append(f"🧬 похож на образец: <code>{ev.trader}</code> — {esc(ev.text())}. "
-                              "Проверю на новых сделках через сутки.")
+                              + ("В очередь на испытание S (как бот, по честной цене)." if to_trial
+                                 else "Проверю на новых сделках через сутки."))
         return events
 
     async def _reference(self, now: datetime) -> list[dict[str, Any]]:

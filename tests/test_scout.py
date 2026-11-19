@@ -236,5 +236,18 @@ async def test_cobuyers_of_profitable_smart():
         assert r["source"] == "рядом со smart" and "4 монет" in r["reason"] and r["score"] > found["PAIR"]["score"]
         await sc.discover_cobuyers()                                       # уже в очереди — те же записи
         assert await db.fetchval("SELECT count(*) FROM scout") == 2
+        # 19.11: опора — и кандидат в плюсе на испытании S, не только smart на A
+        for i in range(5):
+            await db.execute(
+                """INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol, tokens,
+                       tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet)
+                   VALUES ('S', $1, now(), now(), 300, 0.1, 1, 1, 'take_profit', 0.02, 0.2, 'TRIALW')""", f"T{i}")
+        for i in range(2):
+            t = now - timedelta(hours=2 * i)
+            await buy(f"D{i}", "TRIALW", t)
+            await buy(f"D{i}", "NEAR", t + timedelta(minutes=4))
+        await sc.discover_cobuyers()
+        assert await db.fetchval("SELECT status FROM scout WHERE address='NEAR'") == "queued"
+        assert {r["address"] for r in await db.fetch("SELECT address FROM scout")} == {"TWIN", "PAIR", "NEAR"}
     finally:
         await db.close()
