@@ -225,7 +225,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         kb.append([{"text": ("● " if abs(share - v) < 1e-6 else "") + f"{v:.0%}", "callback": f"ps:{v}"}
                    for v in (0.10, 0.15, 0.20, 0.25, 0.35)])
         kb.append([{"text": f"{'✅' if by_level else '⬜'} Размер по силе сигнала", "callback": "tog:paper_size_by_level"}])
-        trends_on, daily = cfg.get("paper_trends", False), cfg.get("paper_daily_reset", True)
+        trends_on, daily = cfg.get("paper_trends", True), cfg.get("paper_daily_reset", True)
         lines.append(f"Бумага: «Тренды» — <b>{'входят' if trends_on else 'не входят'}</b> · сброс каждый день в 00:00 "
                      f"(Батуми) — <b>{'да' if daily else 'нет'}</b>")
         kb.append([{"text": f"{'✅' if trends_on else '⬜'} Тренды в бумаге", "callback": "tog:paper_trends"},

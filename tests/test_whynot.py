@@ -249,20 +249,49 @@ def test_steadiness_t_stat():
     assert v is None and "не устойчивый" in why and "t=1.05" in why
     assert verdict_a(9, 8, 0.115, 0.9, 0.2, {}, t=2.0)[0] == "promote"
     assert verdict_a(20, 12, 0.2, 2.0, 0.5, {}, t=1.0)[0] == "reject"         # 20 копий и всё ещё не устойчиво
-    # свой кошелёк: держит минутами, копируемость в плюсе, но t низкий — не как smart (копии своего списка, H)
+    # свой кошелёк с низким t остаётся «как smart» (меряют A/B/G); на деньги и в M его не пускает unsteady
     base = {"median_hold_s": 600, "copy_30d": 0.05}
-    assert smart_like(base) and smart_like({**base, "copy_t_30d": 2.1})
-    assert not smart_like({**base, "copy_t_30d": 0.8})
+    assert smart_like(base) and smart_like({**base, "copy_t_30d": 0.8})
 
 
-async def test_unsteady_smart_money_goes_to_paper_only(monkeypatch):
+async def test_unsteady_wallet_goes_smart_but_marked_not_for_money(monkeypatch):
     eng = make_engine({"S": {"label": "smart", "manual": False, "copy_30d": 0.03, "copy_t_30d": 0.7},
                        "P": {"label": "из разведки", "manual": False, "pinned": True, "copy_30d": 0.02,
-                             "copy_t_30d": 0.4}}, monkeypatch)
+                             "copy_t_30d": 0.4},
+                       "W": {**OWN_SMART, "copy_t_30d": 0.9}}, monkeypatch)
     await eng._on_smart_trade(coin(100.0), buy("S", 1.0, 100.0))
     await asyncio.sleep(0)
-    assert not eng.composed and eng.papered[-1]["paper_only"]               # не в smart и не на деньги — на бумагу
-    assert "плюс копий не устойчивый: t=0.70" in eng.db.log[-1]["reason"]
+    assert [m for m, _ in eng.composed] == ["smart"] and not eng.papered          # A/B/G меряют, как раньше
+    assert "плюс копий не устойчивый: t=0.70" in eng.composed[-1][1]["unsteady"]  # …но не M и не деньги
     await eng._on_smart_trade(coin(100.0), buy("P", 1.0, 100.0))
-    await asyncio.sleep(0)
-    assert [m for m, _ in eng.composed] == ["smart"]                         # прошедший испытание — решает испытание
+    assert eng.composed[-1][1]["unsteady"] is None                               # прошедший испытание — решает оно
+    await eng._on_smart_trade(coin(100.0), buy("W", 1.0, 100.0))
+    assert eng.composed[-1][0] == "smart" and "t=0.90" in eng.composed[-1][1]["unsteady"]
+
+
+def test_paper_routes_unsteady_without_m_and_trends_to_t():
+    from tests.test_paper import bare_trader
+    tr = bare_trader({})
+    assert tr.route({"modes": ["smart"], "unsteady": "плюс копий не устойчивый: t=0.70 < 1.645"}, "normal")[0] \
+        == set("ABG")
+    assert "M" in tr.route({"modes": ["smart"], "unsteady": None}, "normal")[0]
+    assert tr.route({"modes": ["trend"], "trend": {"pc_m5": 12}}, "normal")[0] == {"T"}
+    tr.e.cfg["paper_trends"] = False
+    assert tr.route({"modes": ["trend"], "trend": {"pc_m5": 12}}, "normal")[0] == set()
+
+
+async def test_real_bot_live_skips_unsteady_smart_but_shadow_measures(monkeypatch):
+    from scanner.real.executor import RealTrader
+    for mode, entered in (("live", False), ("shadow", True)):
+        tr = RealTrader.__new__(RealTrader)
+        tr.accept_new, tr._busy, got, skips = True, {}, [], []
+        tr.mode_for = lambda kind, m=mode: m
+        tr.get = lambda key: None
+        tr._skip = lambda m, k, why, s=skips: s.append(why)
+        tr.entry_block = lambda *a: None
+
+        async def enter(*a, g=got):
+            g.append(a)
+        tr._enter = enter
+        await RealTrader.on_signal(tr, "MINT", "normal", 1, {"modes": ["smart"], "unsteady": "t=0.70"}, "W", {"A", "M"})
+        assert bool(got) is entered and (skips == ["t=0.70"]) is (not entered)

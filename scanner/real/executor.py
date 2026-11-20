@@ -371,6 +371,9 @@ class RealTrader:
         if kind is None:
             return
         mode = self.mode_for(kind)
+        if kind == "smart" and mode == "live" and data.get("unsteady"):
+            # 20.11: на деньги — только кошельки с устойчивым плюсом копий; тень такие сигналы меряет
+            return self._skip(mode, kind, str(data["unsteady"]))
         why = self.entry_block(mint, kind, mode, data)
         if why:
             return self._skip(mode, kind, why)

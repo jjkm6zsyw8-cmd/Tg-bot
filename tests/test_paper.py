@@ -554,7 +554,9 @@ async def test_no_reentry_after_loss_and_day_cap():
     assert "лимит занят" in tr.skipped["D"]
 
 
-async def test_trends_not_in_paper_by_default(monkeypatch):
+async def test_trends_go_to_their_own_portfolio_t(monkeypatch):
+    """20.11: тренды в бумаге по умолчанию — в свой портфель T (раньше их портфели C–F были закрыты и тренды не
+    входили никуда); выключаются переключателем «Тренды в бумаге»."""
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
     tr = bare_trader({}, FakeExt(300_000))
     opened = []
@@ -563,11 +565,12 @@ async def test_trends_not_in_paper_by_default(monkeypatch):
         opened.append(a)
     tr._open = fake_open
     tr.lock = __import__("asyncio").Lock()
-    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
-    assert not opened and "Тренды" in tr.skipped["*"]
-    tr.e.cfg = {"paper_realtime_only": False, "paper_trends": True}
-    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
-    assert opened
+    trend = {"modes": ["trend"], "trend": {"pc_m5": 10}, "mc": 3000.0}
+    await tr.on_alert("M", "normal", None, trend, None)
+    assert [a[0] for a in opened] == ["T"]
+    tr.e.cfg = {"paper_realtime_only": False, "paper_trends": False}
+    await tr.on_alert("M", "normal", None, trend, None)
+    assert len(opened) == 1 and "Тренды" in tr.skipped["*"]
 
 
 async def test_daily_reset_with_summary(monkeypatch):

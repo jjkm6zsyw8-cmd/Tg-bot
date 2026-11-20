@@ -203,12 +203,10 @@ def smart_like(t: Any, cfg: dict[str, Any] | None = None) -> bool:
     get = t.get if hasattr(t, "get") else (lambda k, d=None: d)
     hold, copy = get("median_hold_s"), get("copy_30d")
     need = float((cfg or {}).get("own_smart_min_hold_s", OWN_SMART_MIN_HOLD_S))
-    # 20.11: плюс копий должен быть устойчивым (t ≥ 1.645), а не удачей на нескольких сделках; пока t не посчитан
-    # ночным пересчётом — как раньше
-    t = get("copy_t_30d")
-    steady = t is None or float(t) >= float((cfg or {}).get("own_smart_min_copy_t", MIN_COPY_T))
+    # устойчивость плюса (t ≥ 1.645) здесь не нужна: такие кошельки меряют smart-портфели A/B/G, а на деньги и в
+    # боевую M неустойчивых не пускает engine._steady_gate (20.11: иначе бумага осталась почти без сделок)
     return hold is not None and float(hold) >= need and copy is not None and float(copy) > 0 \
-        and not get("linked_to_dev") and steady
+        and not get("linked_to_dev")
 
 
 SWING_MIN_HOLD_S = 1800.0

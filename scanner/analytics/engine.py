@@ -834,11 +834,8 @@ class Engine:
         blacklisted = bool(self.info.get(st.mint) and self.info[st.mint].cluster_row
                            and self.info[st.mint].cluster_row["blacklisted"])
         if not own:
-            # smart-money с неустойчивым плюсом копий — не в smart-портфели и не на деньги, а на бумагу H (меряем)
-            why = self._steady_gate(trader)
-            fallback_ok = watch or why is not None
-            if why is None:
-                why = self._smart_gate(st, r, now)
+            fallback_ok = watch
+            why = self._smart_gate(st, r, now)
             if why is None:
                 fresh = await self._fresh_share(st)
                 metrics = st.metrics(fresh)
@@ -890,6 +887,7 @@ class Engine:
             "metrics": metrics, "violations": filt.violations, "traders": traders,
             "smart_in_coin": sum(1 for a in self.traders if st.balances.get(a, 0) > 0),
             "exit_rule": "Выход при продаже трейдера или кластера", "trader": r["trader"],
+            "unsteady": None if own else self._steady_gate(trader),
             "cluster_id": st.cluster_id, "stage": self._stage(st),
             **trigger_of(r),            # бумага входит как реальный бот: через 2 блока после этой покупки
         }
@@ -907,10 +905,11 @@ class Engine:
             e.trigger_traders[r["trader"]] = e.trigger_traders.get(r["trader"], 0.0) + r["token_amount"]
 
     def _steady_gate(self, trader: Any) -> str | None:
-        """Плюс копий кошелька за 30 дней устойчивый (t ≥ порога)? Не посчитан, свой кошелёк или прошедший испытание
-        разведки (pinned) — пропускаем: у своих это решает smart_like, у разведки — испытание."""
+        """Плюс копий кошелька за 30 дней устойчивый (t ≥ порога)? Нет — причина: сигнал идёт в smart-портфели A/B/G
+        (меряем), но не в боевую M и не на деньги (paper.route, RealTrader.on_signal). Не посчитан или кошелёк прошёл
+        испытание разведки (pinned — там своя проверка устойчивости) — пропускаем."""
         t = trader.get("copy_t_30d")
-        if t is None or trader.get("manual") or trader.get("pinned"):
+        if t is None or trader.get("pinned"):
             return None
         need = float(self.cfg.get("trader_min_copy_t", MIN_COPY_T))
         if float(t) < need:

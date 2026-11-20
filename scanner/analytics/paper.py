@@ -93,7 +93,11 @@ BIGCOPY_SOL = 5.0
 # (стоп −8%) — это другой выход, а владельцу нужно ровно то, на чём зарабатывает бот: копия 7BNax по A давала 81%
 # в плюс при его собственных 51%. Решение разведки — по S.
 TRIAL = "S"
-OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY, TRIAL)
+# T — «тренды» (с 20.11, наблюдение): монеты, которые уже растут на DexScreener (импульс или откат после него) — это
+# монеты постарше, вне первых минут жизни. До 20.11 тренды в бумагу не попадали вовсе: их портфели C–F закрыты 12.11,
+# а переключатель «Тренды в бумаге» входу не помогал. Как G, по $10
+TREND = "T"
+OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY, TRIAL, TREND)
 OBSERVE_USD = 10.0
 # 12.11: трейдер после нашего входа мелко докупил (≤0.06 SOL ≈ $5) — выходим сразу. По неделе (копии, 88 сделок):
 # цена через 5 мин после такой докупки −13% (медиана); «выйти сразу» +$71 против «держать» +$21
@@ -190,18 +194,21 @@ SCHEMES: dict[str, dict[str, Any]] = {
             "stop": 0.50, "tp_net": None, "tp_share": 0.0, "trail": 0.35, "trail_after_net": 0.30, "target": False,
             "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 24 * 3600},
 }
+SCHEMES[TREND] = {**_G, "name": "T: тренды — монеты, которые уже растут (DexScreener), как G, по $10",
+                  "max_hold_s": 1800}
 SCHEMES[TRIAL] = {**SCHEMES["A"], "name": "S: испытание кандидатов разведки как боевой бот — правило A (всё на +25% "
                                          "без стопа, выход за трейдером, до 30 мин), по $10"}
 LEGEND = ("с 12.11 — только smart (по факту недели копии в минусе при любой тактике): "
           "A всё на +25% без стопа · B 70% на +25%, 30% трейл 15%, без стопа · G всё на +25%, стоп −8% · "
           "M — боевая (как A, позиция ≤30%, дневной стоп −25%) · H — наблюдение: кандидаты разведки и копии своего "
           "списка, по $10 · C, D, E, F новых сделок не открывают · держим до 30 мин · исполнение как у быстрого бота: "
-          "покупка через 2 блока после трейдера по цене блокчейна (не узнали цену — сделки нет; через 30 с цена "
-          "сверяется), стоп/тейк по каждой сделке, продажа через 2 блока · сделки с ⚠ не меняют ни итог, ни баланс · "
+          "покупка через 4 блока (~0.8 с) после трейдера по цене блокчейна (не узнали цену — сделки нет; через 30 с "
+          "цена сверяется), стоп/тейк по каждой сделке, продажа через 2 блока · сделки с ⚠ не меняют ни итог, ни баланс · "
           "старт $100 (H — $1000) · R — смарт-ракеты: новые покупки держателей (≥30 мин), трейл 35% после +30%, "
           "стоп −50%, до суток, по $10, старт $1000, без дневного сброса · Y — мой дев: запуски девов из списка, вход "
-          "через 2 блока после создания, как G · K — крупные копии (трейдер от 5 SOL), как G · Y, K — по $10, старт "
-          "$1000 · во всех: трейдер мелко докупил (до ~$5) — выходим сразу")
+          "через 4 блока после создания, как G · K — крупные копии (трейдер от 5 SOL), как G · T — тренды "
+          "(монеты, которые уже растут, DexScreener), как G · Y, K, T — по $10, старт $1000 · M и бой — только "
+          "кошельки с устойчивым плюсом копий (t ≥ 1.645) · во всех: трейдер мелко докупил (до ~$5) — выходим сразу")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
 # +15%) дали +1.0…+1.1 SOL на портфель (CHICXU ×7, POOH ×2.3, blob ×2.3), а ночью 7.11 с единым правилом все
@@ -586,7 +593,7 @@ class PaperTrader:
         if level not in self.levels():
             self.skipped.setdefault("*", f"уровень «{level}» не выбран для бумажной торговли")
             return
-        if data.get("trend") and not self.cfg.get("paper_trends", False):
+        if data.get("trend") and not self.cfg.get("paper_trends", True):
             self.skipped.setdefault("*", "«Тренды» не входят в бумажную торговлю (настройка)")
             return
         if (trader and not data.get("copy_wallet") and not data.get("source_wallet")
@@ -1223,7 +1230,7 @@ class PaperTrader:
         if name in (SCOUT, TRIAL):
             # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
             size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
-        if name in (SWING, MYDEV, BIGCOPY):
+        if name in (SWING, MYDEV, BIGCOPY, TREND):
             size = float(self.cfg.get("paper_observe_usd", OBSERVE_USD)) / (self.e.price.value or 150)
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * (float(self.cfg.get("paper_m_size_cap", M_SIZE_CAP)) if name == MAIN
@@ -1563,6 +1570,8 @@ class PaperTrader:
                 out.add(BIGCOPY)                     # трейдер зашёл крупно — отдельно смотрим в K
         if "mydev" in modes and self.cfg.get("paper_mydev", True):
             out.add(MYDEV)
+        if "trend" in modes and self.cfg.get("paper_trends", True):
+            out.add(TREND)                           # тренды — свой портфель наблюдения T
         if "smart" in modes:
             out |= smart_set | {MAIN}
         if "dev" in modes and self.cfg.get("paper_lottery_on", False):
@@ -1580,6 +1589,10 @@ class PaperTrader:
                 out.add(MAIN)                        # боевая версия берёт и билеты лотереи (маленькие)
             if not lot and not out:
                 why = "лотерея D: дев купил не ~1 SOL при запуске"
+        if MAIN in out and data.get("unsteady"):
+            # 20.11: плюс копий кошелька за 30 дней неустойчивый (t < 1.645) — A/B/G его меряют, боевая M и бой — нет
+            out.discard(MAIN)
+            self.skipped[MAIN] = f"M: {data['unsteady']}"
         if MAIN in out:
             kind = self.kind_of(data)
             strong = level == "strong" or len(data.get("traders") or []) >= 2
