@@ -348,3 +348,32 @@ async def test_count_from_zero_button(db):
     assert await db.fetchval("SELECT count(*) FROM real_positions") == 1    # ничего не удалено
     r = await R.on_callback(db, reload, "zero!:mg")
     assert "Методы торговли: общие" in r.text and "бумага Y: сделок нет" in r.text and "Итог бумаги — с " in r.text
+
+
+async def test_count_from_zero_on_main_screen_and_trades(db):
+    """«Считать с нуля» действует на все итоги реального бота: главный экран, список сделок; стопы боя не трогает."""
+    from scanner.real import report as R
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain)
+    await tr.start()
+    await fire(tr, chain)
+    chain.set_mc(MINT, 54.0)
+    await trade(tr, chain)
+    await asyncio.sleep(0.05)
+    cfg = dict(tr.e.cfg)
+
+    async def reload():
+        return cfg
+    text, kb = await R.status_view(db, cfg)
+    row = next(line for line in text.split("\n") if line.startswith("Тень всего"))
+    assert row.split()[2] == "1" and "rl:zero:view" in [b["callback"] for r in kb for b in r]
+    r = await R.on_callback(db, reload, "zero:view")
+    assert r.kb[0][1]["callback"] == "rl:view" and "стоп боя считаются как прежде" in r.text
+    r = await R.on_callback(db, reload, "zero!:view")
+    assert r.toast == "Считаю с нуля" and "Итоги считаются с" in r.text
+    row = next(line for line in r.text.split("\n") if line.startswith("Тень с "))
+    assert row.split()[3] == "0"                                  # сделка до нажатия — не в итоге
+    assert "пока нет с" in await R.trades_text(db, cfg)
+    assert R.zero_back("w7") == "rl:w:7" and R.zero_back("mg") == "rl:wme:g" and R.zero_back("cmp") == "rl:cmp"
+    assert tr.day_pnl["shadow"] > 0                               # счёт исполнителя (стопы) кнопка не трогает

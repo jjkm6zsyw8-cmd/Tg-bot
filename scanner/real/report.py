@@ -95,7 +95,11 @@ async def load_status(db: Any) -> tuple[dict[str, Any], float | None]:
 
 async def totals(db: Any, since: datetime | None = None, wallet: Any = "all") -> dict[str, dict[str, float]]:
     """Итог закрытых сделок по режимам: число, в плюс, итог в SOL; для боя — комиссии отклонённых транзакций.
-    wallet — номер кошелька (None — общая полоса без кошелька), "all" — все вместе."""
+    wallet — номер кошелька (None — общая полоса без кошелька), "all" — все вместе.
+    После «🔄 Считать с нуля» — не раньше нажатия (стопы боя считает исполнитель сам, кнопка их не трогает)."""
+    zero = await stats_since(db)
+    if zero is not None and (since is None or zero > since):
+        since = zero
     out: dict[str, dict[str, float]] = {m: {"n": 0, "wins": 0, "pnl": 0.0, "fails": 0, "fail_fees": 0.0}
                                         for m in ("shadow", "live")}
     every = wallet == "all"
@@ -229,10 +233,14 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
             if o.get("id"):
                 kb.append([{"text": f"Продать ${(o.get('symbol') or '?')[:12]}", "callback": f"rl:sell:{o['id']}"}])
     today, alltime = await totals(db, day_start(cfg)), await totals(db)
+    zero = await stats_since(db)
+    tail = f"с {zero.astimezone(tz_of(cfg)):%d.%m}" if zero else "всего"
     table = [f"{'':<13}{'сдел.':>5} {'в плюс':>6} {'итог':>9}",
-             _row("Тень сегодня", today["shadow"], sol_usd), _row("Тень всего", alltime["shadow"], sol_usd),
-             _row("Бой сегодня", today["live"], sol_usd), _row("Бой всего", alltime["live"], sol_usd)]
+             _row("Тень сегодня", today["shadow"], sol_usd), _row(f"Тень {tail}", alltime["shadow"], sol_usd),
+             _row("Бой сегодня", today["live"], sol_usd), _row(f"Бой {tail}", alltime["live"], sol_usd)]
     lines.append("\n<pre>" + "\n".join(table) + "</pre>")
+    if zero:
+        lines.append(f"Итоги считаются с {zero.astimezone(tz_of(cfg)):%d.%m %H:%M} (кнопка «🔄 Считать с нуля»).")
     if alltime["live"]["fails"]:
         lines.append(f"Отклонённые сетью транзакции боя: {int(alltime['live']['fails'])}, комиссии "
                      f"{money(-alltime['live']['fail_fees'], sol_usd)} (уже в итоге).")
@@ -251,6 +259,7 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     kb.append([{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}, {"text": "📄 CSV сделок", "callback": "rl:csv"}])
     kb.append([{"text": "🎯 Методы", "callback": "rl:wme:g"}, {"text": "⚙️ Настройки", "callback": "rl:set"},
                {"text": "🧪 Проверка", "callback": "rl:check"}])
+    kb.append([{"text": "🔄 Считать с нуля", "callback": "rl:zero:view"}])
     return "\n".join(lines), kb
 
 
@@ -333,12 +342,15 @@ def settings_view(cfg: dict[str, Any], wid: int | None = None, name: str = "") -
 # ---------------------------------------------------------------------- сделки
 async def trades_text(db: Any, cfg: dict[str, Any], limit: int = 20, wallet: Any = "all") -> str:
     every = wallet == "all"
+    zero = await stats_since(db)
     rows = await db.fetch("SELECT p.*, t.label trader_label FROM real_positions p "
                           "LEFT JOIN traders t ON t.address = p.trader WHERE p.closed_at IS NOT NULL "
-                          "AND ($2 OR p.wallet_id IS NOT DISTINCT FROM $3::bigint) ORDER BY p.closed_at DESC LIMIT $1",
-                          limit, every, None if every else wallet)
+                          "AND ($2 OR p.wallet_id IS NOT DISTINCT FROM $3::bigint) "
+                          "AND ($4::timestamptz IS NULL OR p.closed_at >= $4) ORDER BY p.closed_at DESC LIMIT $1",
+                          limit, every, None if every else wallet, zero)
     if not rows:
-        return "📋 Закрытых сделок реального бота пока нет."
+        return ("📋 Закрытых сделок реального бота пока нет"
+                + (f" с {zero.astimezone(tz_of(cfg)):%d.%m %H:%M} (кнопка «🔄 Считать с нуля»)." if zero else "."))
     sol_usd = await sol_price(db)
     tz = tz_of(cfg)
     lines = [f"📋 <b>Последние сделки реального бота</b> ({len(rows)})"]
@@ -575,6 +587,17 @@ async def rules_lines(db: Any, since: datetime, sol_usd: float) -> list[str]:
             "5 мин — выход · R — трейлинг 35% после +30%, стоп −50%, до суток"]
 
 
+def zero_back(back: str) -> str:
+    """Куда вернуться из подтверждения «Считать с нуля» по «Нет»."""
+    if back == "cmp":
+        return "rl:cmp"
+    if back[:1] == "m":
+        return f"rl:wme:{back[1:]}"
+    if back[:1] == "w" and back[1:].isdigit():
+        return f"rl:w:{back[1:]}"
+    return "rl:view"
+
+
 # ---------------------------------------------------------------------- нажатия кнопок
 async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], data: str, rpc: Any = None) -> Reply:
     """data — то, что после «rl:» в кнопке. reload() возвращает действующие настройки (после записи — свежие).
@@ -637,20 +660,30 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
                                                     {"text": "← Назад", "callback": "rl:view"}],
                                                    [{"text": "🔄 Считать с нуля", "callback": "rl:zero:cmp"}]])
     if action == "zero":
-        back = rest if rest == "cmp" or rest.startswith("m") else "cmp"
-        return Reply("🔄 <b>Считать с нуля?</b>\nС этой минуты считаются: сделки реального бота и пробы правил в "
-                     "«⚖️ Против бумаги», итог бумаги на экранах методов. Ничего не удаляется, деньги и открытые "
-                     "позиции не трогаются. Бумажные портфели /paper сбрасываются сами в 00:00 (и кнопкой в /paper).",
+        back = rest if rest in ("cmp", "view") or rest[:1] in ("m", "w") else "view"
+        return Reply("🔄 <b>Считать с нуля?</b>\nС этой минуты считаются все итоги реального бота: тень и бой "
+                     "(главный экран, кошельки, сделки), «⚖️ Против бумаги» с пробами правил, итог бумаги на экранах "
+                     "методов. Ничего не удаляется, деньги и открытые позиции не трогаются; дневной и общий стоп боя "
+                     "считаются как прежде (это защита). Бумажные портфели /paper сбрасываются сами в 00:00 "
+                     "и кнопкой «🔄 Сброс портфелей» в /paper.",
                      [[{"text": "Да, с нуля", "callback": f"rl:zero!:{back}"},
-                       {"text": "Нет", "callback": "rl:cmp" if back == "cmp" else f"rl:wme:{back[1:]}"}]], "", True)
+                       {"text": "Нет", "callback": zero_back(back)}]], "", True)
     if action == "zero!":
         await db.kv_set(STATS_SINCE_KEY, datetime.now(timezone.utc).isoformat())
-        if rest.startswith("m"):
-            from .wallets_ui import methods_view
+        if rest[:1] in ("m", "w"):
+            from .wallets_ui import methods_view, wallet_view
             tag = rest[1:]
-            text, kb = await methods_view(db, cfg, int(tag) if tag.isdigit() else None)
+            if rest[0] == "m":
+                text, kb = await methods_view(db, cfg, int(tag) if tag.isdigit() else None)
+            elif tag.isdigit():
+                text, kb = await wallet_view(db, cfg, int(tag), rpc)
+            else:
+                return await main("Считаю с нуля")
             return Reply(text, kb, "Считаю с нуля", True)
-        return Reply(await compare_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]], "Считаю с нуля", True)
+        if rest == "cmp":
+            return Reply(await compare_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]], "Считаю с нуля",
+                         True)
+        return await main("Считаю с нуля")
     if action == "xlsx":
         from ..reports.excel import build_xlsx
         data, caption = await build_xlsx(db, cfg)

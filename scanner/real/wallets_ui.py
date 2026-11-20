@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from ..alerts.format import esc
 from . import settings as S
 from .report import (KINDS, MODE_ICON, MODE_SHORT, STALE_S, Kb, Reply, day_start, lane_status, load_desk, money,
-                     settings_view, sol_price, totals, trades_text, tz_of, wallet_rows)
+                     settings_view, sol_price, totals, trades_text, tz_of, wallet_rows, stats_since)
 
 CREATE_WAIT_S = 8.0
 MASTERKEY_CMD = ("cd /opt/tg-bot &amp;&amp; echo &gt;&gt; .env &amp;&amp; docker compose run --rm --no-deps -T analytics "
@@ -143,7 +143,9 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
     if own_pause or cfg.get("real_paused"):
         lines.append(f"⛔ Новые входы остановлены: {esc(own_pause or str(cfg.get('real_paused')))}")
     today, alltime = await totals(db, day_start(cfg), wallet=wid), await totals(db, wallet=wid)
-    for name, t in (("Сегодня", today), ("Всего", alltime)):
+    zero = await stats_since(db)
+    for name, t in (("Сегодня", today), (f"С {zero.astimezone(tz_of(cfg)):%d.%m %H:%M}" if zero else
+                                          "Всего", alltime)):
         parts = [f"{MODE_SHORT[m]} {int(t[m]['n'])} сд. {money(t[m]['pnl'] - t[m].get('fail_fees', 0.0), sol_usd)}"
                  for m in ("live", "shadow") if t[m]["n"] or t[m].get("fails")]
         lines.append(f"{name}: " + (" · ".join(parts) if parts else "сделок нет"))
@@ -163,7 +165,7 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
          {"text": "⛔ Стоп входов", "callback": f"rl:wp:{wid}"},
          {"text": "💰 Продать всё…", "callback": f"rl:wx:{wid}"}],
         [{"text": "🔄 Обновить", "callback": f"rl:w:{wid}"}, {"text": "🗑 Удалить…", "callback": f"rl:wa:{wid}"}],
-        [{"text": "← Кошельки", "callback": "rl:wl"}],
+        [{"text": "🔄 Считать с нуля", "callback": f"rl:zero:w{wid}"}, {"text": "← Кошельки", "callback": "rl:wl"}],
     ]
     return "\n".join(lines), kb
 
