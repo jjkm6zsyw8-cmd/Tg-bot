@@ -937,3 +937,35 @@ async def test_paper_measure_takes_every_signal():
     assert await tr._open("A", "MX", "normal", None, data, "W", 30.0)
     tr.e.cfg["paper_measure"] = False                                                     # правила боя
     assert await tr._open("A", "MY", "normal", None, data, "W", 30.0) is None and "лимит 3" in tr.skipped["A"]
+
+
+async def test_wrong_start_price_fixed_once_and_dollar_result_in_report():
+    """20.11: T создался по курсу $150 вместо ~$70 (курс ещё не пришёл) — старт ~$470 вместо $1000, и баланс $474
+    при +5% читался как минус. Старт доводится до положенного разово, в отчёте — итог в долларах."""
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        await db.execute("""INSERT INTO paper_portfolios(name, scheme, start_usd, start_sol, balance_sol)
+                            VALUES ('T', '{}', 1000, $1, $2)""", 1000 / 150, 1000 / 150 * 1.05)
+        eng = SimpleNamespace(db=db, price=SimpleNamespace(value=70.0), fee_bps=None, settings=None, cfg={},
+                              states={}, ext=None)
+        tr = pp.PaperTrader(eng)  # type: ignore[arg-type]
+        await tr.start()
+        row = await db.fetchrow("SELECT start_sol, balance_sol FROM paper_portfolios WHERE name='T'")
+        assert row["start_sol"] == pytest.approx(1000 / 70)
+        assert row["balance_sol"] - row["start_sol"] == pytest.approx(1000 / 150 * 0.05)    # итог в SOL тот же
+        await tr.start()                                                                     # разово
+        assert (await db.fetchval("SELECT start_sol FROM paper_portfolios WHERE name='T'")) == pytest.approx(1000 / 70)
+        h = await db.fetchval("SELECT start_sol FROM paper_portfolios WHERE name='H'")
+        assert h == pytest.approx(1000 / 70)                                                 # новые — по курсу
+        text = await tr.render_period(None)
+        assert "итог $" in text and "баланс" not in text.split("</pre>")[0]
+        t_row = next(ln for ln in text.split("\n") if ln.startswith("T"))
+        assert "+$0" in t_row                                                                 # сделок ещё нет
+    finally:
+        await db.close()

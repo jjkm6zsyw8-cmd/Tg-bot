@@ -522,12 +522,24 @@ class PaperTrader:
         return set(self.cfg.get("paper_levels") or ["strong", "normal"])
 
     async def start(self) -> None:
-        sol = self.e.price.value or 150
+        # 20.11: при запуске аналитики курс SOL ещё не получен — портфель T создался по $150 за SOL вместо ~$70 и
+        # стартовал с ~$470 вместо $1000. Без свежего курса — последний известный
+        sol = self.e.price.value or float((await self.db.kv_get("sol_usd", {}) or {}).get("price") or 150)
         for name, scheme in SCHEMES.items():
             await self.db.execute(
                 """INSERT INTO paper_portfolios(name, scheme, start_usd, start_sol, balance_sol)
                    VALUES ($1, $2, $3, $4, $4) ON CONFLICT (name) DO NOTHING""",
                 name, scheme, self.start_usd(name), self.start_usd(name) / sol)
+        if self.e.price.value and not await self.db.kv_get("paper:start_fix_v1"):
+            # разово: портфель наблюдения, созданный по неверному курсу (старт меньше 60% от положенного), доводим до
+            # положенного старта — и старт, и баланс на одну сумму (итог в SOL и доля прибыльных не меняются)
+            for r in await self.db.fetch("SELECT name, start_sol FROM paper_portfolios"):
+                want = self.start_usd(r["name"]) / sol
+                if r["name"] in OBSERVE and r["start_sol"] and r["start_sol"] < 0.6 * want:
+                    await self.db.execute("""UPDATE paper_portfolios SET start_sol = start_sol + $2,
+                                                 balance_sol = balance_sol + $2 WHERE name = $1""",
+                                          r["name"], want - r["start_sol"])
+            await self.db.kv_set("paper:start_fix_v1", True)
         for r in await self.db.fetch("SELECT * FROM paper_portfolios"):
             self.balance[r["name"]] = r["balance_sol"]
             self.paused[r["name"]] = r["paused"]
@@ -1766,9 +1778,10 @@ class PaperTrader:
             why = (self.skipped.get("*") or next((v for v in self.skipped.values()), "")
                    or saved.get("*") or next((v for v in saved.values()), ""))
             lines.append(f"⏸ сделок нет · алертов за период: {parts or '0'}" + (f" · бумага не вошла: {why}" if why else ""))
-        # таблица: портфель · за период · всего · баланс · сделки (доля прибыльных); ★ — лидер по «всего»
+        # таблица: портфель · за период · всего (% от старта и в $) · сделки (доля прибыльных); ★ — лидер по «всего».
+        # 20.11: вместо «баланса» — итог в долларах: баланс $474 при +5% читался как минус (старт у портфелей разный)
         leader = max((n for n in SCHEMES if n not in (SCOUT, TRIAL)), key=lambda n: tot[n]["equity"] / tot[n]["port"]["start_sol"])
-        head = ("    " + (f"{'период':>7}" if hours is not None else "") + f"{'всего':>7}{'баланс':>8}  сделки")
+        head = ("    " + (f"{'период':>7}" if hours is not None else "") + f"{'всего':>7}{'итог $':>8}  сделки")
         rows = [head]
         for n in SCHEMES:
             start_sol = tot[n]["port"]["start_sol"]
@@ -1776,7 +1789,8 @@ class PaperTrader:
             row = f"{n}{'★' if n == leader else ' '}  "
             if hours is not None:
                 row += f"{per[n]['pnl_sol'] / per[n]['port']['start_sol']:>+7.1%}"
-            row += f"{tot[n]['equity'] / start_sol - 1:>+7.0%}{'$' + format(tot[n]['equity'] * sol_usd, '.1f'):>8}  {cnt}"
+            usd = (tot[n]["equity"] - start_sol) * sol_usd
+            row += f"{tot[n]['equity'] / start_sol - 1:>+7.0%}{('+' if usd >= 0 else '−') + '$' + format(abs(usd), '.0f'):>8}  {cnt}"
             if cnt:
                 row += f" ({per[n]['wins'] / cnt:.0%})"
             rows.append(row)
