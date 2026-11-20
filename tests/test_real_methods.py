@@ -402,3 +402,8 @@ async def test_enable_all_methods_button(db):
     await UI.on_wallet_callback(db, {}, "wmall", f"{t}:on!")
     st = await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
     assert all(st[S.METHODS[k][1]] is True for k in S.METHODS) and "real_live_mydev" not in st
+    # общие настройки: есть кошелёк в бою без своих методов — тоже спрашивает
+    w2 = await desk.create_wallet("Бой без своих методов")
+    await db.execute("UPDATE real_wallets SET settings = '{\"real_mode\": \"live\"}'::jsonb WHERE id=$1", w2)
+    r = await UI.on_wallet_callback(db, {}, "wmall", "g:on")
+    assert "режиме «бой»" in r.text and "real_trend" not in (await db.get_overrides())

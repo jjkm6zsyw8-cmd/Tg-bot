@@ -516,7 +516,13 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
         patch = dict(PAPER_A_PRESET)
         drop = [S.stake_key(k) for k in S.METHODS]
     elif action == "wmall" and len(parts) == 2 and parts[1] in ("on", "on!", "off"):
-        if parts[1] == "on" and S.get(wcfg, "real_mode") == "live":
+        live = S.get(wcfg, "real_mode") == "live"
+        if tag == "g" and not live:
+            # общие методы действуют у всех кошельков без своей настройки — в том числе у тех, что в бою
+            live = any(S.get({**cfg, **(w["settings"] or {})}, "real_mode") == "live"
+                       and not any(S.METHODS[k][1] in (w["settings"] or {}) for k in S.METHODS)
+                       for w in await wallet_rows(db))
+        if parts[1] == "on" and live:
             return Reply("💵 <b>Кошелёк в режиме «бой».</b> Включить все методы — значит торговать на реальные деньги "
                          "по всем сигналам: smart, копии, крупные копии, смарт-ракеты, тренды (у «мой дев» в бою — "
                          "отдельный переключатель, он не меняется). Ставка, лимит позиций и стопы — как настроены.",
