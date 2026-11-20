@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, LinkPreviewOptions, ReplyParameters
 
 from ..config import Env, Settings
@@ -24,6 +26,19 @@ from .keyboards import build
 log = logging.getLogger(__name__)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 MUTABLE = {"alert", "summary", "full"}  # что глушится паузой и тихими часами
+# 20.11 23:40–01:00: связь сервера с Telegram была в порядке, а бот получал «Request timeout» на каждый запрос —
+# соединение «залипло»; команды не работали, а сообщения очереди после 5 неудачных попыток выбрасывались.
+# Теперь: обрыв связи — не попытка (сообщение ждёт); нет связи 3 мин — соединение пересоздаётся; 10 мин — сервис
+# бота перезапускается (Docker поднимает его сам, как ручной docker compose restart bot)
+NET_ERRORS = (TelegramNetworkError, aiohttp.ClientError, asyncio.TimeoutError)
+NET_RESET_S = 180.0
+NET_EXIT_S = 600.0
+NET_PING_S = 60.0                         # нет отправок — раз в минуту проверяем связь запросом getMe
+NET_BACKOFF_S = 5.0                       # после обрыва — пауза перед следующей попыткой
+
+
+def _mono() -> float:
+    return time.monotonic()
 
 
 class Limiter:
@@ -68,6 +83,48 @@ class Sender:
         self.sys_buf: list[str] = []      # системные сообщения копятся и уходят не чаще раза в 10 минут
         self.sys_last = 0.0
         self.sys_interval = 600.0
+        self.net_down_since: float | None = None   # с какого момента нет связи с Telegram (monotonic)
+        self.net_reset = False                      # соединение уже пересоздавали в этом обрыве
+        self.net_ok_at = _mono()
+        self.exit = os._exit                        # подменяется в тестах
+
+    def net_ok(self) -> None:
+        if self.net_down_since is not None:
+            log.info("связь с Telegram восстановлена через %.0f с", _mono() - self.net_down_since)
+        self.net_down_since, self.net_reset, self.net_ok_at = None, False, _mono()
+
+    async def net_failed(self, exc: BaseException) -> None:
+        """Запрос к Telegram не прошёл по сети: соединение пересоздаётся, а если не помогло — перезапуск сервиса."""
+        now = _mono()
+        if self.net_down_since is None:
+            self.net_down_since = now
+            log.warning("нет связи с Telegram: %s", str(exc)[:200] or type(exc).__name__)
+            return
+        down = now - self.net_down_since
+        if down >= NET_EXIT_S:
+            log.error("нет связи с Telegram %.0f мин — перезапускаю сервис бота", down / 60)
+            self.exit(1)
+            return
+        if down >= NET_RESET_S and not self.net_reset:
+            self.net_reset = True
+            log.warning("нет связи с Telegram %.0f с — пересоздаю соединение", down)
+            try:
+                await self.bot.session.close()        # следующий запрос откроет новое соединение (и опрос команд тоже)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def ping(self) -> None:
+        """Отправок давно не было — проверяем связь сами: иначе «залипший» опрос команд никто не заметит."""
+        if _mono() - self.net_ok_at < NET_PING_S:
+            return
+        try:
+            await asyncio.wait_for(self.bot.get_me(), 20)
+            self.net_ok()
+        except NET_ERRORS as exc:
+            self.net_ok_at = _mono() - NET_PING_S + 15     # следующая проверка через 15 с
+            await self.net_failed(exc)
+        except Exception:  # noqa: BLE001
+            log.exception("проверка связи с Telegram")
 
     @property
     def chat_id(self) -> int | None:
@@ -124,6 +181,7 @@ class Sender:
             self.wake.clear()
             try:
                 await self.drain()
+                await self.ping()
             except Exception:  # noqa: BLE001
                 log.exception("sender")
                 await asyncio.sleep(2)
@@ -182,6 +240,13 @@ class Sender:
             try:
                 await self.deliver(kind, p)
                 await self._done(r["id"])
+                self.net_ok()
+            except NET_ERRORS as exc:
+                # обрыв связи — не вина сообщения: попытку не засчитываем, ждём связь (раньше после 5 обрывов
+                # сообщение выбрасывалось из очереди)
+                await self.net_failed(exc)
+                await asyncio.sleep(NET_BACKOFF_S)
+                return
             except TelegramRetryAfter as exc:
                 log.warning("flood control: %s с", exc.retry_after)
                 try:
