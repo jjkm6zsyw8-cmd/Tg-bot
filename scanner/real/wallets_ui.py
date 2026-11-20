@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ..alerts.format import esc
 from . import settings as S
@@ -305,12 +306,24 @@ ABOUT = {"smart": "покупка smart-кошелька", "mydev": "запус�
 async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float]]:
     """Бумага по портфелям за days дней: (сделок, в плюс, итог в $ при $10 на сделку). Только честные входы
     (цена блока +2 из блокчейна) и без сделок ⚠."""
+    from .report import stats_since
+    zero = await stats_since(db)
     rows = await db.fetch(
         """SELECT portfolio, count(*) n, count(*) FILTER (WHERE pnl_pct > 0) w, COALESCE(sum(pnl_pct), 0) s
            FROM paper_positions WHERE closed_at > now() - make_interval(days => $1) AND NOT suspect
+             AND ($2::timestamptz IS NULL OR opened_at >= $2)
              AND exit_reason IS DISTINCT FROM 'reset' AND (entry_src LIKE 'блок%' OR portfolio = 'T')
-           GROUP BY portfolio""", int(days))
+           GROUP BY portfolio""", int(days), zero)
     return {r["portfolio"]: (int(r["n"]), int(r["w"]), float(r["s"]) * 10) for r in rows}
+
+
+async def paper_period(db: Any, days: int = PAPER_DAYS) -> str:
+    """«за 7 дн.» или «с 20.11 21:05» — после кнопки «Считать с нуля»."""
+    from .report import stats_since
+    zero = await stats_since(db)
+    if zero and zero > datetime.now(timezone.utc) - timedelta(days=days):
+        return f"с {zero.astimezone(ZoneInfo('Asia/Tbilisi')):%d.%m %H:%M}"
+    return f"за {days} дн."
 
 
 def paper_of(kind: str, rule: str, smart_filter: str = "all") -> str | None:
@@ -349,7 +362,8 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
     lines = [f"🎯 <b>Методы торговли: {title}</b>",
              "Метод = <b>когда покупать</b> (чей сигнал) + <b>когда продавать</b> (правило A / B / G / R) + "
              "<b>на сколько</b> (ставка). Включайте сколько угодно; на один сигнал — одна покупка.",
-             f"Итог бумаги — за {PAPER_DAYS} дн. при $10 на сделку (честные входы, без ⚠).", ""]
+             f"Итог бумаги — {await paper_period(db)} при $10 на сделку (честные входы, без ⚠). Это сумма за "
+             "несколько дней: в /paper — только сегодня (портфели сбрасываются в 00:00).", ""]
     kb: Kb = []
     for i, kind in enumerate(ORDER, 1):
         name, on_key, _port = S.METHODS[kind]
@@ -367,6 +381,7 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
               "«📋 Как бумага A»: только smart, все сигналы, выход A, ставка $10, до 3 позиций, дневной стоп $30, "
               "общий стоп $50 — как бумажный портфель A, давший +$710 за 14–17.11."]
     kb.append([{"text": "📋 Как бумага A ($10)", "callback": f"rl:wmp:{tag}"}])
+    kb.append([{"text": "🔄 Считать с нуля", "callback": f"rl:zero:m{tag}"}])
     kb.append([{"text": "← Назад", "callback": back}])
     return "\n".join(lines), kb
 

@@ -103,7 +103,7 @@ class RealDesk:
     async def on_trade(self, st: Any, eff: Any, trader: str, is_buy: bool, slot: int | None = None,
                        sol: float | None = None) -> None:
         for lane in list(self.lanes.values()):
-            if lane.positions:
+            if lane.positions or lane.trials:
                 try:
                     await lane.on_trade(st, eff, trader, is_buy, slot, sol)
                 except Exception:  # noqa: BLE001
@@ -127,14 +127,14 @@ class RealDesk:
 
     async def poll_prices(self) -> None:
         """Цена открытых позиций всех кошельков — из сети, одним запросом на 16 монет (а не запрос на кошелёк)."""
-        lanes = [lane for lane in self.lanes.values() if lane.pollable()]
+        lanes = [lane for lane in self.lanes.values() if lane.watched()]
         if not lanes or self.chain is None:
             return
         every = min(float(lane.get("real_poll_s")) for lane in lanes)
         if time.time() - self._last_poll < every:
             return
         self._last_poll = time.time()
-        mints = list(dict.fromkeys(p.mint for lane in lanes for p in lane.pollable()))
+        mints = list(dict.fromkeys(p.mint for lane in lanes for p in lane.watched()))
         for i in range(0, len(mints), 16):
             chunk = mints[i:i + 16]
             try:
@@ -144,7 +144,7 @@ class RealDesk:
                 return
             by_mint = dict(zip(chunk, sts))
             for lane in lanes:
-                for p in lane.pollable():
+                for p in lane.watched():
                     if p.mint in by_mint:
                         try:
                             lane.on_state(p, by_mint[p.mint])

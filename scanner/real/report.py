@@ -54,6 +54,19 @@ def day_start(cfg: dict[str, Any]) -> datetime:
     return datetime.now(tz_of(cfg)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+# «Считать с нуля» (кнопка в «Против бумаги» и на экране методов): с этого момента считаются сделки бота, пробы правил
+# и итог бумаги на экранах методов. Ничего не удаляется — меняется только начало подсчёта
+STATS_SINCE_KEY = "real:stats_since"
+
+
+async def stats_since(db: Any) -> datetime | None:
+    v = await db.kv_get(STATS_SINCE_KEY)
+    try:
+        return datetime.fromisoformat(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
 def money(sol: float, sol_usd: float) -> str:
     v = sol * sol_usd
     return f"{'+' if v > 0 else '−' if v < 0 else ''}${abs(v):.2f}"
@@ -431,13 +444,16 @@ async def paper_pairs(db: Any, rows: list[Any], days: int) -> list[tuple[Any, st
 
 async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int = 12) -> str:
     """Те же сигналы у реального бота и у бумаги: результат, цена входа, задержка — итогом и по каждой сделке."""
+    zero = await stats_since(db)
+    period = f"с {zero.astimezone(tz_of(cfg)):%d.%m %H:%M}" if zero else f"{days} дн."
     rows = await db.fetch(
         """SELECT r.id, r.mode, r.kind, r.symbol, r.mint, r.alert_id, r.pnl_pct, r.pnl_sol, r.entry_mc, r.closed_at,
                   r.exit_reason, r.extra, (r.extra->>'blocks_after')::int AS blocks, r.opened_at, r.trader
            FROM real_positions r WHERE r.closed_at IS NOT NULL AND r.closed_at > now() - make_interval(days => $1)
-           ORDER BY r.closed_at""", int(days))
+             AND ($2::timestamptz IS NULL OR r.opened_at >= $2)
+           ORDER BY r.closed_at""", int(days), zero)
     if not rows:
-        return f"⚖️ За {days} дн. закрытых сделок реального бота нет — сравнивать нечего."
+        return f"⚖️ {period.capitalize()}: закрытых сделок реального бота нет — сравнивать нечего."
     pairs = await paper_pairs(db, rows, days)
     sol_usd = await sol_price(db)
     head = f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"
@@ -487,6 +503,8 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
     first = min(r["closed_at"] for r in rows)
     since = max(datetime.now(timezone.utc) - timedelta(days=days),
                 await db.fetchval("SELECT min(opened_at) FROM real_positions") or first)
+    if zero is not None:
+        since = max(since, zero)
     missed = await db.fetchval(
         """SELECT count(*) FROM paper_positions pp WHERE pp.portfolio IN ('A', 'Y') AND pp.opened_at >= $1
              AND pp.exit_reason IS DISTINCT FROM 'reset' AND NOT pp.suspect
@@ -504,7 +522,7 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
              AND NOT EXISTS (SELECT 1 FROM real_positions r WHERE r.alert_id = pp.alert_id AND r.mint = pp.mint)
            ORDER BY pp.opened_at DESC LIMIT 8""", since)
     no_pair = sum(1 for _r, port, q in pairs if q is None)
-    out = [f"⚖️ <b>Реальный бот против бумаги</b> · {days} дн.",
+    out = [f"⚖️ <b>Реальный бот против бумаги</b> · {period}",
            "Сравнение с бумажным портфелем, который торгует так же: smart A — с A, «мой дев» — с Y и т. д.",
            "<pre>" + "\n".join(table) + "</pre>"]
     out += [f"• {esc(x)}" for x in notes]
@@ -519,8 +537,42 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
                        f"(бумага {m['portfolio']} {res}) — "
                        + (f"бот: {esc(skip_text(m['why']))}" if m["why"] else "причина не записана (сигнал до бота не дошёл "
                           "или это было до 18.11)"))
+    out += await rules_lines(db, since, sol_usd)
     out.append("Почему бот не входил — «Пропуски» на главном экране /real.")
     return "\n".join(out)
+
+
+async def rules_lines(db: Any, since: datetime, sol_usd: float) -> list[str]:
+    """Пробы правил выхода: на тех же входах бота — что дало бы каждое правило A / B / G / R."""
+    rows = await db.fetch(
+        """SELECT mode, kind, rule, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w, avg(pnl_pct) a,
+                  COALESCE(sum(pnl_sol), 0) s
+           FROM real_rule_trials WHERE closed_at IS NOT NULL AND opened_at >= $1 GROUP BY 1, 2, 3""", since)
+    if not rows:
+        return []
+    by: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        by.setdefault((r["mode"], r["kind"]), {})[r["rule"]] = r
+    table = [f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"]
+    for mode in ("live", "shadow"):
+        for kind in S.METHODS:
+            rules = by.get((mode, kind))
+            if not rules:
+                continue
+            best = max(rules, key=lambda x: float(rules[x]["s"]))
+            table.append(f"{MODE_SHORT[mode]} {KINDS.get(kind, kind)}")
+            for rule in S.SCHEMES:
+                r = rules.get(rule)
+                if r is None:
+                    continue
+                n = int(r["n"])
+                table.append(f"{'  ' + rule + (' ★' if rule == best and len(rules) > 1 else ''):<17}{n:>5} "
+                             f"{int(r['w']) / n:>6.0%} {float(r['a'] or 0):>+7.1%} {money(float(r['s']), sol_usd):>9}")
+    return ["", "🧪 <b>Все правила выхода на тех же входах</b> (пробы: тот же вход, продажа по цене в сети, без "
+            "транзакций и денег). ★ — больше всех в сумме.",
+            "<pre>" + "\n".join(table) + "</pre>",
+            "A — всё на +25%, без стопа · B — 70% на +25%, остаток трейлинг 15% · G — +25%, стоп −8%, нет +10% за "
+            "5 мин — выход · R — трейлинг 35% после +30%, стоп −50%, до суток"]
 
 
 # ---------------------------------------------------------------------- нажатия кнопок
@@ -582,7 +634,23 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
         return Reply(await trades_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]])
     if action == "cmp":
         return Reply(await compare_text(db, cfg), [[{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"},
-                                                    {"text": "← Назад", "callback": "rl:view"}]])
+                                                    {"text": "← Назад", "callback": "rl:view"}],
+                                                   [{"text": "🔄 Считать с нуля", "callback": "rl:zero:cmp"}]])
+    if action == "zero":
+        back = rest if rest == "cmp" or rest.startswith("m") else "cmp"
+        return Reply("🔄 <b>Считать с нуля?</b>\nС этой минуты считаются: сделки реального бота и пробы правил в "
+                     "«⚖️ Против бумаги», итог бумаги на экранах методов. Ничего не удаляется, деньги и открытые "
+                     "позиции не трогаются. Бумажные портфели /paper сбрасываются сами в 00:00 (и кнопкой в /paper).",
+                     [[{"text": "Да, с нуля", "callback": f"rl:zero!:{back}"},
+                       {"text": "Нет", "callback": "rl:cmp" if back == "cmp" else f"rl:wme:{back[1:]}"}]], "", True)
+    if action == "zero!":
+        await db.kv_set(STATS_SINCE_KEY, datetime.now(timezone.utc).isoformat())
+        if rest.startswith("m"):
+            from .wallets_ui import methods_view
+            tag = rest[1:]
+            text, kb = await methods_view(db, cfg, int(tag) if tag.isdigit() else None)
+            return Reply(text, kb, "Считаю с нуля", True)
+        return Reply(await compare_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]], "Считаю с нуля", True)
     if action == "xlsx":
         from ..reports.excel import build_xlsx
         data, caption = await build_xlsx(db, cfg)

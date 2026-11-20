@@ -267,3 +267,84 @@ async def test_wallet_watch_is_faster_than_coin_watch():
     task.cancel()
     subs = {m["params"][0]["mentions"][0]: m["params"][1]["commitment"] for m in sent if m["method"] == "logsSubscribe"}
     assert subs == {"WALLET1": "processed", "COIN1": "confirmed"}
+
+
+async def test_rule_trials_measure_all_exit_rules_on_same_entry(db):
+    """20.11: у метода одно правило выхода, а сравнить хочется все: на каждый вход бота — пробы A / B / G / R с тем
+    же входом. Пробы — только расчёт: в позиции бота, итог дня и лимиты не входят; после перезапуска продолжаются."""
+    from scanner.real import report as R
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain, real_max_open=10)
+    await tr.start()
+    await fire(tr, chain)
+    main = only(tr)
+    assert sorted(t.extra["rule"] for t in tr.trials.values()) == ["A", "B", "G", "R"]
+    assert all(t.entry_mc == main.entry_mc and t.extra["mode"] == "shadow" for t in tr.trials.values())
+    chain.set_mc(MINT, 54.0)                                   # +35%: тейк A и G, B продаёт 70%, R держит
+    await trade(tr, chain)
+    await asyncio.sleep(0.05)
+    assert not tr.positions                                    # позиция бота (правило A) закрылась тейком
+    left = {t.extra["rule"]: t for t in tr.trials.values()}
+    assert set(left) == {"B", "R"} and left["B"].tp_done
+    # перезапуск: открытые пробы подхватываются из базы, вместе с пиком цены (его пишет цикл раз в минуту)
+    await tr._flush_trials()
+    tr2 = shadow(db, chain, real_max_open=10)
+    await tr2.start()
+    assert sorted(t.extra["rule"] for t in tr2.trials.values()) == ["B", "R"]
+    chain.set_mc(MINT, 30.0)                                   # −44% от пика: трейлинг у B и R
+    await trade(tr2, chain)
+    await asyncio.sleep(0.05)
+    assert not tr2.trials
+    rows = {r["rule"]: r for r in await db.fetch("SELECT * FROM real_rule_trials")}
+    assert {k: r["exit_reason"] for k, r in rows.items()} == {"A": "take_profit", "B": "trailing",
+                                                              "G": "take_profit", "R": "trailing"}
+    assert rows["A"]["pnl_pct"] > 0.25 and 0 < rows["B"]["pnl_pct"] < rows["A"]["pnl_pct"] and rows["R"]["pnl_pct"] < 0
+    assert await db.fetchval("SELECT count(*) FROM real_positions") == 1    # пробы — не сделки бота
+    main_pnl = await db.fetchval("SELECT pnl_sol FROM real_positions")
+    assert tr.day_pnl["shadow"] == pytest.approx(main_pnl)     # итог дня — только позиция бота
+    text = await R.compare_text(db, tr.e.cfg)
+    assert "Все правила выхода на тех же входах" in text and "тень smart" in text
+    for rule in ("A", "B", "G", "R"):
+        assert any(line.strip().startswith(rule) and " 1 " in line for line in text.split("\n"))
+    # выключатель: без проб — только позиция бота
+    tr.e.cfg["real_rule_trials"] = False
+    m2 = pk("no-trials")
+    chain.add_curve(m2, 40.0)
+    await fire(tr, chain, m2, alert_id=2)
+    assert len(tr.positions) == 1 and not [t for t in tr.trials.values() if t.mint == str(m2)]
+    assert await db.fetchval("SELECT count(*) FROM real_rule_trials WHERE mint=$1", str(m2)) == 0
+
+
+async def test_count_from_zero_button(db):
+    """Кнопка «Считать с нуля»: «Против бумаги» и итог бумаги на экранах методов считаются с нажатия; ничего не
+    удаляется."""
+    from scanner.real import report as R
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain)
+    await tr.start()
+    await fire(tr, chain)
+    chain.set_mc(MINT, 54.0)
+    await trade(tr, chain)
+    await asyncio.sleep(0.05)
+    await db.execute(
+        """INSERT INTO paper_positions(portfolio, mint, opened_at, entry_mc, cost_sol, tokens, tokens_initial, closed_at,
+               exit_reason, pnl_sol, pnl_pct, suspect, entry_src)
+           VALUES ('Y', 'X', now() - interval '3 days', 30, 0.1, 1, 1, now() - interval '3 days', 'take_profit', 1, 10.0,
+                   false, 'блок +2 (блокчейн)')""")
+    cfg = dict(tr.e.cfg)
+
+    async def reload():
+        return cfg
+    assert "тень smart" in await R.compare_text(db, cfg)
+    text, kb = await UI.methods_view(db, cfg, None)
+    assert "бумага Y: 1 сд., в плюс 100%, +$100" in text and "за 7 дн." in text
+    assert "rl:zero:mg" in [b["callback"] for row in kb for b in row]
+    r = await R.on_callback(db, reload, "zero:cmp")
+    assert "Считать с нуля?" in r.text and r.kb[0][0]["callback"] == "rl:zero!:cmp"
+    r = await R.on_callback(db, reload, "zero!:cmp")
+    assert "закрытых сделок реального бота нет" in r.text and r.toast == "Считаю с нуля"
+    assert await db.fetchval("SELECT count(*) FROM real_positions") == 1    # ничего не удалено
+    r = await R.on_callback(db, reload, "zero!:mg")
+    assert "Методы торговли: общие" in r.text and "бумага Y: сделок нет" in r.text and "Итог бумаги — с " in r.text

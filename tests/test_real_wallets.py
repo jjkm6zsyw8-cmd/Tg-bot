@@ -349,7 +349,7 @@ async def test_desk_checks_price_of_shadow_positions_from_chain(db):
     m2 = pk("mint-two")
     chain.add_curve(MINT, 40.0)
     chain.add_curve(m2, 40.0)
-    desk = make_desk(db, chain)
+    desk = make_desk(db, chain, real_rule_trials=False)        # здесь — только опрос цен (у проб свои продажи)
     await desk.start()
     w1 = await desk.create_wallet("A")
     w2 = await desk.create_wallet("B")

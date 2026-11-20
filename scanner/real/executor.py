@@ -136,6 +136,11 @@ class RealTrader:
             self.wallet, self.wallet_note = load_wallet()
         self.chain = chain if chain is not None else self._make_chain()
         self.positions: dict[int, Position] = {}
+        # пробы правил выхода (таблица real_rule_trials): тот же вход, выход по A / B / G / R — только расчёт, без
+        # транзакций; в позиции бота, лимиты, стопы и итоги дня не входят
+        self.trials: dict[int, Position] = {}
+        self._trial_st: dict[str, tuple[float, Any]] = {}   # монета → (когда, запрос состояния): общий для проб
+        self._trials_saved = time.time()
         self.balance: int | None = None             # лампорты на кошельке (кэш)
         self._balance_at = 0.0
         self.day_pnl: dict[str, float] = {}         # режим → итог закрытых сделок за сегодня, SOL
@@ -197,6 +202,11 @@ class RealTrader:
         if m == "live" and kind == "mydev" and not self.get("real_live_mydev"):
             return "shadow"                          # запуски девов в бою — только по отдельному разрешению
         return m
+
+    def scheme_of(self, p: Position) -> dict[str, Any]:
+        """Правила выхода позиции: у пробы — её правило, у позиции бота — правило метода."""
+        rule = p.extra.get("rule") if p.extra.get("trial") else None
+        return SCHEMES[rule] if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
 
     def scheme_for(self, kind: str | None) -> dict[str, Any]:
         """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага): у smart и
@@ -278,6 +288,10 @@ class RealTrader:
                 tokens_initial=float(r["tokens"] or 0), target_mc=None, trader=r["trader"], symbol=r["symbol"] or "",
                 proceeds_sol=float(r["proceeds_sol"] or 0), max_mc=float(r["max_mc"] or r["entry_mc"] or 0),
                 tp_done=bool(r["tp_done"]), alert_id=r["alert_id"], extra=ex)
+        for r in await self.db.fetch("SELECT * FROM real_rule_trials WHERE closed_at IS NULL "
+                                     "AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
+            t = self._trial_position(r)
+            self.trials[t.id] = t
         today = self.day_key()
         for r in await self.db.fetch("SELECT mode, pnl_sol, closed_at FROM real_positions WHERE closed_at IS NOT NULL "
                                      "AND closed_at > now() - interval '30 hours' AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
@@ -823,6 +837,11 @@ class RealTrader:
             extra={"mode": base["mode"], "kind": base["kind"], "venue": base["venue"],
                    "token_program": base["token_program"], "tokens_raw": tokens_raw, "rent": rent_sol,
                    "last_mc": entry_mc, "entry_slot": slot})
+        if self.get("real_rule_trials"):
+            try:
+                await self._open_trials(base, pid, entry_mc, cost_sol - rent_sol, tokens_raw, slot)
+            except Exception:  # noqa: BLE001 — пробы не должны мешать торговле
+                log.exception("реальный бот: пробы правил %s", base["mint"])
         if base["mode"] == "live" or self.get("real_notify_shadow"):
             sol_usd = self.sol_usd()
             await self._say(f"{MODE_ICON[base['mode']]} Купил ${fmt.esc(base['symbol'] or '?')} "
@@ -834,10 +853,11 @@ class RealTrader:
     async def on_trade(self, st: Any, eff: Any, trader: str, is_buy: bool, slot: int | None = None,
                        sol: float | None = None) -> None:
         """Каждая сделка монеты из потока: выход за трейдером, мелкая докупка, продажа дева, стоп/тейк по цене."""
-        for p in [p for p in self.positions.values() if p.mint == st.mint and not p.closing]:
+        both = [*self.positions.values(), *self.trials.values()]
+        for p in [p for p in both if p.mint == st.mint and not p.closing]:
             if p.extra.get("retry_at"):
                 continue                              # продажа уже идёт повторами из цикла
-            sc = self.scheme_for(p.extra.get("kind"))
+            sc = self.scheme_of(p)
             reason = "emergency" if eff is not None and getattr(eff, "cluster_sell", False) else None
             if (reason is None and p.trader and trader == p.trader and not is_buy and not sc.get("ignore_trader_sell")
                     and not (p.tp_done and sc.get("follow_runner") is False)):
@@ -858,7 +878,8 @@ class RealTrader:
     def _check(self, p: Position, mc: float, reason: str | None = None, confirmed: bool = False) -> None:
         """Решение по позиции на цене mc; если пора выходить — запускает продажу.
         confirmed — цена из блокчейна (а не из потока): проверка на скачок не нужна."""
-        if p.closing or p.id not in self.positions or mc <= 0:
+        trial = bool(p.extra.get("trial"))
+        if p.closing or p.id not in (self.trials if trial else self.positions) or mc <= 0:
             return
         last = float(p.extra.get("last_mc") or 0)
         if reason is None and not confirmed and last > 0 and (mc > JUMP_X * last or mc < last / JUMP_X):
@@ -868,9 +889,13 @@ class RealTrader:
                 return
         p.extra.pop("jump", None)
         p.extra["last_mc"] = mc
-        d = decide_exit(p, mc, time.time(), self.scheme_for(p.extra.get("kind")), pump.FEE_BPS, self.fees_sol(),
-                        emergency=reason)
-        if d is not None:
+        d = decide_exit(p, mc, time.time(), self.scheme_of(p), pump.FEE_BPS, self.fees_sol(), emergency=reason)
+        if d is None:
+            return
+        if trial:
+            p.closing = True
+            asyncio.create_task(self._trial_exit_safe(p, d[0], float(d[1])))
+        else:
             self._start_exit(p, d[0], float(d[1]))
 
     def _start_exit(self, p: Position, reason: str, share: float) -> None:
@@ -1013,6 +1038,97 @@ class RealTrader:
                             f"{len(SELL_SLIPPAGE_STEPS)} попытки не прошли. Повторяю каждые 20 с. "
                             f"Монета: <code>{p.mint}</code>")
         await self._check_fail_pause()
+
+    # ------------------------------------------------------------------ пробы правил выхода
+    @staticmethod
+    def _trial_position(r: Any) -> Position:
+        raw = int(r["tokens_raw"] or 0)
+        p = Position(
+            id=int(r["id"]), portfolio="TRIAL", mint=r["mint"], opened_ts=r["opened_at"].timestamp(),
+            entry_mc=float(r["entry_mc"] or 0), cost_sol=float(r["cost_sol"] or 0), tokens=raw / 1e6,
+            tokens_initial=raw / 1e6, target_mc=None, trader=r["trader"], symbol=r["symbol"] or "",
+            proceeds_sol=float(r["proceeds_sol"] or 0), max_mc=float(r["max_mc"] or r["entry_mc"] or 0),
+            tp_done=bool(r["tp_done"]), alert_id=r["alert_id"],
+            extra={"trial": True, "rule": r["rule"], "mode": r["mode"], "kind": r["kind"], "tokens_raw": raw,
+                   "last_mc": float(r["max_mc"] or r["entry_mc"] or 0), "position_id": r["position_id"],
+                   "saved_max": float(r["max_mc"] or 0)})
+        if p.max_mc > p.entry_mc:
+            # после перезапуска: пик цены — из базы, иначе трейлинг R «забывал», что монета уже росла
+            p.max_net = p.net_if_sold(p.max_mc, pump.FEE_BPS, 0.0)
+        return p
+
+    async def _flush_trials(self) -> None:
+        """Пик цены открытых проб — в базу (раз в минуту): переживает перезапуск."""
+        rows = [(t.id, float(t.max_mc)) for t in self.trials.values() if t.max_mc > float(t.extra.get("saved_max") or 0)]
+        if not rows:
+            return
+        for tid, mx in rows:
+            await self.db.execute("UPDATE real_rule_trials SET max_mc=$2 WHERE id=$1", tid, mx)
+            if tid in self.trials:
+                self.trials[tid].extra["saved_max"] = mx
+
+    async def _open_trials(self, base: dict[str, Any], pid: int | None, entry_mc: float, cost_sol: float,
+                           tokens_raw: int, slot: int | None) -> None:
+        """На вход бота — по пробе на каждое правило выхода: тот же вход, те же токены и затраты."""
+        for rule in S.SCHEMES:
+            r = await self.db.fetchrow(
+                """INSERT INTO real_rule_trials(position_id, wallet_id, mode, kind, rule, mint, symbol, trader,
+                       alert_id, opened_at, entry_mc, cost_sol, tokens_raw, max_mc)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),$10,$11,$12,$10) RETURNING *""",
+                pid, self.wid, base["mode"], base["kind"], rule, base["mint"], base["symbol"], base["trader"],
+                base["alert_id"], entry_mc, cost_sol, tokens_raw)
+            t = self._trial_position(r)
+            t.extra["entry_slot"] = slot
+            self.trials[t.id] = t
+
+    async def _trial_state(self, mint: str) -> dict[str, Any]:
+        """Состояние монеты для продажи проб: пробы одной монеты выходят вместе (тейк A / B / G) — один запрос на всех."""
+        now = time.time()
+        hit = self._trial_st.get(mint)
+        if hit is None or now - hit[0] > 1.0:
+            hit = (now, asyncio.ensure_future(self._state(Pubkey.from_string(mint))))
+            self._trial_st = {m: v for m, v in self._trial_st.items() if now - v[0] <= 1.0}
+            self._trial_st[mint] = hit
+        return await asyncio.shield(hit[1])
+
+    async def _trial_exit_safe(self, p: Position, reason: str, share: float) -> None:
+        try:
+            await self._trial_exit(p, reason, share)
+        except Exception:  # noqa: BLE001
+            log.exception("реальный бот: проба правила %s", p.mint)
+            p.closing = False
+
+    async def _trial_exit(self, p: Position, reason: str, share: float) -> None:
+        """Продажа пробы: как в тени — цена по состоянию кривой/пула через real_land_s (без транзакции)."""
+        await asyncio.sleep(float(self.get("real_land_s")))
+        have = int(p.extra["tokens_raw"])
+        raw = int(have * share) if share < 1 else have
+        st: dict[str, Any] = {}
+        if self.chain is not None:
+            try:
+                st = await self._trial_state(p.mint)
+            except Exception:  # noqa: BLE001
+                st = {}
+        if st.get("venue") and not st.get("why"):
+            proceeds, mc = max(0.0, self._quote_sell(st, raw) / 1e9 - self.fees_sol()), float(st["mc"])
+        else:
+            mc = float(p.extra.get("last_mc") or p.entry_mc)
+            proceeds = sell_fill(mc, raw / 1e6, pump.FEE_BPS, self.fees_sol()).sol
+        p.proceeds_sol += proceeds
+        p.extra["tokens_raw"] = have - raw
+        p.tokens = p.extra["tokens_raw"] / 1e6
+        p.max_mc = max(p.max_mc or 0.0, mc)
+        if share < 1 and p.extra["tokens_raw"] > 0:
+            p.tp_done, p.closing = True, False
+            await self.db.execute("UPDATE real_rule_trials SET tokens_raw=$2, proceeds_sol=$3, tp_done=true, max_mc=$4 "
+                                  "WHERE id=$1", p.id, p.extra["tokens_raw"], p.proceeds_sol, p.max_mc)
+            return
+        pnl = p.proceeds_sol - p.cost_sol
+        await self.db.execute(
+            """UPDATE real_rule_trials SET tokens_raw=0, proceeds_sol=$2, closed_at=now(), exit_reason=$3, exit_mc=$4,
+                   pnl_sol=$5, pnl_pct=$6, max_mc=$7 WHERE id=$1""",
+            p.id, p.proceeds_sol, reason, mc, pnl, pnl / p.cost_sol if p.cost_sol else 0.0, p.max_mc)
+        self.trials.pop(p.id, None)
 
     async def _tokens_gone(self, p: Position, mint: Pubkey) -> bool:
         """Сколько токенов на самом деле на счёте: ноль (проданы или переведены вручную) — закрываем позицию без
@@ -1164,9 +1280,17 @@ class RealTrader:
                     self._start_exit(p, str(reason), float(share))
                 continue
             self._check(p, float(p.extra.get("last_mc") or p.entry_mc), None, confirmed=True)   # выходы по времени
+        for t in [t for t in self.trials.values() if not t.closing]:
+            self._check(t, float(t.extra.get("last_mc") or t.entry_mc), None, confirmed=True)
+        if self.trials and now - self._trials_saved >= 60:
+            self._trials_saved = now
+            try:
+                await self._flush_trials()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("реальный бот: пики проб: %s", str(exc)[:120])
         # цена открытых позиций — прямо из сети, и в бою, и в тени (17.11: тень видела цену только по сделкам из
         # потока, пропустила пик +32% и вышла на +19%, когда бумага взяла тейк)
-        open_ps = self.pollable()
+        open_ps = self.watched()
         if open_ps and not self.external_poll and self.chain is not None \
                 and now - self._last_poll >= float(self.get("real_poll_s")):
             self._last_poll = now
@@ -1182,6 +1306,10 @@ class RealTrader:
         """Открытые позиции, цену которых надо проверить (не продаются прямо сейчас и не ждут повтора продажи)."""
         return [p for p in self.positions.values() if not p.closing and not p.extra.get("retry_at")]
 
+    def watched(self) -> list[Position]:
+        """Позиции и пробы правил, цену которых проверяем из сети."""
+        return self.pollable() + [t for t in self.trials.values() if not t.closing]
+
     def on_state(self, p: Position, st: dict[str, Any]) -> None:
         """Цена позиции из сети (кривая / пул) — решение о выходе."""
         if st.get("venue") and st.get("mc"):
@@ -1191,13 +1319,16 @@ class RealTrader:
     async def _poll(self, ps: list[Position]) -> None:
         """Контроль цены открытых позиций: состояние кривой/пула из блокчейна одним запросом на 16 монет
         (по многим монетам сделки из потока не приходят или приходят с опозданием)."""
-        mints = list(dict.fromkeys(p.mint for p in ps))[:16]
-        try:
-            sts, _ = await self._states([Pubkey.from_string(m) for m in mints])
-        except Exception as exc:  # noqa: BLE001
-            log.warning("реальный бот: состояние позиций: %s", str(exc)[:120])
-            return
-        by_mint = dict(zip(mints, sts))
+        mints = list(dict.fromkeys(p.mint for p in ps))
+        by_mint: dict[str, dict[str, Any]] = {}
+        for i in range(0, min(len(mints), 64), 16):           # пробы правил R живут до суток — монет бывает больше 16
+            chunk = mints[i:i + 16]
+            try:
+                sts, _ = await self._states([Pubkey.from_string(m) for m in chunk])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("реальный бот: состояние позиций: %s", str(exc)[:120])
+                break
+            by_mint.update(zip(chunk, sts))
         for p in ps:
             if p.mint in by_mint:
                 self.on_state(p, by_mint[p.mint])

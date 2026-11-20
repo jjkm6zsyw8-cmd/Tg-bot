@@ -578,6 +578,35 @@ CREATE TABLE IF NOT EXISTS real_positions (
 );
 CREATE INDEX IF NOT EXISTS real_positions_open_idx ON real_positions (mint) WHERE closed_at IS NULL;
 CREATE INDEX IF NOT EXISTS real_positions_opened_idx ON real_positions (opened_at);
+-- 20.11: пробы правил выхода. На каждый вход бота (тень или бой) — по пробе на каждое правило A / B / G / R с тем же
+-- входом; выход пробы — по своему правилу, продажа считается по состоянию кривой/пула (без транзакций и без денег).
+-- Так на одних и тех же входах видно, какое правило выхода дало бы больше.
+CREATE TABLE IF NOT EXISTS real_rule_trials (
+    id            bigserial PRIMARY KEY,
+    position_id   bigint,                        -- позиция бота, на чьём входе проба
+    wallet_id     bigint,
+    mode          text NOT NULL,                 -- режим входа: shadow | live
+    kind          text NOT NULL,                 -- метод: smart | mydev | copy | bigcopy | swing | trend
+    rule          text NOT NULL,                 -- правило выхода пробы: A | B | G | R
+    mint          text NOT NULL,
+    symbol        text,
+    trader        text,
+    alert_id      bigint,
+    opened_at     timestamptz NOT NULL DEFAULT now(),
+    entry_mc      double precision,
+    cost_sol      double precision NOT NULL,
+    tokens_raw    bigint NOT NULL,
+    proceeds_sol  double precision NOT NULL DEFAULT 0,
+    tp_done       boolean NOT NULL DEFAULT false,
+    max_mc        double precision,
+    closed_at     timestamptz,
+    exit_reason   text,
+    exit_mc       double precision,
+    pnl_sol       double precision,
+    pnl_pct       double precision
+);
+CREATE INDEX IF NOT EXISTS real_rule_trials_open_idx ON real_rule_trials (wallet_id) WHERE closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS real_rule_trials_closed_idx ON real_rule_trials (closed_at);
 
 CREATE TABLE IF NOT EXISTS real_orders (
     id          bigserial PRIMARY KEY,
