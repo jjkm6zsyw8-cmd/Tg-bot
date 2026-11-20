@@ -252,6 +252,7 @@ async def test_stale_own_price_is_not_used():
 async def test_entry_price_sources(monkeypatch):
     """Вход по рыночной цене: Jupiter → сделка своего потока не старше 10 с → не входим. «Тренды» — тоже Jupiter."""
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    monkeypatch.setattr(pp, "TREND_JUP_RETRY_S", 0)
     opened = []
 
     async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
@@ -263,6 +264,7 @@ async def test_entry_price_sources(monkeypatch):
     tr.lock = __import__("asyncio").Lock()
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
     assert not opened and "Jupiter" in tr.skipped["*"]               # «Тренды»: Jupiter не знает монету — не входим
+    assert tr.no_block["тренд: Jupiter не дал цену"] == 1            # причина видна в отчёте /paper (🧱)
     tr.e.ext = FakeExt(300_000, jup=310_000 / 1e9)                   # DexScreener $300k, Jupiter $310k
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
     assert opened[0] == (pytest.approx(3100.0), "jup")               # вход по рынку Jupiter, не по DexScreener
@@ -344,6 +346,7 @@ async def test_persistent_dexscreener_glitch_needs_jupiter(monkeypatch, old_sche
 
 async def test_entry_skipped_when_jupiter_disagrees(monkeypatch):
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    monkeypatch.setattr(pp, "TREND_JUP_RETRY_S", 0)
     tr = bare_trader({}, FakeExt(300_000, jup=0.03))     # DexScreener $0.0003, Jupiter $0.03 — в 100 раз
     tr.e.cfg = {"paper_realtime_only": False, "paper_trends": True}
     tr.lock = __import__("asyncio").Lock()
@@ -978,3 +981,26 @@ async def test_wrong_start_price_fixed_once_and_dollar_result_in_report():
         assert "+$0" in t_row                                                                 # сделок ещё нет
     finally:
         await db.close()
+
+
+async def test_trend_entry_retries_jupiter_once(monkeypatch):
+    """20.11: T не торговал вечером — бесплатный Jupiter (1 запрос в 2 с на весь бот) был занят. Повтор через 2 с."""
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    monkeypatch.setattr(pp, "TREND_JUP_RETRY_S", 0)
+
+    class Busy(FakeExt):
+        calls = 0
+
+        async def jup_price(self, mint, ttl=None):
+            Busy.calls += 1
+            return None if Busy.calls == 1 else self.jup
+    tr = bare_trader({}, Busy(300_000, jup=0.0003))
+    tr.e.cfg = {"paper_realtime_only": False, "paper_trends": True}
+    tr.lock = __import__("asyncio").Lock()
+    opened = []
+
+    async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((name, mc, src))
+    tr._open = fake_open
+    await tr.on_alert("M", "normal", None, {"modes": ["trend"], "trend": {"pc_m5": 10}, "mc": 3000.0}, None)
+    assert opened == [("T", pytest.approx(3000.0), "jup")] and Busy.calls == 2

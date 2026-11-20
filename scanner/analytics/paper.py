@@ -230,6 +230,7 @@ ENTRY_SRC = {"блок": "блок +2 (блокчейн)", "оценка": "оц
              "jup": "рынок (Jupiter)",
              "jupiter": "рынок (Jupiter)", "own": "свой поток", "dex": "DexScreener"}
 JUP_REFRESH_S = 4.0   # цены Jupiter открытых позиций — одним запросом раз в 4 с
+TREND_JUP_RETRY_S = 2.0   # тренд: Jupiter не ответил (лимит 1 запрос в 2 с) — ещё одна попытка через 2 с
 JUP_MAX_AGE_S = 8.0   # цена Jupiter годится для решения, если ей не больше 8 с
 OWN_MAX_AGE_S = 10.0  # сделка своего потока годится, если ей не больше 10 с
 FRESH_S = 120.0       # цена из своего потока сделок годится, только если по монете были сделки за 2 минуты
@@ -1178,7 +1179,12 @@ class PaperTrader:
         Jupiter не знает монету — не входим. DexScreener дальше чем вдвое от Jupiter — пара к экзотическому токену."""
         jm = await self.jupiter_mc(mint, ttl=1.0)
         if not jm:
+            # бесплатный Jupiter — 1 запрос в 2 с на весь бот: занят — повтор, когда освободится
+            await asyncio.sleep(TREND_JUP_RETRY_S)
+            jm = await self.jupiter_mc(mint, ttl=TREND_JUP_RETRY_S + 1)
+        if not jm:
             self.skipped.setdefault("*", "тренд: у Jupiter нет цены монеты — не входим")
+            self._bump("no_block", "тренд: Jupiter не дал цену")
             return None, "jup"
         ext = getattr(self.e, "ext", None)
         if ext is not None:
@@ -1188,6 +1194,7 @@ class PaperTrader:
             if pu and not 0.5 <= pu / jp <= 2.0:
                 log.warning("paper %s: DexScreener %.3g $ и Jupiter %.3g $ расходятся — не входим", mint, pu, jp)
                 self.skipped.setdefault("*", "цена DexScreener не сходится с Jupiter")
+                self._bump("no_block", "тренд: DexScreener и Jupiter расходятся")
                 return None, "jup"
         return float(jm), "jup"
 
