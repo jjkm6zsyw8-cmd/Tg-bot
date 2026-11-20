@@ -153,3 +153,74 @@ async def test_bots_are_rejected_and_shadowed(monkeypatch):
 
 async def _none(*_a, **_k):
     return None
+
+
+async def test_top10_rejects_go_to_paper_x_only(monkeypatch):
+    """21.11: отсеянные за «топ-10 держат много» 20.11 росли лучше алертов — опыт: тот же путь (откат, холдеры),
+    покупает только бумажный портфель X; алерта в чат, сопровождения и реального бота нет."""
+    import asyncio
+
+    from scanner.analytics import paper as pp
+    from scanner.analytics.trends import PairInfo, Trends
+
+    def pair(price):
+        return PairInfo.from_pair({
+            "baseToken": {"address": "MINT", "symbol": "TOP"}, "pairAddress": "POOL", "dexId": "pumpswap",
+            "priceUsd": str(price), "marketCap": 200_000 * price, "liquidity": {"usd": 40_000},
+            "volume": {"m5": 9_000, "h1": 40_000}, "txns": {"m5": {"buys": 40, "sells": 10}},
+            "priceChange": {"m5": 12, "h1": 40}, "pairCreatedAt": int((time.time() - 3600) * 1000)})
+    got, composed = [], []
+
+    async def on_alert(mint, level, aid, data, trader):
+        got.append(data)
+
+    async def compose(*a, **k):
+        composed.append(a)
+    db = SimpleNamespace(fetchrow=_none, execute=_none, kv_set=_none)
+    eng = SimpleNamespace(db=db, states={}, cfg={}, settings=SimpleNamespace(overrides={}), price=SimpleNamespace(value=100),
+                          paper=SimpleNamespace(on_alert=on_alert), compose=compose,
+                          costs=lambda: SimpleNamespace(fee_bps=125, extra_slippage_bps=0))
+    tr = Trends(eng)  # type: ignore[arg-type]
+    tr.cands = {"MINT": time.time()}
+    prices = iter([1.0, 1.10, 1.02, 1.06])
+
+    async def pairs(http, mints):
+        return {"MINT": pair(next(prices))}
+
+    async def largest(pi):
+        return 0.6, [{"address": "ACC", "uiAmount": 1}]       # топ-10 держат 60% — больше порога 45%
+
+    async def pools(http, ps):
+        return {"POOL": {"transactions": {"m5": {"buys": 40, "sells": 10, "buyers": 32, "sellers": 9}}}}
+
+    async def ohlcv(http, pool):
+        return candles([1, 1.08, 1.02, 1.12, 1.05, 1.2, 1.1, 1.25, 1.15, 1.3, 1.22, 1.35],
+                       [100, 900, 50, 400, 30, 700, 80, 300, 60, 500, 90, 200])
+
+    async def holders(accounts):
+        return {"checked": 8, "fresh": 0.1, "same_funder": 0.0, "same_time": 0.0}
+    monkeypatch.setattr(tr, "pairs", pairs)
+    monkeypatch.setattr(tr, "largest", largest)
+    monkeypatch.setattr(tr, "gecko_pools", pools)
+    monkeypatch.setattr(tr, "gecko_ohlcv", ohlcv)
+    monkeypatch.setattr(tr, "holder_check", holders)
+    await tr.scan(None, {})
+    assert tr.stats["rejected"] == {"top10": 1} and "MINT" in tr.shadow   # в разборе дня — как отсеянная
+    assert tr.pending["MINT"].extra["x"] is True
+    for _ in range(3):
+        await tr.follow_pending(None, {})
+    await asyncio.sleep(0)
+    assert not composed and not tr.tracked and tr.stats["x_signals"] == 1
+    assert len(got) == 1 and got[0]["modes"] == ["trendx"] and got[0]["trend"]
+    # выключатель опыта — отсеянные никуда не идут
+    tr2 = Trends(eng)  # type: ignore[arg-type]
+    tr2.cands = {"MINT": time.time()}
+    prices = iter([1.0])
+    for name, fn in (("pairs", pairs), ("largest", largest), ("gecko_pools", pools), ("gecko_ohlcv", ohlcv)):
+        monkeypatch.setattr(tr2, name, fn)
+    await tr2.scan(None, {"paper_trend_x": False})
+    assert not tr2.pending
+    # бумага: сигнал опыта — только в X, по $10, как T
+    tp = __import__("tests.test_paper", fromlist=["bare_trader"]).bare_trader({})
+    assert tp.route({"modes": ["trendx"], "trend": {"pc_m5": 12}}, "normal")[0] == {"X"}
+    assert pp.SCHEMES["X"]["stop"] == pp.SCHEMES["T"]["stop"] and "X" in pp.OBSERVE

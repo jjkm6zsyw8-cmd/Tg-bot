@@ -423,12 +423,17 @@ class Trends:
                 continue
             # топ-10 холдеров (2 запроса RPC) — только для прошедших бесплатные фильтры, с кешем на 10 минут
             top10, accs = await self.largest(pi)
+            x = False
             if top10 is not None and top10 > p(cfg, "trend_max_top10"):
                 self.reject(pi, "top10", f"топ-10 держат {top10:.0%}")
-                continue
+                if not cfg.get("paper_trend_x", True):
+                    continue
+                # 21.11: такие монеты 20.11 через час росли лучше алертов — опыт: тот же путь (откат, холдеры), но
+                # покупает только бумажный портфель X, без алерта в чат и без реального бота
+                x = True
             m5 = (g.get("transactions") or {}).get("m5") or {}
             extra = {"top10": top10, "accounts": accs, "cluster_id": cid, "buyers": int(m5.get("buyers") or 0),
-                     "sellers": int(m5.get("sellers") or 0), "signal_price": pi.price}
+                     "sellers": int(m5.get("sellers") or 0), "signal_price": pi.price, "x": x}
             if cfg.get("trend_wait_pullback", True):
                 # 4) не покупаем вершину свечи: ждём отката и отскока (сопровождение каждые 5 с)
                 self.pending[pi.mint] = tc.Pending(pi.mint, now, pi.price, pi.price, extra=extra)
@@ -538,8 +543,9 @@ class Trends:
         target_mult = (1 + thr) / max(0.5, (1 - f) ** 2)
         mc_sol = pi.mc_usd / sol
         self.alerted_at[pi.mint] = time.time()
-        self.tracked[pi.mint] = Tracked(pi.mint, pi.price, time.time(), pi.price * target_mult, max_price=pi.price)
-        self.stats["alerts"] += 1
+        if not extra.get("x"):                # опыт X — без сопровождения в чате
+            self.tracked[pi.mint] = Tracked(pi.mint, pi.price, time.time(), pi.price * target_mult, max_price=pi.price)
+            self.stats["alerts"] += 1
         boosts = self.boosts.get(pi.mint) or pi.boosts
         # бусты — платная реклама команды монеты, силой сигнала не считаются.
         # «Сильный» — много РАЗНЫХ покупателей, вдвое больше продавцов, чистые холдеры.
@@ -564,6 +570,13 @@ class Trends:
                       "age_h": pi.age_h, "buyers": buyers, "sellers": sellers,
                       "pullback": extra.get("pullback"), "holders": {k: v for k, v in hs.items() if k != "funder"}},
         }
+        if extra.get("x"):
+            # опыт X: только бумага, без алерта, сопровождения и реального бота
+            self.stats["x_signals"] = self.stats.get("x_signals", 0) + 1
+            paper = getattr(self.e, "paper", None)
+            if paper is not None:
+                asyncio.create_task(paper.on_alert(pi.mint, level, None, {**data, "modes": ["trendx"]}, None))
+            return
         await self.e.compose("trend", pi.mint, level, data, signal="impulse")
 
     async def follow(self, http: aiohttp.ClientSession, cfg: dict[str, Any]) -> None:

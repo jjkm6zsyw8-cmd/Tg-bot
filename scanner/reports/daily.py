@@ -17,6 +17,9 @@ from .sim import SimTrade, best_windows, series, utc_day_bounds
 
 log = logging.getLogger(__name__)
 
+# монета к SOL стартует с MC ~28 SOL и даже вся кривая — ~410 SOL; выше на старте — пара не к SOL (цена в чужой валюте)
+NON_SOL_START_MC = 450.0
+
 MISSED_REASONS = {**REASONS, "": "нет решения (не оценивалась)", "alerted": "алерт был",
                   "outage": "сбой источника", "latency": "задержка"}
 
@@ -31,7 +34,7 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
     alerts = await db.fetch(
         """SELECT a.*, o.net_result, o.achievable_profit, o.exit_reason, o.max_mc,
                   (SELECT mark FROM user_marks m WHERE m.alert_id=a.id ORDER BY m.id DESC LIMIT 1) user_mark,
-                  t.symbol
+                  t.symbol, t.initial_mc_sol
            FROM alerts a LEFT JOIN alert_outcomes o ON o.alert_id=a.id LEFT JOIN tokens t ON t.mint=a.mint
            WHERE a.created_at >= $1 AND a.created_at < $2 ORDER BY a.created_at""", start, end)
     lines = [f"📅 <b>Разбор дня {day.strftime('%d.%m.%Y')}</b>"]
@@ -43,10 +46,13 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
                  "выход по цели или сливу дева; реальный результат по рыночным ценам — блок «Бумажная торговля» ниже)"
                  .format(cfg.get("reaction_s", 5)))
     sims: dict[str, list[SimTrade]] = {}
-    glitches = 0
+    glitches = non_sol = 0
     for a in alerts:
         if a["exit_reason"] == "glitch":
             glitches += 1
+            continue
+        if float(a["initial_mc_sol"] or 0) > NON_SOL_START_MC:
+            non_sol += 1                       # пара не к SOL: цена в чужой валюте — «+21766%» у mydev 20.11
             continue
         if a["net_result"] is None:
             continue
@@ -64,6 +70,9 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
             lines.append(f"  · {mode}: {s['n']} сделок, итог {pct(s['series'])}")
     else:
         lines.append(f"Алертов {len(alerts)}, закрытых с итогом пока нет.")
+    if non_sol:
+        lines.append(f"Не в оценке: {non_sol} алертов по монетам в паре не к SOL (USDC, другие монеты) — их цена в чужой "
+                     "валюте; бумага их тоже не считает")
     if glitches:
         lines.append(f"⚠ Не учтено {glitches} алертов: итог не подтвердил Jupiter (сбой цены источника)")
 

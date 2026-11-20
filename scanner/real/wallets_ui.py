@@ -380,8 +380,12 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
         kb.append([{"text": f"{'✅' if on else '⬜'} {name}", "callback": f"rl:wmx:{tag}:{kind}:{'off' if on else 'on'}"},
                    {"text": "⚙️ настроить", "callback": f"rl:wmk:{tag}:{kind}"}])
     lines += ["", "Бумага — не реальные сделки: реальный результат покажет тень и «⚖️ Против бумаги».",
+              "Правила выхода A / B / G / R тень проверяет на каждом входе сразу (пробы) — таблица внизу «⚖️ Против "
+              "бумаги». «✅ Включить все методы» — все сигналы (в тени без денег; если кошелёк в бою — спросит).",
               "«📋 Как бумага A»: только smart, все сигналы, выход A, ставка $10, до 3 позиций, дневной стоп $30, "
               "общий стоп $50 — как бумажный портфель A, давший +$710 за 14–17.11."]
+    kb.append([{"text": "✅ Включить все методы", "callback": f"rl:wmall:{tag}:on"},
+               {"text": "⬜ Выключить все", "callback": f"rl:wmall:{tag}:off"}])
     kb.append([{"text": "📋 Как бумага A ($10)", "callback": f"rl:wmp:{tag}"}])
     kb.append([{"text": "🔄 Считать с нуля", "callback": f"rl:zero:m{tag}"}])
     kb.append([{"text": "← Назад", "callback": back}])
@@ -511,6 +515,15 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
     elif action == "wmp":
         patch = dict(PAPER_A_PRESET)
         drop = [S.stake_key(k) for k in S.METHODS]
+    elif action == "wmall" and len(parts) == 2 and parts[1] in ("on", "on!", "off"):
+        if parts[1] == "on" and S.get(wcfg, "real_mode") == "live":
+            return Reply("💵 <b>Кошелёк в режиме «бой».</b> Включить все методы — значит торговать на реальные деньги "
+                         "по всем сигналам: smart, копии, крупные копии, смарт-ракеты, тренды (у «мой дев» в бою — "
+                         "отдельный переключатель, он не меняется). Ставка, лимит позиций и стопы — как настроены.",
+                         [[{"text": "Да, включить все", "callback": f"rl:wmall:{tag}:on!", "style": "danger"},
+                           {"text": "Нет", "callback": f"rl:wme:{tag}"}]], "", True)
+        on = parts[1] != "off"
+        patch = {S.METHODS[k][1]: on for k in S.METHODS}
     elif action not in ("wme", "wmk"):
         return Reply(None, None, "Не понял кнопку")
     if patch or drop:
@@ -519,7 +532,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
             cfg = {**cfg, **patch}
             for k in drop:
                 cfg.pop(k, None)
-    if action in ("wme", "wmx", "wmp"):       # список методов (с него нажимают «вкл/выкл» и «как бумага»)
+    if action in ("wme", "wmx", "wmp", "wmall"):   # список методов (с него нажимают «вкл/выкл» и «как бумага»)
         text, kb = await methods_view(db, cfg, None if tag == "g" else int(tag))
     else:                                     # экран одного метода
         text, kb = await method_view(db, cfg, tag, kind if kind in S.METHODS else "smart")
@@ -530,7 +543,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
 async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: str, rpc: Any = None) -> Reply:
     parts = rest.split(":") if rest else []
     wid = int(parts[0]) if parts and parts[0].isdigit() else None
-    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms", "wmp"):
+    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms", "wmp", "wmall"):
         r = await methods_callback(db, cfg, action, parts)
         if r is not None:
             return r

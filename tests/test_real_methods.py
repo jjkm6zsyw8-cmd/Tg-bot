@@ -377,3 +377,28 @@ async def test_count_from_zero_on_main_screen_and_trades(db):
     assert "пока нет с" in await R.trades_text(db, cfg)
     assert R.zero_back("w7") == "rl:w:7" and R.zero_back("mg") == "rl:wme:g" and R.zero_back("cmp") == "rl:cmp"
     assert tr.day_pnl["shadow"] > 0                               # счёт исполнителя (стопы) кнопка не трогает
+
+
+async def test_enable_all_methods_button(db):
+    """«✅ Включить все методы»: в тени — сразу; кошелёк в бою — сначала подтверждение (это реальные деньги)."""
+    chain = FakeChain()
+    desk = make_desk(db, chain)
+    await desk.start()
+    wid = await desk.create_wallet("Все")
+    t = str(wid)
+    text, kb = await UI.methods_view(db, {}, wid)
+    assert f"rl:wmall:{t}:on" in [b["callback"] for row in kb for b in row]
+    r = await UI.on_wallet_callback(db, {}, "wmall", f"{t}:on")
+    st = await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
+    assert all(st[S.METHODS[k][1]] is True for k in S.METHODS) and "Методы торговли" in r.text
+    r = await UI.on_wallet_callback(db, {}, "wmall", f"{t}:off")
+    st = await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
+    assert not any(st[S.METHODS[k][1]] for k in S.METHODS)
+    await db.execute("UPDATE real_wallets SET settings = settings || '{\"real_mode\": \"live\"}'::jsonb WHERE id=$1", wid)
+    r = await UI.on_wallet_callback(db, {}, "wmall", f"{t}:on")
+    assert "режиме «бой»" in r.text and r.kb[0][0]["callback"] == f"rl:wmall:{t}:on!"
+    st = await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
+    assert not any(st[S.METHODS[k][1]] for k in S.METHODS)    # без подтверждения ничего не включилось
+    await UI.on_wallet_callback(db, {}, "wmall", f"{t}:on!")
+    st = await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
+    assert all(st[S.METHODS[k][1]] is True for k in S.METHODS) and "real_live_mydev" not in st
