@@ -113,17 +113,18 @@ def signal(**kw):
 
 
 async def test_realtime_entry_and_stop_exit_two_blocks_later(monkeypatch):
-    trades = [row(101, 31.0), row(103, 34.0), row(104, 29.0), row(105, 27.0), row(107, 40.0)]
+    # 20.11: блок ~0.21 с — бой входит через 4 блока (~0.8 с), бумага тоже
+    trades = [row(101, 31.0), row(105, 34.0), row(106, 29.0), row(107, 27.0), row(109, 40.0)]
     tr, st, sold = realtime_trader(monkeypatch, trades)
 
     async def block(mint, sig, s0, target, trig_mc):
-        assert (s0, target) == (100, 102)
+        assert (s0, target) == (100, 100 + pp.ENTRY_BLOCKS) == (100, 104)
         return 33.0
     tr.block_mc = block
     tr.route = lambda data, level: ({"G"}, "")
     await tr.on_alert("M", "normal", None, signal(), "W")
     await asyncio.sleep(0.05)
-    # вход по цене блока +2 (33); стоп −8% пробит сделкой блока 104 (29) — продажа по последней сделке к блоку 106 (27)
+    # вход по цене блока +4 (33); стоп −8% пробит сделкой блока 106 (29) — продажа по последней сделке к блоку 108 (27)
     assert sold == [("G", "stop", 27.0)]
 
 
@@ -508,7 +509,7 @@ async def test_mydev_entry_resolves_creation_slot(monkeypatch):
             "trigger_mc": 1.0, "trigger_at": time.time(), "trigger_create": True}
     assert tr.realtime(data)
     await tr.on_alert("M", "normal", None, data, "DEV")
-    assert opened == [("Y", 34.0, "блок")] and asked == [(777, 779)] and len(tries) == 2
+    assert opened == [("Y", 34.0, "блок")] and asked == [(777, 777 + pp.ENTRY_BLOCKS)] and len(tries) == 2
 
 
 async def test_block_mc_non_sol_pair_is_never_entered(monkeypatch):

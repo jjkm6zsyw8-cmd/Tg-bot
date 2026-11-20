@@ -85,6 +85,11 @@ ORDER_DEAD_S = 75.0                   # заявка не найдена в се
                                       # 280 в минуту, блокхэш живёт ~30 с; было 180 при блоке 0.4 с)
 STATE_RETRY_S, UNTRADABLE_RETRY_S = 1.0, 2.0    # паузы между попытками продажи, если сеть не ответила / монета закрыта
 SWEEP_TRIES = 3
+# 20.11: «мой дев» через 2 блока после создания монеты — узел, который симулирует, иногда ещё не видит монету:
+# открытие счёта токена отвечает IncorrectProgramId (монета «принадлежит» системной программе). Те же монеты позже
+# симулируются без ошибок (проверено в сети) — повторяем симуляцию через пару блоков
+SIM_RETRY_ERRORS = ("IncorrectProgramId", "InvalidAccountData", "AccountNotFound")
+SIM_RETRIES, SIM_RETRY_S = 3, 0.4
 NO_FUNDS = "не хватает SOL или токенов на счёте"
 
 
@@ -661,6 +666,12 @@ class RealTrader:
                 sim_min = max(1, int(self._quote_buy(st, sim_stake) * (1 - base["slip"])))
                 ixs = self._buy_ixs(st, mint, sim_stake, sim_min)
                 sim = await self.chain.simulate(self.wallet.unsigned(rtx.compile_message(self.wallet.pubkey, ixs)))
+                for _ in range(SIM_RETRIES):
+                    if sim.err is None or not any(e in str(sim.err) for e in SIM_RETRY_ERRORS) \
+                            or (self.balance or 0) < sim_stake + SIM_RESERVE:
+                        break                # на кошельке мало SOL — AccountNotFound ничего не ждёт
+                    await asyncio.sleep(SIM_RETRY_S)
+                    sim = await self.chain.simulate(self.wallet.unsigned(rtx.compile_message(self.wallet.pubkey, ixs)))
                 cu = sim.units
                 err = self._err_text(sim.err, st["venue"]) if sim.err is not None else None
                 if err is None:

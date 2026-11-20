@@ -988,3 +988,28 @@ async def test_shadow_measures_every_method_without_stops(db, monkeypatch):
     assert not skipped(tr, "лимит открытых позиций") and not skipped(tr, "дневной стоп")
     lv = live(db, FakeChain(), monkeypatch, real_shadow_all=True, real_smart=False, real_copy=True)
     assert lv.mode_for("smart") == "shadow" and lv.mode_for("copy") == "live"   # выключенный — не на деньги
+
+
+async def test_shadow_retries_simulation_when_node_does_not_see_new_coin(db, monkeypatch):
+    """20.11: «мой дев» через 2 блока — узел симуляции ещё не видит монету (IncorrectProgramId), позже — проходит."""
+    monkeypatch.setattr(ex, "SIM_RETRY_S", 0.0)
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain)
+    await tr.start()
+    real_sim, fails = chain.simulate, [2]
+
+    async def lagging(tx, watch=None):
+        if fails[0] > 0:
+            fails[0] -= 1
+            chain.simulated += 1
+            return rtx.Sim({"InstructionError": [3, "IncorrectProgramId"]}, [], 0, [])
+        return await real_sim(tx, watch)
+    chain.simulate = lagging
+    await fire(tr, chain)
+    assert only(tr).mint == str(MINT) and chain.simulated == 3          # две неудачи и успех — вход
+    fails[0] = 10                                                       # узел так и не увидел — пропуск с причиной
+    m2 = pk("coin-never-seen")
+    chain.add_curve(m2, 40.0)
+    await fire(tr, chain, mint=m2)
+    assert len(tr.positions) == 1 and skipped(tr, "IncorrectProgramId")

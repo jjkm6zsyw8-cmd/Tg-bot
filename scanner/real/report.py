@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from ..alerts.format import esc
-from ..analytics.paper import SCHEMES as PAPER_SCHEMES
+from ..analytics.paper import ENTRY_BLOCKS, SCHEMES as PAPER_SCHEMES
 from . import settings as S
 
 STATUS_KEY = "real:status"
@@ -469,7 +469,7 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
             blocks = [int(r["blocks"]) for r, _p, _q in rs if r["blocks"] is not None]
             if blocks:
                 notes.append(f"{name}: вход через {statistics.median(blocks):.0f} бл. после сигнала (медиана; "
-                             f"от {min(blocks)} до {max(blocks)}); бумага считает 2")
+                             f"от {min(blocks)} до {max(blocks)}); бумага считает {ENTRY_BLOCKS}")
     tz = tz_of(cfg)
     lines = []
     for r, port, q in pairs[-last:][::-1]:
