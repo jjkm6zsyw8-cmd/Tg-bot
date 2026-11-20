@@ -234,8 +234,8 @@
 | Неприкосновенный остаток | 0.02 SOL | `real_reserve_sol` |
 | Тень: задержка «посадки» | 0.8 с | `real_land_s` |
 | Сигналы smart / «мой дев» | да / да | `real_smart` / `real_mydev` |
-| Копии / крупные копии / смарт-ракеты | нет / нет / нет | `real_copy` / `real_bigcopy` / `real_swing` |
-| Правило выхода метода | smart A, мой дев G, копии G, крупные копии G, ракеты R | `real_scheme`, `real_scheme_mydev`, `real_scheme_copy`, `real_scheme_bigcopy`, `real_scheme_swing` |
+| Копии / крупные копии / смарт-ракеты / тренды | нет / нет / нет / нет | `real_copy` / `real_bigcopy` / `real_swing` / `real_trend` |
+| Правило выхода метода | smart A, мой дев G, копии G, крупные копии G, ракеты R, тренды G | `real_scheme`, `real_scheme_mydev`, `real_scheme_copy`, `real_scheme_bigcopy`, `real_scheme_swing`, `real_scheme_trend` |
 | Отбор smart | все сигналы | `real_smart_filter` (`all` / `m`) |
 | Своя ставка метода | как у кошелька | `real_stake_usd_<метод>` |
 | «Мой дев» в бою | нет | `real_live_mydev` |

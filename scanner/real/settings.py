@@ -24,9 +24,9 @@ MODES = {"off": "выключен", "shadow": "тень (без денег)", "l
 #   R — трейлинг 35% после +30%, стоп −50%, до суток (как бумажный R, «смарт-ракеты»).
 SCHEMES = ("A", "B", "G", "R")
 SCHEME_KEYS = {"smart": "real_scheme", "mydev": "real_scheme_mydev", "bigcopy": "real_scheme_bigcopy",
-               "copy": "real_scheme_copy", "swing": "real_scheme_swing"}
+               "copy": "real_scheme_copy", "swing": "real_scheme_swing", "trend": "real_scheme_trend"}
 DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "G", "real_scheme_bigcopy": "G", "real_scheme_copy": "G",
-                   "real_scheme_swing": "R"}
+                   "real_scheme_swing": "R", "real_scheme_trend": "G"}
 SCHEME_TEXT = {"A": "всё на +25%, без стопа, до 30 мин", "B": "70% на +25%, остаток трейлинг 15%, до 30 мин",
                "G": "всё на +25%, стоп −8%, нет +10% за 5 мин — выход", "R": "трейлинг 35% после +30%, стоп −50%, до суток"}
 # Вход smart: «all» — все smart-сигналы (как бумажные A / B / G), «m» — только те, что бумага пустила в боевой
@@ -81,6 +81,9 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
     "real_bigcopy": ("Крупные копии — трейдер зашёл от 5 SOL (как K)", False, "Выход как G."),
     "real_swing": ("Смарт-ракеты — покупки держателей (как R)", False,
                    "Трейлинг 35% после +30%, стоп −50%, держит до суток — занимает место позиции надолго."),
+    "real_trend": ("Тренды — монеты, которые уже растут (как T)", False,
+                   "Вход после отката, выход как G. Только монеты на кривой pump.fun и в пуле PumpSwap: на других "
+                   "биржах реальный бот не торгует."),
     "real_mev_protect": ("Обходить валидаторов-«сэндвичеров»", True, "Параметр mev-protect у Helius Sender."),
     "real_close_ata": ("Закрывать пустые счета токенов (возврат залога)", True, "≈0.0015 SOL с каждой монеты."),
     "real_notify_shadow": ("Сообщения о сделках тени", False, ""),
@@ -145,7 +148,8 @@ def method_name(cfg: dict[str, Any], kind: str) -> str:
         if get(cfg, "real_smart_filter") == "m":
             return "Smart M" if rule == "A" else f"Smart (отбор M) → {rule}"
         return f"Smart {rule}"
-    base = {"mydev": "Мой дев", "bigcopy": "Крупные копии", "copy": "Копии", "swing": "Смарт-ракеты"}[kind]
+    base = {"mydev": "Мой дев", "bigcopy": "Крупные копии", "copy": "Копии", "swing": "Смарт-ракеты",
+            "trend": "Тренды"}[kind]
     default = DEFAULT_SCHEMES[SCHEME_KEYS[kind]]
     out = f"{base} {rule}" if kind == "mydev" else (base if rule == default else f"{base} → {rule}")
     if kind == "mydev" and not get(cfg, "real_live_mydev"):
@@ -196,15 +200,18 @@ METHODS: dict[str, tuple[str, str, str]] = {
     "copy": ("Копии своего списка и разведки", "real_copy", "H"),
     "bigcopy": ("Крупные копии (от 5 SOL)", "real_bigcopy", "K"),
     "swing": ("Смарт-ракеты (держатели)", "real_swing", "R"),
+    # 20.11: тренды — монеты, которые уже растут (сигнал DexScreener, вход после отката). Без трейдера: вход по
+    # времени сигнала, а не по блоку покупки. Только pump.fun и PumpSwap — другие биржи бот не умеет
+    "trend": ("Тренды (монеты, которые уже растут)", "real_trend", "T"),
 }
 KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", "bigcopy": "крупная копия",
-              "swing": "смарт-ракета"}
+              "swing": "смарт-ракета", "trend": "тренд"}
 
 
 def methods_summary(cfg: dict[str, Any]) -> str:
     """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»; своя ставка — в скобках."""
     out = []
-    for kind in ("smart", "mydev", "bigcopy", "copy", "swing"):
+    for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend"):
         if get(cfg, METHODS[kind][1]):
             stake = method_stake(cfg, kind)
             out.append(method_name(cfg, kind) + (f" ${stake:g}" if stake else ""))
@@ -217,4 +224,5 @@ def paper_portfolio(kind: str, rule: str, smart_filter: str = "all") -> str | No
         if smart_filter == "m":
             return "M" if rule == "A" else None
         return rule if rule in ("A", "B", "G") else None
-    return {("mydev", "G"): "Y", ("copy", "G"): "H", ("bigcopy", "G"): "K", ("swing", "R"): "R"}.get((kind, rule))
+    return {("mydev", "G"): "Y", ("copy", "G"): "H", ("bigcopy", "G"): "K", ("swing", "R"): "R",
+            ("trend", "G"): "T"}.get((kind, rule))

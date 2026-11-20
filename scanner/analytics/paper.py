@@ -622,7 +622,7 @@ class PaperTrader:
             self.skipped["*"] = why
             return
         real = getattr(self.e, "real", None)
-        if real is not None and targets & ({MAIN, MYDEV, SCOUT, BIGCOPY, SWING} | set(SMART_SET)):
+        if real is not None and targets & ({MAIN, MYDEV, SCOUT, BIGCOPY, SWING, TREND} | set(SMART_SET)):
             # реальный бот получает сигнал одновременно с бумагой и сам решает, входить ли (scanner/real)
             asyncio.create_task(real.on_signal(mint, level, alert_id, dict(data), trader, set(targets)))
         if self.realtime(data):

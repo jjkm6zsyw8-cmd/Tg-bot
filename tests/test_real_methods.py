@@ -11,7 +11,7 @@ from scanner.analytics import paper as pp
 from scanner.real import executor as ex, settings as S, wallets_ui as UI
 from scanner.real.executor import kinds_of
 from tests.real_helpers import FakeChain, pk
-from tests.test_real import MINT, _fast, db, engine, fire, shadow, trade  # noqa: F401 — фикстуры
+from tests.test_real import MINT, _fast, db, engine, fire, only, shadow, skipped, trade  # noqa: F401 — фикстуры
 from tests.test_real_wallets import make_desk
 
 
@@ -23,6 +23,7 @@ def test_kinds_of_signal_by_paper_route():
     assert kinds_of({"modes": ["scout"]}, {"H"}) == ["copy"]
     assert kinds_of({"modes": ["swing"]}, {"R"}) == ["swing"]
     assert kinds_of({"modes": ["trend"]}, {"A"}) == []
+    assert kinds_of({"modes": ["trend"]}, {"T"}) == ["trend"]
 
 
 def test_exit_rules_per_method():
@@ -102,6 +103,44 @@ async def test_new_methods_trade_only_when_enabled(db):
     assert next(p for p in tr.positions.values() if p.mint == str(m4)).extra["kind"] == "copy"
 
 
+async def test_trend_method_in_real_bot(db):
+    """20.11: тренды (бумага T) — у реального бота: покупки трейдера нет, вход по времени сигнала; выход как G.
+    Выключен — только замер тенью (не деньги). Монета не с pump.fun — пропуск с понятной причиной."""
+    from scanner.real import pump
+    chain = FakeChain()
+    m1, m2, m3 = pk("trend-1"), pk("trend-late"), pk("trend-other-dex")
+    chain.add_curve(m1, 40.0)
+    chain.add_curve(m2, 40.0)
+    chain.programs[str(m3)] = pump.TOKEN                       # монета есть, но не на pump.fun и не в PumpSwap
+    tr = shadow(db, chain, real_max_open=10)
+    await tr.start()
+
+    async def send(mint, at, **kw):
+        data = {"modes": ["trend"], "symbol": "TR", "mc": 40.0, "trend_at": at, **kw}
+        await tr.on_signal(str(mint), "normal", 7, data, None, {"T"})
+    await send(m1, time.time())
+    assert not tr.positions and tr.mode_for("trend") == "off"  # выключен, замер тенью выключен
+    tr.e.cfg["real_shadow_all"] = True
+    assert tr.mode_for("trend") == "shadow"                   # выключенный метод — только тень, не деньги
+    tr.e.cfg.update(real_shadow_all=False, real_trend=True)
+    assert S.methods_summary(tr.e.cfg) == "Smart A · Мой дев G (только тень) · Тренды"
+    # блок и цена от прошлого алерта этой монеты (другой метод) тренду не мешают
+    await send(m1, time.time(), trigger_slot=chain.slot - 500, trigger_mc=1.0)
+    p = only(tr)
+    assert p.extra["kind"] == "trend" and p.extra["mode"] == "shadow" and tr.scheme_for("trend") is pp.SCHEMES["G"]
+    await send(m2, time.time() - 60)
+    assert skipped(tr, "тренд: сигнал опоздал")
+    await send(m3, time.time())
+    assert skipped(tr, "тренд: не pump.fun и не PumpSwap")
+    await send(m2, None)
+    assert skipped(tr, "тренд: нет времени сигнала") and len(tr.positions) == 1
+    chain.set_mc(m1, 36.0)                                    # −10%: стоп G −8%
+    await trade(tr, chain, m1)
+    r = await db.fetchrow("SELECT kind, exit_reason, extra FROM real_positions")
+    assert r["kind"] == "trend" and r["exit_reason"] == "stop"
+    assert S.paper_portfolio("trend", "G") == "T" and UI.ABOUT["trend"] and "trend" in UI.ORDER
+
+
 async def test_paper_sends_all_method_signals_to_real_bot(monkeypatch):
     from tests.test_paper import bare_trader
     got = []
@@ -116,11 +155,11 @@ async def test_paper_sends_all_method_signals_to_real_bot(monkeypatch):
                            "kv_set": staticmethod(lambda *a: asyncio.sleep(0))})()
     monkeypatch.setattr(tr, "realtime", lambda data: False)
     monkeypatch.setattr(tr, "_bump", lambda *a: None)
-    for targets in ({"H"}, {"H", "K"}, {"R"}, {"Y"}, {"M", "A"}, {"D"}):
+    for targets in ({"H"}, {"H", "K"}, {"R"}, {"Y"}, {"M", "A"}, {"T"}, {"D"}):
         monkeypatch.setattr(tr, "route", lambda data, level, t=targets: (set(t), ""))
         await tr.on_alert("M1", "normal", 1, {"modes": ["copy"]}, "T")
     await asyncio.sleep(0.01)
-    assert got == [["H"], ["H", "K"], ["R"], ["Y"], ["A", "M"]]           # лотерея D — не реальному боту
+    assert got == [["H"], ["H", "K"], ["R"], ["Y"], ["A", "M"], ["T"]]    # лотерея D — не реальному боту
 
 
 async def test_methods_screen_for_wallet_and_common(db, monkeypatch):

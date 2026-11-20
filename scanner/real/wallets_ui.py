@@ -295,10 +295,11 @@ async def create_and_wait(db: Any, cfg: dict[str, Any], name: str, rpc: Any = No
 
 # ---------------------------------------------------------------------- методы торговли
 PAPER_DAYS = 7
-ORDER = ("smart", "mydev", "bigcopy", "copy", "swing")
+ORDER = ("smart", "mydev", "bigcopy", "copy", "swing", "trend")
 ABOUT = {"smart": "покупка smart-кошелька", "mydev": "запуск монеты девом из вашего списка",
          "bigcopy": "трейдер из списка зашёл от 5 SOL", "copy": "покупка кошелька из списка или кандидата разведки",
-         "swing": "покупка держателя (кошелёк, который держит монеты часами)"}
+         "swing": "покупка держателя (кошелёк, который держит монеты часами)",
+         "trend": "монета уже растёт (DexScreener), вход после отката; только pump.fun и PumpSwap"}
 
 
 async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float]]:
@@ -307,7 +308,8 @@ async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, i
     rows = await db.fetch(
         """SELECT portfolio, count(*) n, count(*) FILTER (WHERE pnl_pct > 0) w, COALESCE(sum(pnl_pct), 0) s
            FROM paper_positions WHERE closed_at > now() - make_interval(days => $1) AND NOT suspect
-             AND exit_reason IS DISTINCT FROM 'reset' AND entry_src LIKE 'блок%' GROUP BY portfolio""", int(days))
+             AND exit_reason IS DISTINCT FROM 'reset' AND (entry_src LIKE 'блок%' OR portfolio = 'T')
+           GROUP BY portfolio""", int(days))
     return {r["portfolio"]: (int(r["n"]), int(r["w"]), float(r["s"]) * 10) for r in rows}
 
 
@@ -370,7 +372,7 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
 
 
 PAPER_A_PRESET = {"real_smart": True, "real_scheme": "A", "real_smart_filter": "all", "real_mydev": False,
-                  "real_live_mydev": False, "real_copy": False, "real_bigcopy": False, "real_swing": False,
+                  "real_live_mydev": False, "real_copy": False, "real_bigcopy": False, "real_swing": False, "real_trend": False,
                   "real_stake_usd": 10, "real_max_open": 3, "real_day_stop_usd": 30, "real_total_stop_usd": 50}
 
 

@@ -381,7 +381,7 @@ async def trades_csv(db: Any, cfg: dict[str, Any]) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------- сравнение с бумагой
-DEFAULT_RULE = {"smart": "A", "mydev": "G", "copy": "G", "bigcopy": "G", "swing": "R"}
+DEFAULT_RULE = {"smart": "A", "mydev": "G", "copy": "G", "bigcopy": "G", "swing": "R", "trend": "G"}
 
 
 def paper_target(kind: str, extra: dict[str, Any]) -> str | None:
@@ -443,7 +443,7 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
     head = f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"
     table, notes = [head], []
     for mode in ("live", "shadow"):
-        for kind in ("smart", "mydev", "bigcopy", "copy", "swing"):
+        for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend"):
             rs = [x for x in pairs if x[0]["mode"] == mode and x[0]["kind"] == kind]
             if not rs:
                 continue

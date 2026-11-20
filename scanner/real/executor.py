@@ -32,8 +32,8 @@ from typing import TYPE_CHECKING, Any
 from solders.pubkey import Pubkey
 
 from ..alerts import format as fmt
-from ..analytics.paper import (BIGCOPY, MAIN, MYDEV, SCHEMES, SCOUT, SMART_SET, SWING, TINY_REBUY_SOL, Position,
-                               decide_exit, sell_fill)
+from ..analytics.paper import (BIGCOPY, MAIN, MYDEV, SCHEMES, SCOUT, SMART_SET, SWING, TINY_REBUY_SOL, TREND,
+                               Position, decide_exit, sell_fill)
 from . import pump, pumpswap, settings as S, tx as rtx
 from .keys import Wallet, load_wallet
 
@@ -53,6 +53,9 @@ SHADOW_MAX_OPEN = 30                  # тень-замер: столько по
 SHADOW_SKIP = {"copy"}
 KINDS = S.KIND_NAMES
 SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
+# тренд — без покупки трейдера в блоке: возраст сигнала считаем от алерта (DexScreener опрашивается раз в 5 с,
+# первый алерт монеты ещё ~1 с ждёт внешних проверок)
+TREND_MAX_AGE_S = 15.0
 
 
 def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
@@ -69,6 +72,8 @@ def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
         out.append("copy")
     if SWING in targets and "swing" in modes:
         out.append("swing")
+    if TREND in targets and "trend" in modes:
+        out.append("trend")
     return out
 MODE_ICON = {"live": "💵", "shadow": "👻"}
 MODE_SHORT_RU = {"live": "💵 бой", "shadow": "👻 тень", "off": "выкл"}
@@ -393,9 +398,14 @@ class RealTrader:
         """Причина не входить (до запросов к сети) или None."""
         if self.paused():
             return f"входы остановлены: {self.paused()}"
-        if not data.get("trigger_at"):
+        if kind == "trend":
+            if not data.get("trend_at"):
+                return "нет времени сигнала"
+            if time.time() - float(data["trend_at"]) > TREND_MAX_AGE_S:
+                return "сигнал опоздал"
+        elif not data.get("trigger_at"):
             return "нет покупки трейдера в блоке"
-        if time.time() - float(data["trigger_at"]) > float(self.get("real_max_signal_age_s")):
+        elif time.time() - float(data["trigger_at"]) > float(self.get("real_max_signal_age_s")):
             return "сигнал опоздал"
         if mint in self._busy or any(p.mint == mint for p in self.positions.values()):
             return "уже есть позиция по монете"
@@ -498,7 +508,8 @@ class RealTrader:
             return out
         vault, vault_key = (acc[3], keys[3]) if tp == pump.TOKEN_2022 else (acc[4], keys[4])
         if acc[2] is None or vault is None or acc[5] is None:
-            out["why"] = "кривая закрыта, пул PumpSwap ещё не создан" if curve is not None else "нет ни кривой, ни пула"
+            out["why"] = ("кривая закрыта, пул PumpSwap ещё не создан" if curve is not None else
+                          "не pump.fun и не PumpSwap — на других биржах бот не торгует")
             return out
         try:
             pool = pumpswap.parse_pool(str(keys[2]), acc[2].data)
@@ -589,13 +600,17 @@ class RealTrader:
         if user is not None and st["extra"]:
             self.balance = st["extra"][0].lamports if st["extra"][0] is not None else 0
             self._balance_at = time.time()
-        trig_slot = int(data.get("trigger_slot") or 0)
+        trend = kind == "trend"
+        # у тренда нет покупки трейдера: блок и цена сигнала от другого алерта этой монеты ему не судьи
+        trig_slot = 0 if trend else int(data.get("trigger_slot") or 0)
         if trig_slot and st["slot"] and st["slot"] - trig_slot > int(self.get("real_max_blocks")):
             return self._skip(mode, kind, "после сигнала прошло слишком много блоков")
         stake, why = self.stake_lamports(st["v_quote"], kind)
         if why:
             return self._skip(mode, kind, why)
-        trig_mc = float(data.get("trigger_mc") or 0)
+        trig_mc = 0.0 if trend else float(data.get("trigger_mc") or 0)
+        # тренд: цена сигнала — DexScreener (отстаёт на секунды) — «цена уже убежала» по ней не считаем; от переплаты
+        # защищает проскальзывание покупки
         if data.get("trigger_create"):
             trig_mc = 0.0                             # у запуска цена сигнала — не цена монеты
         if data.get("trigger_mc_rough"):
@@ -613,7 +628,8 @@ class RealTrader:
                 "symbol": str(data.get("symbol") or "")[:40], "venue": st["venue"],
                 "token_program": str(st["token_program"]), "trigger_slot": trig_slot or None,
                 "trigger_mc": trig_mc or None,
-                "lag_s": round(time.time() - float(data.get("trigger_ts") or data.get("trigger_at") or t0), 3),
+                "lag_s": round(time.time() - float((data.get("trend_at") if trend else None)
+                                                    or data.get("trigger_ts") or data.get("trigger_at") or t0), 3),
                 "stake": stake, "min_out": min_out, "slip": slip, "mc": st["mc"],
                 "rule": self.get(S.SCHEME_KEYS[kind]),
                 "filter": self.get("real_smart_filter") if kind == "smart" else "all"}

@@ -553,7 +553,7 @@ class Trends:
         if hs.get("checked"):
             metrics["fresh_wallets"] = hs.get("fresh")
         data = {
-            "symbol": pi.symbol, "mc": mc_sol, "age_s": pi.age_h * 3600,
+            "symbol": pi.symbol, "mc": mc_sol, "age_s": pi.age_h * 3600, "trend_at": time.time(),
             "signal": "откат после импульса" if extra.get("pullback") else "импульс",
             "entry_mc": mc_sol, "entry_max_mc": mc_sol * 1.1, "target_mc": mc_sol * target_mult,
             "metrics": metrics, "violations": [],
