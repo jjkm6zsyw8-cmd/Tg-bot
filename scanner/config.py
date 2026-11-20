@@ -199,8 +199,8 @@ class Settings:
         return self.yaml.section("reliability")
 
     def topics(self) -> dict[str, str]:
-        return {"new": "Новые монеты", "trend": "Тренды", "paper": "Бумажная торговля", "copy": "Копитрейд",
-                "real": "Реальный бот", **self.yaml.section("topics")}
+        return {"main": "🏠 Главная", "new": "Новые монеты", "trend": "Тренды", "paper": "Бумажная торговля",
+                "copy": "Копитрейд", "real": "Реальный бот", **self.yaml.section("topics")}
 
     def exchanges(self) -> set[str]:
         return set(self.yaml.data.get("exchanges") or [])

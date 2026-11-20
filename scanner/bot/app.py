@@ -15,7 +15,7 @@ from .sender import Sender
 log = logging.getLogger(__name__)
 
 COMMANDS = [
-    ("start", "Главное меню"), ("mode", "Режимы"), ("settings", "Настройки"), ("token", "Разбор монеты"),
+    ("start", "Панель управления (в теме «Главная» — закреплена)"), ("mode", "Режимы"), ("settings", "Настройки"), ("token", "Разбор монеты"),
     ("dev", "Профиль дева"), ("trader", "Профиль трейдера"), ("wallet", "Кошелёк"), ("coin", "Разбор монеты"), ("watch", "Сопровождение монеты"),
     ("watchlist", "Отслеживаемое"), ("addwallet", "Добавить кошелёк (источник и отбор — кнопками)"), ("removewallet", "Убрать кошелёк"),
     ("import", "Импорт кошельков: источник и отбор кнопками, потом файл/адреса"),
@@ -55,10 +55,14 @@ async def run_bot(env: Env, settings: Settings, db: Database) -> None:
     dp = Dispatcher()
     router = Router()
     sender = Sender(bot, env, settings, db)
-    handlers.setup(router, env, settings, db, sender)
+    ensure_panel = handlers.setup(router, env, settings, db, sender)
     dp.include_router(router)
     settings.overrides = await db.get_overrides()
     log.info(await sender.setup_topics())
+    try:
+        log.info(await ensure_panel(bot))            # закреплённая панель со всеми кнопками в теме «Главная»
+    except Exception as exc:  # noqa: BLE001 — без панели бот всё равно работает (команды, /start)
+        log.warning("панель «Главной»: %s", exc)
     try:
         await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS])
     except Exception as exc:  # noqa: BLE001

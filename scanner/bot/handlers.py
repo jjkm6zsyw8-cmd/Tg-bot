@@ -109,7 +109,12 @@ TOGGLES_ON_BY_DEFAULT = {"smart_filtered", "paper_size_by_level", "trend_autotun
                          "paper_daily_reset"}
 
 
-def setup(router: Router, env: Env, settings: Settings, db: Database, sender: Any) -> None:
+PANEL_TEXT = ("🏠 <b>Главная — управление ботом</b>\n"
+              "Нажмите кнопку — ответ появится здесь же, прошлый ответ убирается. Сигналы, сделки и отчёты бота "
+              "идут в свои темы и сюда не мешаются. Панель закреплена: вернуться к ней — значок 📌 сверху.")
+
+
+def setup(router: Router, env: Env, settings: Settings, db: Database, sender: Any) -> Any:
     from ..external import ExternalHub
     ext = ExternalHub(env, db)   # внешние источники только по командам /token, /dev, /trader
     router.message.outer_middleware(Whitelist(env.allowed_ids))
@@ -162,15 +167,57 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     def main_menu() -> list[list[dict[str, Any]]]:
         return [
-            [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
-            [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "👛 Кошельки", "callback": "rl:wl"}],
-            [{"text": "📥 Импорт кошельков", "callback": "menu:import"},
-             {"text": "➕ Добавить кошелёк", "callback": "menu:add"}],
-            [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "📦 Выгрузка", "callback": "menu:export"}],
-            [{"text": "Режимы", "callback": "menu:mode"}, {"text": "Настройки", "callback": "menu:settings"}],
-            [{"text": "Отслеживаемое", "callback": "menu:watchlist"}, {"text": "Разбор дня", "callback": "menu:today"}],
-            [{"text": "Итог серии", "callback": "menu:stats"}, {"text": "Состояние", "callback": "menu:health"}],
+            [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "⚖️ Бой против бумаги", "callback": "menu:cmp"}],
+            [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "📊 Excel: весь отчёт", "callback": "menu:excel"}],
+            [{"text": "💳 Кошельки бота", "callback": "rl:wl"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
+            [{"text": "🔍 Разведка", "callback": "menu:scout"}, {"text": "⭐ Рейтинг кошельков", "callback": "menu:rating"}],
+            [{"text": "📋 Журнал копий", "callback": "menu:copylog"}, {"text": "📄 Файл по кошелькам", "callback": "menu:wallets"}],
+            [{"text": "➕ Добавить кошелёк", "callback": "menu:add"}, {"text": "📥 Импорт кошельков", "callback": "menu:import"}],
+            [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "👁 Отслеживаемое", "callback": "menu:watchlist"}],
+            [{"text": "📅 Разбор дня", "callback": "menu:today"}, {"text": "📈 Итог серии", "callback": "menu:stats"}],
+            [{"text": "⚙️ Настройки", "callback": "menu:settings"}, {"text": "🎛 Режимы", "callback": "menu:mode"}],
+            [{"text": "📦 Выгрузка (архив)", "callback": "menu:export"}, {"text": "🩺 Состояние", "callback": "menu:health"}],
         ]
+
+    screens: dict[tuple[int, int | None], int] = {}   # (чат, тема) → сообщение-экран под панелью «Главной»
+
+    async def show(m: Message, text: str, kb: Any = None) -> None:
+        """Ответ на кнопку панели: прошлый экран удаляется, новый — внизу (в «Главной» не копятся ответы).
+        Длинный текст — несколькими сообщениями, как раньше."""
+        key = (m.chat.id, m.message_thread_id if m.is_topic_message else None)
+        old = screens.pop(key, None)
+        if old:
+            try:
+                await m.bot.delete_message(m.chat.id, old)
+            except Exception:  # noqa: BLE001 — уже удалено руками или старше 48 часов
+                pass
+        if len(text) > 4000:
+            return await reply(m, text, kb)
+        sent = await m.answer(text, parse_mode="HTML", reply_markup=build(kb), link_preview_options=NO_PREVIEW)
+        screens[key] = sent.message_id
+
+    async def ensure_panel(bot: Any) -> str:
+        """Закреплённая панель со всеми кнопками в теме «Главная» (создаётся при запуске бота, если её нет)."""
+        chat, thread = sender.chat_id, sender.thread("main")
+        if not chat or not env.alert_chat_id:
+            return "панель: чат алертов не задан"
+        saved = await db.kv_get("main_panel", {}) or {}
+        if saved.get("chat") == chat and saved.get("thread") == thread and saved.get("id"):
+            try:
+                await bot.edit_message_text(PANEL_TEXT, chat_id=chat, message_id=int(saved["id"]), parse_mode="HTML",
+                                            reply_markup=build(main_menu()))
+                return "панель «Главной» на месте"
+            except Exception as exc:  # noqa: BLE001
+                if "not modified" in str(exc):
+                    return "панель «Главной» на месте"
+        msg = await bot.send_message(chat, PANEL_TEXT, parse_mode="HTML", reply_markup=build(main_menu()),
+                                     message_thread_id=thread)
+        await db.kv_set("main_panel", {"chat": chat, "thread": thread, "id": msg.message_id})
+        try:
+            await bot.pin_chat_message(chat, msg.message_id, disable_notification=True)
+        except Exception as exc:  # noqa: BLE001 — нет права «Закреплять сообщения»: панель есть, просто не закреплена
+            return f"панель «Главной» отправлена, закрепить не удалось: {exc}"
+        return "панель «Главной» отправлена и закреплена"
 
     def mode_view(cfg: dict[str, Any]) -> tuple[str, list[list[dict[str, Any]]]]:
         m = cfg.get("modes", {})
@@ -237,9 +284,18 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         return "\n".join(lines), kb
 
     # ------------------------------------------------------------------ команды
-    @router.message(Command("start", "help"))
+    @router.message(Command("start", "help", "menu"))
     async def cmd_start(m: Message) -> None:
         note = await sender.setup_topics() if m.chat.type in ("supergroup", "group") else ""
+        if m.chat.type in ("supergroup", "group") and m.message_thread_id == sender.thread("main"):
+            # в «Главной» — новая панель внизу (старая остаётся выше), она же закрепляется
+            msg = await m.answer(PANEL_TEXT, parse_mode="HTML", reply_markup=build(main_menu()))
+            await db.kv_set("main_panel", {"chat": m.chat.id, "thread": m.message_thread_id, "id": msg.message_id})
+            try:
+                await m.bot.pin_chat_message(m.chat.id, msg.message_id, disable_notification=True)
+            except Exception:  # noqa: BLE001
+                pass
+            return
         await reply(m, HELP + (f"\n\n<i>{esc(note)}</i>" if note else ""), main_menu())
 
     @router.message(Command("mode"))
@@ -1009,15 +1065,29 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await paper_answer(m, "state")
         if what == "real":
             text, kb = await real_report.status_view(db, await reload())
-            return await reply(m, text, kb)
+            return await show(m, text, kb)
+        if what == "cmp":
+            return await show(m, await real_report.compare_text(db, await reload()),
+                              [[{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}]])
+        if what == "excel":
+            return await cmd_excel(m)
+        if what == "wallets":
+            return await cmd_wallets(m)
+        if what == "scout":
+            from ..analytics.scout import scout_report
+            return await show(m, (await scout_report(db))[:4000])
+        if what == "rating":
+            return await cmd_rating(m, CommandObject(prefix="/", command="rating", args=None))
+        if what == "copylog":
+            return await cmd_copylog(m, CommandObject(prefix="/", command="copylog", args=None))
         if what == "smart":
             return await send_smart(m, 7)
         if what in ("import", "add"):
             text, kb = wiz.start(c.from_user.id, what)
-            return await m.answer(text, parse_mode="HTML", reply_markup=build(kb))
+            return await show(m, text, kb)
         if what == "origin":
             text, kb = await origin_view()
-            return await m.answer(text, parse_mode="HTML", reply_markup=build(kb))
+            return await show(m, text, kb)
         if what == "export":
             return await send_export(m)
         if what == "mode":
@@ -1033,7 +1103,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         else:
             cfg = await reload()
             text, _csv, kb = await build_daily(db, settings, today_in(cfg.get("timezone", "UTC")))
-        await m.answer(text[:4000], parse_mode="HTML", reply_markup=build(kb))
+        await show(m, text[:4000], kb)
 
     @router.callback_query(F.data.startswith(("mode:", "tog:", "set:", "preset:")))
     async def cb_settings(c: CallbackQuery) -> None:
@@ -1182,3 +1252,5 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         _, kind, addr = c.data.split(":", 2)
         await remove(addr, kind if kind in ("t", "d", "k") else None)
         await c.answer(f"Убрано: {short(addr)}")
+
+    return ensure_panel

@@ -426,3 +426,46 @@ async def test_receiver_backfills_blocks_of_early_trades_for_patterns():
     rec.slot_research["t1"] -= 100                                      # 90+ с — выбрасываем
     await rec.research_slots_once()
     assert not rec.slot_research
+
+
+async def test_main_topic_panel_sent_pinned_and_reused():
+    """20.11: тема «Главная» — закреплённая панель со всеми кнопками; при перезапуске бота панель не дублируется."""
+    from aiogram import Router
+
+    from scanner.bot import handlers
+    from scanner.config import Env, Settings, YamlConfig
+    kv: dict = {}
+
+    class Db:
+        async def kv_get(self, k, default=None):
+            return kv.get(k, default)
+
+        async def kv_set(self, k, v):
+            kv[k] = v
+
+    class Bot:
+        def __init__(self):
+            self.sent, self.pinned, self.edited, self.n = [], [], [], 500
+
+        async def send_message(self, chat, text, **kw):
+            self.n += 1
+            self.sent.append((chat, kw.get("message_thread_id"), kw.get("reply_markup")))
+            return SimpleNamespace(message_id=self.n)
+
+        async def pin_chat_message(self, chat, mid, **kw):
+            self.pinned.append(mid)
+
+        async def edit_message_text(self, text, **kw):
+            self.edited.append(kw["message_id"])
+
+    sender = SimpleNamespace(chat_id=-100, thread=lambda t: 77 if t == "main" else None)
+    env = Env(alert_chat_id="-100", allowed_user_ids="1")
+    ensure = handlers.setup(Router(), env, Settings(YamlConfig("config/config.yaml")), Db(), sender)
+    bot = Bot()
+    assert "закреплена" in await ensure(bot)
+    assert bot.sent[0][:2] == (-100, 77) and bot.pinned == [501] and kv["main_panel"]["id"] == 501
+    buttons = [b.text for row in bot.sent[0][2].inline_keyboard for b in row]
+    assert "💵 Реальный бот" in buttons and "⚖️ Бой против бумаги" in buttons and len(buttons) >= 20
+    assert "на месте" in await ensure(bot)                      # перезапуск — та же панель обновляется
+    assert len(bot.sent) == 1 and bot.edited == [501]
+    assert "main" in Settings(YamlConfig("config/config.yaml")).topics()
