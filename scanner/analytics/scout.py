@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -40,7 +41,7 @@ from . import dunescout as DS
 from . import family as FAM
 from . import lookalike as LK
 from .copytrade import linked_to_dev
-from .paper import SCOUT, TRIAL
+from .paper import SCOUT, TREND, TRIAL
 
 if TYPE_CHECKING:
     from .engine import Engine
@@ -85,7 +86,14 @@ DEFAULTS: dict[str, Any] = {
     "scout_min_profit_usd": 300,       # GMGN: прибыль на монете, $
     "scout_gmgn_min_winrate": 0.45,    # GMGN 7 дней
     "scout_gmgn_min_tokens": 10,
-    "scout_gmgn_min_hold_s": 30,
+    "scout_gmgn_min_hold_s": 180,      # 20.11: было 30 с — на испытание шли скальперы (BYaf: продаёт через 10 с)
+    # 20.11: на испытание — только кто держит монету от 3 минут (копия успевает войти и выйти; 7BNax держал ~7 мин);
+    # скальперов (по своей базе или GMGN) — сразу в отсев, даже если уже на испытании. Держатели — первыми в очереди
+    "scout_min_hold_s": 180,
+    # держатели в своей базе: раз в 6 ч — кто за 2 дня закрыл в плюс 2+ монеты, держа их в медиане от 10 минут
+    "scout_holders_every_h": 6,
+    "scout_holders_min_hold_s": 600,
+    "scout_holders_min_coins": 3,
     "scout_gmgn_max_big_losses": 0.35,
 }
 BAD_TAGS = {"sniper", "bundler", "rat_trader", "dev", "dex_bot", "insider", "creator", "sandwich_bot"}
@@ -211,6 +219,11 @@ def verdict_a(n: int, wins: int, pnl: float, cost: float, age_days: float, cfg: 
     return None, res
 
 
+def scalper_text(hold_s: float, need_s: float) -> str:
+    return (f"скальпер: держит монету ~{hold_s:.0f} с (на испытание — от {need_s / 60:.0f} мин) — копия входит, "
+            "когда он уже продаёт")
+
+
 def trial_t(x: dict[str, Any]) -> float | None:
     """Устойчивость плюса копий на испытании: среднее / (разброс / √n); меньше 3 копий — не считаем."""
     n = int(x.get("n") or 0)
@@ -250,6 +263,7 @@ class Scout:
         self.stats = {"found": 0, "queued": 0, "started": 0, "promoted": 0, "rejected": 0, "demoted": 0,
                       "gmgn_errors": 0, "runs": 0}
         self._token_cursor = 0
+        self._trend_done: set[str] = set()      # монеты трендов, по которым уже искали ранних покупателей
         self.lookalike = LK.Lookalike(engine)
         self.family = FAM.Family(engine, self)
         self.dune = DS.DuneScout(engine, self)
@@ -275,6 +289,10 @@ class Scout:
         await self.discover_own()
         await self.discover_cobuyers()
         await self.discover_gmgn()
+        try:
+            await self.discover_holders()
+        except Exception:  # noqa: BLE001 — тяжёлый запрос мог отмениться по времени; в следующий раз
+            log.exception("разведка: держатели")
         events += await self.decide()
         events += await self.demote()
         events += await self.requeue_patient()
@@ -343,7 +361,8 @@ class Scout:
         added = 0
         sol_usd = self.e.price.value or 150
         for r in rows:
-            if r["trader"] in known or (r["hold"] is not None and r["hold"] < 20):
+            if r["trader"] in known or (r["hold"] is not None
+                                        and r["hold"] < float(cfg_get(self.cfg, "scout_min_hold_s"))):
                 continue
             added += await self._queue(
                 r["trader"], "свои данные", f"в топе по прибыли на {r['n']} монетах за 3 дня ({r['pnl']:+.2f} SOL)",
@@ -401,10 +420,17 @@ class Scout:
         except Unavailable:
             self.stats["gmgn_errors"] += 1
             return 0
-        if not hot:
+        # 20.11: монеты трендов (T), закрытые в плюс за сутки, — первыми: кто их рано купил и держал
+        trend = [{"mint": r["mint"], "symbol": r["symbol"]} for r in await self.db.fetch(
+            """SELECT mint, max(symbol) symbol FROM paper_positions WHERE portfolio = $1 AND closed_at IS NOT NULL
+                 AND closed_at > now() - interval '1 day' AND pnl_sol > 0 AND NOT suspect
+               GROUP BY mint ORDER BY max(pnl_pct) DESC LIMIT 3""", TREND)
+            if r["mint"] not in self._trend_done]
+        self._trend_done.update(t["mint"] for t in trend)
+        if not hot and not trend:
             return 0
-        i = self._token_cursor % len(hot)
-        batch = (hot[i:] + hot[:i])[:tokens_per_run]
+        i = self._token_cursor % len(hot) if hot else 0
+        batch = trend + (hot[i:] + hot[:i])[:max(0, tokens_per_run - len(trend))]
         self._token_cursor += tokens_per_run
         known = await self._known()
         cands: dict[str, tuple[dict[str, Any], str]] = {}
@@ -443,12 +469,23 @@ class Scout:
         if free <= 0:
             return []
         rows = await self.db.fetch(
-            "SELECT * FROM scout WHERE status='queued' ORDER BY score DESC NULLS LAST, found_at LIMIT $1", free * 3)
+            "SELECT * FROM scout WHERE status='queued' ORDER BY score DESC NULLS LAST, found_at LIMIT $1", free * 5)
+        holds = await self.hold_of([r["address"] for r in rows], {r["address"]: r["stats"] for r in rows})
+        need = float(cfg_get(self.cfg, "scout_min_hold_s"))
+        # держатели — первыми: 30+ мин, потом 10+ мин, потом остальные по очереди
+        tier = lambda a: 2 if (holds.get(a) or 0) >= 1800 else 1 if (holds.get(a) or 0) >= 600 else 0  # noqa: E731
+        rows = sorted(rows, key=lambda r: (-tier(r["address"]), -(r["score"] or 0)))
         started = []
         for r in rows:
-            if len(started) >= free:
-                break
             addr = r["address"]
+            h = holds.get(addr)
+            if h is not None and h < need:
+                # скальпера — из очереди сразу, даже если мест сейчас нет: не ждёт своей очереди зря
+                await self._close(addr, "rejected", scalper_text(h, need), REJECT_DAYS)
+                self.stats["rejected"] += 1
+                continue
+            if len(started) >= free:
+                continue
             launched = await self.db.fetchval("SELECT count(*) FROM tokens WHERE deployer=$1", addr)
             if launched and launched >= 2 or await linked_to_dev(self.db, addr):
                 await self._close(addr, "rejected", "дев или связан с кластером дева", REJECT_DAYS)
@@ -459,6 +496,80 @@ class Scout:
         if not started:
             return []
         return [f"🧪 на испытание {len(started)}: " + "; ".join(started[:8]) + (" …" if len(started) > 8 else "")]
+
+    async def hold_of(self, addrs: list[str], stats: dict[str, Any] | None = None) -> dict[str, float]:
+        """Сколько кошелёк держит монету (медиана, с): по своей базе — пересчёт трейдеров или сделки за 30 дней
+        (от первой покупки до последней продажи; 3+ монеты), иначе — средняя GMGN из данных кандидата."""
+        if not addrs:
+            return {}
+        out = {r["address"]: float(r["median_hold_s"]) for r in await self.db.fetch(
+            """SELECT address, median_hold_s FROM traders WHERE address = ANY($1::text[])
+                 AND median_hold_s IS NOT NULL AND trades_30d >= 3""", addrs)}
+        rest = [a for a in addrs if a not in out]
+        if rest:
+            try:
+                rows = await LK._fetch(self.db, """
+                    SELECT trader, percentile_cont(0.5) WITHIN GROUP (ORDER BY hold) hold FROM (
+                        SELECT trader, mint, extract(epoch FROM max(ts) FILTER (WHERE NOT is_buy)
+                                                         - min(ts) FILTER (WHERE is_buy)) hold
+                        FROM trades WHERE trader = ANY($1::text[]) AND ts > now() - interval '30 days'
+                        GROUP BY trader, mint) x
+                    WHERE hold > 0 GROUP BY trader HAVING count(*) >= 3""", rest, timeout_s=30)
+                out.update({r["trader"]: float(r["hold"]) for r in rows})
+            except Exception:  # noqa: BLE001 — база занята: решит испытание
+                log.warning("разведка: удержание кандидатов не посчитано")
+        for a in addrs:
+            if a in out:
+                continue
+            st = (stats or {}).get(a)
+            if isinstance(st, str):
+                try:
+                    import json
+                    st = json.loads(st)
+                except ValueError:
+                    st = None
+            if isinstance(st, dict) and st.get("avg_hold_s") is not None:
+                out[a] = float(st["avg_hold_s"])
+        return out
+
+    async def discover_holders(self) -> int:
+        """Держатели в своей базе (раз в 6 ч): кто за 2 дня закрыл 2+ монеты, держа их в медиане от 10 минут, и в
+        сумме по закрытым — в плюсе; покупал за последние сутки. Таких можно копировать без гонки скорости."""
+        now = time.time()
+        every = float(cfg_get(self.cfg, "scout_holders_every_h")) * 3600
+        if now - getattr(self, "_holders_at", 0.0) < every:
+            return 0
+        self._holders_at = now
+        rows = await LK._fetch(self.db, """
+            WITH p AS (
+                SELECT trader, mint, min(ts) FILTER (WHERE is_buy) b_ts, max(ts) FILTER (WHERE NOT is_buy) s_ts,
+                       sum(sol_amount) FILTER (WHERE is_buy) b_sol, sum(sol_amount) FILTER (WHERE NOT is_buy) s_sol
+                FROM trades WHERE ts > now() - interval '2 days' AND pool = 'pump' GROUP BY trader, mint)
+            SELECT trader, count(*) n, count(*) FILTER (WHERE s_ts > b_ts) closed,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM s_ts - b_ts))
+                       FILTER (WHERE s_ts > b_ts) hold,
+                   sum(s_sol - b_sol) FILTER (WHERE s_ts > b_ts) pnl
+            FROM p WHERE b_sol BETWEEN 0.3 AND 5
+            GROUP BY trader
+            HAVING count(*) >= $1 AND count(*) FILTER (WHERE s_ts > b_ts) >= 2
+               AND max(b_ts) > now() - interval '24 hours'
+            ORDER BY pnl DESC NULLS LAST LIMIT 300""", int(cfg_get(self.cfg, "scout_holders_min_coins")),
+            timeout_s=120)
+        need = float(cfg_get(self.cfg, "scout_holders_min_hold_s"))
+        known = await self._known()
+        sol_usd = self.e.price.value or 150
+        added = 0
+        for r in rows:
+            if r["trader"] in known or r["hold"] is None or float(r["hold"]) < need or float(r["pnl"] or 0) <= 0:
+                continue
+            added += await self._queue(
+                r["trader"], "держатели (своя база)",
+                f"держит монету ~{float(r['hold']) / 60:.0f} мин, за 2 дня закрыл {r['closed']} монет в плюс "
+                f"{float(r['pnl']):+.2f} SOL", score_of(None, int(r["closed"]), float(r["pnl"]) * sol_usd) + 50, None)
+            if added >= 20:
+                break
+        self.stats["found"] += added
+        return added
 
     async def _close(self, addr: str, status: str, why: str, days: float) -> None:
         await self.db.execute(
@@ -513,6 +624,8 @@ class Scout:
         rows = await self.db.fetch("SELECT * FROM scout WHERE status='probation'")
         res = await self.results(TRIAL, [r["address"] for r in rows], "started_at")
         patient = await self.patient_set([r["address"] for r in rows])
+        holds = await self.hold_of([r["address"] for r in rows], {r["address"]: r["stats"] for r in rows})
+        need = float(cfg_get(self.cfg, "scout_min_hold_s"))
         now = datetime.now(timezone.utc)
         auto = int(await self.db.fetchval("SELECT count(*) FROM scout WHERE status='promoted'") or 0)
         cap = int(cfg_get(self.cfg, "scout_max_auto"))
@@ -524,6 +637,13 @@ class Scout:
             TRIAL, [r["address"] for r in rows])}
         out: list[str] = []
         for r in rows:
+            h = holds.get(r["address"])
+            if h is not None and h < need:
+                # скальпер на испытании (пустили до 20.11) — место держателю
+                await self._close(r["address"], "rejected", scalper_text(h, need), REJECT_DAYS)
+                self.stats["rejected"] += 1
+                out.append(f"❌ отсеян {esc(short(r['address']))} — {esc(scalper_text(h, need))}")
+                continue
             x = res.get(r["address"], {"n": 0, "wins": 0, "pnl": 0.0, "cost": 0.0, "best": 0.0})
             age = (now - r["started_at"]).total_seconds() / 86400 if r["started_at"] else 0.0
             v, why = verdict_a(int(x["n"]), int(x["wins"]), float(x["pnl"]), float(x["cost"]), age, self.cfg,

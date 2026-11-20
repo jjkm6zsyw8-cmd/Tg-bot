@@ -135,8 +135,9 @@ async def test_scout_cycle_with_db():
         await db.migrate()
         for mint, rank, w, pnl in (("A1", 1, "W", 0.5), ("A2", 2, "W", 0.3), ("A1", 3, "X", 0.2), ("A3", 1, "X", 0.4),
                                    ("A2", 1, "ONE", 1.0)):
+            # держат по 5 минут: с 20.11 скальперы (меньше 3 минут) в кандидаты не идут
             await db.execute("""INSERT INTO coin_top_traders(mint, rank, trader, pnl_sol, hold_s)
-                                VALUES ($1, $2, $3, $4, 90)""", mint, rank, w, pnl)
+                                VALUES ($1, $2, $3, $4, 300)""", mint, rank, w, pnl)
         loads = []
 
         async def load_traders():
@@ -304,5 +305,71 @@ async def test_promotion_waits_for_open_copies_and_full_trial_can_demote():
         assert await db.fetchval("SELECT status FROM scout WHERE address='W'") == "demoted"
         assert any("испытание целиком" in e for e in events)
         assert not await db.fetchval("SELECT active FROM traders WHERE address='W'")
+    finally:
+        await db.close()
+
+
+async def test_scalpers_cut_before_trial_and_holders_go_first():
+    """20.11: на испытание — только кто держит монету от 3 минут; скальпер на испытании снимается сразу;
+    держатели (30+ мин) — первыми в очереди; поиск держателей по своей базе."""
+    from datetime import datetime, timedelta, timezone
+
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        now = datetime.now(timezone.utc)
+        n = 0
+
+        async def trip(w, mint, hold_s, buy=1.0, sell=1.2, ago_h=5.0):
+            nonlocal n
+            t0 = now - timedelta(hours=ago_h)
+            for is_buy, dt, sol in ((True, 0, buy), (False, hold_s, sell)):
+                n += 1
+                await db.execute(
+                    """INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol, ts, pool,
+                           source) VALUES ($1, $2, $3, $4, $5, 1e7, 50, $6, 'pump', 'blocks')""",
+                    f"s{n}", mint, w, is_buy, sol, t0 + timedelta(seconds=dt))
+        for i in range(3):
+            await trip("SCALP", f"A{i}", 10)              # продаёт через 10 с
+            await trip("HOLD", f"B{i}", 2400)             # держит 40 минут
+            await trip("MID", f"C{i}", 700)               # держит ~12 минут
+        await db.execute("""INSERT INTO scout(address, status, source, score) VALUES
+                            ('SCALP', 'queued', 'x', 100), ('MID', 'queued', 'x', 50), ('HOLD', 'queued', 'x', 10),
+                            ('GMG', 'queued', 'GMGN', 90, '{"avg_hold_s": 25}')""".replace(
+            "('GMG', 'queued', 'GMGN', 90, '{\"avg_hold_s\": 25}')", "('GMG', 'queued', 'GMGN', 90)"))
+        await db.execute("""UPDATE scout SET stats='{"avg_hold_s": 25}'::jsonb WHERE address='GMG'""")
+        sc = Scout(SimpleNamespace(db=db, cfg={"scout_slots": 2}, price=SimpleNamespace(value=100.0), ext=None,
+                                   scouts=set()))  # type: ignore[arg-type]
+        holds = await sc.hold_of(["SCALP", "HOLD", "MID", "GMG"],
+                                 {"GMG": {"avg_hold_s": 25}})
+        assert holds["SCALP"] == pytest.approx(10) and holds["HOLD"] == pytest.approx(2400) and holds["GMG"] == 25
+        ev = await sc.fill_slots()
+        st = {r["address"]: r for r in await db.fetch("SELECT address, status, decision FROM scout")}
+        assert st["HOLD"]["status"] == "probation" and st["MID"]["status"] == "probation"   # держатели первыми
+        assert st["SCALP"]["status"] == "rejected" and "скальпер" in st["SCALP"]["decision"]
+        assert st["GMG"]["status"] == "rejected"                                              # GMGN: 25 с
+        assert ev and "HOLD" in ev[0]
+        # скальпер, уже стоящий на испытании (пустили раньше), — снимается при следующем решении
+        await trip("SCALP2", "D0", 5)
+        await trip("SCALP2", "D1", 5)
+        await trip("SCALP2", "D2", 5)
+        await db.execute("INSERT INTO scout(address, status, started_at) VALUES ('SCALP2', 'probation', now())")
+        out = await sc.decide()
+        assert any("скальпер" in e for e in out)
+        assert await db.fetchval("SELECT status FROM scout WHERE address='SCALP2'") == "rejected"
+        # поиск держателей по своей базе: держит ≥10 мин, закрыл 2+ монеты в плюс, покупал за сутки
+        for i in range(3):
+            await trip("NEWHOLD", f"E{i}", 900, buy=1.0, sell=1.5)
+            await trip("NEWFAST", f"F{i}", 30, buy=1.0, sell=1.5)
+        assert await sc.discover_holders() >= 1
+        q = {r["address"]: r for r in await db.fetch("SELECT address, source, reason FROM scout WHERE status='queued'")}
+        assert "NEWHOLD" in q and q["NEWHOLD"]["source"] == "держатели (своя база)" and "~15 мин" in q["NEWHOLD"]["reason"]
+        assert "NEWFAST" not in q
+        assert await sc.discover_holders() == 0                                               # раз в 6 часов
     finally:
         await db.close()
