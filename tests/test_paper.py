@@ -250,7 +250,7 @@ async def test_stale_own_price_is_not_used():
 
 
 async def test_entry_price_sources(monkeypatch):
-    """Вход по рыночной цене: Jupiter → сделка своего потока не старше 10 с → не входим. «Тренды» — DexScreener."""
+    """Вход по рыночной цене: Jupiter → сделка своего потока не старше 10 с → не входим. «Тренды» — тоже Jupiter."""
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
     opened = []
 
@@ -262,8 +262,13 @@ async def test_entry_price_sources(monkeypatch):
     tr._open = fake_open
     tr.lock = __import__("asyncio").Lock()
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
-    assert opened and opened[0] == (3000.0, "dex")                   # «Тренды» — по DexScreener
+    assert not opened and "Jupiter" in tr.skipped["*"]               # «Тренды»: Jupiter не знает монету — не входим
+    tr.e.ext = FakeExt(300_000, jup=310_000 / 1e9)                   # DexScreener $300k, Jupiter $310k
+    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 2900.0}, None)
+    assert opened[0] == (pytest.approx(3100.0), "jup")               # вход по рынку Jupiter, не по DexScreener
     opened.clear()
+    tr.jup_cache.clear()
+    tr.e.ext = FakeExt(300_000)
     await tr.on_alert("M", "normal", None, {"mc": 28.0}, None)       # Jupiter нет — свежая сделка своего потока
     assert opened[0] == (28.0, "own")
     opened.clear()
@@ -349,7 +354,11 @@ async def test_entry_skipped_when_jupiter_disagrees(monkeypatch):
     tr._open = fake_open
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
     assert not opened and "Jupiter" in tr.skipped["*"]
-    tr.e.ext = FakeExt(300_000, jup=None)                # Jupiter молчит — входим по DexScreener
+    tr.e.ext = FakeExt(300_000, jup=None)                # Jupiter молчит — не входим (с 20.11; раньше — по DexScreener)
+    tr.jup_cache.clear()
+    await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
+    assert not opened
+    tr.e.ext = FakeExt(300_000, jup=0.00029)             # сходятся — входим
     await tr.on_alert("M", "normal", None, {"trend": {"pc_m5": 10}, "mc": 3000.0}, None)
     assert opened
 
@@ -558,7 +567,7 @@ async def test_trends_go_to_their_own_portfolio_t(monkeypatch):
     """20.11: тренды в бумаге по умолчанию — в свой портфель T (раньше их портфели C–F были закрыты и тренды не
     входили никуда); выключаются переключателем «Тренды в бумаге»."""
     monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
-    tr = bare_trader({}, FakeExt(300_000))
+    tr = bare_trader({}, FakeExt(300_000, jup=0.0003))
     opened = []
 
     async def fake_open(*a, **k):

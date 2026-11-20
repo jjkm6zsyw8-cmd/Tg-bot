@@ -95,7 +95,8 @@ BIGCOPY_SOL = 5.0
 TRIAL = "S"
 # T — «тренды» (с 20.11, наблюдение): монеты, которые уже растут на DexScreener (импульс или откат после него) — это
 # монеты постарше, вне первых минут жизни. До 20.11 тренды в бумагу не попадали вовсе: их портфели C–F закрыты 12.11,
-# а переключатель «Тренды в бумаге» входу не помогал. Как G, по $10
+# а переключатель «Тренды в бумаге» входу не помогал. Как G, по $10. Цена — рынок Jupiter, как у всех (первые сделки
+# 20.11 шли по DexScreener: вход и выход без проверки блокчейном, только свечи ±15%)
 TREND = "T"
 OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY, TRIAL, TREND)
 OBSERVE_USD = 10.0
@@ -194,7 +195,8 @@ SCHEMES: dict[str, dict[str, Any]] = {
             "stop": 0.50, "tp_net": None, "tp_share": 0.0, "trail": 0.35, "trail_after_net": 0.30, "target": False,
             "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 24 * 3600},
 }
-SCHEMES[TREND] = {**_G, "name": "T: тренды — монеты, которые уже растут (DexScreener), как G, по $10",
+SCHEMES[TREND] = {**_G, "name": "T: тренды — монеты, которые уже растут (сигнал DexScreener, цена — рынок Jupiter), "
+                                     "как G, по $10",
                   "max_hold_s": 1800}
 SCHEMES[TRIAL] = {**SCHEMES["A"], "name": "S: испытание кандидатов разведки как боевой бот — правило A (всё на +25% "
                                          "без стопа, выход за трейдером, до 30 мин), по $10"}
@@ -207,7 +209,8 @@ LEGEND = ("с 12.11 — только smart (по факту недели коп�
           "старт $100 (H — $1000) · R — смарт-ракеты: новые покупки держателей (≥30 мин), трейл 35% после +30%, "
           "стоп −50%, до суток, по $10, старт $1000, без дневного сброса · Y — мой дев: запуски девов из списка, вход "
           "через 4 блока после создания, как G · K — крупные копии (трейдер от 5 SOL), как G · T — тренды "
-          "(монеты, которые уже растут, DexScreener), как G · Y, K, T — по $10, старт $1000 · M и бой — только "
+          "(монеты, которые уже растут: сигнал DexScreener, вход и выход по рынку Jupiter), как G · Y, K, T — по $10, "
+          "старт $1000 · M и бой — только "
           "кошельки с устойчивым плюсом копий (t ≥ 1.645) · во всех: трейдер мелко докупил (до ~$5) — выходим сразу")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
@@ -1168,22 +1171,25 @@ class PaperTrader:
             await self._sell(p, reason, share, mc)
 
     async def _trend_entry_price(self, mint: str, data: dict[str, Any]) -> tuple[float | None, str]:
-        """«Тренды» — по DexScreener (по нему дан алерт), со сверкой с Jupiter."""
-        dex = await self.dex_price(mint)
+        """«Тренды»: сигнал даёт DexScreener, а цена входа — рынок (Jupiter), как у остальных портфелей; дальше стопы,
+        тейки и выход — тоже по Jupiter (позиция с src «jup» идёт общим путём). Первые сделки T (20.11) и входили, и
+        выходили по DexScreener — источнику, от которого бумага отказалась 8–9.11 (входы ниже рынка завышали плюс);
+        защитой были только сверка с Jupiter «не дальше чем вдвое» и минутные свечи ±15%.
+        Jupiter не знает монету — не входим. DexScreener дальше чем вдвое от Jupiter — пара к экзотическому токену."""
+        jm = await self.jupiter_mc(mint, ttl=1.0)
+        if not jm:
+            self.skipped.setdefault("*", "тренд: у Jupiter нет цены монеты — не входим")
+            return None, "jup"
         ext = getattr(self.e, "ext", None)
-        if dex and ext is not None:
+        if ext is not None:
             pair = await ext.dex_pair(mint, timeout=2.0, ttl=1.0)
-            jp = await ext.jup_price(mint)
             pu = (pair or {}).get("price_usd")
-            if jp and pu and not 0.5 <= pu / jp <= 2.0:
+            jp = jm * (self.e.price.value or 150) / 1e9
+            if pu and not 0.5 <= pu / jp <= 2.0:
                 log.warning("paper %s: DexScreener %.3g $ и Jupiter %.3g $ расходятся — не входим", mint, pu, jp)
                 self.skipped.setdefault("*", "цена DexScreener не сходится с Jupiter")
-                return None, "dex"
-        mc = dex or data.get("mc")
-        if not mc or mc <= 0:
-            self.skipped.setdefault("*", "нет свежей цены монеты")
-            return None, "dex"
-        return float(mc), "dex"
+                return None, "jup"
+        return float(jm), "jup"
 
     async def _open(self, name: str, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
                     trader: str | None, mc: float, src: str = "auto") -> float | None:
