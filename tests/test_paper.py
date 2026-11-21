@@ -1039,3 +1039,21 @@ async def test_portfolio_n_skips_when_price_already_at_target():
     assert "уже у цели" in tr.skipped["N"]
     assert await pp.PaperTrader._open(tr, "N", "M", "strong", None, {}, None, 40.0) is None
     assert "нет цели" in tr.skipped["N"]
+
+
+async def test_holder_copies_in_h_follow_the_trader(monkeypatch):
+    """21.11: 6d7y держит ~27 мин (копируемость +21%), а копии в H по G выходили через 5 минут — 1 из 12 в плюсе.
+    Копия держателя (от 3 мин) в H — «за трейдером»: без тейка и 5-минутки, аварийный стоп −50%, до 6 ч."""
+    tr = bare_trader({})
+    tr.e.traders = {"HOLDER": {"median_hold_s": 1600}, "SCALP": {"median_hold_s": 9}}
+    assert tr.is_holder("HOLDER") and not tr.is_holder("SCALP") and not tr.is_holder(None)
+    p = pos(entry=40.0, target=None)
+    p.portfolio, p.rule = "H", "hold"
+    sc = pp.PaperTrader.scheme_for(p)
+    assert sc is pp.HOLD_FOLLOW
+    assert decide_exit(p, 34.0, 400, sc, 125, 0.0005) is None          # −15% и 6+ минут — держим, как он
+    assert decide_exit(p, 60.0, 400, sc, 125, 0.0005) is None          # +50% — тоже держим (тейка нет)
+    assert decide_exit(p, 19.0, 400, sc, 125, 0.0005) == ("stop", 1.0)  # −52% — аварийный стоп
+    p2 = pos(entry=40.0, target=None)
+    p2.portfolio = "H"
+    assert pp.PaperTrader.scheme_for(p2) is pp.SCHEMES["H"]            # копия скальпера — как раньше, по G

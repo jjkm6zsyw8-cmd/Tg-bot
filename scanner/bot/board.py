@@ -79,6 +79,12 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
         w["n"] += 1
         w["plus"] += pct > 0
         w["sum_pct"] += pct
+    for r in await db.fetch(
+            """SELECT source_wallet, count(*) n, count(*) FILTER (WHERE pnl_pct > 0) w, COALESCE(sum(pnl_pct), 0) s
+               FROM paper_positions WHERE source_wallet = ANY($1::text[]) AND portfolio = 'H' AND rule = 'hold'
+                 AND closed_at IS NOT NULL AND NOT suspect AND exit_reason IS DISTINCT FROM 'reset'
+               GROUP BY 1""", addrs):
+        out[r["source_wallet"]]["hold"] = (int(r["n"]), int(r["w"]), float(r["s"]))
     for w in out.values():
         w["tier"] = w.get("manual_tier") or w.get("tier") or "new"
         w["section"] = section_of(w["tier"])
@@ -147,6 +153,10 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
              (f"Копии на бумаге (${COPY_USD:g}): {w['n']} сд., в плюсе {w['plus']} ({w['plus'] / w['n']:.0%}), итог "
               f"<b>{money(w['copy_usd'])}</b> · твой кошелёк (ставка ${stake:g}) ≈ {money(w['sum_pct'] * stake)}")
              if w["n"] else "Копий на бумаге пока нет.",
+             (f"   из них «за трейдером» (продаёт, когда он): {w['hold'][0]} сд., в плюсе {w['hold'][1]}, итог "
+              f"{money(w['hold'][2] * COPY_USD)}" if w.get("hold") else
+              ("   копии держателя теперь идут «за трейдером» (продаёт, когда он), а не по G"
+               if float(w.get("median_hold_s") or 0) >= 180 else "")),
              "Копируемость 30 д: " + (f"{float(w['copy_30d']):+.0%} на сделку" if w.get("copy_30d") is not None else "—")
              + (f", устойчивость t={float(w['copy_t_30d']):.1f} (от 1.645 — не случайность)"
                 if w.get("copy_t_30d") is not None else ""),
@@ -157,7 +167,7 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
           [{"text": "GMGN ↗", "url": f"https://gmgn.ai/sol/address/{addr}"},
            {"text": "🗑 Убрать из списка…", "callback": f"bd:x:{addr}"}],
           [{"text": "← Доска", "callback": f"bd:s:{w['section']}"}]]
-    return "\n".join(lines), kb
+    return "\n".join(x for x in lines if x), kb
 
 
 def live_confirm(cfg: dict[str, Any], addr: str) -> tuple[str, list[list[dict[str, Any]]]]:

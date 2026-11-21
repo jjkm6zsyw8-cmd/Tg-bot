@@ -84,3 +84,26 @@ async def test_mid_section_sorted_by_copyability_and_find():
         assert await B.find(db, "zzzz") and not await B.find(db, "nope")
     finally:
         await db.close()
+
+
+async def test_rating_of_holder_uses_follow_copies():
+    """Держатель с 3+ копиями «за трейдером» — рейтинг по ним, а не по старым копиям G (выход через 5 мин)."""
+    from scanner.analytics import rating
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        rows = [("G", -0.08, None)] * 6 + [("H", 0.25, "hold")] * 3
+        for i, (port, pct, rule) in enumerate(rows):
+            await db.execute(
+                """INSERT INTO paper_positions(portfolio, mint, opened_at, closed_at, entry_mc, cost_sol, tokens,
+                       tokens_initial, exit_reason, pnl_sol, pnl_pct, source_wallet, rule)
+                   VALUES ($1, $2, now(), now() - make_interval(secs => $5), 30, 0.1, 1, 1, 'x', 0, $3, 'HOLDER', $4)""",
+                port, f"M{i}", pct, rule, float(i))
+        r = (await rating.compute(db, {}))["HOLDER"]
+        assert r["n"] == 3 and r["tier"] in ("ok", "top") and r["sum"] > 0
+    finally:
+        await db.close()

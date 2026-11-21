@@ -82,16 +82,24 @@ def mult_of(tier: str, cfg: dict[str, Any]) -> float:
 async def compute(db: Any, cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Рейтинг всех кошельков с копиями: адрес → {tier, mult, score, n, wins, sum, manual}."""
     rows = await db.fetch(
-        """SELECT source_wallet w, pnl_pct FROM (
-               SELECT source_wallet, pnl_pct, row_number() OVER (PARTITION BY source_wallet ORDER BY closed_at DESC) rn
+        """SELECT source_wallet w, pnl_pct, rule FROM (
+               SELECT source_wallet, pnl_pct, rule,
+                      row_number() OVER (PARTITION BY source_wallet ORDER BY closed_at DESC) rn
                FROM paper_positions
                WHERE source_wallet IS NOT NULL AND portfolio = ANY($1::text[]) AND closed_at IS NOT NULL
                  AND exit_reason <> 'reset' AND NOT suspect AND closed_at > now() - interval '14 days') x
            WHERE rn <= $2""", list(REF_PORTFOLIOS), WINDOW)
     from .origin import capped
     by: dict[str, list[float]] = {}
+    held: dict[str, list[float]] = {}
     for r in rows:                      # икс выше +100% считается как +100%: одна ракета не делает кошелёк «топом»
         by.setdefault(r["w"], []).append(capped(float(r["pnl_pct"] or 0)))
+        if r["rule"] == "hold":
+            held.setdefault(r["w"], []).append(capped(float(r["pnl_pct"] or 0)))
+    for w, pcts in held.items():
+        # 21.11: держатели — по копиям «за трейдером»; старые копии по G (выход через 5 мин) их занижали
+        if len(pcts) >= int(cfg_get(cfg, "rating_min_copies")):
+            by[w] = pcts
     manual = {r["address"]: r["manual_tier"] for r in await db.fetch(
         "SELECT address, manual_tier FROM wallet_rating WHERE manual_tier IS NOT NULL")}
     out: dict[str, dict[str, Any]] = {}

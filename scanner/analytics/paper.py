@@ -60,7 +60,7 @@ SMART_ONLY = ""               # smart-money — во все основные п�
 # H — испытательный срок: кандидаты «Разведки» (analytics/scout.py) копируются только сюда, как G, фиксированной
 # суммой; по итогу их копий разведка решает — в свой список или в отсев. На остальные портфели не влияет.
 SCOUT = "H"
-SCOUT_MAX_OPEN = 40            # с 12.11 сюда же идут копии своего списка (наблюдение, без денег) — поток больше
+SCOUT_MAX_OPEN = 80            # с 12.11 сюда же идут копии своего списка (наблюдение, без денег) — поток больше
 SCOUT_USD = 10.0
 SCOUT_START_MULT = 10          # H — наблюдение: старт ×10 ($1000), чтобы $10-копии не упирались в баланс
 # С 12.11 (решение по факту недели 5–11.11, scripts/entry_check.py, сделки в порядке блоков, $10 на сигнал):
@@ -213,6 +213,13 @@ SCHEMES[DEV_NEW] = {"name": "N: опыт — сильные «ДЕВ+НОВАЯ�
                              "до 30 мин, по $10", "stop": 0.20, "tp_net": None, "tp_share": 0.0, "trail": None,
                     "target": True, "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 1800,
                     "ignore_trader_sell": True}
+# 21.11: копии держателей в H — «за трейдером». Правило G (тейк +25%, стоп −8%, 5 мин без +10% — выход) резало
+# кошельки, которые держат монету минутами: 6d7y держит ~27 мин, копируемость +21% (t=2.3), а копии в H — 1 из 12 в
+# плюсе: бумага выходила через 5 минут. Копия держателя продаёт, когда продаёт он; аварийный стоп −50%, до 6 ч
+HOLDER_MIN_HOLD_S = 180.0
+HOLD_FOLLOW = {"name": "H, держатель: продать, когда продаёт он; аварийный стоп −50%, до 6 ч", "stop": 0.50,
+               "tp_net": None, "tp_share": 0.0, "trail": None, "target": False, "time_stop_s": None,
+               "time_stop_gain": None, "max_hold_s": 6 * 3600}
 SCHEMES[TRIAL] = {**SCHEMES["A"], "name": "S: испытание кандидатов разведки как боевой бот — правило A (всё на +25% "
                                          "без стопа, выход за трейдером, до 30 мин), по $10"}
 LEGEND = ("с 12.11 — только smart (по факту недели копии в минусе при любой тактике): "
@@ -1311,6 +1318,8 @@ class PaperTrader:
         self.balance[name] -= size
         target = data.get("target_mc")
         rule = kind or ("copy" if data.get("copy_wallet") else None)
+        if name == SCOUT and self.is_holder(data.get("copy_wallet") or data.get("source_wallet") or trader):
+            rule = "hold"                         # копия держателя — «за трейдером», а не по G
         now = datetime.now(timezone.utc)
         pid = await self.db.fetchval(
             """INSERT INTO paper_positions(portfolio, mint, alert_id, level, symbol, opened_at, entry_mc, cost_sol,
@@ -1488,7 +1497,17 @@ class PaperTrader:
     def scheme_for(p: Position) -> dict[str, Any]:
         if p.portfolio == MAIN:
             return M_KINDS.get(p.rule or "copy", M_KINDS["copy"])      # M: схема по типу сигнала позиции
+        if p.portfolio == SCOUT and p.rule == "hold":
+            return HOLD_FOLLOW
         return SCHEMES[p.portfolio]
+
+    def is_holder(self, wallet: str | None) -> bool:
+        """Кошелёк обычно держит монету от 3 минут (своя база: пересчёт трейдеров)."""
+        t = (getattr(self.e, "traders", None) or {}).get(wallet or "") or {}
+        try:
+            return float(t.get("median_hold_s") or 0) >= HOLDER_MIN_HOLD_S
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def kind_of(data: dict[str, Any]) -> str:
