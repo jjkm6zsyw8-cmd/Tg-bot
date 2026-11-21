@@ -131,7 +131,7 @@ async def test_paper_trader_full_cycle(monkeypatch, old_schemes):
         period = await tr.render_period(1)
         assert "за 1 час" in period and "★" in period and "всё на +25%" in period
         whole = await tr.render()                                 # /paper и кнопка «Всё» (hours=None)
-        assert "за всё время" in whole and "период" not in whole
+        assert ("за всё время" in whole or "с последнего сброса" in whole) and "период" not in whole
         hist = await tr.history()
         assert "дев продал" in hist
         day = await tr.trades_text(24)

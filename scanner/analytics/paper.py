@@ -1824,6 +1824,11 @@ class PaperTrader:
         per = await self._row(since)
         tot = per if hours is None else await self._row(None)
         title = PERIOD_NAMES.get(hours) or f"за {hours:g} ч"   # f-строка в get() считалась и при hours=None
+        if hours is None:
+            # 22.11: «за всё время» читалось как «за всё время работы», а портфели сбрасываются каждую ночь
+            last = await self.db.fetchval("SELECT max(reset_at) FROM paper_portfolios")
+            if last is not None:
+                title = f"с последнего сброса ({last.astimezone(self.tz()):%d.%m %H:%M}) · R — без сброса"
         lines = [f"📒 <b>Бумага · {title}</b> · позиция {self.share():.0%}"
                  + (" (×1.5 сильный / ×0.75 обычный)" if self.cfg.get("paper_size_by_level", True) else "")]
 
