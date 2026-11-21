@@ -450,7 +450,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             f" · отбор: {PICKS[pick]}.\n" if pick else ".\n")
         await reply(m, f"📥 Принял кошельков: <b>{len(found)}</b> (новых {new}).\n{sample}{more}\n{src}\n"
                        "Слежка в реальном времени начнётся в течение минуты. Проверяю историю каждого "
-                       "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в топик «Смарт-мани».")
+                       "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в тему «Копитрейд».")
 
     @router.message(Command("diag"))
     async def cmd_diag(m: Message) -> None:

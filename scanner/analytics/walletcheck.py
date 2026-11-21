@@ -223,5 +223,5 @@ async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
                      f"{float(cfg.get('copy_min_buy_sol', 0.1)):g} SOL, выход при их продаже\n" + "\n".join(trader_lines)
                      + "\n<i>Копия — без нашей задержки, это потолок; честную цифру покажет бумага.</i>")
     text = "\n".join(parts)
-    for i in range(0, len(text), 3800):
-        await e.db.enqueue("text", {"topic": "copy", "text": text[i:i + 3800]}, priority=4)
+    for part in fmt.split_html(text, 3800):      # по строкам, теги разметки целые
+        await e.db.enqueue("text", {"topic": "copy", "text": part}, priority=4)
