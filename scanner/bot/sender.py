@@ -21,6 +21,7 @@ from aiogram.types import BufferedInputFile, LinkPreviewOptions, ReplyParameters
 
 from ..config import Env, Settings
 from ..db.pool import Database
+from ..alerts.format import split_html
 from .keyboards import build
 
 log = logging.getLogger(__name__)
@@ -309,6 +310,13 @@ class Sender:
         chat = self.chat_id
         if chat is None:
             raise RuntimeError("нет получателя: задайте ALERT_CHAT_ID или ALLOWED_USER_IDS")
+        parts = split_html(text) if len(text) > 4000 else [text]
+        for part in parts[:-1]:                 # длинный текст — несколькими сообщениями, кнопки — у последнего
+            self.limiter.take()
+            await self.bot.send_message(
+                chat, part, parse_mode="HTML", disable_notification=silent, link_preview_options=NO_PREVIEW,
+                message_thread_id=thread if thread is not None else self.thread(topic))
+        text = parts[-1]
         self.limiter.take()
         return await self.bot.send_message(
             chat, text, parse_mode="HTML", reply_markup=build(keyboard, self.styles),
@@ -352,7 +360,7 @@ class Sender:
             topic = {"full": "full", "system": "system"}.get(kind, p.get("topic"))
             await self.send(p["text"], topic, p.get("keyboard"), silent=True)
         elif kind == "daily":
-            await self.send(p["text"][:4000], "daily", p.get("keyboard"), silent=False)
+            await self.send(split_html(p["text"])[0], "daily", p.get("keyboard"), silent=False)
             if p.get("csv"):
                 chat = self.chat_id
                 self.limiter.take()

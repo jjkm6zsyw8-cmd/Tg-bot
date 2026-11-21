@@ -388,15 +388,9 @@ def to_xlsx(cols: dict[float, Columns], text: str) -> bytes:
 
 
 def split(text: str, limit: int = 3800) -> list[str]:
-    parts, cur = [], ""
-    for ln in text.split("\n"):
-        if cur and len(cur) + len(ln) + 1 > limit:
-            parts.append(cur)
-            cur = ""
-        cur = f"{cur}\n{ln}" if cur else ln
-    if cur:
-        parts.append(cur)
-    return parts
+    """Текст на сообщения по строкам; теги разметки на стыке закрываются и открываются заново."""
+    from ..alerts.format import split_html
+    return split_html(text, limit)
 
 
 async def run(db: Any, days: float = 3.0, at: Iterable[float] = (30.0, 60.0), send: bool = True,

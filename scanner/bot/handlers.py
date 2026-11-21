@@ -10,6 +10,7 @@ from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObject
 
+from ..alerts import format as fmt
 from ..alerts.format import esc, pct
 from ..analytics.newcoins import DEFAULTS as _NEW_DEFAULTS
 
@@ -161,8 +162,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await ext.publish_health("bot")
         except Exception:  # noqa: BLE001
             pass
-        for i in range(0, len(text), 4000):
-            await m.answer(text[i:i + 4000], parse_mode="HTML", reply_markup=build(kb) if i == 0 else None,
+        for i, part in enumerate(fmt.split_html(text)):
+            await m.answer(part, parse_mode="HTML", reply_markup=build(kb) if i == 0 else None,
                            link_preview_options=NO_PREVIEW)
 
     def main_menu() -> list[list[dict[str, Any]]]:
@@ -502,7 +503,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             for e_ in errs[-5:]:
                 lines.append(f"• {fmt.ago((now - datetime.fromisoformat(e_['at'])).total_seconds())} назад · "
                              f"{esc(e_.get('cmd') or '')} · {esc(e_['text'][:150])}")
-        await reply(m, "\n".join(lines)[:4000])
+        await reply(m, "\n".join(lines))
 
     @router.message(Command("copylog"))
     async def cmd_copylog(m: Message, command: CommandObject) -> None:
@@ -711,7 +712,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         if not is_valid_address(addr):
             return
         text, kb = await (views.wallet_view(db, addr, ext) if kind == "w" else views.coin_view(db, settings, addr, ext))
-        await c.message.answer(text[:4000], parse_mode="HTML", reply_markup=build(kb), link_preview_options=NO_PREVIEW)
+        await c.message.answer(fmt.split_html(text)[0], parse_mode="HTML", reply_markup=build(kb), link_preview_options=NO_PREVIEW)
 
     @router.callback_query(F.data.startswith(("wt:", "wb:")))
     async def cb_wallet_actions(c: CallbackQuery) -> None:
@@ -868,7 +869,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def cmd_filter(m: Message) -> None:
         """Автофильтр сигналов: чему научился на сделках трейдеров, включён ли, что отсеивает."""
         from ..analytics.autofilter import filter_report
-        await reply(m, (await filter_report(db))[:4000])
+        await reply(m, await filter_report(db))
 
     @router.message(Command("rating"))
     async def cmd_rating(m: Message, command: CommandObject) -> None:
@@ -901,7 +902,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def cmd_scout(m: Message) -> None:
         """Разведка кошельков: кто на испытании, кого добавили и отсеяли."""
         from ..analytics.scout import scout_report
-        await reply(m, (await scout_report(db))[:4000])
+        await reply(m, await scout_report(db))
 
     @router.message(Command("wallets"))
     async def cmd_wallets(m: Message) -> None:
@@ -1075,7 +1076,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await cmd_wallets(m)
         if what == "scout":
             from ..analytics.scout import scout_report
-            return await show(m, (await scout_report(db))[:4000])
+            return await show(m, await scout_report(db))
         if what == "rating":
             return await cmd_rating(m, CommandObject(prefix="/", command="rating", args=None))
         if what == "copylog":
@@ -1103,7 +1104,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         else:
             cfg = await reload()
             text, _csv, kb = await build_daily(db, settings, today_in(cfg.get("timezone", "UTC")))
-        await show(m, text[:4000], kb)
+        await show(m, text, kb)
 
     @router.callback_query(F.data.startswith(("mode:", "tog:", "set:", "preset:")))
     async def cb_settings(c: CallbackQuery) -> None:
@@ -1164,7 +1165,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         _, kind, ref = c.data.split(":", 2)
         await c.answer()
         text = await (views.dev_view(db, settings, ref, ext) if kind == "d" else views.trader_view(db, settings, ref, ext))
-        await c.message.answer(text[:4000], parse_mode="HTML")
+        await c.message.answer(fmt.split_html(text)[0], parse_mode="HTML")
 
     @router.callback_query(F.data.startswith("trk:"))
     async def cb_track(c: CallbackQuery) -> None:

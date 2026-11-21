@@ -229,3 +229,44 @@ def render_full_line(t: dict[str, Any], sol_usd: float) -> str:
     side = "🟢 BUY" if t["is_buy"] else "🔴 SELL"
     return (f"{side} {esc(t.get('label') or short(t['trader']))} {t['sol']:.2f} SOL · "
             f"${esc(t.get('symbol') or '?')} · MC {mc_usd(t['mc'], sol_usd)} · <code>{esc(t['mint'])}</code>")
+
+
+_TAG = __import__("re").compile(r"<(/?)(b|i|u|s|code|pre|a)(\s[^>]*)?>")
+
+
+def split_html(text: str, limit: int = 3900) -> list[str]:
+    """Длинный текст с разметкой Telegram — на сообщения не длиннее limit: по строкам, теги, открытые на стыке,
+    закрываются в конце части и открываются заново в следующей (21.11: /paper резался по 4000 символов внутри
+    <i>…</i> — «can't find end tag»)."""
+    lines: list[str] = []
+    for ln in text.split("\n"):
+        while len(ln) > limit:                          # строка длиннее сообщения — режем по месту, не внутри тега
+            cut = ln.rfind(" ", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            if ln.rfind("<", 0, cut) > ln.rfind(">", 0, cut):
+                cut = ln.rfind("<", 0, cut)
+            lines.append(ln[:cut])
+            ln = ln[cut:]
+        lines.append(ln)
+    parts: list[str] = []
+    cur, stack = "", []                                 # stack — открытые теги: (имя, открывающий тег целиком)
+    reopen = ""
+    for ln in lines:
+        if cur and len(cur) + len(ln) + 1 + sum(len(n) + 3 for n, _ in stack) > limit:
+            parts.append(cur + "".join(f"</{n}>" for n, _ in reversed(stack)))
+            reopen = "".join(t for _, t in stack)
+            cur = ""
+        piece = (reopen + ln) if not cur else ln
+        reopen = ""
+        cur = f"{cur}\n{piece}" if cur else piece
+        for m in _TAG.finditer(ln):
+            if m.group(1):
+                for k in range(len(stack) - 1, -1, -1):
+                    if stack[k][0] == m.group(2):
+                        del stack[k]
+                        break
+            else:
+                stack.append((m.group(2), m.group(0)))
+    if cur:
+        parts.append(cur)
+    return parts or [""]
