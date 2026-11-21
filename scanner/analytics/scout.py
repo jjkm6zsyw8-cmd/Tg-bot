@@ -270,6 +270,7 @@ class Scout:
         self.stats = {"found": 0, "queued": 0, "started": 0, "promoted": 0, "rejected": 0, "demoted": 0,
                       "gmgn_errors": 0, "runs": 0}
         self._token_cursor = 0
+        self.channels: dict[str, dict[str, Any]] = {}   # итог последнего запуска каналов поиска — в отчёт /scout
         self._trend_done: set[str] = set()      # монеты трендов, по которым уже искали ранних покупателей
         self.lookalike = LK.Lookalike(engine)
         self.family = FAM.Family(engine, self)
@@ -324,6 +325,10 @@ class Scout:
         if self.dune.key and (self._dune_task is None or self._dune_task.done()):
             self._dune_task = asyncio.create_task(self._dune_bg())   # весь PumpSwap через Dune — раз в сутки, в фоне
         await self.load()
+        try:
+            await self.db.kv_set(CHANNELS_KEY, self.channels)     # итог каналов — в отчёт /scout (процесс бота)
+        except Exception:  # noqa: BLE001
+            pass
         if events:
             await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
         return events
@@ -390,6 +395,12 @@ class Scout:
                                  {"copy_30d": copy, "copy_t": t, "trades": n, "hold_s": hold}):
                 added.append(f"• <code>{addr[:4]}…{addr[-4:]}</code> — {reason}")
         self.stats["found"] += len(added)
+        self.channels["copytest"] = {"at": datetime.now(timezone.utc).isoformat(), "computed": computed,
+                                     "found": len(good), "queued": len(added)}
+        try:
+            await self.db.kv_set(CHANNELS_KEY, self.channels)
+        except Exception:  # noqa: BLE001
+            pass
         return computed, added
 
     async def _dune_bg(self) -> None:
@@ -491,12 +502,23 @@ class Scout:
     async def discover_gmgn(self, tokens_per_run: int = 6, wallets_per_run: int = 15) -> int:
         ext = getattr(self.e, "ext", None)
         gm = getattr(ext, "gmgn", None)
+        now_iso = datetime.now(timezone.utc).isoformat()
         if gm is None or not gm.enabled:
+            self.channels["gmgn"] = {"at": now_iso, "off": getattr(gm, "disabled_reason", None) or "нет ключа"}
             return 0
+        ch: dict[str, Any] = {"at": now_iso, "tokens": 0, "traders": 0, "trader_ok": 0, "checked": 0, "queued": 0,
+                              "errors": 0, "why": {}}
+        self.channels["gmgn"] = ch
+
+        def why(reason: str) -> None:
+            key = reason.split(" (")[0].split(" — ")[0][:40]
+            ch["why"][key] = ch["why"].get(key, 0) + 1
         try:
             hot = await gm.trending("1h", 20)
-        except Unavailable:
+        except Unavailable as exc:
             self.stats["gmgn_errors"] += 1
+            ch["errors"] += 1
+            ch["error"] = str(exc)[:60]
             return 0
         # 20.11: монеты трендов (T), закрытые в плюс за сутки, — первыми: кто их рано купил и держал
         trend = [{"mint": r["mint"], "symbol": r["symbol"]} for r in await self.db.fetch(
@@ -515,28 +537,40 @@ class Scout:
         for tok in batch:
             try:
                 tops = await gm.top_traders(tok["mint"], 30)
-            except Unavailable:
+            except Unavailable as exc:
                 self.stats["gmgn_errors"] += 1
+                ch["errors"] += 1
+                ch["error"] = str(exc)[:60]
                 break
+            ch["tokens"] += 1
+            ch["traders"] += len(tops)
             for t in tops:
-                ok, _ = trader_ok(t, self.cfg)
-                if ok and t["address"] not in known and t["address"] not in cands:
+                ok, reason = trader_ok(t, self.cfg)
+                if not ok:
+                    why(reason)
+                elif t["address"] not in known and t["address"] not in cands:
                     cands[t["address"]] = (t, tok.get("symbol") or "?")
+        ch["trader_ok"] = len(cands)
         added = 0
         for addr, (t, sym) in list(cands.items())[:wallets_per_run]:
             try:
                 w = await gm.wallet_stats(addr, "7d")
-            except Unavailable:
+            except Unavailable as exc:
                 self.stats["gmgn_errors"] += 1
+                ch["errors"] += 1
+                ch["error"] = str(exc)[:60]
                 break
-            ok, _ = wallet_ok(w, self.cfg)
+            ch["checked"] += 1
+            ok, reason = wallet_ok(w, self.cfg)
             if not ok:
+                why(reason)
                 continue
             stats = {k: (w or {}).get(k) for k in ("winrate", "realized_profit", "token_num", "avg_hold_s",
                                                    "big_losses", "x5", "tags", "fund_from")}
             added += await self._queue(addr, "GMGN", f"топ-трейдер ${sym}: {t['profit_usd']:+,.0f}$ на монете",
                                        score_of(w, 1, float(t["profit_usd"] or 0)), stats)
         self.stats["found"] += added
+        ch["queued"] = added
         return added
 
     # ------------------------------------------------------------------ испытание
@@ -793,6 +827,33 @@ class Scout:
         return out
 
 
+CHANNELS_KEY = "scout:channels"
+
+
+def channel_lines(ch: dict[str, Any]) -> list[str]:
+    """Каналы поиска: что нашёл последний запуск GMGN и проверки копированием (и почему никого)."""
+    out: list[str] = []
+    g = ch.get("gmgn")
+    if g:
+        if g.get("off"):
+            out.append(f"• GMGN: выключен — {esc(str(g['off']))}")
+        else:
+            txt = (f"• GMGN (раз в 15 мин): монет {g.get('tokens', 0)}, трейдеров в их топах {g.get('traders', 0)}, "
+                   f"прошли первый отсев {g.get('trader_ok', 0)}, проверено по статистике {g.get('checked', 0)}, "
+                   f"в очередь {g.get('queued', 0)}")
+            if g.get("errors"):
+                txt += f" · ошибок {g['errors']} ({esc(str(g.get('error') or ''))})"
+            top = sorted((g.get("why") or {}).items(), key=lambda kv: -kv[1])[:4]
+            if top:
+                txt += ". Отсев: " + "; ".join(f"{esc(k)} — {v}" for k, v in top)
+            out.append(txt)
+    c = ch.get("copytest")
+    if c:
+        out.append(f"• Проверка копированием (раз в 6 ч): посчитано кошельков {c.get('computed', 0)}, устойчиво в плюсе "
+                   f"{c.get('found', 0)}, в очередь {c.get('queued', 0)}")
+    return (["\n<b>Каналы поиска</b> (последний запуск)"] + out) if out else []
+
+
 async def scout_report(db: Any) -> str:
     """/scout — что разведка делает сейчас."""
     cnt = {r["status"]: r["n"] for r in await db.fetch("SELECT status, count(*) n FROM scout GROUP BY 1")}
@@ -818,6 +879,7 @@ async def scout_report(db: Any) -> str:
             if r["started_at"]:
                 res += f" · за {(now - r['started_at']).total_seconds() / 3600:.0f} ч"
             lines.append(f"• {esc(short(r['address']))} ({esc(r['source'] or '')}) · {res}")
+    lines += channel_lines(await db.kv_get(CHANNELS_KEY) or {})
     done = await db.fetch(
         """SELECT address, status, decision FROM scout WHERE decided_at > now() - interval '2 days'
            AND status IN ('promoted', 'passed', 'demoted', 'rejected') ORDER BY decided_at DESC LIMIT 15""")

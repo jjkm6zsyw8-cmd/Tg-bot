@@ -428,3 +428,17 @@ async def test_copytest_finds_wallets_whose_copy_works(monkeypatch):
         assert seen == []
     finally:
         await db.close()
+
+
+def test_channel_lines_show_why_gmgn_found_nobody():
+    from scanner.analytics.scout import channel_lines
+    lines = channel_lines({"gmgn": {"tokens": 6, "traders": 180, "trader_ok": 12, "checked": 12, "queued": 0,
+                                    "errors": 1, "error": "лимит запросов",
+                                    "why": {"мало прибыли на монете": 120, "держит в среднем 40 с": 9}},
+                           "copytest": {"computed": 150, "found": 2, "queued": 1}})
+    text = "\n".join(lines)
+    assert "Каналы поиска" in text and "трейдеров в их топах 180" in text and "в очередь 0" in text
+    assert "мало прибыли на монете — 120" in text and "лимит запросов" in text
+    assert "посчитано кошельков 150, устойчиво в плюсе 2, в очередь 1" in text
+    assert "выключен — нет ключа" in "\n".join(channel_lines({"gmgn": {"off": "нет ключа"}}))
+    assert channel_lines({}) == []
