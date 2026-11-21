@@ -573,7 +573,7 @@ async def rules_lines(db: Any, since: datetime, sol_usd: float) -> list[str]:
                 continue
             best = max(rules, key=lambda x: float(rules[x]["s"]))
             table.append(f"{MODE_SHORT[mode]} {KINDS.get(kind, kind)}")
-            for rule in S.SCHEMES:
+            for rule in S.TRIAL_RULES:
                 r = rules.get(rule)
                 if r is None:
                     continue
@@ -584,7 +584,8 @@ async def rules_lines(db: Any, since: datetime, sol_usd: float) -> list[str]:
             "транзакций и денег). ★ — больше всех в сумме.",
             "<pre>" + "\n".join(table) + "</pre>",
             "A — всё на +25%, без стопа · B — 70% на +25%, остаток трейлинг 15% · G — +25%, стоп −8%, нет +10% за "
-            "5 мин — выход · R — трейлинг 35% после +30%, стоп −50%, до суток"]
+            "5 мин — выход · R — трейлинг 35% после +30%, стоп −50%, до суток · W — продать раньше трейдера: через его "
+            "обычное время удержания − 2 с (только проба, у копий)"]
 
 
 def zero_back(back: str) -> str:

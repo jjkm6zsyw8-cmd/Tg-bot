@@ -146,6 +146,10 @@ class RealTrader:
         self.trials: dict[int, Position] = {}
         self._trial_st: dict[str, tuple[float, Any]] = {}   # монета → (когда, запрос состояния): общий для проб
         self._trials_saved = time.time()
+        # «за ним» с доски кошельков (kv real:follow): адрес → shadow | live — его покупки берём, даже если метод
+        # сигнала выключен; live — только когда сам кошелёк бота в бою
+        self.follow: dict[str, str] = {}
+        self._follow_at = 0.0
         self.balance: int | None = None             # лампорты на кошельке (кэш)
         self._balance_at = 0.0
         self.day_pnl: dict[str, float] = {}         # режим → итог закрытых сделок за сегодня, SOL
@@ -211,6 +215,9 @@ class RealTrader:
     def scheme_of(self, p: Position) -> dict[str, Any]:
         """Правила выхода позиции: у пробы — её правило, у позиции бота — правило метода."""
         rule = p.extra.get("rule") if p.extra.get("trial") else None
+        if rule == "W":
+            return {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": None, "target": False, "time_stop_s": None,
+                    "time_stop_gain": None, "max_hold_s": float(p.extra.get("w_hold") or 1.0)}
         return SCHEMES[rule] if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
 
     def scheme_for(self, kind: str | None) -> dict[str, Any]:
@@ -281,6 +288,10 @@ class RealTrader:
     # ------------------------------------------------------------------ запуск
     async def start(self) -> None:
         self._roll_day()
+        try:
+            self.follow = dict(await self.db.kv_get("real:follow") or {})
+        except Exception:  # noqa: BLE001
+            self.follow = {}
         for r in await self.db.fetch("SELECT * FROM real_positions WHERE closed_at IS NULL AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
             ex = dict(r["extra"] or {})
             ex.update(mode=r["mode"], kind=r["kind"], venue=r["venue"], token_program=r["token_program"],
@@ -384,18 +395,31 @@ class RealTrader:
             log.warning("баланс кошелька: %s", str(exc)[:160])
 
     # ------------------------------------------------------------------ вход
+    def follow_mode(self, wallet: str | None) -> str | None:
+        """«За ним» с доски кошельков: режим для его сигналов (live — только если этот кошелёк бота в бою)."""
+        f = (getattr(self, "follow", None) or {}).get(wallet or "")
+        if not f or self.mode() == "off":
+            return None
+        return "live" if f == "live" and self.mode() == "live" else "shadow"
+
     async def on_signal(self, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
                         trader: str | None, targets: set[str]) -> None:
         """Сигнал бумаги: smart (идёт в боевой портфель M) или «мой дев» (портфель Y)."""
-        if not self.accept_new or data.get("paper_only"):
+        wallet = data.get("copy_wallet") or data.get("source_wallet") or trader
+        followed = self.follow_mode(wallet)
+        if not self.accept_new or (data.get("paper_only") and not followed):
             return                       # paper_only — копия только на бумагу (свой кошелёк вне рамок smart), не деньги
         _SIGNAL.set((mint, alert_id))
-        kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
-                     and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
+        if followed:
+            kind = next(iter(kinds_of(data, targets)), None)
+            mode = followed
+        else:
+            kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
+                         and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
+            mode = self.mode_for(kind) if kind else "off"
         if kind is None:
             return
-        mode = self.mode_for(kind)
-        if kind == "smart" and mode == "live" and data.get("unsteady"):
+        if kind == "smart" and mode == "live" and data.get("unsteady") and not followed:
             # 20.11: на деньги — только кошельки с устойчивым плюсом копий; тень такие сигналы меряет
             return self._skip(mode, kind, str(data["unsteady"]))
         why = self.entry_block(mint, kind, mode, data)
@@ -1061,7 +1085,7 @@ class RealTrader:
             tp_done=bool(r["tp_done"]), alert_id=r["alert_id"],
             extra={"trial": True, "rule": r["rule"], "mode": r["mode"], "kind": r["kind"], "tokens_raw": raw,
                    "last_mc": float(r["max_mc"] or r["entry_mc"] or 0), "position_id": r["position_id"],
-                   "saved_max": float(r["max_mc"] or 0)})
+                   "saved_max": float(r["max_mc"] or 0), "w_hold": r["hold_s"]})
         if p.max_mc > p.entry_mc:
             # после перезапуска: пик цены — из базы, иначе трейлинг R «забывал», что монета уже росла
             p.max_net = p.net_if_sold(p.max_mc, pump.FEE_BPS, 0.0)
@@ -1080,16 +1104,29 @@ class RealTrader:
     async def _open_trials(self, base: dict[str, Any], pid: int | None, entry_mc: float, cost_sol: float,
                            tokens_raw: int, slot: int | None) -> None:
         """На вход бота — по пробе на каждое правило выхода: тот же вход, те же токены и затраты."""
-        for rule in S.SCHEMES:
+        w_hold = self.w_hold(base)
+        for rule in S.TRIAL_RULES:
+            if rule == "W" and w_hold is None:
+                continue                         # обычное удержание трейдера неизвестно (или это не копия)
             r = await self.db.fetchrow(
                 """INSERT INTO real_rule_trials(position_id, wallet_id, mode, kind, rule, mint, symbol, trader,
-                       alert_id, opened_at, entry_mc, cost_sol, tokens_raw, max_mc)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),$10,$11,$12,$10) RETURNING *""",
+                       alert_id, opened_at, entry_mc, cost_sol, tokens_raw, max_mc, hold_s)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),$10,$11,$12,$10,$13) RETURNING *""",
                 pid, self.wid, base["mode"], base["kind"], rule, base["mint"], base["symbol"], base["trader"],
-                base["alert_id"], entry_mc, cost_sol, tokens_raw)
+                base["alert_id"], entry_mc, cost_sol, tokens_raw, w_hold if rule == "W" else None)
             t = self._trial_position(r)
             t.extra["entry_slot"] = slot
             self.trials[t.id] = t
+
+    def w_hold(self, base: dict[str, Any]) -> float | None:
+        """Проба W: через сколько секунд после нашего входа продать — обычное удержание трейдера − 2 с − наше
+        опоздание (от его покупки до нашей). None — трейдера нет или удержание неизвестно / дольше 30 мин."""
+        t = (getattr(self.e, "traders", None) or {}).get(base.get("trader") or "")
+        hold = float((t or {}).get("median_hold_s") or 0)
+        if hold <= 0 or hold > 1800:
+            return None
+        late = float(base.get("lag_s") or 0) + float(self.get("real_land_s"))
+        return max(1.0, hold - 2.0 - late)
 
     async def _trial_state(self, mint: str) -> dict[str, Any]:
         """Состояние монеты для продажи проб: пробы одной монеты выходят вместе (тейк A / B / G) — один запрос на всех."""
@@ -1292,6 +1329,12 @@ class RealTrader:
             self._check(p, float(p.extra.get("last_mc") or p.entry_mc), None, confirmed=True)   # выходы по времени
         for t in [t for t in self.trials.values() if not t.closing]:
             self._check(t, float(t.extra.get("last_mc") or t.entry_mc), None, confirmed=True)
+        if now - self._follow_at >= 30:
+            self._follow_at = now
+            try:
+                self.follow = dict(await self.db.kv_get("real:follow") or {})
+            except Exception:  # noqa: BLE001
+                pass
         if self.trials and now - self._trials_saved >= 60:
             self._trials_saved = now
             try:

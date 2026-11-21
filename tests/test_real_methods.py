@@ -11,7 +11,7 @@ from scanner.analytics import paper as pp
 from scanner.real import executor as ex, settings as S, wallets_ui as UI
 from scanner.real.executor import kinds_of
 from tests.real_helpers import FakeChain, pk
-from tests.test_real import MINT, _fast, db, engine, fire, only, shadow, skipped, trade  # noqa: F401 — фикстуры
+from tests.test_real import MINT, _fast, db, engine, fire, live, only, shadow, skipped, trade  # noqa: F401 — фикстуры
 from tests.test_real_wallets import make_desk
 
 
@@ -448,3 +448,54 @@ async def test_method_screen_shows_shadow_result_of_every_exit_rule(db):
     assert "тень: 1 сд., в плюс 100%, в среднем +20.0%, итог +$1.00" in text          # A
     assert "тень: 1 сд., в плюс 0%, в среднем -4.0%, итог −$0.20" in text             # B
     assert "тень: проб ещё нет" in text                                                # R
+
+
+async def test_trial_w_sells_before_trader(db, monkeypatch):
+    """21.11, идея владельца: выйти раньше трейдера — через его обычное время удержания − 2 с, не попадая под его
+    продажу. Проба W — у копий с известным удержанием; без трейдера (тренд, запуск) её нет."""
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain, real_max_open=10)
+    tr.e.traders = {"TRADER": {"median_hold_s": 30.0}}
+    await tr.start()
+    await fire(tr, chain)
+    w = next(t for t in tr.trials.values() if t.extra["rule"] == "W")
+    assert 25.0 <= w.extra["w_hold"] <= 28.0                   # 30 с − 2 с − наше опоздание (~0.8 с)
+    assert await db.fetchval("SELECT hold_s FROM real_rule_trials WHERE rule='W'") == pytest.approx(w.extra["w_hold"])
+    w.opened_ts -= 40                                          # прошло больше его обычного времени
+    tr._check(w, float(w.extra["last_mc"]), None, confirmed=True)
+    await asyncio.sleep(0.05)
+    assert await db.fetchval("SELECT exit_reason FROM real_rule_trials WHERE rule='W'") == "max_hold"
+    m2 = pk("no-hold")
+    chain.add_curve(m2, 40.0)
+    await fire(tr, chain, m2, trader="UNKNOWN", alert_id=3)    # удержание неизвестно — W нет
+    assert await db.fetchval("SELECT count(*) FROM real_rule_trials WHERE mint=$1 AND rule='W'", str(m2)) == 0
+
+
+async def test_follow_wallet_from_board(db, monkeypatch):
+    """Доска кошельков: «тень за ним» — его покупки бот берёт, даже если метод «копии» выключен; «бой за ним» — на
+    деньги, только если кошелёк бота в бою (иначе тень)."""
+    chain = FakeChain()
+    m1, m2, m3 = pk("f-1"), pk("f-2"), pk("f-3")
+    for m in (m1, m2, m3):
+        chain.add_curve(m, 40.0)
+
+    async def copy(tr, mint, aid):
+        data = {"modes": ["copy"], "symbol": "C", "trigger_at": time.time(), "trigger_slot": chain.slot - 2,
+                "trigger_mc": chain.mc(mint), "trigger_sig": "s", "copy_wallet": "STAR"}
+        await tr.on_signal(str(mint), "normal", aid, data, "STAR", {"H"})
+    tr = shadow(db, chain, real_max_open=10)
+    await tr.start()
+    await copy(tr, m1, 1)
+    assert not tr.positions                                    # копии выключены, тень-замер выключен
+    tr.follow = {"STAR": "live"}                               # бой за ним, но кошелёк бота в тени — тень
+    await copy(tr, m1, 1)
+    assert only(tr).extra["mode"] == "shadow" and only(tr).extra["kind"] == "copy"
+    lv = live(db, chain, monkeypatch, real_max_open=10)
+    await lv.start()
+    lv.follow = {"STAR": "live"}
+    await copy(lv, m2, 2)
+    assert [p.extra["mode"] for p in lv.positions.values() if p.mint == str(m2)] == ["live"]
+    lv.follow = {"STAR": "shadow"}                             # тень за ним — даже у кошелька в бою без денег
+    await copy(lv, m3, 3)
+    assert [p.extra["mode"] for p in lv.positions.values() if p.mint == str(m3)] == ["shadow"]

@@ -430,8 +430,11 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
              "Тень проверяет <b>все 4 правила сразу</b> на каждом входе (пробы: тот же вход, разные выходы) — их итог "
              f"в строке «тень», {await paper_period(db)}. Выбор ● — по какому правилу продаёт сам бот (в бою — на "
              "деньги)."]
-    for x in S.SCHEMES:
-        lines.append(f"{'●' if rule == x else '○'} <b>{x}</b> — {S.SCHEME_TEXT[x]}")
+    for x in S.TRIAL_RULES:
+        if x == "W" and kind not in ("smart", "copy", "bigcopy", "swing"):
+            continue                              # W — только у сигналов с трейдером
+        mark = "◇" if x == "W" else ("●" if rule == x else "○")
+        lines.append(f"{mark} <b>{x}</b> — {S.SCHEME_TEXT[x]}" + (" · только проба" if x == "W" else ""))
         t = trials.get(x)
         lines.append("   тень: " + (f"{t[0]} сд., в плюс {t[1] / t[0]:.0%}, в среднем {t[3]:+.1%}, итог "
                                      f"{money(t[2], sol_usd)}" if t else "проб ещё нет")

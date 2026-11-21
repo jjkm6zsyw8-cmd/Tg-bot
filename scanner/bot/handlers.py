@@ -182,6 +182,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "⚖️ Бой против бумаги", "callback": "menu:cmp"}],
             [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "📊 Excel: весь отчёт", "callback": "menu:excel"}],
             [{"text": "💳 Кошельки бота", "callback": "rl:wl"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
+            [{"text": "🏆 Доска кошельков", "callback": "menu:board"}],
             [{"text": "🔍 Разведка", "callback": "menu:scout"}, {"text": "⭐ Рейтинг кошельков", "callback": "menu:rating"}],
             [{"text": "📋 Журнал копий", "callback": "menu:copylog"}, {"text": "📄 Файл по кошелькам", "callback": "menu:wallets"}],
             [{"text": "➕ Добавить кошелёк", "callback": "menu:add"}, {"text": "📥 Импорт кошельков", "callback": "menu:import"}],
@@ -1090,6 +1091,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await show(m, await scout_report(db))
         if what == "rating":
             return await cmd_rating(m, CommandObject(prefix="/", command="rating", args=None))
+        if what == "board":
+            from . import board
+            text, kb = await board.board_view(db)
+            return await show(m, text, kb)
         if what == "copylog":
             return await cmd_copylog(m, CommandObject(prefix="/", command="copylog", args=None))
         if what == "smart":
@@ -1258,6 +1263,49 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await import_wallets(m, m.text or "", st.get("origin"), st.get("pick"))
         else:
             await add_wallet(m, m.text or "", st.get("origin"), st.get("pick"))
+
+    @router.callback_query(F.data.startswith("bd:"))
+    async def cb_board(c: CallbackQuery) -> None:
+        """Доска кошельков: секции, карточка, «тень/бой за ним», убрать из списка (bot/board.py)."""
+        from . import board
+        parts = c.data.split(":")
+        act, arg = (parts[1] if len(parts) > 1 else ""), (parts[2] if len(parts) > 2 else "")
+        cfg = await reload()
+        toast = None
+        if act == "s":
+            text, kb = await board.board_view(db, arg or "best")
+        elif act == "w" and arg:
+            text, kb = await board.card_view(db, cfg, arg)
+        elif act == "f" and arg and len(parts) > 3:
+            mode = parts[3]
+            if mode == "live":
+                text, kb = board.live_confirm(cfg, arg)
+            else:
+                new = {"shadow": "shadow", "live!": "live"}.get(mode)
+                await board.set_follow(db, arg, new)
+                toast = {"shadow": "Тень за ним включена", "live": "Бой за ним включён"}.get(new or "", "Не торгую за ним")
+                text, kb = await board.card_view(db, cfg, arg)
+        elif act == "x" and arg:
+            if len(parts) > 3 and parts[3] == "!":
+                await remove(arg, "t")
+                await board.set_follow(db, arg, None)
+                toast = f"Убран: {short(arg)}"
+                text, kb = await board.board_view(db)
+            else:
+                text = f"🗑 Убрать {short(arg)} из списка? Слежка, копии и торговля за ним прекратятся."
+                kb = [[{"text": "Да, убрать", "callback": f"bd:x:{arg}:!", "style": "danger"},
+                       {"text": "Нет", "callback": f"bd:w:{arg}"}]]
+        else:
+            text, kb = await board.board_view(db)
+        await c.answer(toast)
+        if c.message is None:
+            return
+        try:
+            await c.message.edit_text(fmt.split_html(text)[0], parse_mode="HTML", reply_markup=build(kb),
+                                      link_preview_options=NO_PREVIEW)
+        except TelegramBadRequest as exc:
+            if "not modified" not in str(exc):
+                await reply(c.message, text, kb)
 
     @router.callback_query(F.data.startswith("wl:"))
     async def cb_unwatch(c: CallbackQuery) -> None:
