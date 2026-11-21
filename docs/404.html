@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Открываю Pump.fun…</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0f14;color:#e6edf3;display:flex;min-height:100vh;
+align-items:center;justify-content:center;margin:0}main{text-align:center;padding:24px}a{color:#7ee787}</style>
+</head><body><main id="m"><p>Открываю монету в приложении Pump.fun…</p></main>
+<script>
+/* Страница перехода бота Pump.fun Dev Scanner (GitHub Pages, без своего сервера).
+   Ссылка вида https://<user>.github.io/<repo>/p/<адрес токена>. Принимается только валидный адрес
+   Solana (base58, 32–44 символа) и переход только на pump:// или https://pump.fun — открытого редиректа нет.
+   На телефоне: pump://coin/<адрес>, если приложение не открылось за 1.5 с — https://pump.fun/coin/<адрес>.
+   На компьютере: сразу https://pump.fun/coin/<адрес>. */
+(function () {
+  var parts = location.pathname.split("/").filter(Boolean);
+  var i = parts.lastIndexOf("p");
+  var mint = new URLSearchParams(location.search).get("m") ||
+             (i >= 0 && parts[i + 1] && parts[i + 1] !== "index.html" ? parts[i + 1] : null);
+  var box = document.getElementById("m");
+  if (!mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+    box.textContent = "Неверный адрес токена.";
+    return;
+  }
+  var app = "pump://coin/" + mint, web = "https://pump.fun/coin/" + mint;
+  box.innerHTML = '<p>Открываю монету в приложении Pump.fun…</p><p><a id="a">Открыть в приложении</a> · ' +
+                  '<a id="w">Открыть на сайте</a></p>';
+  document.getElementById("a").href = app;
+  document.getElementById("w").href = web;
+  var mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if (!mobile) { location.replace(web); return; }
+  var t = setTimeout(function () { location.replace(web); }, 1500);
+  document.addEventListener("visibilitychange", function () { if (document.hidden) clearTimeout(t); });
+  location.href = app;
+})();
+</script></body></html>

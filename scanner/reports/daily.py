@@ -1,0 +1,211 @@
+"""Разбор дня (разд. 5 ТЗ): итог сигналов, упущенные возможности, лучшие окна входа,
+новые кандидаты, сделки пользователя. Короткая сводка в Telegram + CSV-файлом."""
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from ..alerts.format import esc, mc_usd, pct
+from ..analytics.copytrade import round_trips
+from ..analytics.scoring import REASONS
+from ..config import Settings
+from ..db.pool import Database
+from ..solana import short
+from .sim import SimTrade, best_windows, series, utc_day_bounds
+
+log = logging.getLogger(__name__)
+
+# монета к SOL стартует с MC ~28 SOL и даже вся кривая — ~410 SOL; выше на старте — пара не к SOL (цена в чужой валюте)
+NON_SOL_START_MC = 450.0
+
+MISSED_REASONS = {**REASONS, "": "нет решения (не оценивалась)", "alerted": "алерт был",
+                  "outage": "сбой источника", "latency": "задержка"}
+
+
+async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str, bytes, list[list[dict[str, Any]]]]:
+    cfg = settings.effective()
+    tz = ZoneInfo(cfg.get("timezone", "UTC"))
+    start, end = utc_day_bounds(day, tz)
+    price = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+    thr = float(cfg.get("min_net_profit", 0.3))
+
+    alerts = await db.fetch(
+        """SELECT a.*, o.net_result, o.achievable_profit, o.exit_reason, o.max_mc,
+                  (SELECT mark FROM user_marks m WHERE m.alert_id=a.id ORDER BY m.id DESC LIMIT 1) user_mark,
+                  t.symbol, t.initial_mc_sol
+           FROM alerts a LEFT JOIN alert_outcomes o ON o.alert_id=a.id LEFT JOIN tokens t ON t.mint=a.mint
+           WHERE a.created_at >= $1 AND a.created_at < $2 ORDER BY a.created_at""", start, end)
+    lines = [f"📅 <b>Разбор дня {day.strftime('%d.%m.%Y')}</b>"]
+
+    # 1) итог сигналов
+    # ВНИМАНИЕ: это оценка по своему потоку цен и без стопа (держим до цели, слива дева или 60 минут) — она сильно
+    # оптимистичнее реальности: 11.11 «итог серии +15%» при бумаге по рыночным ценам −50…−92% на тех же сигналах
+    lines.append("\n<b>Итог сигналов — грубая оценка, не реальный результат</b> (свой поток цен, вход +{} с, без стопа, "
+                 "выход по цели или сливу дева; реальный результат по рыночным ценам — блок «Бумажная торговля» ниже)"
+                 .format(cfg.get("reaction_s", 5)))
+    sims: dict[str, list[SimTrade]] = {}
+    glitches = non_sol = 0
+    for a in alerts:
+        if a["exit_reason"] == "glitch":
+            glitches += 1
+            continue
+        if float(a["initial_mc_sol"] or 0) > NON_SOL_START_MC:
+            non_sol += 1                       # пара не к SOL: цена в чужой валюте — «+21766%» у mydev 20.11
+            continue
+        if a["net_result"] is None:
+            continue
+        p = a["payload"] or {}
+        sims.setdefault(a["mode"], []).append(SimTrade(
+            mint=a["mint"], mode=a["mode"], alerted=True, reason="alerted", t_alert=a["created_at"].timestamp(),
+            age_s=float(p.get("age_s") or 0), mc_alert=float(a["mc_alert"] or 0), net=a["net_result"]))
+    all_s = series([s for v in sims.values() for s in v])
+    if all_s["n"]:
+        lines.append(f"Алертов {len(alerts)}, закрыто {all_s['n']}, удачных {all_s['wins']} ({all_s['win_rate']:.0%}), "
+                     f"средний плюс {pct(all_s['avg_win'])}, средний минус {pct(-all_s['avg_loss'])}, "
+                     f"<b>итог серии {pct(all_s['series'])}</b> на сделку")
+        for mode, items in sims.items():
+            s = series(items)
+            lines.append(f"  · {mode}: {s['n']} сделок, итог {pct(s['series'])}")
+    else:
+        lines.append(f"Алертов {len(alerts)}, закрытых с итогом пока нет.")
+    if non_sol:
+        lines.append(f"Не в оценке: {non_sol} алертов по монетам в паре не к SOL (USDC, другие монеты) — их цена в чужой "
+                     "валюте; бумага их тоже не считает")
+    if glitches:
+        lines.append(f"⚠ Не учтено {glitches} алертов: итог не подтвердил Jupiter (сбой цены источника)")
+
+    # 2) упущенные возможности
+    launches = await db.fetch(
+        """SELECT l.*, t.symbol, t.received_at, EXISTS(SELECT 1 FROM alerts a WHERE a.mint=l.mint) alerted
+           FROM launches l JOIN tokens t ON t.mint=l.mint WHERE l.created_at >= $1 AND l.created_at < $2""",
+        start, end)
+    gaps = await db.fetch("SELECT started_at, COALESCE(ended_at, now()) e FROM ingest_gaps "
+                          "WHERE started_at < $2 AND COALESCE(ended_at, now()) > $1", start, end)
+    missed, outage_missed = [], []
+    for l in launches:
+        if l["alerted"] or l["achievable_profit"] is None or l["achievable_profit"] <= thr:
+            continue
+        reason = (l["features"] or {}).get("decision_reason") or ""
+        out = any(g["started_at"] <= l["created_at"] <= g["e"] for g in gaps) or (
+            l["received_at"] and (l["received_at"] - l["created_at"]).total_seconds() > 10)
+        if out:
+            outage_missed.append(l)
+        else:
+            missed.append((l, reason))
+    lines.append(f"\n<b>Упущенные возможности</b>: {len(missed)} (+{len(outage_missed)} из-за сбоя источника, "
+                 "не входят в статистику)")
+    by_reason: dict[str, int] = {}
+    for _l, r in missed:
+        by_reason[r] = by_reason.get(r, 0) + 1
+    if by_reason:
+        lines.append("Причины: " + ", ".join(f"{MISSED_REASONS.get(k, k)} — {v}"
+                                             for k, v in sorted(by_reason.items(), key=lambda x: -x[1])))
+    for l, r in sorted(missed, key=lambda x: -(x[0]["achievable_profit"] or 0))[:5]:
+        lines.append(f"  · ${esc(l['symbol'] or '?')} {pct(l['achievable_profit'])} — {MISSED_REASONS.get(r, r)} "
+                     f"<code>{l['mint']}</code>")
+
+    # 3) лучшие окна входа
+    windows = []
+    for mode, items in sims.items():
+        for w in best_windows(items, price):
+            windows.append(f"  · {mode}, {w}")
+    dev_launch_sims = [SimTrade(mint=l["mint"], mode="dev", alerted=True, reason="", t_alert=0,
+                                age_s=float(cfg.get("reaction_s", 5)) + 1.5, mc_alert=float(l["entry_mc"] or 0),
+                                net=l["achievable_profit"]) for l in launches if l["achievable_profit"] is not None]
+    for w in best_windows(dev_launch_sims, price):
+        windows.append(f"  · все запуски (достижимый профит), {w}")
+    if windows:
+        lines.append("\n<b>Лучшие окна входа</b>")
+        lines += windows
+
+    # 4) новые кандидаты
+    kb: list[list[dict[str, Any]]] = []
+    new_cl = await db.fetch("SELECT id, profile FROM clusters WHERE qualified_at >= $1 AND qualified_at < $2 "
+                            "ORDER BY qualified_at LIMIT 10", start, end)
+    new_tr = await db.fetch("SELECT address, label, copy_30d, win_rate FROM traders "
+                            "WHERE qualified_at >= $1 AND qualified_at < $2 LIMIT 10", start, end)
+    if new_cl or new_tr:
+        lines.append("\n<b>Новые кандидаты</b>")
+        for c in new_cl:
+            p = c["profile"] or {}
+            lines.append(f"  · дев #{c['id']}: {p.get('launches')} запусков, повторяемость "
+                         f"{pct(p.get('repeatability'), False)}, типичный дамп "
+                         f"{mc_usd((p.get('medians') or {}).get('dump_mc'), price)}")
+            kb.append([{"text": f"Отслеживать дева #{c['id']}", "callback": f"cand:c:{c['id']}"}])
+        for t in new_tr:
+            lines.append(f"  · трейдер {short(t['address'])}: копируемость {pct(t['copy_30d'])}, "
+                         f"удачных {pct(t['win_rate'], False)}")
+            kb.append([{"text": f"Отслеживать {short(t['address'])}", "callback": f"cand:t:{t['address']}"}])
+
+    # 5) сделки пользователя
+    wallet = (await db.get_overrides()).get("trading_wallet")
+    if wallet:
+        rows = await db.fetch(
+            "SELECT t.*, k.created_slot FROM trades t LEFT JOIN tokens k ON k.mint=t.mint "
+            "WHERE t.trader=$1 AND t.ts >= $2 AND t.ts < $3 ORDER BY t.ts", wallet, start, end)
+        trips = round_trips([{"mint": r["mint"], "ts": r["ts"].timestamp(), "is_buy": r["is_buy"],
+                              "sol": r["sol_amount"], "tokens": r["token_amount"], "slot": r["slot"],
+                              "mc": r["mc_sol"]} for r in rows], {r["mint"]: r["created_slot"] for r in rows})
+        alerted = {a["mint"]: a for a in alerts}
+        lines.append(f"\n<b>Ваши сделки</b> ({short(wallet)}): {len(trips)} закрытых, "
+                     f"PnL {sum(t.own_pnl for t in trips):+.2f} SOL")
+        by_alert = [t for t in trips if t.mint in alerted]
+        if by_alert:
+            pnl = sum(t.own_pnl for t in by_alert)
+            delays = [t.entry_ts - alerted[t.mint]["created_at"].timestamp() for t in by_alert]
+            lines.append(f"  по алертам бота: {len(by_alert)} сделок, PnL {pnl:+.2f} SOL, "
+                         f"средняя задержка входа {sum(delays) / len(delays):.0f} с")
+        other = len(trips) - len(by_alert)
+        if other:
+            lines.append(f"  без алерта: {other} сделок, PnL {sum(t.own_pnl for t in trips if t.mint not in alerted):+.2f} SOL")
+
+    # 5б) «Тренды»: что отсеяли фильтры и что с этими монетами было через час
+    from ..analytics.trendcheck import shadow_summary
+    lines += ["", *await shadow_summary(db, start, end)] if await db.fetchval(
+        "SELECT 1 FROM trend_shadow WHERE created_at >= $1 AND created_at < $2 LIMIT 1", start, end) else []
+
+    # 6) бумажная торговля
+    ports = await db.fetch("SELECT * FROM paper_portfolios ORDER BY name")
+    if ports:
+        lines.append("\n<b>Бумажная торговля</b> (за день)")
+        for p in ports:
+            r = await db.fetchrow(
+                """SELECT count(*) FILTER (WHERE NOT suspect) n, count(*) FILTER (WHERE pnl_sol > 0 AND NOT suspect) w,
+                          COALESCE(sum(pnl_sol) FILTER (WHERE NOT suspect), 0) pnl,
+                          count(*) FILTER (WHERE suspect) odd
+                   FROM paper_positions WHERE portfolio=$1 AND closed_at >= $2 AND closed_at < $3
+                   AND exit_reason <> 'reset'""", p["name"], start, end)
+            odd = f" · не учтено сбойных {r['odd']}" if r["odd"] else ""
+            lines.append(f"  {p['name']}: сделок {r['n']}, удачных {r['w']}, итог {r['pnl']:+.4f} SOL "
+                         f"(${r['pnl'] * price:+.2f}){odd}")
+
+    # CSV: расширенные колонки (сделки, продажи кластера, причина склейки, окно входа, лучшие трейдеры)
+    from .verify import extended_csv
+    csv_bytes = await extended_csv(db, start, end)
+    return "\n".join(lines), csv_bytes, kb
+
+
+def _r(v: Any) -> Any:
+    return round(v, 4) if isinstance(v, float) else v
+
+
+async def send_daily(db: Database, settings: Settings, day: date) -> None:
+    text, csv_bytes, kb = await build_daily(db, settings, day)
+    await db.enqueue("daily", {"text": text, "keyboard": kb or None,
+                               "csv": csv_bytes.decode("utf-8"), "filename": f"day_{day.isoformat()}.csv"},
+                     priority=5)
+    try:                                    # отдельным сообщением — только smart-сигналы (то же, что /smart)
+        from .smart import chunks, smart_report
+        eff = settings.effective()
+        smart = await smart_report(db, 7, str(eff.get("timezone") or "Asia/Tbilisi"), int(eff.get("smart_accounts") or 2))
+        for part in chunks(smart):
+            await db.enqueue("text", {"text": part, "topic": "daily"}, priority=5)
+    except Exception:  # noqa: BLE001 — разбор дня важнее
+        log.exception("smart в разборе дня")
+
+
+def today_in(tz_name: str) -> date:
+    return datetime.now(ZoneInfo(tz_name)).date()
+

@@ -1,0 +1,1331 @@
+"""Команды и кнопки Telegram (разд. 9 ТЗ). Доступ — только user_id из белого списка."""
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable
+
+from aiogram import BaseMiddleware, F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandObject
+from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObject
+
+from ..alerts import format as fmt
+from ..alerts.format import esc, pct
+from ..analytics.newcoins import DEFAULTS as _NEW_DEFAULTS
+
+from ..analytics.copyguard import DEFAULTS as _COPY_DEFAULTS  # noqa: E402
+
+NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005, "paper_min_position_sol": 0.05,
+                "paper_day_cap_usd": 0, "paper_day_from_h": 8, "paper_day_to_h": 18, "paper_reentry_cooldown_min": 60,
+                "paper_start_usd": 100, "paper_lottery_day_stop_usd": 0, "paper_day_stop_pct": 0,
+                "paper_scout_usd": 10, "scout_slots": 20, "scout_max_auto": 15, "scout_min_copies": 6,
+                "paper_m_day_stop_pct": 0.25, "paper_m_size_cap": 0.30, "paper_entry_slip": 0.05,
+                "paper_m_entry_slip": 0.02, "rating_top": 0.04, "rating_pause": -0.03,
+                "rating_top_mult": 1.5, "smart_accounts": 2,
+                "own_smart_min_hold_s": 180, "wallet_autoclean_min_copies": 10, "swing_min_hold_s": 1800,
+                "swing_min_buy_sol": 0.3}
+from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
+from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
+from ..db.pool import Database
+from ..reports.backtest import run_backtest
+from ..real import report as real_report
+from ..reports.daily import build_daily, today_in
+from ..solana import is_valid_address, short
+from . import views
+from .keyboards import build
+from .sender import NO_PREVIEW
+
+log = logging.getLogger(__name__)
+
+
+class Whitelist(BaseMiddleware):
+    """Команды и нажатия от остальных пользователей игнорируются."""
+
+    def __init__(self, allowed: set[int]):
+        self.allowed = allowed
+
+    async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+                       event: TelegramObject, data: dict[str, Any]) -> Any:
+        user = getattr(event, "from_user", None)
+        if user is None or user.id not in self.allowed:
+            return None
+        return await handler(event, data)
+
+
+HELP = """<b>Pump.fun Dev Scanner</b>
+Бот присылает ранние сигналы по девам и смарт-мани. Торговля — вручную в Axiom или Pump.fun.
+
+/mode — режимы и «фильтрованный / полный»
+/settings — пороги, пресет фильтров, реакция, позиция
+/token &lt;адрес&gt; — разбор монеты
+/dev &lt;адрес|#&gt; — профиль кластера дева
+/trader &lt;адрес&gt; — профиль трейдера
+/watch &lt;адрес&gt; — сопровождение монеты
+/watchlist — что отслеживается
+/addwallet — добавить кошелёк (источник и отбор спросит кнопками) · /import — импорт списка/файла
+/origin — откуда кошельки и как отобраны (реализованный / нереализованный PnL)
+/removewallet &lt;адрес&gt;
+/blacklist &lt;адрес&gt;
+/real — реальный бот: режим (выкл / тень / бой), стоп-кран, сделки, настройки
+/today — разбор дня · /backtest &lt;период&gt; [a=1 vs a=2]
+/stats — итог серии · /mute &lt;минуты&gt; · /health
+/quiet 01:00-08:00 · /tz Europe/Moscow · /dailytime 21:00 · /mywallet &lt;адрес&gt;"""
+
+
+DOC_TIMEOUT_S = 300          # 19.11: отчёт Excel ~0.7 МБ не успевал уйти за 60 с по умолчанию — «Request timeout error»
+
+
+async def send_doc(msg: Message, data: bytes, filename: str, caption: str | None = None) -> None:
+    """Файл в тот же чат и тему: до 5 минут на отправку, повтор при сбое сети или «Gateway Timeout» Telegram
+    (19.11: файлы не уходили с сервера, текст — уходил). Не ушёл и с третьего раза — файл остаётся на сервере
+    в logs/, бот пишет, где он лежит (скачать — через SFTP в Termius)."""
+    from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+    thread = msg.message_thread_id if msg.is_topic_message else None
+    err: Exception | None = None
+    for attempt, pause in enumerate((10, 30, 0), 1):
+        try:
+            await msg.bot.send_document(msg.chat.id, BufferedInputFile(data, filename=filename), caption=caption,
+                                        message_thread_id=thread, request_timeout=DOC_TIMEOUT_S)
+            return
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            err = exc
+            log.warning("файл %s (%d КБ): попытка %d — %s", filename, len(data) // 1024, attempt, exc)
+            if pause:
+                await asyncio.sleep(pause)
+    import os
+    folder = os.environ.get("LOG_DIR", "logs")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, filename), "wb") as f:
+            f.write(data)
+        where = f"он сохранён на сервере: <code>/opt/tg-bot/logs/{filename}</code> (скачать — SFTP в Termius)"
+    except OSError as exc:
+        where = f"и сохранить на сервере не вышло ({exc})"
+    await msg.answer(f"⚠️ Файл {filename} ({len(data) // 1024} КБ) Telegram не принял с трёх попыток "
+                     f"({type(err).__name__}: {err}) — {where}.", parse_mode="HTML")
+
+
+TOGGLES_ON_BY_DEFAULT = {"smart_filtered", "paper_size_by_level", "trend_autotune", "trend_wait_pullback",
+                         "paper_daily_reset"}
+
+
+PANEL_TEXT = ("🏠 <b>Главная — управление ботом</b>\n"
+              "Нажмите кнопку — ответ появится здесь же, прошлый ответ убирается. Сигналы, сделки и отчёты бота "
+              "идут в свои темы и сюда не мешаются. Панель закреплена: вернуться к ней — значок 📌 сверху.")
+
+
+def setup(router: Router, env: Env, settings: Settings, db: Database, sender: Any) -> Any:
+    from ..external import ExternalHub
+    ext = ExternalHub(env, db)   # внешние источники только по командам /token, /dev, /trader
+    router.message.outer_middleware(Whitelist(env.allowed_ids))
+    router.callback_query.outer_middleware(Whitelist(env.allowed_ids))
+    from .wizard import Wizard
+    wiz = Wizard()                 # пошаговые меню /import и /addwallet на кнопках
+    from ..ingest.rpc import SolanaRpc
+    # только чтение: свежий баланс в карточке кошелька реального бота (ключей у сервиса бота нет)
+    balance_rpc = SolanaRpc(env.rpc_endpoint, rps=3, concurrency=2, timeout=4, fallback=env.rpc_fallback_url or None)
+
+    async def reload() -> dict[str, Any]:
+        settings.overrides = await db.get_overrides()
+        return settings.effective()
+
+    @router.errors()
+    async def on_error(event: Any) -> bool:
+        """Команда упала — не молчим: ответ с ошибкой в тот же чат/топик и запись для /diag."""
+        exc = event.exception
+        log.error("ошибка обработчика: %r", exc, exc_info=exc)
+        upd = event.update
+        msg = upd.message or (upd.callback_query.message if upd.callback_query else None)
+        text = f"{type(exc).__name__}: {exc}"[:300]
+        try:
+            errs = (await db.kv_get("bot:errors", []) or [])[-9:]
+            from datetime import datetime, timezone
+            errs.append({"at": datetime.now(timezone.utc).isoformat(), "text": text,
+                         "cmd": ((upd.message.text or "") if upd.message else "")[:40]})
+            await db.kv_set("bot:errors", errs)
+        except Exception:  # noqa: BLE001
+            pass
+        if msg is not None:
+            try:
+                await msg.answer(f"⚠️ Команда упала: <code>{esc(text)}</code>\nПришлите скрин — разберу.",
+                                 parse_mode="HTML")
+            except Exception:  # noqa: BLE001
+                try:
+                    await msg.answer(f"Команда упала: {text}")
+                except Exception:  # noqa: BLE001
+                    pass
+        return True
+
+    async def reply(m: Message, text: str, kb: Any = None) -> None:
+        try:
+            await ext.publish_health("bot")
+        except Exception:  # noqa: BLE001
+            pass
+        for i, part in enumerate(fmt.split_html(text)):
+            await answer_html(m, part, build(kb) if i == 0 else None)
+
+    async def answer_html(m: Message, text: str, markup: Any = None) -> Any:
+        """Ответ с разметкой; Telegram не разобрал её (в тексте «<» и т. п.) — тот же текст без оформления, а не
+        «Команда упала» (21.11: «сделок 0 < 30» при добавлении кошелька)."""
+        try:
+            return await m.answer(text, parse_mode="HTML", reply_markup=markup, link_preview_options=NO_PREVIEW)
+        except TelegramBadRequest as exc:
+            if "parse entities" not in str(exc):
+                raise
+            log.warning("разметка не разобрана, отправляю без оформления: %s", exc)
+            return await m.answer(fmt.plain(text)[:4096], reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+    def main_menu() -> list[list[dict[str, Any]]]:
+        return [
+            [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "⚖️ Бой против бумаги", "callback": "menu:cmp"}],
+            [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "📊 Excel: весь отчёт", "callback": "menu:excel"}],
+            [{"text": "💳 Кошельки бота", "callback": "rl:wl"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
+            [{"text": "🏆 Доска кошельков", "callback": "menu:board"}],
+            [{"text": "🔍 Разведка", "callback": "menu:scout"}, {"text": "⭐ Рейтинг кошельков", "callback": "menu:rating"}],
+            [{"text": "📋 Журнал копий", "callback": "menu:copylog"}, {"text": "📄 Файл по кошелькам", "callback": "menu:wallets"}],
+            [{"text": "➕ Добавить кошелёк", "callback": "menu:add"}, {"text": "📥 Импорт кошельков", "callback": "menu:import"}],
+            [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "👁 Отслеживаемое", "callback": "menu:watchlist"}],
+            [{"text": "📅 Разбор дня", "callback": "menu:today"}, {"text": "📈 Итог серии", "callback": "menu:stats"}],
+            [{"text": "⚙️ Настройки", "callback": "menu:settings"}, {"text": "🎛 Режимы", "callback": "menu:mode"}],
+            [{"text": "📦 Выгрузка (архив)", "callback": "menu:export"}, {"text": "🩺 Состояние", "callback": "menu:health"}],
+        ]
+
+    screens: dict[tuple[int, int | None], int] = {}   # (чат, тема) → сообщение-экран под панелью «Главной»
+
+    async def show(m: Message, text: str, kb: Any = None) -> None:
+        """Ответ на кнопку панели: прошлый экран удаляется, новый — внизу (в «Главной» не копятся ответы).
+        Длинный текст — несколькими сообщениями, как раньше."""
+        key = (m.chat.id, m.message_thread_id if m.is_topic_message else None)
+        old = screens.pop(key, None)
+        if old:
+            try:
+                await m.bot.delete_message(m.chat.id, old)
+            except Exception:  # noqa: BLE001 — уже удалено руками или старше 48 часов
+                pass
+        if len(text) > 4000:
+            return await reply(m, text, kb)
+        sent = await answer_html(m, text, build(kb))
+        screens[key] = sent.message_id
+
+    async def ensure_panel(bot: Any) -> str:
+        """Закреплённая панель со всеми кнопками в теме «Главная» (создаётся при запуске бота, если её нет)."""
+        chat, thread = sender.chat_id, sender.thread("main")
+        if not chat or not env.alert_chat_id:
+            return "панель: чат алертов не задан"
+        saved = await db.kv_get("main_panel", {}) or {}
+        if saved.get("chat") == chat and saved.get("thread") == thread and saved.get("id"):
+            try:
+                await bot.edit_message_text(PANEL_TEXT, chat_id=chat, message_id=int(saved["id"]), parse_mode="HTML",
+                                            reply_markup=build(main_menu()))
+                return "панель «Главной» на месте"
+            except Exception as exc:  # noqa: BLE001
+                if "not modified" in str(exc):
+                    return "панель «Главной» на месте"
+        msg = await bot.send_message(chat, PANEL_TEXT, parse_mode="HTML", reply_markup=build(main_menu()),
+                                     message_thread_id=thread)
+        await db.kv_set("main_panel", {"chat": chat, "thread": thread, "id": msg.message_id})
+        try:
+            await bot.pin_chat_message(chat, msg.message_id, disable_notification=True)
+        except Exception as exc:  # noqa: BLE001 — нет права «Закреплять сообщения»: панель есть, просто не закреплена
+            return f"панель «Главной» отправлена, закрепить не удалось: {exc}"
+        return "панель «Главной» отправлена и закреплена"
+
+    def mode_view(cfg: dict[str, Any]) -> tuple[str, list[list[dict[str, Any]]]]:
+        m = cfg.get("modes", {})
+        on = lambda v: "✅" if v else "⬜"  # noqa: E731
+        text = ("<b>Режимы</b>\nСмарт-мани: " + ("фильтрованный" if cfg.get("smart_filtered", True) else "полный")
+                + "\nУровень «Наблюдение»: " + ("включён" if cfg.get("watch_level_enabled") else "выключен"))
+        kb = [
+            [{"text": f"{on(m.get('dev', True))} Девы", "callback": "mode:dev"},
+             {"text": f"{on(m.get('smart', True))} Смарт-мани", "callback": "mode:smart"},
+             {"text": f"{on(m.get('daily', True))} Разбор дня", "callback": "mode:daily"}],
+            [{"text": f"{on(m.get('new', True))} Новые монеты (проверка каждой монеты)", "callback": "mode:new"}],
+            [{"text": f"{on(m.get('trend', True))} Тренды (DexScreener, GeckoTerminal)", "callback": "mode:trend"}],
+            [{"text": f"{on(m.get('copy', True))} Копитрейд (свой список: девы и трейдеры)", "callback": "mode:copy"}],
+            [{"text": "Смарт: " + ("фильтрованный → полный" if cfg.get("smart_filtered", True) else "полный → фильтрованный"),
+              "callback": "tog:smart_filtered"}],
+            [{"text": f"{on(cfg.get('smart_full_feed'))} Лента полного режима вместе с фильтрованным",
+              "callback": "tog:smart_full_feed"}],
+            [{"text": f"{on(cfg.get('watch_level_enabled'))} Уровень «Наблюдение»", "callback": "tog:watch_level_enabled"}],
+            [{"text": f"{on(cfg.get('trend_autotune', True))} Тренды: автоподбор фильтров по истории",
+              "callback": "tog:trend_autotune"}],
+            [{"text": f"{on(cfg.get('trend_wait_pullback', True))} Тренды: вход только на откате",
+              "callback": "tog:trend_wait_pullback"}],
+        ]
+        return text, kb
+
+    def settings_view(cfg: dict[str, Any]) -> tuple[str, list[list[dict[str, Any]]]]:
+        lines = ["<b>Настройки</b>"]
+        kb = []
+        for key, (label, _step, _lo, _hi, kind) in EDITABLE.items():
+            v = cfg.get(key, NEW_DEFAULTS.get(key))
+            shown = pct(v, False) if kind == "pct" else f"{v:g}" if isinstance(v, (int, float)) else str(v)
+            lines.append(f"{label}: <b>{shown}</b>")
+            kb.append([{"text": f"− {label[:24]}", "callback": f"set:{key}:-"},
+                       {"text": "+", "callback": f"set:{key}:+"}])
+        preset = cfg.get("filter_preset", "normal")
+        lines.append(f"Пресет фильтров: <b>{PRESET_NAMES.get(preset, preset)}</b>")
+        kb.append([{"text": ("● " if p == preset else "") + PRESET_NAMES[p], "callback": f"preset:{p}"} for p in PRESETS])
+        lines.append(f"Формат: <b>{'компактный' if cfg.get('compact') else 'подробный'}</b> · "
+                     f"Неполные данные: <b>{'ждать' if cfg.get('wait_full_data') else 'слать с пометкой'}</b>")
+        kb.append([{"text": "Компактный/подробный", "callback": "tog:compact"},
+                   {"text": "Ждать полные данные", "callback": "tog:wait_full_data"}])
+        pl = set(cfg.get("paper_levels") or ["strong", "normal"])
+        lines.append("Бумажная торговля входит по уровням: <b>" + (", ".join(
+            {"strong": "Сильный", "normal": "Обычный", "watch": "Наблюдение"}[x] for x in ("strong", "normal", "watch")
+            if x in pl) or "ни по каким") + "</b>")
+        kb.append([{"text": ("✅ " if x in pl else "⬜ ") + n, "callback": f"pl:{x}"}
+                   for x, n in (("strong", "Сильный"), ("normal", "Обычный"), ("watch", "Наблюдение"))])
+        share = float(cfg.get("paper_position_share") or 0.2)
+        by_level = cfg.get("paper_size_by_level", True)
+        lines.append(f"Бумажная позиция: <b>{share:.0%}</b> баланса"
+                     + (" · по силе сигнала: Сильный ×1.5, Обычный ×0.75" if by_level else ""))
+        kb.append([{"text": ("● " if abs(share - v) < 1e-6 else "") + f"{v:.0%}", "callback": f"ps:{v}"}
+                   for v in (0.10, 0.15, 0.20, 0.25, 0.35)])
+        kb.append([{"text": f"{'✅' if by_level else '⬜'} Размер по силе сигнала", "callback": "tog:paper_size_by_level"}])
+        trends_on, daily = cfg.get("paper_trends", True), cfg.get("paper_daily_reset", True)
+        lines.append(f"Бумага: «Тренды» — <b>{'входят' if trends_on else 'не входят'}</b> · сброс каждый день в 00:00 "
+                     f"(Батуми) — <b>{'да' if daily else 'нет'}</b>")
+        kb.append([{"text": f"{'✅' if trends_on else '⬜'} Тренды в бумаге", "callback": "tog:paper_trends"},
+                   {"text": f"{'✅' if daily else '⬜'} Сброс в 00:00", "callback": "tog:paper_daily_reset"}])
+        lines.append(f"Тихие часы: <b>{cfg.get('quiet_hours') or 'нет'}</b> · Часовой пояс: <b>{cfg.get('timezone')}</b>"
+                     f" · Разбор дня в <b>{cfg.get('daily_report_time')}</b>")
+        if cfg.get("trading_wallet"):
+            lines.append(f"Торговый кошелёк (только чтение): <code>{cfg['trading_wallet']}</code>")
+        return "\n".join(lines), kb
+
+    # ------------------------------------------------------------------ команды
+    @router.message(Command("start", "help", "menu"))
+    async def cmd_start(m: Message) -> None:
+        note = await sender.setup_topics() if m.chat.type in ("supergroup", "group") else ""
+        if m.chat.type in ("supergroup", "group") and m.message_thread_id == sender.thread("main"):
+            # в «Главной» — новая панель внизу (старая остаётся выше), она же закрепляется
+            msg = await m.answer(PANEL_TEXT, parse_mode="HTML", reply_markup=build(main_menu()))
+            await db.kv_set("main_panel", {"chat": m.chat.id, "thread": m.message_thread_id, "id": msg.message_id})
+            try:
+                await m.bot.pin_chat_message(m.chat.id, msg.message_id, disable_notification=True)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        await reply(m, HELP + (f"\n\n<i>{esc(note)}</i>" if note else ""), main_menu())
+
+    @router.message(Command("mode"))
+    async def cmd_mode(m: Message) -> None:
+        text, kb = mode_view(await reload())
+        await reply(m, text, kb)
+
+    @router.message(Command("settings"))
+    async def cmd_settings(m: Message) -> None:
+        text, kb = settings_view(await reload())
+        await reply(m, text, kb)
+
+    def arg_addr(c: CommandObject | None) -> str | None:
+        a = (c.args or "").split()[0] if c and c.args else None
+        return a if is_valid_address(a) else None
+
+    @router.message(Command("token"))
+    async def cmd_token(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /token &lt;адрес токена&gt;")
+        await reply(m, await views.token_view(db, settings, a, ext),
+                    [[{"text": "Отслеживать", "callback": f"trk:{a}"}, {"text": "Скопировать адрес", "copy": a}]])
+
+    @router.message(Command("dev"))
+    async def cmd_dev(m: Message, command: CommandObject) -> None:
+        ref = (command.args or "").strip().lstrip("#")
+        if not ref:
+            return await reply(m, "Формат: /dev &lt;адрес деплоера, монеты или номер кластера&gt;")
+        await reply(m, await views.dev_view(db, settings, ref, ext))
+
+    @router.message(Command("trader"))
+    async def cmd_trader(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /trader &lt;адрес&gt;")
+        await reply(m, await views.trader_view(db, settings, a, ext))
+
+    @router.message(Command("watch"))
+    async def cmd_watch(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /watch &lt;адрес токена&gt;")
+        await watch_token(a)
+        await reply(m, f"👁 Сопровождаю <code>{a}</code>: сигналы на выход придут в «Сопровождение монет».")
+
+    async def watch_token(mint: str) -> None:
+        cfg = await reload()
+        await db.execute(
+            "INSERT INTO watchlist(kind, address, until) VALUES ('token', $1, now() + make_interval(mins => $2)) "
+            "ON CONFLICT (kind, address) DO UPDATE SET until=EXCLUDED.until", mint, int(cfg.get("follow_minutes", 60)))
+        await db.job("watch", {"mint": mint})
+
+    @router.message(Command("watchlist"))
+    async def cmd_watchlist(m: Message) -> None:
+        text, kb = await views.watchlist_view(db)
+        await reply(m, text, kb)
+
+    @router.message(Command("addwallet"))
+    async def cmd_addwallet(m: Message, command: CommandObject) -> None:
+        if not (command.args or "").strip():
+            text, kb = wiz.start(m.from_user.id if m.from_user else 0, "add")
+            return await reply(m, text, kb)
+        await add_wallet(m, command.args or "")
+
+    async def add_wallet(m: Message, args: str, origin: str | None = None, pick: str | None = None) -> None:
+        parts = args.split()
+        if not parts or not is_valid_address(parts[0]):
+            return await reply(m, "Не похоже на адрес кошелька. Формат: <code>адрес метка</code> "
+                                  "[dev|trader] [axiom|pumpfun|gmgn] [реализ|нереализ|нейтрал]")
+        from ..analytics.origin import ORIGINS, PICKS, parse_origin, parse_pick, set_origin, set_pick
+        addr = parts[0]
+        origin = next((o for o in (parse_origin(p) for p in parts[1:]) if o), origin)
+        pick = next((o for o in (parse_pick(p) for p in parts[1:]) if o), pick)
+        parts = [parts[0]] + [p for p in parts[1:] if not parse_origin(p) and not parse_pick(p)]
+        kind = parts[-1].lower() if len(parts) > 1 and parts[-1].lower() in ("dev", "trader") else None
+        label = " ".join(p for p in parts[1:] if p.lower() not in ("dev", "trader"))[:64] or None
+        if origin:
+            await set_origin(db, [addr], origin)
+        if pick:
+            await set_pick(db, [addr], pick)
+        deployed = await db.fetchval("SELECT count(*) FROM tokens WHERE deployer=$1", addr)
+        if kind == "dev" or (kind is None and deployed):
+            from ..analytics.clusters import add_link, cluster_of, new_cluster
+            known = await cluster_of(db, addr)
+            cid = known[0] if known else await new_cluster(db, addr)
+            await add_link(db, cid, addr, "добавлен пользователем", "high", status="confirmed")
+            await db.execute("UPDATE clusters SET priority=true, label=COALESCE($2, label) WHERE id=$1", cid, label)
+            await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('dev', $1, $2) "
+                             "ON CONFLICT (kind, address) DO UPDATE SET label=EXCLUDED.label", addr, label)
+            await db.job("recompute_cluster", {"cluster_id": cid})
+            await reply(m, f"✅ Дев добавлен в кластер #{cid}.\n\n" + await views.dev_view(db, settings, str(cid), ext))
+            return
+        cfg = await reload()
+        s7, s30, _ = await compute_trader(db, addr, cfg, views.costs_of(settings))
+        linked = await linked_to_dev(db, addr)
+        ok, fails = qualifies(s7, s30, linked, cfg)
+        await save_trader(db, addr, s7, s30, ok, linked, label=label, manual=True)
+        await db.execute("UPDATE traders SET active=true WHERE address=$1", addr)
+        await db.job("reload")
+        note = "" if ok else "\n⚠️ Не проходит автофильтр (" + "; ".join(esc(f) for f in fails) + "), но оставлен в списке по вашему выбору."
+        note += f"\nИсточник: {ORIGINS[origin]}" if origin else "\nИсточник не указан — /origin адрес axiom|pumpfun|gmgn"
+        note += f" · отбор: {PICKS[pick]}" if pick else ""
+        await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr, ext),
+                    [[{"text": "Убрать из списка", "callback": f"wl:t:{addr}"}]])
+
+    async def import_wallets(m: Message, text: str, origin: str | None = None, pick: str | None = None) -> None:
+        from ..analytics.origin import ORIGINS, PICKS, parse_origin, parse_pick, set_origin, set_pick
+        from .importer import extract_wallets
+        for _ in range(2):                                   # /import axiom нереализ … — первыми словами
+            first = text.strip().split(maxsplit=1)
+            if first and parse_origin(first[0]):
+                origin = origin or parse_origin(first[0])
+            elif first and parse_pick(first[0]):
+                pick = pick or parse_pick(first[0])
+            else:
+                break
+            text = first[1] if len(first) > 1 else ""
+        found = extract_wallets(text)
+        if not found:
+            return await reply(m, "Не нашёл адресов кошельков. Пришлите файл экспорта из Axiom (JSON/CSV/TXT) "
+                                  "или адреса списком: <code>/import адрес подпись</code>, по одному в строке.")
+        new = 0
+        for addr, label in found:
+            existed = await db.fetchval("SELECT 1 FROM watchlist WHERE kind='trader' AND address=$1", addr)
+            new += not existed
+            await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $2) "
+                             "ON CONFLICT (kind, address) DO UPDATE SET label=COALESCE(EXCLUDED.label, watchlist.label)",
+                             addr, label)
+        if origin:
+            await set_origin(db, [a for a, _ in found], origin)
+        if pick:
+            await set_pick(db, [a for a, _ in found], pick)
+        await db.job("reload")
+        await db.job("import_wallets", {"wallets": [[a, lb] for a, lb in found]})
+        sample = "\n".join(f"• {esc(lb or '')} <code>{a[:4]}…{a[-4:]}</code>" for a, lb in found[:10])
+        more = f"\n… и ещё {len(found) - 10}" if len(found) > 10 else ""
+        src = (f"Источник: {ORIGINS[origin]}" if origin else
+               "Источник не указан (в следующий раз — /import без слов, бот спросит кнопками)") + (
+            f" · отбор: {PICKS[pick]}.\n" if pick else ".\n")
+        await reply(m, f"📥 Принял кошельков: <b>{len(found)}</b> (новых {new}).\n{sample}{more}\n{src}\n"
+                       "Слежка в реальном времени начнётся в течение минуты. Проверяю историю каждого "
+                       "(~30 с на кошелёк) — отчёт «кого стоит копировать» придёт в тему «Копитрейд».")
+
+    @router.message(Command("diag"))
+    async def cmd_diag(m: Message) -> None:
+        """Диагностика без терминала: живы ли процессы, не застряли ли задачи и сообщения, ошибки."""
+        from datetime import datetime, timezone
+
+        from ..alerts import format as fmt
+        now = datetime.now(timezone.utc)
+
+        def age(iso: str | None) -> str:
+            if not iso:
+                return "нет данных"
+            sec = (now - datetime.fromisoformat(iso)).total_seconds()
+            return f"{fmt.ago(sec)} назад" + (" ⚠️" if sec > 120 else "")
+        ing = await db.kv_get("health:ingest", {}) or {}
+        ana = await db.kv_get("health:analytics", {}) or {}
+        lines = ["🔧 <b>Диагностика</b>",
+                 f"Приёмник: {age(ing.get('at'))} · Аналитика: {age(ana.get('at'))}",
+                 f"Бумага: открыто {ana.get('paper_open', '—')}, ложных ценовых выходов отменено "
+                 f"{ana.get('paper_false_exits', 0)}, сбойных цен отброшено {ana.get('paper_bad_prices', 0)}, "
+                 f"входов по цене Jupiter (свой поток отстал) {ana.get('paper_entry_fixed', 0)}, "
+                 f"выходов по цене Jupiter {ana.get('paper_exit_fixed', 0)}, без подтверждённой цены не вошли "
+                 f"{ana.get('paper_no_price', 0)}",
+                 "Самопроверка по свечам GeckoTerminal: проверено {checked}, неверная цена {bad}, нет свечей {nodata}"
+                 .format(**{"checked": 0, "bad": 0, "nodata": 0, **(ana.get('paper_pricecheck') or {})}),
+                 "Разведка: на испытании {probation}, найдено {found}, начато {started}, добавлено {promoted}, "
+                 "отсеяно {rejected}, убрано {demoted}, ошибок GMGN {gmgn_errors} (с запуска)"
+                 .format(**{"probation": 0, "found": 0, "started": 0, "promoted": 0, "rejected": 0, "demoted": 0,
+                            "gmgn_errors": 0, **(ana.get('scout') or {})})]
+        pend = await db.fetchrow("SELECT count(*) n, min(created_at) oldest FROM jobs WHERE done_at IS NULL")
+        lines.append(f"\n<b>Задачи</b> (команды бота → аналитика): в очереди {pend['n']}"
+                     + (f", самая старая {fmt.ago((now - pend['oldest']).total_seconds())} назад ⚠️"
+                        if pend["n"] and (now - pend["oldest"]).total_seconds() > 60 else ""))
+        for j in await db.fetch("SELECT * FROM jobs ORDER BY id DESC LIMIT 6"):
+            took = (f"за {fmt.ago((j['done_at'] - j['created_at']).total_seconds())}" if j["done_at"]
+                    else "ещё не выполнена")
+            cmd = (j["payload"] or {}).get("cmd", "")
+            lines.append(f"• {j['kind']}{' ' + str(cmd) if cmd else ''} · {fmt.ago((now - j['created_at']).total_seconds())} "
+                         f"назад · {took}" + (f" · ❌ {esc(j['error'][:120])}" if j["error"] else ""))
+        ob = await db.fetchrow(
+            """SELECT count(*) FILTER (WHERE sent_at IS NULL AND attempts < 5) pending,
+                      count(*) FILTER (WHERE sent_at IS NULL AND attempts >= 5 AND created_at > now() - interval '1 day') failed,
+                      min(created_at) FILTER (WHERE sent_at IS NULL AND attempts < 5) oldest
+               FROM outbox""")
+        lines.append(f"\n<b>Отправка в Telegram</b>: ждут {ob['pending']}"
+                     + (f" (самое старое {fmt.ago((now - ob['oldest']).total_seconds())})" if ob["pending"] else "")
+                     + f", не отправлено за сутки {ob['failed']}")
+        for r in await db.fetch(
+                """SELECT kind, payload->>'topic' topic, attempts, error, created_at FROM outbox
+                   WHERE error IS NOT NULL AND error NOT IN ('buffered', 'superseded', 'muted', 'stale')
+                   AND created_at > now() - interval '1 day' ORDER BY id DESC LIMIT 5"""):
+            lines.append(f"• {r['kind']}/{r['topic'] or '—'} · {fmt.ago((now - r['created_at']).total_seconds())} назад · "
+                         f"попыток {r['attempts']} · {esc((r['error'] or '')[:150])}")
+        flood = await db.kv_get("sender:flood", {}) or {}
+        if flood.get("at"):
+            lines.append(f"Последнее ограничение Telegram (flood): пауза {flood.get('seconds')} с, "
+                         f"{fmt.ago((now - datetime.fromisoformat(flood['at'])).total_seconds())} назад")
+        errs = await db.kv_get("bot:errors", []) or []
+        if errs:
+            lines.append("\n<b>Ошибки команд бота</b>")
+            for e_ in errs[-5:]:
+                lines.append(f"• {fmt.ago((now - datetime.fromisoformat(e_['at'])).total_seconds())} назад · "
+                             f"{esc(e_.get('cmd') or '')} · {esc(e_['text'][:150])}")
+        await reply(m, "\n".join(lines))
+
+    @router.message(Command("copylog"))
+    async def cmd_copylog(m: Message, command: CommandObject) -> None:
+        """Журнал копитрейда: по каждому своему кошельку — скопировано/пропущено, дельта входа, анти-PVP
+        и итог бумаги по его копиям (/copylog 72 — за 72 часа)."""
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        from ..alerts import format as fmt
+        cfg = await reload()
+        try:
+            tz = ZoneInfo(str(cfg.get("timezone") or "UTC"))
+        except Exception:  # noqa: BLE001
+            tz = ZoneInfo("UTC")
+        labels = {r["address"]: r["label"] for r in await db.fetch(
+            "SELECT address, label FROM watchlist WHERE kind IN ('trader', 'dev')")}
+        name = lambda w: esc(labels.get(w) or f"{w[:4]}…{w[-4:]}")  # noqa: E731
+        paused = await db.kv_get("copy:paused", {}) or {}
+        now = datetime.now(timezone.utc).timestamp()
+        arg = (command.args or "").strip().lower().rstrip("чh")
+        hours = min(24 * 30, max(1, int(arg))) if arg.isdigit() else 24
+        stats = {r["wallet"]: r for r in await db.fetch(
+            """SELECT wallet, count(*) FILTER (WHERE action='copied') c, count(*) FILTER (WHERE action='skipped') s,
+                      avg(delta) d, count(delta) dn
+               FROM copy_log WHERE ts > now() - $1::float8 * interval '1 hour' GROUP BY wallet""", float(hours))}
+        # итог бумаги по кошельку: одна копия = одна монета, результат — средний по портфелям (позиция одна и та же)
+        paper = {r["w"]: r for r in await db.fetch(
+            """WITH x AS (SELECT source_wallet w, COALESCE(alert_id::text, mint) k, avg(pnl_sol) s, avg(pnl_pct) p
+                          FROM paper_positions WHERE source_wallet IS NOT NULL AND closed_at IS NOT NULL
+                            AND exit_reason <> 'reset' AND NOT suspect
+                            AND closed_at > now() - $1::float8 * interval '1 hour' GROUP BY 1, 2)
+               SELECT w, count(*) n, count(*) FILTER (WHERE s > 0) wins, sum(s) sol, min(p) worst FROM x GROUP BY w""",
+            float(hours))}
+        sol = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+        lines = [f"📒 <b>Копитрейд за {hours} ч</b> · по итогу бумаги, сначала худшие"]
+        for w in sorted(set(stats) | set(paper), key=lambda w: (paper[w]["sol"] if w in paper else 0.0,
+                                                                -(stats[w]["c"] if w in stats else 0))):
+            r, pr = stats.get(w), paper.get(w)
+            p_until = float(paused.get(w, 0) or 0)
+            late = bool(r and r["dn"] and r["dn"] >= float(cfg.get("copy_delta_min_n", 5))
+                        and (r["d"] or 0) > float(cfg.get("copy_max_delta", 0.15)))
+            res = ""
+            if pr:
+                mark = "✅" if pr["sol"] > 0 else "❌"
+                res = (f" · {mark} бумага {pr['n']} сд., в плюсе {pr['wins']}, {pr['sol']:+.3f} SOL "
+                       f"(${pr['sol'] * sol:+.2f}), худшая {pr['worst']:+.0%}")
+            lines.append(f"• {name(w)}: скопировано {r['c'] if r else 0}, пропущено {r['s'] if r else 0}"
+                         + (f" · дельта входа {r['d']:+.0%} ({r['dn']})" if r and r["dn"] else "")
+                         + res
+                         + (f" · ⏸ анти-PVP ещё {fmt.ago(p_until - now)}" if p_until > now else "")
+                         + (" · ⛔ не копируется: опаздываем" if late else "")
+                         + (f"\n   <code>{w}</code>" if (pr and pr["sol"] < 0) or late or p_until > now
+                            else ""))   # нажать — скопировать адрес для /removewallet
+        if len(lines) == 1:
+            lines.append("Сделок своих кошельков пока не было.")
+        else:
+            lines.append("<i>бумага: SOL на один портфель; убрать кошелёк — /removewallet адрес</i>")
+        rows = await db.fetch("SELECT * FROM copy_log ORDER BY id DESC LIMIT 15")
+        if rows:
+            lines.append("\n<b>Последние</b>")
+        for r in rows:
+            icon = {"copied": "✅", "skipped": "⛔"}.get(r["action"], "↘")
+            verb = {"buy": "купил", "sell": "продал", "launch": "запустил"}.get(r["side"], r["side"])
+            sol_part = f" {r['sol']:.2f} SOL" if r["sol"] else ""
+            delta = f" · вход {r['delta']:+.0%}" if r["delta"] is not None else ""
+            lines.append(f"{icon} {r['ts'].astimezone(tz):%H:%M} {name(r['wallet'])} {verb}{sol_part} "
+                         f"${esc(r['symbol'] or '?')} · MC {fmt.mc_usd(r['mc'], sol)}{delta}"
+                         + (f" — {esc(r['reason'])}" if r["reason"] else ""))
+        chunk = ""
+        for line in lines:                     # по строкам: длинный список не рвёт HTML-теги посередине
+            if chunk and len(chunk) + len(line) + 1 > 3900:
+                await reply(m, chunk)
+                chunk = ""
+            chunk = f"{chunk}\n{line}" if chunk else line
+        await reply(m, chunk)
+
+    @router.message(Command("devonce"))
+    async def cmd_devonce(m: Message, command: CommandObject) -> None:
+        addr = (command.args or "").strip().split(" ")[0]
+        if not is_valid_address(addr):
+            return await reply(m, "Формат: <code>/devonce адрес</code> — заходить к этому деву только один раз "
+                                  "(повтор команды выключает).")
+        cur = await db.fetchval("SELECT once FROM my_devs WHERE address=$1", addr)
+        new = not bool(cur)
+        await db.execute("INSERT INTO my_devs(address, once, once_done) VALUES ($1, $2, false) "
+                         "ON CONFLICT (address) DO UPDATE SET once=EXCLUDED.once, once_done=false", addr, new)
+        await db.execute("INSERT INTO watchlist(kind, address) VALUES ('dev', $1) ON CONFLICT DO NOTHING", addr)
+        await reply(m, "✅ Режим «один раз» включён: после первого алерта по этому деву — пауза."
+                    if new else "Режим «один раз» выключен: алерты по каждому запуску.")
+
+    @router.message(Command("import"))
+    async def cmd_import(m: Message, command: CommandObject) -> None:
+        if m.document is not None:          # файл с подписью /import
+            return await on_document(m)
+        if not command.args:
+            text, kb = wiz.start(m.from_user.id if m.from_user else 0, "import")
+            return await reply(m, text, kb)
+        await import_wallets(m, command.args)
+
+    @router.message(F.document)
+    async def on_document(m: Message) -> None:
+        doc = m.document
+        if doc is None or (doc.file_size or 0) > 2_000_000:
+            return await reply(m, "Файл больше 2 МБ — это не похоже на список кошельков.")
+        buf = await m.bot.download(doc)
+        raw = buf.read() if buf is not None else b""
+        text = raw.decode("utf-8-sig", errors="ignore")
+        from ..analytics.origin import parse_origin, parse_pick
+        st = wiz.waiting_input(m.from_user.id if m.from_user else 0) or {}
+        origin = next((o for o in (parse_origin(w) for w in (m.caption or "").split()) if o), st.get("origin"))
+        pick = next((o for o in (parse_pick(w) for w in (m.caption or "").split()) if o), st.get("pick"))
+        await import_wallets(m, text, origin, pick)
+
+    @router.message(Command("removewallet"))
+    async def cmd_removewallet(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /removewallet &lt;адрес&gt;")
+        await remove(a)
+        await reply(m, f"Убран из отслеживания: <code>{a}</code>")
+
+    async def remove(addr: str, code: str | None = None) -> None:
+        """code: t — трейдер, d — дев, k — монета, None — везде."""
+        if code in (None, "t"):
+            await db.execute("UPDATE traders SET active=false, manual=false WHERE address=$1", addr)
+        if code is None:
+            await db.execute("DELETE FROM watchlist WHERE address=$1", addr)
+        else:
+            kind = {"t": "trader", "d": "dev", "k": "token"}[code]
+            await db.execute("DELETE FROM watchlist WHERE address=$1 AND kind=$2", addr, kind)
+        await db.job("reload")
+
+    @router.message(Command("blacklist"))
+    async def cmd_blacklist(m: Message, command: CommandObject) -> None:
+        ref = (command.args or "").strip().lstrip("#")
+        if not ref:
+            return await reply(m, "Формат: /blacklist &lt;адрес или номер кластера&gt;")
+        cid = await views.resolve_cluster(db, ref)
+        if is_valid_address(ref):
+            await db.execute("INSERT INTO wallets(address, blacklisted) VALUES ($1, true) "
+                             "ON CONFLICT (address) DO UPDATE SET blacklisted=true", ref)
+        if cid:
+            await db.execute("UPDATE clusters SET blacklisted=true, blacklist_reason='вручную' WHERE id=$1", cid)
+        await remove(ref)
+        await reply(m, f"⛔ В чёрном списке: {esc(ref)}" + (f" (кластер #{cid})" if cid else ""))
+
+    @router.message(Command("today"))
+    async def cmd_today(m: Message) -> None:
+        cfg = await reload()
+        text, csv_bytes, kb = await build_daily(db, settings, today_in(cfg.get("timezone", "UTC")))
+        await reply(m, text, kb)
+        await send_doc(m, csv_bytes, "today.csv")
+
+    @router.message(Command("backtest"))
+    async def cmd_backtest(m: Message, command: CommandObject) -> None:
+        await reload()
+        await reply(m, "🧪 Считаю бэктест, это может занять пару минут…")
+
+        async def job() -> None:
+            try:
+                text = await run_backtest(db, settings, command.args or "7d")
+            except ValueError as exc:
+                text = f"Ошибка: {esc(exc)}"
+            except Exception as exc:  # noqa: BLE001
+                log.exception("backtest")
+                text = f"Бэктест не удался: {esc(exc)}"
+            await reply(m, text)
+        asyncio.create_task(job())
+
+    @router.message(Command("stats"))
+    async def cmd_stats(m: Message) -> None:
+        await reply(m, await views.stats_view(db))
+
+    @router.message(Command("mute"))
+    async def cmd_mute(m: Message, command: CommandObject) -> None:
+        arg = (command.args or "60").strip()
+        minutes = int(arg) if arg.isdigit() else 60
+        if minutes == 0:
+            await db.kv_set("mute_until", None)
+            return await reply(m, "🔔 Алерты снова включены.")
+        until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        await db.kv_set("mute_until", until.isoformat())
+        await reply(m, f"🔕 Пауза алертов на {minutes} мин. Экстренные сигналы на выход по открытым монетам "
+                       "продолжат приходить. /mute 0 — снять паузу.")
+
+    @router.message(Command("wallet"))
+    async def cmd_wallet(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /wallet &lt;адрес&gt;")
+        text, kb = await views.wallet_view(db, a, ext)
+        await reply(m, text, kb)
+
+    @router.message(Command("coin"))
+    async def cmd_coin(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /coin &lt;адрес токена&gt;")
+        text, kb = await views.coin_view(db, settings, a, ext)
+        await reply(m, text, kb)
+
+    @router.callback_query(F.data.startswith(("w:", "coin:")))
+    async def cb_wallet_coin(c: CallbackQuery) -> None:
+        kind, _, addr = c.data.partition(":")
+        await c.answer()
+        if not is_valid_address(addr):
+            return
+        text, kb = await (views.wallet_view(db, addr, ext) if kind == "w" else views.coin_view(db, settings, addr, ext))
+        await c.message.answer(fmt.split_html(text)[0], parse_mode="HTML", reply_markup=build(kb), link_preview_options=NO_PREVIEW)
+
+    @router.callback_query(F.data.startswith(("wt:", "wb:")))
+    async def cb_wallet_actions(c: CallbackQuery) -> None:
+        kind, _, addr = c.data.partition(":")
+        if not is_valid_address(addr):
+            return await c.answer()
+        if kind == "wt":
+            await db.execute("INSERT INTO watchlist(kind, address) VALUES ('trader', $1) ON CONFLICT DO NOTHING", addr)
+            await db.job("reload")
+            await c.answer("Отслеживаю кошелёк")
+        else:
+            await db.execute("INSERT INTO wallets(address, blacklisted) VALUES ($1, true) "
+                             "ON CONFLICT (address) DO UPDATE SET blacklisted=true", addr)
+            cid = await views.resolve_cluster(db, addr)
+            if cid:
+                await db.execute("UPDATE clusters SET blacklisted=true, blacklist_reason='вручную' WHERE id=$1", cid)
+            await remove(addr)
+            await c.answer("В чёрном списке")
+
+    async def paper_view() -> Any:
+        """Отчёт бумажной торговли строит сам бот по БД — не зависит от того, занята ли аналитика."""
+        from types import SimpleNamespace
+
+        from ..analytics.paper import PaperTrader
+        cfg = await reload()
+        price = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+        eng = SimpleNamespace(db=db, price=SimpleNamespace(value=price), fee_bps=None, settings=settings, cfg=cfg,
+                              states={}, ext=None)
+        tr = PaperTrader(eng)  # type: ignore[arg-type]
+        await tr.start()
+        return tr
+
+    async def paper_answer(target: Message, cmd: str, hours: float | None = None) -> None:
+        from ..analytics.paper import PERIOD_KEYBOARD
+        tr = await paper_view()
+        if cmd == "csv":
+            data = await tr.trades_csv(None)
+            n = max(0, data.count("\n") - 1)
+            await send_doc(target, data.encode("utf-8-sig"), "paper_trades.csv",
+                           f"📄 Все сделки с последнего сброса: {n}. Открывается в Numbers / Excel.")
+            return
+        if cmd == "trades":
+            parts = await tr.trades_text(hours or 24)
+            for i, part in enumerate(parts):
+                await reply(target, part, PERIOD_KEYBOARD if i == len(parts) - 1 else None)
+            return
+        text = await tr.history(20) if cmd == "history" else await tr.render_period(hours)
+        await reply(target, text, PERIOD_KEYBOARD + [[{"text": "🔄 Сброс портфелей…", "callback": "pp:reset"}]])
+
+    @router.message(Command("paper"))
+    async def cmd_paper(m: Message, command: CommandObject) -> None:
+        arg = (command.args or "").strip().lower()
+        cmd = {"reset": "reset", "history": "history", "day": "trades", "24": "trades", "csv": "csv",
+               "file": "csv"}.get(arg, "state")
+        if cmd == "reset":
+            await db.job("paper", {"cmd": "reset"})
+            return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
+        await paper_answer(m, cmd, 24 if cmd == "trades" else None)
+
+    @router.message(Command("origin"))
+    async def cmd_origin(m: Message, command: CommandObject) -> None:
+        """Откуда кошелёк: /origin адрес axiom|pumpfun|gmgn|other; /origin все axiom — все непомеченные из своего списка."""
+        from ..analytics.origin import ORIGINS, origins, own_wallets, parse_origin, set_origin
+        parts = (command.args or "").split()
+        from ..analytics.origin import PICKS, parse_pick, picks, set_pick
+        if len(parts) >= 2 and parse_pick(parts[-1]):
+            pick = parse_pick(parts[-1])
+            addrs = await own_wallets(db) if parts[0].lower() in ("все", "all") else \
+                [p for p in parts[:-1] if is_valid_address(p)]
+            if parts[0].lower() in ("все", "all"):
+                marked_p = await picks(db)
+                addrs = [a for a in addrs if a not in marked_p]
+            if not addrs:
+                return await reply(m, "Некого помечать: нет подходящих адресов.")
+            await set_pick(db, addrs, pick)  # type: ignore[arg-type]
+            return await reply(m, f"✅ Отбор «{PICKS[pick]}» — кошельков: {len(addrs)}.")  # type: ignore[index]
+        if len(parts) >= 2 and parse_origin(parts[-1]):
+            origin = parse_origin(parts[-1])
+            if parts[0].lower() in ("все", "all"):
+                marked = await origins(db)
+                addrs = [a for a in await own_wallets(db) if a not in marked]
+            else:
+                addrs = [p for p in parts[:-1] if is_valid_address(p)]
+            if not addrs:
+                return await reply(m, "Некого помечать: нет подходящих адресов.")
+            await set_origin(db, addrs, origin)  # type: ignore[arg-type]
+            return await reply(m, f"✅ Источник «{ORIGINS[origin]}» — кошельков: {len(addrs)}.")  # type: ignore[index]
+        await reply(m, *(await origin_view()))
+
+    async def origin_view() -> tuple[str, list[list[dict[str, Any]]]]:
+        from ..analytics.origin import ORIGINS, PICK_UNMARKED, UNMARKED, origins, own_wallets, picks
+        marked, marked_p = await origins(db), await picks(db)
+        own = await own_wallets(db)
+        cnt: dict[str, int] = {}
+        cnt_p: dict[str, int] = {}
+        for a in own:
+            cnt[marked.get(a, UNMARKED)] = cnt.get(marked.get(a, UNMARKED), 0) + 1
+            cnt_p[marked_p.get(a, PICK_UNMARKED)] = cnt_p.get(marked_p.get(a, PICK_UNMARKED), 0) + 1
+        text = ("🏷 <b>Кошельки своего списка</b>\nОткуда:\n"
+                + ("\n".join(f"• {k}: {v}" for k, v in sorted(cnt.items(), key=lambda kv: -kv[1])) or "список пуст")
+                + "\nКак отобраны:\n"
+                + "\n".join(f"• {k}: {v}" for k, v in sorted(cnt_p.items(), key=lambda kv: -kv[1]))
+                + "\n\nОдин кошелёк: <code>/origin адрес axiom</code> или <code>/origin адрес нереализ</code>\n"
+                  "Новые — через «📥 Импорт кошельков» / «➕ Добавить кошелёк»: источник и отбор спросят кнопками.\n"
+                  "Пометить все непомеченные:")
+        kb = [[{"text": ORIGINS[o], "callback": f"og:o:{o}"} for o in ("pumpfun", "axiom", "gmgn")],
+              [{"text": "Реализ.", "callback": "og:p:realized"}, {"text": "Нереализ.", "callback": "og:p:unrealized"},
+               {"text": "Нейтрал", "callback": "og:p:neutral"}]]
+        return text, kb
+
+    @router.callback_query(F.data.startswith("og:"))
+    async def cb_origin_all(c: CallbackQuery) -> None:
+        from ..analytics.origin import ORIGINS, PICKS, origins, own_wallets, picks, set_origin, set_pick
+        _, kind, value = c.data.split(":", 2)
+        own = await own_wallets(db)
+        if kind == "o" and value in ORIGINS:
+            marked = await origins(db)
+            addrs = [a for a in own if a not in marked]
+            if addrs:
+                await set_origin(db, addrs, value)
+            await c.answer(f"Источник «{ORIGINS[value]}»: {len(addrs)}")
+        elif kind == "p" and value in PICKS:
+            marked_p = await picks(db)
+            addrs = [a for a in own if a not in marked_p]
+            if addrs:
+                await set_pick(db, addrs, value)
+            await c.answer(f"Отбор «{PICKS[value]}»: {len(addrs)}")
+        if c.message is not None:
+            text, kb = await origin_view()
+            await c.message.answer(text, parse_mode="HTML", reply_markup=build(kb))
+
+    @router.message(Command("smart"))
+    async def cmd_smart(m: Message, command: CommandObject) -> None:
+        """Только smart-сигналы: итог при $10 на сделку, по дням, по кошелькам, что отличает плюсовые (/smart 14)."""
+        arg = (command.args or "").strip().lower().rstrip("dд")
+        await send_smart(m, min(30, max(1, int(arg))) if arg.isdigit() else 7)
+
+    async def send_smart(m: Message, days: int) -> None:
+        from ..reports.smart import chunks, smart_report
+        cfg = await reload()
+        parts = chunks(await smart_report(db, days, str(cfg.get("timezone") or "Asia/Tbilisi"),
+                                          int(cfg.get("smart_accounts") or 2)))
+        kb = [[{"text": ("● " if d == days else "") + f"{d} дн.", "callback": f"sm:{d}"} for d in (1, 3, 7, 14, 30)]]
+        for i, part in enumerate(parts):
+            await reply(m, part, kb if i == len(parts) - 1 else None)
+
+    @router.callback_query(F.data.startswith("sm:"))
+    async def cb_smart(c: CallbackQuery) -> None:
+        await c.answer("Считаю…")
+        if c.message is not None:
+            await send_smart(c.message, int(c.data[3:]))
+
+    @router.message(Command("filter"))
+    async def cmd_filter(m: Message) -> None:
+        """Автофильтр сигналов: чему научился на сделках трейдеров, включён ли, что отсеивает."""
+        from ..analytics.autofilter import filter_report
+        await reply(m, await filter_report(db))
+
+    @router.message(Command("rating"))
+    async def cmd_rating(m: Message, command: CommandObject) -> None:
+        """Рейтинг кошельков по итогу их копий; /rating адрес топ|норм|слабый|пауза|авто — ручная правка."""
+        from ..analytics.rating import MANUAL, TIERS, rating_report
+        cfg = await reload()
+        parts = (command.args or "").split()
+        if parts and is_valid_address(parts[0]):
+            what = parts[1].lower() if len(parts) > 1 else ""
+            if what in ("авто", "auto"):
+                await db.execute("UPDATE wallet_rating SET manual_tier=NULL WHERE address=$1", parts[0])
+                return await reply(m, "✅ Кошелёк снова оценивается автоматически (применится в течение 5 минут).")
+            tier = MANUAL.get(what)
+            if not tier:
+                return await reply(m, "Формат: /rating адрес топ|норм|слабый|пауза|авто")
+            await db.execute(
+                """INSERT INTO wallet_rating(address, tier, manual_tier) VALUES ($1, $2, $2)
+                   ON CONFLICT (address) DO UPDATE SET manual_tier=EXCLUDED.manual_tier""", parts[0], tier)
+            return await reply(m, f"✅ Вручную: {TIERS[tier]} (применится в течение 5 минут). Вернуть — /rating {parts[0]} авто")
+        text, chunk = await rating_report(db, cfg), ""
+        for line in text.split("\n"):
+            if len(chunk) + len(line) > 3900:
+                await reply(m, chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            await reply(m, chunk)
+
+    @router.message(Command("scout"))
+    async def cmd_scout(m: Message) -> None:
+        """Разведка кошельков: кто на испытании, кого добавили и отсеяли."""
+        from ..analytics.scout import scout_report
+        await reply(m, await scout_report(db))
+
+    @router.message(Command("wallets"))
+    async def cmd_wallets(m: Message) -> None:
+        """Файл по всем кошелькам: свои, разведка, кандидаты, smart-money — с итогом копий и вердиктом."""
+        from ..reports.wallets import wallets_csv
+        cfg = await reload()
+        sol = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
+        data, n = await wallets_csv(db, sol, str(cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
+        await send_doc(m, data.encode("utf-8-sig"), "wallets.csv",
+                       f"👛 Кошельков: {n}, сначала худшие. Вердикт — по итогу копий в бумаге.")
+
+    @router.message(Command("export"))
+    async def cmd_export(m: Message) -> None:
+        await send_export(m)
+
+    @router.message(Command("excel"))
+    async def cmd_excel(m: Message) -> None:
+        """Вся отчётность одним файлом Excel: реальный бот, сравнение с бумагой, пропуски, бумага, кошельки, разведка."""
+        from ..reports.excel import build_xlsx
+        cfg = await reload()
+        data, caption = await build_xlsx(db, cfg)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+        await send_doc(m, data, f"report_{stamp}.xlsx", caption)
+
+    async def send_export(m: Message) -> None:
+        """Всё для разбора одним архивом: сделки за сутки и 30 дней, кошельки, журнал копитрейда."""
+        from ..reports.export import build_export
+        tr = await paper_view()
+        data, caption = await build_export(db, tr)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await send_doc(m, data, f"scanner_{stamp}.zip", "📦 " + caption)
+
+    @router.message(Command("calib"))
+    async def cmd_calib(m: Message, command: CommandObject) -> None:
+        """Калибровка стопов и тейков по пути цены после входа (/calib 14 — за 14 дней)."""
+        from ..reports.calib import calib_report
+        arg = (command.args or "").strip().lower().rstrip("dд")
+        days = min(60.0, max(1.0, float(arg))) if arg.replace(".", "", 1).isdigit() else 7.0
+        text, chunk = await calib_report(db, days), ""
+        for line in text.split("\n"):                       # режем по строкам, чтобы не порвать HTML-теги
+            if len(chunk) + len(line) > 3900:
+                await reply(m, chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            await reply(m, chunk)
+
+    @router.message(Command("tune"))
+    async def cmd_tune(m: Message) -> None:
+        """Автоподбор фильтров «Трендов» по истории (обучение 2/3, проверка 1/3)."""
+        from ..analytics.tuning import tune_trends
+        cfg = await reload()
+        res = await tune_trends(db, cfg)
+        tail = ("\nПрименится в течение 5 минут. Ночью (03:00 UTC) подбор повторяется сам."
+                if res.adopted else "")
+        await reply(m, res.text(cfg) + tail)
+
+    @router.callback_query(F.data.startswith("pp:"))
+    async def cb_paper_period(c: CallbackQuery) -> None:
+        arg = c.data[3:]
+        await c.answer("Считаю…")
+        if c.message is None:
+            return
+        if arg == "reset":
+            await reply(c.message, "Сбросить все бумажные портфели к стартовому балансу?",
+                        [[{"text": "Да, сбросить", "callback": "pp:reset!"}, {"text": "Нет", "callback": "pp:no"}]])
+        elif arg == "reset!":
+            await db.job("paper", {"cmd": "reset"})
+            await reply(c.message, "Сбрасываю портфели… Подтверждение придёт в «Бумажная торговля».")
+        elif arg == "no":
+            pass
+        elif arg == "hist":
+            await paper_answer(c.message, "history")
+        elif arg == "day":
+            await paper_answer(c.message, "trades", 24)
+        elif arg == "csv":
+            await paper_answer(c.message, "csv")
+        else:
+            await paper_answer(c.message, "period", None if arg == "all" else float(arg))
+
+    # ------------------------------------------------------------------ реальный бот (scanner/real/report.py)
+    @router.message(Command("real"))
+    async def cmd_real(m: Message) -> None:
+        text, kb = await real_report.status_view(db, await reload())
+        await reply(m, text, kb)
+
+    @router.callback_query(F.data.startswith("rl:"))
+    async def cb_real(c: CallbackQuery) -> None:
+        r = await real_report.on_callback(db, reload, c.data[3:], balance_rpc)
+        await c.answer(r.toast[:190] if r.toast else None)
+        if r.ask and c.from_user is not None:
+            wiz.ask(c.from_user.id, r.ask)           # следующее текстовое сообщение — ответ (название кошелька)
+        if c.message is None:
+            return
+        if r.document is not None:
+            data, name, caption = r.document
+            await send_doc(c.message, data, name, caption)
+        elif r.text and r.edit and len(r.text) <= 4000:
+            try:
+                await c.message.edit_text(r.text, parse_mode="HTML", reply_markup=build(r.kb),
+                                          link_preview_options=NO_PREVIEW)
+            except Exception:  # noqa: BLE001 — «текст не изменился» и подобное
+                pass
+        elif r.text:
+            await reply(c.message, r.text, r.kb)
+
+    @router.message(Command("testalert"))
+    async def cmd_testalert(m: Message) -> None:
+        await sender.setup_topics()
+        res = await sender.send_test_alerts()
+        await reply(m, "Тестовые алерты отправлены: " + ", ".join(esc(x) for x in res))
+
+    @router.message(Command("health"))
+    async def cmd_health(m: Message) -> None:
+        await reply(m, await views.health_view(db))
+
+    async def set_text(m: Message, key: str, value: Any, ok: str) -> None:
+        await db.set_override(key, value)
+        await reply(m, ok)
+
+    @router.message(Command("quiet"))
+    async def cmd_quiet(m: Message, command: CommandObject) -> None:
+        v = (command.args or "").strip()
+        await set_text(m, "quiet_hours", v or None, f"Тихие часы: {esc(v) or 'выключены'}")
+
+    @router.message(Command("tz"))
+    async def cmd_tz(m: Message, command: CommandObject) -> None:
+        from zoneinfo import ZoneInfo
+        v = (command.args or "").strip()
+        try:
+            ZoneInfo(v)
+        except Exception:  # noqa: BLE001
+            return await reply(m, "Формат: /tz Europe/Moscow")
+        await set_text(m, "timezone", v, f"Часовой пояс: {esc(v)}")
+
+    @router.message(Command("dailytime"))
+    async def cmd_dailytime(m: Message, command: CommandObject) -> None:
+        v = (command.args or "").strip()
+        try:
+            datetime.strptime(v, "%H:%M")
+        except ValueError:
+            return await reply(m, "Формат: /dailytime 21:00")
+        await set_text(m, "daily_report_time", v, f"Разбор дня в {v}")
+
+    @router.message(Command("mywallet"))
+    async def cmd_mywallet(m: Message, command: CommandObject) -> None:
+        a = arg_addr(command)
+        if not a:
+            return await reply(m, "Формат: /mywallet &lt;публичный адрес&gt;. Ключи не нужны и не принимаются.")
+        await set_text(m, "trading_wallet", a, "Торговый кошелёк сохранён (только публичный адрес, только чтение).")
+
+    # ------------------------------------------------------------------ кнопки
+    @router.callback_query(F.data.startswith("menu:"))
+    async def cb_menu(c: CallbackQuery) -> None:
+        what = c.data.split(":", 1)[1]
+        await c.answer()
+        m = c.message
+        if m is None:
+            return
+        if what == "paper":
+            return await paper_answer(m, "state")
+        if what == "real":
+            text, kb = await real_report.status_view(db, await reload())
+            return await show(m, text, kb)
+        if what == "cmp":
+            return await show(m, await real_report.compare_text(db, await reload()),
+                              [[{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}]])
+        if what == "excel":
+            return await cmd_excel(m)
+        if what == "wallets":
+            return await cmd_wallets(m)
+        if what == "scout":
+            from ..analytics.scout import scout_report
+            return await show(m, await scout_report(db))
+        if what == "rating":
+            return await cmd_rating(m, CommandObject(prefix="/", command="rating", args=None))
+        if what == "board":
+            from . import board
+            text, kb = await board.board_view(db)
+            return await show(m, text, kb)
+        if what == "copylog":
+            return await cmd_copylog(m, CommandObject(prefix="/", command="copylog", args=None))
+        if what == "smart":
+            return await send_smart(m, 7)
+        if what in ("import", "add"):
+            text, kb = wiz.start(c.from_user.id, what)
+            return await show(m, text, kb)
+        if what == "origin":
+            text, kb = await origin_view()
+            return await show(m, text, kb)
+        if what == "export":
+            return await send_export(m)
+        if what == "mode":
+            text, kb = mode_view(await reload())
+        elif what == "settings":
+            text, kb = settings_view(await reload())
+        elif what == "watchlist":
+            text, kb = await views.watchlist_view(db)
+        elif what == "stats":
+            text, kb = await views.stats_view(db), None
+        elif what == "health":
+            text, kb = await views.health_view(db), None
+        else:
+            cfg = await reload()
+            text, _csv, kb = await build_daily(db, settings, today_in(cfg.get("timezone", "UTC")))
+        await show(m, text, kb)
+
+    @router.callback_query(F.data.startswith(("mode:", "tog:", "set:", "preset:")))
+    async def cb_settings(c: CallbackQuery) -> None:
+        cfg = await reload()
+        kind, _, rest = c.data.partition(":")
+        if kind == "mode":
+            modes = dict(cfg.get("modes", {}))
+            modes[rest] = not modes.get(rest, True)
+            await db.set_override("modes", modes)
+            view = mode_view
+        elif kind == "tog":
+            await db.set_override(rest, not cfg.get(rest, rest in TOGGLES_ON_BY_DEFAULT))
+            view = mode_view if rest in ("smart_filtered", "smart_full_feed", "watch_level_enabled",
+                                         "trend_autotune", "trend_wait_pullback") else settings_view
+        elif kind == "set":
+            key, _, sign = rest.partition(":")
+            label, step, lo, hi, _k = EDITABLE[key]
+            v = float(cfg.get(key, NEW_DEFAULTS.get(key)) or 0) + (step if sign == "+" else -step)
+            await db.set_override(key, round(min(hi, max(lo, v)), 4))
+            view = settings_view
+        else:
+            await db.set_override("filter_preset", rest)
+            view = settings_view
+        text, kb = view(await reload())
+        await c.answer("Сохранено")
+        try:
+            await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("ps:"))
+    async def cb_paper_share(c: CallbackQuery) -> None:
+        v = float(c.data[3:])
+        await db.set_override("paper_position_share", min(0.5, max(0.05, v)))
+        text, kb = settings_view(await reload())
+        await c.answer(f"Позиция {v:.0%} баланса")
+        try:
+            await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("pl:"))
+    async def cb_paper_levels(c: CallbackQuery) -> None:
+        cfg = await reload()
+        lv = c.data[3:]
+        cur = set(cfg.get("paper_levels") or ["strong", "normal"])
+        cur ^= {lv}
+        await db.set_override("paper_levels", sorted(cur))
+        text, kb = settings_view(await reload())
+        await c.answer("Сохранено")
+        try:
+            await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("prof:"))
+    async def cb_profile(c: CallbackQuery) -> None:
+        _, kind, ref = c.data.split(":", 2)
+        await c.answer()
+        text = await (views.dev_view(db, settings, ref, ext) if kind == "d" else views.trader_view(db, settings, ref, ext))
+        await c.message.answer(fmt.split_html(text)[0], parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("trk:"))
+    async def cb_track(c: CallbackQuery) -> None:
+        mint = c.data[4:]
+        if is_valid_address(mint):
+            await watch_token(mint)
+        await c.answer("Сопровождаю монету")
+
+    @router.callback_query(F.data.startswith("mk:"))
+    async def cb_mark(c: CallbackQuery) -> None:
+        _, aid, mark = c.data.split(":")
+        await db.execute(
+            "INSERT INTO user_marks(alert_id, user_id, mark) VALUES ($1,$2,$3) "
+            "ON CONFLICT (alert_id, user_id) DO UPDATE SET mark=EXCLUDED.mark, created_at=now()",
+            int(aid), c.from_user.id, mark)
+        await db.job("mark", {"alert_id": int(aid), "mark": mark})
+        names = {"great": "Очень успешно", "good": "Успешно", "fail": "Провал", "scam": "Скам"}
+        await c.answer(f"Отмечено: {names[mark]}")
+
+    @router.callback_query(F.data.startswith("lk:"))
+    async def cb_link(c: CallbackQuery) -> None:
+        _, lid, yn = c.data.split(":")
+        row = await db.fetchrow(
+            "UPDATE cluster_links SET status=$2, decided_at=now(), confidence=CASE WHEN $2='confirmed' THEN 'high' "
+            "ELSE confidence END WHERE id=$1 RETURNING cluster_id, wallet",
+            int(lid), "confirmed" if yn == "y" else "rejected")
+        if row:
+            await db.job("recompute_cluster", {"cluster_id": row["cluster_id"]})
+        await c.answer("Подтверждено" if yn == "y" else "Отклонено")
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+            await c.message.answer(("✅ Кошелёк вошёл в кластер" if yn == "y" else "✖ Связь отклонена, больше не предложу")
+                                   + (f" #{row['cluster_id']}: <code>{row['wallet']}</code>" if row else ""),
+                                   parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("lt:"))
+    async def cb_lower(c: CallbackQuery) -> None:
+        cid = int(c.data[3:])
+        cfg = await reload()
+        thr = round(float(cfg.get("min_net_profit", 0.3)) * 0.7, 3)
+        await db.execute("UPDATE clusters SET threshold_override=$2 WHERE id=$1", cid, thr)
+        await c.answer(f"Порог для кластера #{cid}: {thr:.0%}")
+
+    @router.callback_query(F.data.startswith("cand:"))
+    async def cb_candidate(c: CallbackQuery) -> None:
+        _, kind, ref = c.data.split(":", 2)
+        if kind == "c":
+            await db.execute("UPDATE clusters SET priority=true WHERE id=$1", int(ref))
+            await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('dev', $1, $2) ON CONFLICT DO NOTHING",
+                             f"cluster:{ref}", f"кластер #{ref}")
+        else:
+            await db.execute("UPDATE traders SET active=true, manual=true WHERE address=$1", ref)
+            await db.job("reload")
+        await c.answer("Отслеживаю")
+
+    @router.callback_query(F.data.startswith("wz:"))
+    async def cb_wizard(c: CallbackQuery) -> None:
+        text, kb = wiz.on_button(c.from_user.id, c.data)
+        await c.answer()
+        if c.message is not None:
+            try:
+                await c.message.edit_text(text, parse_mode="HTML", reply_markup=build(kb))
+            except Exception:  # noqa: BLE001 — сообщение старое или не изменилось
+                await c.message.answer(text, parse_mode="HTML", reply_markup=build(kb))
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def on_text(m: Message) -> None:
+        """Ответ на шаг 3 мастера: адреса для импорта или адрес с меткой для добавления."""
+        st = wiz.waiting_input(m.from_user.id if m.from_user else 0)
+        if st is None:
+            return
+        if st["kind"] == "wallet_name":
+            from ..real.wallets_ui import create_and_wait
+            r = await create_and_wait(db, await reload(), (m.text or "").strip()[:32], balance_rpc)
+            return await reply(m, r.text or "", r.kb)
+        if st["kind"] == "import":
+            await import_wallets(m, m.text or "", st.get("origin"), st.get("pick"))
+        else:
+            await add_wallet(m, m.text or "", st.get("origin"), st.get("pick"))
+
+    @router.message(Command("card"))
+    async def cmd_card(m: Message, command: CommandObject) -> None:
+        """Карточка кошелька доски по началу адреса или метке: /card 6d7y."""
+        from . import board
+        part = (command.args or "").strip()
+        if len(part) < 3:
+            return await reply(m, "Формат: /card начало адреса (от 3 знаков), например <code>/card 6d7y</code>")
+        hits = await board.find(db, part)
+        if len(hits) == 1:
+            text, kb = await board.card_view(db, await reload(), hits[0]["address"])
+            return await reply(m, text, kb)
+        if not hits:
+            return await reply(m, f"Кошелька «{esc(part)}» нет в своём списке и smart-money — добавить: ➕ в Главной.")
+        await reply(m, f"Нашлось {len(hits)} — выберите:", [[board.button(w)] for w in hits[:20]])
+
+    @router.callback_query(F.data.startswith("bd:"))
+    async def cb_board(c: CallbackQuery) -> None:
+        """Доска кошельков: секции, карточка, «тень/бой за ним», убрать из списка (bot/board.py)."""
+        from . import board
+        parts = c.data.split(":")
+        act, arg = (parts[1] if len(parts) > 1 else ""), (parts[2] if len(parts) > 2 else "")
+        cfg = await reload()
+        toast = None
+        if act == "s":
+            text, kb = await board.board_view(db, arg or "best")
+        elif act == "w" and arg:
+            text, kb = await board.card_view(db, cfg, arg)
+        elif act == "f" and arg and len(parts) > 3:
+            mode = parts[3]
+            if mode == "live":
+                text, kb = board.live_confirm(cfg, arg)
+            else:
+                new = {"shadow": "shadow", "live!": "live"}.get(mode)
+                await board.set_follow(db, arg, new)
+                toast = {"shadow": "Тень за ним включена", "live": "Бой за ним включён"}.get(new or "", "Не торгую за ним")
+                text, kb = await board.card_view(db, cfg, arg)
+        elif act == "x" and arg:
+            if len(parts) > 3 and parts[3] == "!":
+                await remove(arg, "t")
+                await board.set_follow(db, arg, None)
+                toast = f"Убран: {short(arg)}"
+                text, kb = await board.board_view(db)
+            else:
+                text = f"🗑 Убрать {short(arg)} из списка? Слежка, копии и торговля за ним прекратятся."
+                kb = [[{"text": "Да, убрать", "callback": f"bd:x:{arg}:!", "style": "danger"},
+                       {"text": "Нет", "callback": f"bd:w:{arg}"}]]
+        else:
+            text, kb = await board.board_view(db)
+        await c.answer(toast)
+        if c.message is None:
+            return
+        try:
+            await c.message.edit_text(fmt.split_html(text)[0], parse_mode="HTML", reply_markup=build(kb),
+                                      link_preview_options=NO_PREVIEW)
+        except TelegramBadRequest as exc:
+            if "not modified" not in str(exc):
+                await reply(c.message, text, kb)
+
+    @router.callback_query(F.data.startswith("wl:"))
+    async def cb_unwatch(c: CallbackQuery) -> None:
+        _, kind, addr = c.data.split(":", 2)
+        await remove(addr, kind if kind in ("t", "d", "k") else None)
+        await c.answer(f"Убрано: {short(addr)}")
+
+    return ensure_panel
