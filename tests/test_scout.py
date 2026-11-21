@@ -373,3 +373,58 @@ async def test_scalpers_cut_before_trial_and_holders_go_first():
         assert await sc.discover_holders() == 0                                               # раз в 6 часов
     finally:
         await db.close()
+
+
+async def test_copytest_finds_wallets_whose_copy_works(monkeypatch):
+    """21.11: поиск по главному признаку — работает ли копия (задержка 5 с, комиссии, 30 дней): в плюсе, устойчиво
+    (t от 1.645), 15+ сделок, держит от 3 минут. Плюс «как у Fpf3» (+59% при t 0.81 — одна ракета) не проходит."""
+    from datetime import datetime, timedelta, timezone
+
+    from scanner.analytics import copytrade as CT
+    from scanner.analytics.curve import Costs
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        now = datetime.now(timezone.utc)
+        for addr, copy, t, n, hold in (("GOODT", 0.2, 2.5, 20, 300), ("LUCKY", 0.59, 0.81, 38, 268),
+                                       ("FEW", 0.3, 3.0, 8, 300), ("FASTT", 0.2, 2.5, 20, 30)):
+            await db.execute(
+                """INSERT INTO traders(address, copy_30d, copy_t_30d, trades_30d, median_hold_s, last_active, active,
+                       updated_at) VALUES ($1, $2, $3, $4, $5, now(), false, now() - interval '2 days')""",
+                addr, copy, t, n, hold)
+        n_sig = 0
+        for who in ("NEWW", "SCALP", "MINE"):                     # новые кошельки базы: 8 монет за неделю
+            for i in range(8):
+                n_sig += 1
+                await db.execute("""INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol,
+                                        ts, pool) VALUES ($1, $2, $3, true, 0.5, 1000, 300, $4, 'pump')""",
+                                 f"s{n_sig}", f"{who}{i}", who, now - timedelta(hours=i))
+        await db.execute("INSERT INTO watchlist(kind, address) VALUES ('trader', 'MINE')")   # уже свой — не трогаем
+        stats = {"NEWW": CT.TraderStats(18, 0.6, 0.15, 1.0, 400, 300, 0, None, 2.0),
+                 "SCALP": CT.TraderStats(18, 0.6, 0.15, 1.0, 20, 300, 0, None, 2.0)}
+        seen = []
+
+        async def compute(db_, addr, cfg, costs, days=30):
+            seen.append(addr)
+            return stats[addr], stats[addr], []
+        monkeypatch.setattr(CT, "compute_trader", compute)
+        eng = SimpleNamespace(db=db, cfg={}, price=SimpleNamespace(value=100.0), ext=None, scouts=set(),
+                              _load_traders=None, costs=lambda: Costs())
+        sc = Scout(eng)  # type: ignore[arg-type]
+        computed, added = await sc.discover_copytest()
+        found = {r["address"]: r for r in await db.fetch("SELECT * FROM scout")}
+        assert set(found) == {"GOODT", "NEWW"} and len(added) == 2 and computed == 2
+        assert sorted(seen) == ["NEWW", "SCALP"]                  # свой кошелёк не считаем
+        r = found["NEWW"]
+        assert r["source"] == "проверка копированием" and "+15% на сделку на 18 сделках" in r["reason"]
+        assert "t=2.0" in r["reason"] and found["GOODT"]["score"] > r["score"]   # устойчивее — выше в очереди
+        seen.clear()
+        await sc.discover_copytest()                              # посчитанные недавно — не пересчитываем
+        assert seen == []
+    finally:
+        await db.close()

@@ -40,6 +40,7 @@ from ..external.base import Unavailable
 from . import dunescout as DS
 from . import family as FAM
 from . import lookalike as LK
+from . import copytrade as CT
 from .copytrade import linked_to_dev
 from .paper import SCOUT, TREND, TRIAL
 
@@ -94,6 +95,12 @@ DEFAULTS: dict[str, Any] = {
     "scout_holders_every_h": 6,
     "scout_holders_min_hold_s": 600,
     "scout_holders_min_coins": 3,
+    # 21.11: поиск по главному признаку — работает ли копия. Кошельки своей базы: копия за 30 дней (задержка 5 с,
+    # комиссии) в плюсе, устойчиво (t от scout_min_t), 15+ сделок, держит от 3 минут → на испытание первыми
+    "scout_copytest_enabled": True,
+    "scout_copytest_every_h": 6,
+    "scout_copytest_min_trades": 15,
+    "scout_copytest_limit": 200,         # новых кошельков за раз (расчёт копии — по запросу на кошелёк)
     "scout_gmgn_max_big_losses": 0.35,
 }
 BAD_TAGS = {"sniper", "bundler", "rat_trader", "dev", "dex_bot", "insider", "creator", "sandwich_bot"}
@@ -268,6 +275,9 @@ class Scout:
         self.family = FAM.Family(engine, self)
         self.dune = DS.DuneScout(engine, self)
         self._dune_task: asyncio.Task[None] | None = None
+        self._ct_task: asyncio.Task[None] | None = None
+        self._ct_at = 0.0
+        self._ct_seen: dict[str, float] = {}          # кошелёк → когда считали копию (повтор — не раньше суток)
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -307,12 +317,80 @@ class Scout:
             log.exception("разведка: семья лучших кошельков")
         if any("👪" in e for e in events):
             events += await self.fill_slots()             # кандидат «семья» — на испытание сразу, а не через 15 минут
+        if cfg_get(self.cfg, "scout_copytest_enabled") and (self._ct_task is None or self._ct_task.done()) \
+                and time.time() - self._ct_at >= float(cfg_get(self.cfg, "scout_copytest_every_h")) * 3600:
+            self._ct_at = time.time()
+            self._ct_task = asyncio.create_task(self._copytest_bg())   # расчёт копий — минуты, в фоне
         if self.dune.key and (self._dune_task is None or self._dune_task.done()):
             self._dune_task = asyncio.create_task(self._dune_bg())   # весь PumpSwap через Dune — раз в сутки, в фоне
         await self.load()
         if events:
             await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
         return events
+
+    async def _copytest_bg(self) -> None:
+        try:
+            n, added = await self.discover_copytest()
+            if added:
+                await self.db.system("🔍 <b>Разведка — проверка копированием</b>: посчитано кошельков "
+                                     f"{n}, устойчиво в плюсе и на испытание — {len(added)}:\n" + "\n".join(added[:15]))
+        except Exception:  # noqa: BLE001
+            log.exception("разведка: проверка копированием")
+
+    async def discover_copytest(self) -> tuple[int, list[str]]:
+        """Кандидаты по главному признаку — работает ли копия (21.11). Остальные каналы ищут по прибыли кошелька,
+        а она почти всегда сделана в первые секунды — копия опаздывает. Здесь — повтор всех сделок кошелька за 30
+        дней по своей базе с задержкой 5 с и комиссиями: в плюсе, устойчиво (t от scout_min_t), 15+ сделок, держит от
+        3 минут, не связан с девом → на испытание (решает испытание по цене блокчейна).
+        1) уже посчитанные ежесуточным пересчётом трейдеров (таблица traders); 2) новые кошельки базы."""
+        need_t = float(cfg_get(self.cfg, "scout_min_t"))
+        min_n = int(cfg_get(self.cfg, "scout_copytest_min_trades"))
+        min_hold = float(cfg_get(self.cfg, "scout_min_hold_s"))
+        known = await self._known()
+        good: dict[str, tuple[float, float, int, float]] = {}
+        for r in await self.db.fetch(
+                """SELECT address, copy_30d, copy_t_30d, trades_30d, median_hold_s FROM traders
+                   WHERE copy_t_30d >= $1 AND copy_30d > 0 AND trades_30d >= $2 AND median_hold_s >= $3
+                     AND NOT linked_to_dev AND last_active > now() - interval '2 days'
+                   ORDER BY copy_t_30d DESC LIMIT 50""", need_t, min_n, min_hold):
+            good[r["address"]] = (float(r["copy_30d"]), float(r["copy_t_30d"]), int(r["trades_30d"]),
+                                  float(r["median_hold_s"]))
+        computed = 0
+        costs = self.e.costs() if callable(getattr(self.e, "costs", None)) else None
+        if costs is not None:
+            now = time.time()
+            recent = {r["address"] for r in await self.db.fetch(
+                "SELECT address FROM traders WHERE updated_at > now() - interval '1 day'")}
+            rows = await LK._fetch(self.db, """
+                SELECT trader FROM trades WHERE ts > now() - interval '7 days'
+                GROUP BY trader HAVING count(DISTINCT mint) >= $1 AND max(ts) > now() - interval '2 days'
+                ORDER BY count(DISTINCT mint) DESC LIMIT $2""", max(5, min_n // 2),
+                int(cfg_get(self.cfg, "scout_copytest_limit")) * 3, timeout_s=120)
+            todo = [r["trader"] for r in rows if r["trader"] not in known and r["trader"] not in recent
+                    and r["trader"] not in good and now - self._ct_seen.get(r["trader"], 0.0) > 86400]
+            for addr in todo[:int(cfg_get(self.cfg, "scout_copytest_limit"))]:
+                self._ct_seen[addr] = now
+                try:
+                    _s7, s30, _trips = await CT.compute_trader(self.db, addr, self.cfg, costs)
+                except Exception:  # noqa: BLE001
+                    log.exception("проверка копированием %s", addr)
+                    continue
+                computed += 1
+                if (s30.trades >= min_n and s30.copyability > 0 and s30.copy_t >= need_t
+                        and (s30.median_hold_s or 0) >= min_hold and not await linked_to_dev(self.db, addr)):
+                    good[addr] = (s30.copyability, s30.copy_t, s30.trades, float(s30.median_hold_s or 0))
+            self._ct_seen = {a: t for a, t in self._ct_seen.items() if now - t <= 86400}
+        added: list[str] = []
+        for addr, (copy, t, n, hold) in sorted(good.items(), key=lambda kv: -kv[1][1]):
+            if addr in known:
+                continue
+            reason = (f"копия за 30 дней {copy:+.0%} на сделку на {n} сделках, устойчиво (t={t:.1f}), "
+                      f"держит ~{hold / 60:.0f} мин")
+            if await self._queue(addr, "проверка копированием", reason, 60 + t * 10,
+                                 {"copy_30d": copy, "copy_t": t, "trades": n, "hold_s": hold}):
+                added.append(f"• <code>{addr[:4]}…{addr[-4:]}</code> — {reason}")
+        self.stats["found"] += len(added)
+        return computed, added
 
     async def _dune_bg(self) -> None:
         """Запрос к Dune идёт минуты — в фоне, чтобы разведка не ждала; найденные — в очередь и сообщение."""

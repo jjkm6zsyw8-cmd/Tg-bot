@@ -407,3 +407,28 @@ async def test_enable_all_methods_button(db):
     await db.execute("UPDATE real_wallets SET settings = '{\"real_mode\": \"live\"}'::jsonb WHERE id=$1", w2)
     r = await UI.on_wallet_callback(db, {}, "wmall", "g:on")
     assert "режиме «бой»" in r.text and "real_trend" not in (await db.get_overrides())
+
+
+async def test_fresh_coin_not_yet_visible_is_retried(db, monkeypatch):
+    """21.11: «мой дев: монета не найдена в сети» — узел ещё не видел монету, созданную доли секунды назад. Повтор."""
+    monkeypatch.setattr(ex, "STATE_RETRY_S", 0)
+    chain = FakeChain()
+    m = pk("fresh-launch")
+    chain.add_curve(m, 30.0)
+    tr = shadow(db, chain)
+    await tr.start()
+    real_state, calls = tr._state, [0]
+
+    async def flaky(mint, extra=None):
+        calls[0] += 1
+        if calls[0] <= 2:
+            return {"venue": None, "why": ex.NOT_FOUND, "mc": 0.0, "slot": chain.slot, "extra": []}
+        return await real_state(mint, extra)
+    monkeypatch.setattr(tr, "_state", flaky)
+    await fire(tr, chain, m, kind="mydev")
+    assert only(tr).extra["kind"] == "mydev" and calls[0] >= 3
+    # так и не появилась — пропуск после повторов
+    m2 = pk("never-visible")
+    calls[0] = -100
+    await fire(tr, chain, m2, kind="mydev", alert_id=2)
+    assert skipped(tr, "монета не найдена в сети") and len(tr.positions) == 1

@@ -56,6 +56,11 @@ SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге
 # тренд — без покупки трейдера в блоке: возраст сигнала считаем от алерта (DexScreener опрашивается раз в 5 с,
 # первый алерт монеты ещё ~1 с ждёт внешних проверок)
 TREND_MAX_AGE_S = 15.0
+# свежий запуск («мой дев»): узел ещё не видит монету, созданную доли секунды назад — повтор (21.11: пропуски
+# «монета не найдена в сети», а бумага Y входит через 4 блока); «слишком много блоков» после повтора проверяется
+NOT_FOUND = "монета не найдена в сети"
+STATE_RETRIES = 3
+STATE_RETRY_S = 0.35
 
 
 def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
@@ -504,7 +509,7 @@ class RealTrader:
         """Где монета торгуется (кривая / PumpSwap), резервы, программа токена; why — почему торговать нельзя."""
         out: dict[str, Any] = {"venue": None, "why": None, "mc": 0.0}
         if acc[1] is None or acc[1].owner not in pump.TOKEN_PROGRAMS:
-            out["why"] = "монета не найдена в сети"
+            out["why"] = NOT_FOUND
             return out
         tp = pump.TOKEN_PROGRAMS[acc[1].owner]
         out["token_program"] = tp
@@ -608,6 +613,11 @@ class RealTrader:
         if mode == "live":                           # блокхэш — тем же заходом, что и состояние: без лишней задержки
             st, bh = await asyncio.gather(self._state(mint, [user]), self.chain.blockhash())
         else:
+            st = await self._state(mint, [user] if user is not None else None)
+        for _ in range(STATE_RETRIES):
+            if st["why"] != NOT_FOUND:
+                break
+            await asyncio.sleep(STATE_RETRY_S)
             st = await self._state(mint, [user] if user is not None else None)
         if st["why"]:
             return self._skip(mode, kind, st["why"])
