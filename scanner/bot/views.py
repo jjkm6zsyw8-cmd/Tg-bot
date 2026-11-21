@@ -199,7 +199,7 @@ async def trader_view(db: Database, settings: Settings, address: str, ext: Any =
         f"Копируемость (задержка {cfg.get('copy_delay_s', 5)} с): 7 д {pct(s7.copyability)} · 30 д {pct(s30.copyability)} на сделку",
         f"Сделок за 30 д: {s30.trades}, удачных {pct(s30.win_rate, False)}, медианное удержание {age(s30.median_hold_s)}",
         f"Средний MC входа {mc_usd(s30.avg_entry_mc, price)}, входов в первые 2 слота {pct(s30.snipe_share, False)}",
-        "Фильтр отбора: " + ("✅ проходит" if ok else "❌ " + "; ".join(fails)),
+        "Фильтр отбора: " + ("✅ проходит" if ok else "❌ " + "; ".join(esc(f) for f in fails)),
     ]
     if alerts and alerts["n"]:
         lines.append(f"Алертов по нему: {alerts['n']}, удачных {alerts['wins']}, средний итог {pct(alerts['avg'])}")

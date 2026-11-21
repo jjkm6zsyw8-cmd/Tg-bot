@@ -270,3 +270,9 @@ def split_html(text: str, limit: int = 3900) -> list[str]:
     if cur:
         parts.append(cur)
     return parts or [""]
+
+
+def plain(text: str) -> str:
+    """Текст без разметки Telegram: теги убраны, &lt; &gt; &amp; — обратно в символы."""
+    import html
+    return html.unescape(__import__("re").sub(r"</?(b|i|u|s|code|pre|a)(\s[^>]*)?>", "", text))

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObject
 
@@ -163,8 +164,18 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         except Exception:  # noqa: BLE001
             pass
         for i, part in enumerate(fmt.split_html(text)):
-            await m.answer(part, parse_mode="HTML", reply_markup=build(kb) if i == 0 else None,
-                           link_preview_options=NO_PREVIEW)
+            await answer_html(m, part, build(kb) if i == 0 else None)
+
+    async def answer_html(m: Message, text: str, markup: Any = None) -> Any:
+        """Ответ с разметкой; Telegram не разобрал её (в тексте «<» и т. п.) — тот же текст без оформления, а не
+        «Команда упала» (21.11: «сделок 0 < 30» при добавлении кошелька)."""
+        try:
+            return await m.answer(text, parse_mode="HTML", reply_markup=markup, link_preview_options=NO_PREVIEW)
+        except TelegramBadRequest as exc:
+            if "parse entities" not in str(exc):
+                raise
+            log.warning("разметка не разобрана, отправляю без оформления: %s", exc)
+            return await m.answer(fmt.plain(text)[:4096], reply_markup=markup, link_preview_options=NO_PREVIEW)
 
     def main_menu() -> list[list[dict[str, Any]]]:
         return [
@@ -194,7 +205,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                 pass
         if len(text) > 4000:
             return await reply(m, text, kb)
-        sent = await m.answer(text, parse_mode="HTML", reply_markup=build(kb), link_preview_options=NO_PREVIEW)
+        sent = await answer_html(m, text, build(kb))
         screens[key] = sent.message_id
 
     async def ensure_panel(bot: Any) -> str:
@@ -397,7 +408,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await save_trader(db, addr, s7, s30, ok, linked, label=label, manual=True)
         await db.execute("UPDATE traders SET active=true WHERE address=$1", addr)
         await db.job("reload")
-        note = "" if ok else "\n⚠️ Не проходит автофильтр (" + "; ".join(fails) + "), но оставлен в списке по вашему выбору."
+        note = "" if ok else "\n⚠️ Не проходит автофильтр (" + "; ".join(esc(f) for f in fails) + "), но оставлен в списке по вашему выбору."
         note += f"\nИсточник: {ORIGINS[origin]}" if origin else "\nИсточник не указан — /origin адрес axiom|pumpfun|gmgn"
         note += f" · отбор: {PICKS[pick]}" if pick else ""
         await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr, ext),

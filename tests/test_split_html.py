@@ -32,3 +32,9 @@ def test_long_italic_legend_is_split_with_balanced_tags():
 
 def test_short_text_untouched():
     assert split_html("<b>коротко</b>") == ["<b>коротко</b>"]
+
+
+def test_plain_fallback_and_escaped_fail_reasons():
+    from scanner.alerts.format import esc, plain
+    assert plain("<b>Итог</b> сделок 0 &lt; 30 &amp; <code>A</code>") == "Итог сделок 0 < 30 & A"
+    assert "<" not in esc("сделок 0 < 30")                         # причины отсева экранируются
