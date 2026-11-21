@@ -412,6 +412,18 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         note = "" if ok else "\n⚠️ Не проходит автофильтр (" + "; ".join(esc(f) for f in fails) + "), но оставлен в списке по вашему выбору."
         note += f"\nИсточник: {ORIGINS[origin]}" if origin else "\nИсточник не указан — /origin адрес axiom|pumpfun|gmgn"
         note += f" · отбор: {PICKS[pick]}" if pick else ""
+        try:                                      # 21.11: сразу — через все выходы; лучший в плюсе — тень за ним
+            from ..analytics import wallet_rules as WR
+            rr = await WR.evaluate(db, addr, cfg, views.costs_of(settings))
+            if rr["n"]:
+                await WR.save(db, addr, rr)
+                note += "\n🧮 " + esc(WR.top_line(rr["rules"], rr["best"]))
+                for ev in await WR.autofollow(db, {addr: rr}, {addr}):
+                    note += "\n" + esc(ev)
+            else:
+                note += "\n🧮 Выходы: его сделок в базе пока нет — посчитаю, когда наберутся (раз в 6 ч)."
+        except Exception:  # noqa: BLE001
+            log.exception("выходы кошелька %s", addr)
         await reply(m, "✅ Трейдер добавлен." + note + "\n\n" + await views.trader_view(db, settings, addr, ext),
                     [[{"text": "Убрать из списка", "callback": f"wl:t:{addr}"}]])
 

@@ -609,6 +609,9 @@ CREATE INDEX IF NOT EXISTS real_rule_trials_open_idx ON real_rule_trials (wallet
 CREATE INDEX IF NOT EXISTS real_rule_trials_closed_idx ON real_rule_trials (closed_at);
 -- 21.11: проба W — продать через обычное время удержания трейдера − 2 с (от нашего входа)
 ALTER TABLE real_rule_trials ADD COLUMN IF NOT EXISTS hold_s double precision;
+-- 21.11: кошелёк через все выходы (analytics/wallet_rules.py): правило → {n, w, avg, sum, t}; лучший устойчивый выход
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS rules_30d jsonb;
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS best_rule text;
 
 CREATE TABLE IF NOT EXISTS real_orders (
     id          bigserial PRIMARY KEY,

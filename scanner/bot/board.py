@@ -53,7 +53,7 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
                SELECT address, label, COALESCE(qualified_at, updated_at) FROM traders
                WHERE active AND address NOT IN (SELECT address FROM watchlist WHERE kind = 'trader'))
            SELECT w.address, COALESCE(w.label, t.label) AS label, w.added, t.win_rate, t.trades_30d, t.median_hold_s,
-                  t.copy_30d, t.copy_t_30d, r.tier, r.manual_tier, r.copies, r.wins
+                  t.copy_30d, t.copy_t_30d, t.rules_30d, t.best_rule, r.tier, r.manual_tier, r.copies, r.wins
            FROM w LEFT JOIN traders t ON t.address = w.address LEFT JOIN wallet_rating r ON r.address = w.address""")
     out = {r["address"]: {**dict(r), "last": None, "today": 0, "own_pnl": None, "n": 0, "plus": 0, "sum_pct": 0.0}
            for r in rows}
@@ -88,8 +88,38 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
     for w in out.values():
         w["tier"] = w.get("manual_tier") or w.get("tier") or "new"
         w["section"] = section_of(w["tier"])
+        rules = w.get("rules_30d") or {}
+        if isinstance(rules, str):
+            import json
+            rules = json.loads(rules)
+        w["rules_30d"] = rules
+        # 21.11: его сделки через все выходы — главнее рейтинга по копиям одного правила: устойчивый плюс по
+        # лучшему выходу — «лучшие»; все выходы в минусе на 8+ сделках — «на вылет»
+        if w.get("best_rule") and not w.get("manual_tier"):
+            w["section"] = "best"
+        elif rules and not w.get("manual_tier") and all(r["avg"] <= 0 for r in rules.values()) \
+                and max(r["n"] for r in rules.values()) >= 8:
+            w["section"] = "bad"
         w["copy_usd"] = w["sum_pct"] * COPY_USD
     return list(out.values())
+
+
+def rules_line(w: dict[str, Any]) -> str:
+    """Его сделки через все выходы: за ним / A / B / G / R / W — средний результат копии и сколько сделок."""
+    from ..analytics.wallet_rules import RULE_NAMES, RULES
+    rules = w.get("rules_30d") or {}
+    if not rules:
+        return "Выходы: ещё не посчитаны (раз в 6 ч и при добавлении)."
+    parts = []
+    for k in RULES:
+        r = rules.get(k)
+        if r:
+            star = "★" if k == w.get("best_rule") else ""
+            parts.append(f"{star}{RULE_NAMES[k]} {r['avg']:+.0%}")
+    n = max(r["n"] for r in rules.values())
+    best = w.get("best_rule")
+    tail = (f" — лучший: <b>{RULE_NAMES[best]}</b>" if best else " — устойчивого плюса нет")
+    return f"Выходы ({n} его сделок, вход через 5 с): " + " · ".join(parts) + tail
 
 
 def button(w: dict[str, Any]) -> dict[str, Any]:
@@ -157,6 +187,7 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
               f"{money(w['hold'][2] * COPY_USD)}" if w.get("hold") else
               ("   копии держателя теперь идут «за трейдером» (продаёт, когда он), а не по G"
                if float(w.get("median_hold_s") or 0) >= 180 else "")),
+             rules_line(w),
              "Копируемость 30 д: " + (f"{float(w['copy_30d']):+.0%} на сделку" if w.get("copy_30d") is not None else "—")
              + (f", устойчивость t={float(w['copy_t_30d']):.1f} (от 1.645 — не случайность)"
                 if w.get("copy_t_30d") is not None else ""),

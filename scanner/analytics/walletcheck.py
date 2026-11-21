@@ -177,6 +177,8 @@ async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
     dev_lines: list[str] = []
     trader_lines: list[str] = []
     good = 0
+    from . import wallet_rules as WR
+    rule_res: dict[str, dict[str, Any]] = {}
     for item in wallets:
         addr, label = item[0], (item[1] if len(item) > 1 else None)
         name = fmt.esc(label or f"{addr[:4]}…{addr[-4:]}")
@@ -197,6 +199,13 @@ async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
             ok, _fails = qualifies(s7, s30, linked, cfg)
             await save_trader(e.db, addr, s7, s30, ok, linked, label=label, manual=True)
             await e.db.execute("UPDATE traders SET active=true WHERE address=$1", addr)
+            try:                                  # 21.11: сразу — через все выходы (за ним, A, B, G, R, W)
+                rr = await WR.evaluate(e.db, addr, cfg, costs)
+                if rr["n"]:
+                    await WR.save(e.db, addr, rr)
+                    rule_res[addr] = rr
+            except Exception:  # noqa: BLE001
+                log.exception("выходы кошелька %s", addr)
         except Exception:  # noqa: BLE001
             log.exception("проверка кошелька %s", addr)
             trader_lines.append(f"❔ {name}: не удалось проверить")
@@ -208,10 +217,21 @@ async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
             days = (datetime.now(timezone.utc).timestamp() - oldest) / 86400
             span = f" · история {days:.0f} д" if days >= 1 else f" · история {days * 24:.0f} ч"
         if s30.trades:
+            rr = rule_res.get(addr)
+            if rr and rr.get("best"):
+                mark, why = "✅", "копировать"
+            elif rr and mark == "✅":
+                mark, why = "⚪", "по выходам плюс неустойчивый — решит бумага"
             trader_lines.append(f"{mark} <b>{name}</b> · {s30.trades} сд · прибыльных {s30.win_rate:.0%} · "
-                                f"копия {s30.copyability:+.0%}/сд · держит ~{fmt.ago(s30.median_hold_s)}{span} — {why}")
+                                f"держит ~{fmt.ago(s30.median_hold_s)}{span} — {why}"
+                                + (f"\n   ↳ {fmt.esc(WR.top_line(rr['rules'], rr['best']))}" if rr else ""))
         else:
             trader_lines.append(f"{mark} <b>{name}</b> · сделок Pump.fun не найдено{span} — {why}")
+    try:
+        follow_events = await WR.autofollow(e.db, rule_res, {str(i[0]) for i in wallets})
+    except Exception:  # noqa: BLE001
+        log.exception("авто-тень после импорта")
+        follow_events = []
     await e._load_traders()
     parts = [f"📥 <b>Импорт: {len(wallets)}</b> · девов {len(dev_lines)}, трейдеров {len(trader_lines)} "
              f"(стоит копировать {good})"]
@@ -221,7 +241,11 @@ async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
     if trader_lines:
         parts.append("\n<b>Трейдеры</b> — алерт и бумажная копия при покупке от "
                      f"{float(cfg.get('copy_min_buy_sol', 0.1)):g} SOL, выход при их продаже\n" + "\n".join(trader_lines)
-                     + "\n<i>Копия — без нашей задержки, это потолок; честную цифру покажет бумага.</i>")
+                     + "\n<i>↳ выходы — его сделки, прогнанные через все наши способы выхода с задержкой 5 с и "
+                       "комиссиями: «за ним» — продать, когда он; A / B / G / R — наши правила; W — раньше него. Лучший "
+                       "— если 8+ сделок и плюс устойчивый (t от 1.645).</i>")
+    if follow_events:
+        parts.append("\n" + "\n".join(fmt.esc(x) for x in follow_events))
     text = "\n".join(parts)
     for part in fmt.split_html(text, 3800):      # по строкам, теги разметки целые
         await e.db.enqueue("text", {"topic": "copy", "text": part}, priority=4)

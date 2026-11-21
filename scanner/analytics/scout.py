@@ -277,6 +277,8 @@ class Scout:
         self.dune = DS.DuneScout(engine, self)
         self._dune_task: asyncio.Task[None] | None = None
         self._ct_task: asyncio.Task[None] | None = None
+        self._rules_task: asyncio.Task[None] | None = None
+        self._rules_at = 0.0
         self._ct_at = 0.0
         self._ct_seen: dict[str, float] = {}          # кошелёк → когда считали копию (повтор — не раньше суток)
 
@@ -322,6 +324,10 @@ class Scout:
                 and time.time() - self._ct_at >= float(cfg_get(self.cfg, "scout_copytest_every_h")) * 3600:
             self._ct_at = time.time()
             self._ct_task = asyncio.create_task(self._copytest_bg())   # расчёт копий — минуты, в фоне
+        if (self._rules_task is None or self._rules_task.done()) and time.time() - self._rules_at >= 6 * 3600 \
+                and callable(getattr(self.e, "costs", None)):
+            self._rules_at = time.time()
+            self._rules_task = asyncio.create_task(self._rules_bg())   # кошельки через все выходы — в фоне
         if self.dune.key and (self._dune_task is None or self._dune_task.done()):
             self._dune_task = asyncio.create_task(self._dune_bg())   # весь PumpSwap через Dune — раз в сутки, в фоне
         await self.load()
@@ -332,6 +338,20 @@ class Scout:
         if events:
             await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
         return events
+
+    async def _rules_bg(self) -> None:
+        """Кошельки своего списка, smart и испытания — через все выходы (analytics/wallet_rules.py); авто-тень."""
+        from . import wallet_rules as WR
+        try:
+            n, events = await WR.refresh(self.db, self.cfg, self.e.costs())
+            self.channels["rules"] = {"at": datetime.now(timezone.utc).isoformat(), "computed": n,
+                                      "events": len(events)}
+            await self.db.kv_set(CHANNELS_KEY, self.channels)
+            if events:
+                await self.db.enqueue("text", {"topic": "copy", "text": "🧮 <b>Кошельки через все выходы</b> "
+                                               f"(посчитано {n})\n" + "\n".join(events[:25])}, priority=4)
+        except Exception:  # noqa: BLE001
+            log.exception("разведка: кошельки через все выходы")
 
     async def _copytest_bg(self) -> None:
         try:
@@ -847,6 +867,10 @@ def channel_lines(ch: dict[str, Any]) -> list[str]:
             if top:
                 txt += ". Отсев: " + "; ".join(f"{esc(k)} — {v}" for k, v in top)
             out.append(txt)
+    rr = ch.get("rules")
+    if rr:
+        out.append(f"• Кошельки через все выходы (раз в 6 ч): посчитано {rr.get('computed', 0)}, тень включена/снята "
+                   f"{rr.get('events', 0)}")
     c = ch.get("copytest")
     if c:
         out.append(f"• Проверка копированием (раз в 6 ч): посчитано кошельков {c.get('computed', 0)}, устойчиво в плюсе "
