@@ -1057,3 +1057,17 @@ async def test_holder_copies_in_h_follow_the_trader(monkeypatch):
     p2 = pos(entry=40.0, target=None)
     p2.portfolio = "H"
     assert pp.PaperTrader.scheme_for(p2) is pp.SCHEMES["H"]            # копия скальпера — как раньше, по G
+
+
+def test_h_copy_uses_wallets_best_exit():
+    """22.11: C2qq держит ~7 ч, «за ним» −5%, а «всё на +25%» +45% — копировать вход, но не выход. Копия в H — по
+    лучшему выходу кошелька (wallet_rules), а не «за трейдером» по одному удержанию."""
+    tr = bare_trader({})
+    tr.e.traders = {"C2QQ": {"median_hold_s": 24774, "best_rule": "G"}, "HOLD": {"median_hold_s": 1600}}
+    assert tr.best_exit("C2QQ") == "G" and tr.best_exit("HOLD") is None
+    p = pos(entry=40.0, target=None)
+    p.portfolio, p.rule = "H", "best:G"
+    sc = pp.PaperTrader.scheme_for(p)
+    assert sc["tp_net"] == 0.25 and sc["stop"] == 0.08                  # правило G
+    p.rule = "best:F"
+    assert pp.PaperTrader.scheme_for(p)["tp_net"] is None              # «за ним»: без тейка, аварийный стоп

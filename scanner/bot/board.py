@@ -119,7 +119,7 @@ def rules_line(w: dict[str, Any]) -> str:
     n = max(r["n"] for r in rules.values())
     best = w.get("best_rule")
     tail = (f" — лучший: <b>{RULE_NAMES[best]}</b>" if best else " — устойчивого плюса нет")
-    return f"Выходы ({n} его сделок, вход через 5 с): " + " · ".join(parts) + tail
+    return f"Выходы ({n} его сделок, вход через ~1 с, как бот): " + " · ".join(parts) + tail
 
 
 def button(w: dict[str, Any]) -> dict[str, Any]:

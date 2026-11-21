@@ -213,7 +213,13 @@ class RealTrader:
         return m
 
     def scheme_of(self, p: Position) -> dict[str, Any]:
-        """Правила выхода позиции: у пробы — её правило, у позиции бота — правило метода."""
+        """Правила выхода позиции: у пробы — её правило, у позиции «за ним» — лучший выход кошелька, у остальных —
+        правило метода."""
+        if p.extra.get("best_exit") and not p.extra.get("trial"):
+            from ..analytics.wallet_rules import exit_scheme
+            es = exit_scheme(p.extra["best_exit"])
+            if es:
+                return es[1]
         rule = p.extra.get("rule") if p.extra.get("trial") else None
         if rule == "W":
             return {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": None, "target": False, "time_stop_s": None,
@@ -413,6 +419,7 @@ class RealTrader:
         if followed:
             kind = next(iter(kinds_of(data, targets)), None)
             mode = followed
+            data = {**data, "_followed": wallet}
         else:
             kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
                          and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
@@ -680,7 +687,10 @@ class RealTrader:
                                                     or data.get("trigger_ts") or data.get("trigger_at") or t0), 3),
                 "stake": stake, "min_out": min_out, "slip": slip, "mc": st["mc"],
                 "rule": self.get(S.SCHEME_KEYS[kind]),
-                "filter": self.get("real_smart_filter") if kind == "smart" else "all"}
+                "filter": self.get("real_smart_filter") if kind == "smart" else "all",
+                "best_exit": self.best_exit(data.get("_followed"))}
+        if base["best_exit"]:
+            base["rule"] = base["best_exit"]       # «за ним» — продаём по его лучшему выходу (wallet_rules)
         if mode == "live":
             await self._buy_live(st, mint, base, expected, bh)
         else:
@@ -856,7 +866,7 @@ class RealTrader:
             base["token_program"], datetime.now(timezone.utc), base.get("trigger_slot"), base.get("trigger_mc"),
             base.get("lag_s"), entry_mc, slot, cost_sol, tokens_raw / 1e6, tokens_raw, rent_sol, sig,
             {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9, "rule": base.get("rule"),
-             "filter": base.get("filter")}, self.wid)
+             "filter": base.get("filter"), "best_exit": base.get("best_exit")}, self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
                                    tokens_raw=tokens_raw, position_id=pid, note=note)
@@ -870,7 +880,7 @@ class RealTrader:
             symbol=base["symbol"], max_mc=entry_mc, alert_id=base["alert_id"],
             extra={"mode": base["mode"], "kind": base["kind"], "venue": base["venue"],
                    "token_program": base["token_program"], "tokens_raw": tokens_raw, "rent": rent_sol,
-                   "last_mc": entry_mc, "entry_slot": slot})
+                   "last_mc": entry_mc, "entry_slot": slot, "best_exit": base.get("best_exit")})
         if self.get("real_rule_trials"):
             try:
                 await self._open_trials(base, pid, entry_mc, cost_sol - rent_sol, tokens_raw, slot)
@@ -1117,6 +1127,17 @@ class RealTrader:
             t = self._trial_position(r)
             t.extra["entry_slot"] = slot
             self.trials[t.id] = t
+
+    def best_exit(self, wallet: str | None) -> str | None:
+        """Лучший выход кошелька по его сделкам (traders.best_rule) — для позиций «за ним»."""
+        if not wallet:
+            return None
+        t = (getattr(self.e, "traders", None) or {}).get(wallet) or {}
+        try:
+            b = t.get("best_rule")
+        except AttributeError:
+            return None
+        return b if b in ("F", "A", "B", "G", "R", "W") else None
 
     def w_hold(self, base: dict[str, Any]) -> float | None:
         """Проба W: через сколько секунд после нашего входа продать — обычное удержание трейдера − 2 с − наше

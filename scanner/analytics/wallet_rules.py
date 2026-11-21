@@ -3,7 +3,7 @@
 Раньше каждая проверка смотрела кошелёк одним способом: разбор при импорте — «купил через 5 с после него, продал через
 5 с после него», бумага H — по правилу G, тень — все правила, но только у тех, за кем бот уже торгует. Теперь — его
 последние 40 сделок за 30 дней (своя база) прогоняются через все наши выходы сразу, на настоящем пути цены монеты
-(сделки своего потока), с задержкой входа 5 с и комиссиями — как бумага (та же функция decide_exit):
+(сделки своего потока), со скоростью бота (вход через ~1 с) и комиссиями — как бумага (та же функция decide_exit):
 
   F — за ним: продать, когда продаёт он (это и есть «копируемость»);
   A — всё на +25%, без стопа, до 30 мин;   B — 70% на +25%, остаток трейлинг 15%, до 30 мин;
@@ -34,6 +34,7 @@ RULE_TEXT = {"F": "продать, когда продаёт он", "A": "всё
              "G": "+25%, стоп −8%, 5 мин без +10% — выход", "R": "трейлинг 35% после +30%, стоп −50%",
              "W": "продать раньше него: его время − 2 с"}
 LAST_TRIPS = 40
+BOT_DELAY_S = 1.0                      # бот входит через 4 блока после трейдера (~0.8 с) + посадка
 HORIZON_S = 6 * 3600
 MIN_N = 8
 FOLLOW_KEY = "real:follow"
@@ -85,9 +86,11 @@ def simulate(path: list[tuple[float, float]], entry_at: float, entry_mc: float, 
 
 async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> dict[str, Any]:
     """Последние сделки кошелька — через все выходы. {"rules": {правило: {n, w, avg, sum, t}}, "best", "hold", "n"}."""
-    _s7, s30, trips = await compute_trader(db, address, cfg, costs)
+    # 22.11: вход — со скоростью бота (4 блока ≈ 1 с), а не «руками» через 5 с: у Arkd (держит ~3 с) при 5 с все
+    # выходы выходили около нуля, а бумага (вход через 4 блока) дала +$162 на 162 копиях
+    delay = float(cfg.get("rules_delay_s", BOT_DELAY_S))
+    _s7, s30, trips = await compute_trader(db, address, {**cfg, "copy_delay_s": delay}, costs)
     trips = sorted(trips, key=lambda t: t.entry_ts)[-LAST_TRIPS:]
-    delay = float(cfg.get("copy_delay_s", 5))
     pos = float(cfg.get("position_sol", 0.5))
     hold = float(s30.median_hold_s or 0)
     out: dict[str, Any] = {"rules": {}, "best": None, "hold": hold, "n": len(trips)}
@@ -126,6 +129,18 @@ async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> di
                                   "sum": sum(vals), "t": t_stat(vals)}
     out["best"] = best_rule(out["rules"])
     return out
+
+
+def exit_scheme(rules_or_best: Any, hold_s: float = 0.0) -> tuple[str, dict[str, Any]] | None:
+    """Схема выхода копии по лучшему выходу кошелька: A / B / G / R — наши правила; F и W — «за ним» (продать, когда
+    он; аварийный стоп −50%, до 6 ч). None — лучшего нет (тогда правило по умолчанию)."""
+    best = rules_or_best if isinstance(rules_or_best, str) else None
+    if best in ("A", "B", "G", "R"):
+        return best, scheme(best, hold_s, BOT_DELAY_S) or SCHEMES[best]
+    if best in ("F", "W"):
+        return best, {"stop": 0.50, "tp_net": None, "tp_share": 0.0, "trail": None, "target": False,
+                      "time_stop_s": None, "time_stop_gain": None, "max_hold_s": HORIZON_S}
+    return None
 
 
 def best_rule(rules: dict[str, dict[str, Any]], min_n: int = MIN_N) -> str | None:

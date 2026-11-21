@@ -1318,8 +1318,13 @@ class PaperTrader:
         self.balance[name] -= size
         target = data.get("target_mc")
         rule = kind or ("copy" if data.get("copy_wallet") else None)
-        if name == SCOUT and self.is_holder(data.get("copy_wallet") or data.get("source_wallet") or trader):
-            rule = "hold"                         # копия держателя — «за трейдером», а не по G
+        if name == SCOUT:
+            src = data.get("copy_wallet") or data.get("source_wallet") or trader
+            best = self.best_exit(src)
+            if best:
+                rule = f"best:{best}"             # 22.11: копия — по лучшему выходу этого кошелька (wallet_rules)
+            elif self.is_holder(src):
+                rule = "hold"                     # копия держателя — «за трейдером», а не по G
         now = datetime.now(timezone.utc)
         pid = await self.db.fetchval(
             """INSERT INTO paper_positions(portfolio, mint, alert_id, level, symbol, opened_at, entry_mc, cost_sol,
@@ -1499,7 +1504,21 @@ class PaperTrader:
             return M_KINDS.get(p.rule or "copy", M_KINDS["copy"])      # M: схема по типу сигнала позиции
         if p.portfolio == SCOUT and p.rule == "hold":
             return HOLD_FOLLOW
+        if p.portfolio == SCOUT and (p.rule or "").startswith("best:"):
+            from .wallet_rules import exit_scheme
+            es = exit_scheme(p.rule[5:])
+            if es:
+                return es[1]
         return SCHEMES[p.portfolio]
+
+    def best_exit(self, wallet: str | None) -> str | None:
+        """Лучший выход кошелька по его сделкам (traders.best_rule, пересчёт раз в 6 ч) или None."""
+        t = (getattr(self.e, "traders", None) or {}).get(wallet or "") or {}
+        try:
+            b = t.get("best_rule")
+        except AttributeError:
+            return None
+        return b if b in ("F", "A", "B", "G", "R", "W") else None
 
     def is_holder(self, wallet: str | None) -> bool:
         """Кошелёк обычно держит монету от 3 минут (своя база: пересчёт трейдеров)."""

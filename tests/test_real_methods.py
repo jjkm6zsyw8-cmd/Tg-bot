@@ -499,3 +499,20 @@ async def test_follow_wallet_from_board(db, monkeypatch):
     lv.follow = {"STAR": "shadow"}                             # тень за ним — даже у кошелька в бою без денег
     await copy(lv, m3, 3)
     assert [p.extra["mode"] for p in lv.positions.values() if p.mint == str(m3)] == ["shadow"]
+
+
+async def test_followed_wallet_exits_by_its_best_rule(db):
+    """«Тень/бой за ним» — продаём по лучшему выходу этого кошелька (C2qq: G +46%, «за ним» −5%)."""
+    chain = FakeChain()
+    m = pk("best-exit")
+    chain.add_curve(m, 40.0)
+    tr = shadow(db, chain, real_max_open=10)
+    tr.e.traders = {"STAR": {"best_rule": "G"}}
+    await tr.start()
+    tr.follow = {"STAR": "shadow"}
+    data = {"modes": ["copy"], "symbol": "C", "trigger_at": time.time(), "trigger_slot": chain.slot - 2,
+            "trigger_mc": chain.mc(m), "trigger_sig": "s", "copy_wallet": "STAR"}
+    await tr.on_signal(str(m), "normal", 9, data, "STAR", {"H"})
+    p = only(tr)
+    assert p.extra["best_exit"] == "G" and tr.scheme_of(p)["stop"] == 0.08
+    assert (await db.fetchval("SELECT extra->>'rule' FROM real_positions")) == "G"

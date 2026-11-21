@@ -55,7 +55,7 @@ async def test_evaluate_and_autofollow():
         await db.execute("INSERT INTO watchlist(kind, address) VALUES ('trader', 'HOLDER')")
         await db.execute("INSERT INTO traders(address, active) VALUES ('HOLDER', true)")
         res = await WR.evaluate(db, "HOLDER", {}, Costs())
-        assert res["n"] == 10 and res["rules"]["F"]["avg"] > 0.3 and res["best"] in ("F", "R", "W")
+        assert res["n"] == 10 and res["rules"]["F"]["avg"] > 0.2 and res["best"] in ("F", "R", "W")
         assert res["rules"]["G"]["avg"] < res["rules"][res["best"]]["avg"]   # G режет держателя
         count, events = await WR.refresh(db, {}, Costs())
         assert count == 1 and events and "тень за ним включена" in events[0]
