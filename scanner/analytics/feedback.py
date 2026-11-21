@@ -78,7 +78,8 @@ class Feedback:
             await self.e._load_traders()
             await self.e._load_references()
 
-    async def on_mark(self, alert_id: int, mark: str) -> None:
+    async def on_mark(self, alert_id: int, mark: str, silent: bool = False) -> None:
+        """Отметка алерта (кнопкой или автоматически). silent — без сообщения в чат (автоотметка «скам»)."""
         a = await self.db.fetchrow("SELECT * FROM alerts WHERE id=$1", alert_id)
         if not a:
             return
@@ -119,7 +120,8 @@ class Feedback:
                        (SELECT wallet FROM cluster_links WHERE cluster_id=$1 AND status IN ('auto','confirmed'))""",
                     cid)
                 txt += f"\n⛔ Кластер #{cid} в чёрном списке."
-            await self.db.enqueue("text", {"topic": "dev" if a["mode"] != "smart" else "smart", "text": txt})
+            if not silent:
+                await self.db.enqueue("text", {"topic": "dev" if a["mode"] != "smart" else "smart", "text": txt})
         if cid:
             prof, _ = await cluster_profile(self.db, cid, self.e.cfg)
             await save_profile(self.db, cid, prof, self.e.cfg)

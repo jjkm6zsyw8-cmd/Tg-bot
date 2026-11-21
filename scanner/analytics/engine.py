@@ -34,6 +34,7 @@ from .scoring import LEVELS, Snapshot, bump, evaluate_dev
 from .state import TokenState, TradeRow
 
 log = logging.getLogger(__name__)
+AUTO_MARK_NAMES = {"great": "🚀 отлично", "good": "✅ успех", "fail": "❌ провал", "scam": "☠️ скам (дев слил сразу)"}
 
 
 def trigger_of(r: Any) -> dict[str, Any]:
@@ -1274,6 +1275,19 @@ class Engine:
             return
         main_id = e.alert_ids.get("dev") or next(iter(e.alert_ids.values()), None)
         text = fmt.render_final({**e.data, "symbol": st.symbol}, outcome, self.price.value)
+        # 21.11: оценку бот ставит сам (auto_mark); раньше в обучение шли только нажатия. «Скам» (дев слил в первые
+        # 30 с, цена ниже половины входа) применяется сразу: кластер дева — в чёрный список. «Отлично» — только
+        # кнопкой: она делает монету эталоном и добавляет трейдера в свой список, по шумному итогу это опасно
+        applied = ""
+        if auto == "scam" and main_id and cfg.get("auto_scam_feedback", True):
+            try:
+                from .feedback import Feedback
+                await Feedback(self).on_mark(main_id, "scam", silent=True)
+                applied = " — кластер дева в чёрном списке"
+            except Exception:  # noqa: BLE001
+                log.exception("автоотметка «скам» %s", e.mint)
+        text += (f"\nОценка бота: {AUTO_MARK_NAMES.get(auto, auto)}{applied}"
+                 " · кнопки — только если не согласен")
         kb = (fmt.marks_keyboard(main_id) if main_id else []) + [[{"text": "Разбор монеты", "callback": f"coin:{e.mint}"}]]
         await self.db.enqueue("final", {"mint": e.mint, "text": text, "keyboard": kb}, priority=5)
 
