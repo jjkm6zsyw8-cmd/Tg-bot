@@ -64,3 +64,23 @@ async def test_board_sections_buttons_card_and_follow():
         assert "реальные деньги" in text and kb[0][0]["callback"] == f"bd:f:{star}:live!"
     finally:
         await db.close()
+
+
+async def test_mid_section_sorted_by_copyability_and_find():
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        for a, copy in (("aaaa" + "1" * 36 + "zzzz", 0.02), ("6d7y" + "2" * 36 + "vAdy", 0.21), ("bbbb" + "3" * 36 + "yyyy", None)):
+            await db.execute("INSERT INTO watchlist(kind, address) VALUES ('trader', $1)", a)
+            if copy is not None:
+                await db.execute("INSERT INTO traders(address, copy_30d) VALUES ($1, $2)", a, copy)
+        _t, kb = await B.board_view(db, "mid")
+        assert [r[0]["callback"][5:9] for r in kb[1:4]] == ["6d7y", "aaaa", "bbbb"]   # лучшие по копируемости — первыми
+        assert [w["address"][:4] for w in await B.find(db, "6d7y")] == ["6d7y"]
+        assert await B.find(db, "zzzz") and not await B.find(db, "nope")
+    finally:
+        await db.close()

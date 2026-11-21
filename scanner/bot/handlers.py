@@ -1264,6 +1264,21 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         else:
             await add_wallet(m, m.text or "", st.get("origin"), st.get("pick"))
 
+    @router.message(Command("card"))
+    async def cmd_card(m: Message, command: CommandObject) -> None:
+        """Карточка кошелька доски по началу адреса или метке: /card 6d7y."""
+        from . import board
+        part = (command.args or "").strip()
+        if len(part) < 3:
+            return await reply(m, "Формат: /card начало адреса (от 3 знаков), например <code>/card 6d7y</code>")
+        hits = await board.find(db, part)
+        if len(hits) == 1:
+            text, kb = await board.card_view(db, await reload(), hits[0]["address"])
+            return await reply(m, text, kb)
+        if not hits:
+            return await reply(m, f"Кошелька «{esc(part)}» нет в своём списке и smart-money — добавить: ➕ в Главной.")
+        await reply(m, f"Нашлось {len(hits)} — выберите:", [[board.button(w)] for w in hits[:20]])
+
     @router.callback_query(F.data.startswith("bd:"))
     async def cb_board(c: CallbackQuery) -> None:
         """Доска кошельков: секции, карточка, «тень/бой за ним», убрать из списка (bot/board.py)."""

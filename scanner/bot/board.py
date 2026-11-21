@@ -102,17 +102,28 @@ async def board_view(db: Any, section: str = "best") -> tuple[str, list[list[dic
     if section == "bad":
         rows.sort(key=lambda w: w["copy_usd"])
     elif section == "mid":
-        rows.sort(key=lambda w: (-(w["today"] or 0), -(w["last"].timestamp() if w.get("last") else 0)))
+        # новые — без копий на бумаге: первыми те, у кого копия по истории лучше (6d7y +21%, 7HcK +7% и т. п.)
+        rows.sort(key=lambda w: (w.get("copy_30d") is None, -float(w.get("copy_30d") or 0), -(w["today"] or 0)))
     else:
         rows.sort(key=lambda w: -w["copy_usd"])
     text = (f"🏆 <b>Доска кошельков</b> · {SECTIONS[section]} — {len(rows)} из {len(ws)}\n"
-            f"Кнопка: кошелёк · копий в плюсе · итог копий при ${COPY_USD:g} · последняя сделка. Нажми — карточка."
+            f"Кнопка: кошелёк · копий в плюсе · итог копий при ${COPY_USD:g} · последняя сделка. Нажми — карточка. "
+            "Найти любой: /card начало адреса (например /card 6d7y)."
+            + (" Средние — первыми лучшие по копируемости." if section == "mid" else "")
             + ("" if rows else "\n\nВ этой секции пока никого."))
     kb: list[list[dict[str, Any]]] = [[{"text": ("● " if s == section else "") + f"{name} ({cnt[s]})",
                                         "callback": f"bd:s:{s}"} for s, name in SECTIONS.items()]]
     kb += [[button(w)] for w in rows[:LIMIT]]
     kb.append([{"text": "🔄 Обновить", "callback": f"bd:s:{section}"}])
     return text, kb
+
+
+async def find(db: Any, part: str) -> list[dict[str, Any]]:
+    """Кошельки доски, чей адрес начинается с part (или содержит его), либо метка совпадает."""
+    p = part.strip().lower()
+    ws = await wallets(db)
+    hit = [w for w in ws if w["address"].lower().startswith(p)]
+    return hit or [w for w in ws if p in w["address"].lower() or p in str(w.get("label") or "").lower()]
 
 
 async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[list[dict[str, Any]]]]:
