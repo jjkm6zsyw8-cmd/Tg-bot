@@ -102,7 +102,12 @@ TREND = "T"
 # (медиана +50%, 14 из 17 на +30%, ни одна −30%). Тот же путь, что у T (откат, проверка холдеров), без публичного
 # алерта и без реального бота; как T, по $10
 TREND_X = "X"
-OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY, TRIAL, TREND, TREND_X)
+# N — опыт (с 21.11): сильные алерты «ДЕВ+НОВАЯ» (тема «Сильные алерты»), как владелец торгует их руками: вход по рынку
+# через 5 с после алерта, продажа по цели из алерта, стоп −20%, до 30 мин, по $10. Покупки трейдера в блоке у таких
+# алертов нет — вход по рынку (Jupiter / свежая сделка своего потока), цену входа проверяют минутные свечи
+DEV_NEW = "N"
+DEV_NEW_NEAR_TARGET = 0.9     # цена уже у цели (≥ 90% пути) — не входим: «цель» сработала бы сразу
+OBSERVE = (SCOUT, SWING, MYDEV, BIGCOPY, TRIAL, TREND, TREND_X, DEV_NEW)
 OBSERVE_USD = 10.0
 # 12.11: трейдер после нашего входа мелко докупил (≤0.06 SOL ≈ $5) — выходим сразу. По неделе (копии, 88 сделок):
 # цена через 5 мин после такой докупки −13% (медиана); «выйти сразу» +$71 против «держать» +$21
@@ -204,6 +209,10 @@ SCHEMES[TREND] = {**_G, "name": "T: тренды — монеты, которы�
                   "max_hold_s": 1800}
 SCHEMES[TREND_X] = {**_G, "name": "X: опыт — тренды, отсеянные за «топ-10 держат много», как T, по $10",
                     "max_hold_s": 1800}
+SCHEMES[DEV_NEW] = {"name": "N: опыт — сильные «ДЕВ+НОВАЯ»: по рынку через 5 с, продажа по цели алерта, стоп −20%, "
+                             "до 30 мин, по $10", "stop": 0.20, "tp_net": None, "tp_share": 0.0, "trail": None,
+                    "target": True, "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 1800,
+                    "ignore_trader_sell": True}
 SCHEMES[TRIAL] = {**SCHEMES["A"], "name": "S: испытание кандидатов разведки как боевой бот — правило A (всё на +25% "
                                          "без стопа, выход за трейдером, до 30 мин), по $10"}
 LEGEND = ("с 12.11 — только smart (по факту недели копии в минусе при любой тактике): "
@@ -216,7 +225,8 @@ LEGEND = ("с 12.11 — только smart (по факту недели коп�
           "стоп −50%, до суток, по $10, старт $1000, без дневного сброса · Y — мой дев: запуски девов из списка, вход "
           "через 4 блока после создания, как G · K — крупные копии (трейдер от 5 SOL), как G · T — тренды "
           "(монеты, которые уже растут: сигнал DexScreener, вход и выход по рынку Jupiter), как G · X — опыт: тренды, отсеянные за «топ-10 держат много», как T · "
-          "Y, K, T, X — по $10, старт $1000 · M и бой — только "
+          "N — опыт: сильные «ДЕВ+НОВАЯ» по рынку через 5 с, продажа по цели алерта, стоп −20%, до 30 мин · "
+          "Y, K, T, X, N — по $10, старт $1000 · M и бой — только "
           "кошельки с устойчивым плюсом копий (t ≥ 1.645) · во всех: трейдер мелко докупил (до ~$5) — выходим сразу")
 # Копии выходят по правилу своего портфеля. Было единое правило для всех (½ на +30%, трейл 15%, стоп −20%, без
 # выхода по цели) — оно срезало ровно то, что давало плюс: 6.11 вечером копии в C (только цель) и F (трейл после
@@ -635,12 +645,15 @@ class PaperTrader:
         if self.realtime(data):
             await self._enter_realtime(mint, level, alert_id, data, trader, targets)
             return
-        if self.cfg.get("paper_realtime_only", True) and not data.get("trend"):
+        if self.cfg.get("paper_realtime_only", True) and not data.get("trend") and targets - {DEV_NEW}:
             # без свежей покупки в блоке цену входа реального бота не узнать — по «рынку через 5 с» не входим
+            # (опыт N — исключение: у «ДЕВ+НОВАЯ» покупки трейдера нет, он и задуман по рынку)
             why = "покупка трейдера давняя (>15 с)" if data.get("trigger_slot") else "нет покупки трейдера в блоке"
             self._bump("no_block", f"{signal_kind(data)}: {why}")
             self.skipped["*"] = f"{why} — не входим: бумага входит только как реальный бот"
-            return
+            targets = targets & {DEV_NEW}
+            if not targets:
+                return
         # M входит быстрее остальных — как бот на реальных деньгах (бэктест 6–9.11: результат почти целиком решает
         # цена входа внутри минуты; на тех же сигналах M через 1 с против остальных через 5 с покажет, что даёт скорость)
         m_delay = float(self.cfg.get("paper_m_entry_delay_s", M_ENTRY_DELAY_S))
@@ -1227,6 +1240,14 @@ class PaperTrader:
         if not measure and self.day_stopped(name):
             self.skipped[name] = f"дневной стоп: за сегодня −${self.day_stop_usd(name):g} — новых входов нет до 00:00"
             return None
+        if name == DEV_NEW:
+            target = float(data.get("target_mc") or 0)
+            if target <= 0:
+                self.skipped[name] = "N: у алерта нет цели — продавать не по чему"
+                return None
+            if mc >= target * DEV_NEW_NEAR_TARGET:
+                self.skipped[name] = f"N: цена уже у цели ({mc / target:.0%} от неё) — не входим"
+                return None
         if mint in self.rugged:
             # регрессия 6.11: D семь раз за 20 минут входил в раг NORTHKOREA (−56…−99% каждый раз)
             self.skipped[name] = f"монета уже рагнула ({self.rugged[mint]:+.0%}) — больше не входим"
@@ -1261,7 +1282,7 @@ class PaperTrader:
         if name in (SCOUT, TRIAL):
             # испытание кандидатов — одинаковой суммой: сравниваем кошельки, а не размер позиций
             size = float(self.cfg.get("paper_scout_usd", SCOUT_USD)) / (self.e.price.value or 150)
-        if name in (SWING, MYDEV, BIGCOPY, TREND, TREND_X):
+        if name in (SWING, MYDEV, BIGCOPY, TREND, TREND_X, DEV_NEW):
             size = float(self.cfg.get("paper_observe_usd", OBSERVE_USD)) / (self.e.price.value or 150)
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * (float(self.cfg.get("paper_m_size_cap", M_SIZE_CAP)) if name == MAIN
@@ -1605,6 +1626,8 @@ class PaperTrader:
             out.add(TREND)                           # тренды — свой портфель наблюдения T
         if "trendx" in modes and self.cfg.get("paper_trend_x", True):
             out.add(TREND_X)                         # опыт: отсеянные за «топ-10 держат много»
+        if {"dev", "new"} <= modes and level == "strong" and self.cfg.get("paper_dev_new", True):
+            out.add(DEV_NEW)                         # опыт: сильные «ДЕВ+НОВАЯ», как владелец руками
         if "smart" in modes:
             out |= smart_set | {MAIN}
         if "dev" in modes and self.cfg.get("paper_lottery_on", False):

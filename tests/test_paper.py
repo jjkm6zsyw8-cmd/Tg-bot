@@ -1004,3 +1004,38 @@ async def test_trend_entry_retries_jupiter_once(monkeypatch):
     tr._open = fake_open
     await tr.on_alert("M", "normal", None, {"modes": ["trend"], "trend": {"pc_m5": 10}, "mc": 3000.0}, None)
     assert opened == [("T", pytest.approx(3000.0), "jup")] and Busy.calls == 2
+
+
+async def test_strong_dev_new_alerts_go_to_portfolio_n(monkeypatch):
+    """21.11: владелец купил руками по сильному «ДЕВ+НОВАЯ» и продал по цели алерта (+39%). Опыт N: такие алерты —
+    по рынку через 5 с (покупки трейдера у них нет), продажа по цели, стоп −20%, до 30 мин."""
+    monkeypatch.setattr(pp, "ENTRY_DELAY_S", 0)
+    tr = bare_trader({}, FakeExt(300_000, jup=44 / 1e9 * 100))   # рынок: MC 44 SOL
+    tr.e.cfg = {"paper_realtime_only": True}
+    tr.lock = __import__("asyncio").Lock()
+    opened = []
+
+    async def fake_open(name, mint, level, alert_id, data, trader, mc, src="auto"):
+        opened.append((name, round(mc, 1), src))
+    tr._open = fake_open
+    alert = {"modes": ["dev", "new"], "mc": 45.0, "target_mc": 60.0}
+    assert tr.route(alert, "strong")[0] == {"N"}
+    assert tr.route(alert, "normal")[0] == set()                 # только сильные
+    assert tr.route({"modes": ["dev"], "target_mc": 60.0}, "strong")[0] == set()   # только «ДЕВ+НОВАЯ»
+    await tr.on_alert("M", "strong", None, alert, None)
+    assert opened == [("N", 44.0, "jup")]                         # по рынку, без покупки трейдера в блоке
+    sc = pp.SCHEMES["N"]
+    p = pos(entry=44.0, target=60.0)
+    p.opened_ts = 0
+    assert decide_exit(p, 61.0, 10, sc, 125, 0.0005) == ("target", 1.0)
+    assert decide_exit(pos(entry=44.0, target=60.0), 35.0, 10, sc, 125, 0.0005) == ("stop", 1.0)
+    assert decide_exit(pos(entry=44.0, target=60.0), 50.0, 10, sc, 125, 0.0005) is None
+
+
+async def test_portfolio_n_skips_when_price_already_at_target():
+    tr = bare_trader({})
+    tr.positions = {}
+    assert await pp.PaperTrader._open(tr, "N", "M", "strong", None, {"target_mc": 60.0}, None, 56.0) is None
+    assert "уже у цели" in tr.skipped["N"]
+    assert await pp.PaperTrader._open(tr, "N", "M", "strong", None, {}, None, 40.0) is None
+    assert "нет цели" in tr.skipped["N"]
