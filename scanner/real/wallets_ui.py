@@ -319,6 +319,19 @@ async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, i
     return {r["portfolio"]: (int(r["n"]), int(r["w"]), float(r["s"]) * 10) for r in rows}
 
 
+async def trial_stats(db: Any, kind: str, wid: int | None, days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float, float]]:
+    """Пробы правил выхода метода (тень, все 4 правила на тех же входах): правило → (сделок, в плюс, итог SOL,
+    средний %). Кошелёк — его пробы; общие настройки — все."""
+    zero = await stats_since(db)
+    rows = await db.fetch(
+        """SELECT rule, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w, COALESCE(sum(pnl_sol), 0) s,
+                  COALESCE(avg(pnl_pct), 0) a
+           FROM real_rule_trials WHERE kind = $1 AND closed_at IS NOT NULL
+             AND opened_at > now() - make_interval(days => $2) AND ($3::timestamptz IS NULL OR opened_at >= $3)
+             AND ($4::bigint IS NULL OR wallet_id = $4) GROUP BY rule""", kind, int(days), zero, wid)
+    return {r["rule"]: (int(r["n"]), int(r["w"]), float(r["s"]), float(r["a"])) for r in rows}
+
+
 async def paper_period(db: Any, days: int = PAPER_DAYS) -> str:
     """«за 7 дн.» или «с 20.11 21:05» — после кнопки «Считать с нуля»."""
     from .report import stats_since
@@ -409,11 +422,20 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     filt = S.get(wcfg, "real_smart_filter") if kind == "smart" else "all"
     stake = S.method_stake(wcfg, kind)
     st = await paper_stats(db)
+    trials = await trial_stats(db, kind, None if tag == "g" else int(tag))
+    sol_usd = await sol_price(db)
     lines = [f"🎯 <b>{name}</b> · {title}",
              f"Когда покупать: {ABOUT[kind]}" + (f" — {S.SMART_FILTERS[filt]}" if kind == "smart" else "") + ".",
-             f"Состояние: {'✅ включён' if on else '⬜ выключен'}", "", "<b>Когда продавать</b> (правило выхода):"]
-    lines += [f"{'●' if rule == x else '○'} <b>{x}</b> — {S.SCHEME_TEXT[x]} · {_stat(st, paper_of(kind, x, filt))}"
-              for x in S.SCHEMES]
+             f"Состояние: {'✅ включён' if on else '⬜ выключен'}", "", "<b>Когда продавать</b> (правило выхода):",
+             "Тень проверяет <b>все 4 правила сразу</b> на каждом входе (пробы: тот же вход, разные выходы) — их итог "
+             f"в строке «тень», {await paper_period(db)}. Выбор ● — по какому правилу продаёт сам бот (в бою — на "
+             "деньги)."]
+    for x in S.SCHEMES:
+        lines.append(f"{'●' if rule == x else '○'} <b>{x}</b> — {S.SCHEME_TEXT[x]}")
+        t = trials.get(x)
+        lines.append("   тень: " + (f"{t[0]} сд., в плюс {t[1] / t[0]:.0%}, в среднем {t[3]:+.1%}, итог "
+                                     f"{money(t[2], sol_usd)}" if t else "проб ещё нет")
+                     + " · " + _stat(st, paper_of(kind, x, filt)))
     if kind == "smart":
         lines += ["", "<b>Какие сигналы брать:</b>",
                   f"{'●' if filt == 'all' else '○'} все smart-сигналы (как бумажные A / B / G)",

@@ -432,3 +432,19 @@ async def test_fresh_coin_not_yet_visible_is_retried(db, monkeypatch):
     calls[0] = -100
     await fire(tr, chain, m2, kind="mydev", alert_id=2)
     assert skipped(tr, "монета не найдена в сети") and len(tr.positions) == 1
+
+
+async def test_method_screen_shows_shadow_result_of_every_exit_rule(db):
+    """21.11: «из вариантов выхода выбрать можно один» — тень и так проверяет все 4 на каждом входе; их итог теперь
+    прямо на экране метода, рядом с выбором."""
+    for rule, pnl in (("A", 0.01), ("B", -0.002), ("G", 0.004)):
+        await db.execute(
+            """INSERT INTO real_rule_trials(mode, kind, rule, mint, opened_at, entry_mc, cost_sol, tokens_raw,
+                   closed_at, exit_reason, pnl_sol, pnl_pct) VALUES ('shadow', 'trend', $1, 'M', now(), 40, 0.05, 1,
+                   now(), 'take_profit', $2, $3)""", rule, pnl, pnl / 0.05)
+    await db.kv_set("sol_usd", {"price": 100.0})
+    text, _kb = await UI.method_view(db, {}, "g", "trend")
+    assert "все 4 правила сразу" in text
+    assert "тень: 1 сд., в плюс 100%, в среднем +20.0%, итог +$1.00" in text          # A
+    assert "тень: 1 сд., в плюс 0%, в среднем -4.0%, итог −$0.20" in text             # B
+    assert "тень: проб ещё нет" in text                                                # R
