@@ -346,6 +346,11 @@ def paper_of(kind: str, rule: str, smart_filter: str = "all") -> str | None:
     return S.paper_portfolio(kind, rule, smart_filter)
 
 
+def _usd(v: float) -> str:
+    """+$35 / −$9.79: от $10 — без центов."""
+    return f"{'+' if v >= 0 else '−'}${abs(v):.0f}" if abs(v) >= 10 else f"{'+' if v >= 0 else '−'}${abs(v):.2f}"
+
+
 def _stat(st: dict[str, tuple[int, int, float]], port: str | None) -> str:
     if port is None:
         return "на бумаге так не торговали — данных нет"
@@ -424,32 +429,39 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     st = await paper_stats(db)
     trials = await trial_stats(db, kind, None if tag == "g" else int(tag))
     sol_usd = await sol_price(db)
-    lines = [f"🎯 <b>{name}</b> · {title}",
-             f"Когда покупать: {ABOUT[kind]}" + (f" — {S.SMART_FILTERS[filt]}" if kind == "smart" else "") + ".",
-             f"Состояние: {'✅ включён' if on else '⬜ выключен'}", "", "<b>Когда продавать</b> (правило выхода):",
-             "Тень проверяет <b>все 4 правила сразу</b> на каждом входе (пробы: тот же вход, разные выходы) — их итог "
-             f"в строке «тень», {await paper_period(db)}. Выбор ● — по какому правилу продаёт сам бот (в бою — на "
-             "деньги)."]
-    for x in S.TRIAL_RULES:
-        if x == "W" and kind not in ("smart", "copy", "bigcopy", "swing"):
-            continue                              # W — только у сигналов с трейдером
-        mark = "◇" if x == "W" else ("●" if rule == x else "○")
-        lines.append(f"{mark} <b>{x}</b> — {S.SCHEME_TEXT[x]}" + (" · только проба" if x == "W" else ""))
-        t = trials.get(x)
-        lines.append("   тень: " + (f"{t[0]} сд., в плюс {t[1] / t[0]:.0%}, в среднем {t[3]:+.1%}, итог "
-                                     f"{money(t[2], sol_usd)}" if t else "проб ещё нет")
-                     + " · " + _stat(st, paper_of(kind, x, filt)))
-    if kind == "smart":
-        lines += ["", "<b>Какие сигналы брать:</b>",
-                  f"{'●' if filt == 'all' else '○'} все smart-сигналы (как бумажные A / B / G)",
-                  f"{'●' if filt == 'm' else '○'} только отобранные, как у M: автофильтр отсеивает сигналы, которые по "
-                  "истории давали минус · " + _stat(st, paper_of("smart", "A", "m")) + " (с правилом A)"]
+    # 22.11: экран по разделам — каждый с новой строки, тень таблицей, бумага отдельно (владелец: «всё наслоено»)
+    rules = [x for x in S.TRIAL_RULES if x != "W" or kind in ("smart", "copy", "bigcopy", "swing")]
+    stake_txt = (f"${stake:g}" if stake else f"как у кошелька ({S.fmt('real_stake_usd', S.get(wcfg, 'real_stake_usd'))})")
+    state = f"{'✅ включён' if on else '⬜ выключен'} · ставка {stake_txt} · потолок ${S.max_stake_usd():g}"
     if kind == "mydev":
-        lines += ["", f"В бою: {'да' if S.get(wcfg, 'real_live_mydev') else 'нет — только тень, даже если кошелёк в бою'}"]
-    lines += ["", "<b>На сколько покупать:</b> "
-              + (f"${stake:g} (своя ставка метода)" if stake else
-                 f"как у кошелька — {S.fmt('real_stake_usd', S.get(wcfg, 'real_stake_usd'))}")
-              + f" · потолок сервера ${S.max_stake_usd():g}"]
+        state += " · в бою: " + ("да" if S.get(wcfg, "real_live_mydev") else "нет, только тень")
+    lines = [f"🎯 <b>{name}</b> — {title}", state, "",
+             "<b>Покупает</b>", ABOUT[kind] + (f" — {S.SMART_FILTERS[filt]}" if kind == "smart" else ""), "",
+             f"<b>Продаёт</b> по правилу ● <b>{rule}</b> (кнопки «Выход» внизу)", "",
+             f"<b>Тень</b> {await paper_period(db)} — тот же вход, разные выходы"]
+    table = [f"{'выход':<6}{'сд':>4}{'плюс':>6}{'итог':>9}"]
+    for x in rules:
+        t = trials.get(x)
+        mark = f"{x} ●" if x == rule else x
+        table.append(f"{mark:<6}" + (f"{t[0]:>4}{t[1] / t[0]:>6.0%}{_usd(t[2] * sol_usd):>9}" if t else f"{'—':>4}{'':>6}{'нет':>9}"))
+    lines.append("<pre>" + "\n".join(table) + "</pre>")
+    lines += ["", "<b>Бумага</b> " + await paper_period(db)]
+    for x in S.SCHEMES:
+        port = paper_of(kind, x, filt)
+        if port is None:
+            continue
+        n, w, usd = st.get(port, (0, 0, 0.0))
+        lines.append(f"{x} → портфель {port}: " + (f"{n} сд · плюс {w / n:.0%} · {_usd(usd)}" if n else "сделок нет"))
+    if all(paper_of(kind, x, filt) is None for x in S.SCHEMES):
+        lines.append("так на бумаге не торгуют — данных нет")
+    if kind == "smart":
+        n, w, usd = st.get(paper_of("smart", "A", "m") or "", (0, 0, 0.0))
+        lines += ["", "<b>Какие сигналы брать</b>",
+                  f"{'●' if filt == 'all' else '○'} все smart-сигналы",
+                  f"{'●' if filt == 'm' else '○'} только отобранные, как у M"
+                  + (f" · бумага M: {n} сд · плюс {w / n:.0%} · {_usd(usd)}" if n else "")]
+    lines += ["", "<b>Правила</b>"] + [f"{x} — {S.SCHEME_TEXT[x]}" + (" (только проба)" if x == "W" else "")
+                                       for x in rules]
     kb: Kb = [[{"text": "✅ Включён — выключить" if on else "⬜ Выключен — включить",
                 "callback": f"rl:wmo:{tag}:{kind}:{'off' if on else 'on'}"}],
               [{"text": ("● " if rule == x else "") + f"Выход {x}", "callback": f"rl:wmr:{tag}:{kind}:{x}"}

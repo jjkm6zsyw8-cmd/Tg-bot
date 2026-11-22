@@ -188,9 +188,9 @@ async def test_methods_screen_for_wallet_and_common(db, monkeypatch):
         return r, await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid)
     # экран метода smart: правила A/B/G/R с итогом бумаги, отбор, ставка
     r, _ = await press("wmk", f"{t}:smart")
-    assert "● <b>A</b> — всё на +25%, без стопа" in r.text and "бумага A: 2 сд." in r.text
-    assert "○ <b>R</b>" in r.text and "на бумаге так не торговали" in r.text
-    assert "только отобранные, как у M" in r.text and "бумага M: 1 сд., в плюс 100%, +$2" in r.text
+    assert "<b>Продаёт</b> по правилу ● <b>A</b>" in r.text and "A → портфель A: 2 сд · плюс 50% · +$2.00" in r.text
+    assert "R → портфель" not in r.text and "R — трейлинг 35%" in r.text
+    assert "только отобранные, как у M · бумага M: 1 сд · плюс 100% · +$2.00" in r.text
     assert all(len(c.encode()) <= 64 for c in [b["callback"] for row in r.kb for b in row])
     r, st = await press("wmf", f"{t}:M")                       # «сделать как M»
     assert st["real_smart_filter"] == "m" and st["real_scheme"] == "A" and st["real_smart"] is True
@@ -200,7 +200,7 @@ async def test_methods_screen_for_wallet_and_common(db, monkeypatch):
     monkeypatch.setenv("REAL_MAX_STAKE_USD", "30")
     for _ in range(7):
         r, st = await press("wms", f"{t}:smart:+")
-    assert st["real_stake_usd_smart"] == 30 and "$30 (своя ставка метода)" in r.text   # 5 → 30, не выше потолка
+    assert st["real_stake_usd_smart"] == 30 and "ставка $30 · потолок $30" in r.text   # 5 → 30, не выше потолка
     r, st = await press("wms", f"{t}:smart:0")
     assert "real_stake_usd_smart" not in st and "как у кошелька" in r.text
     # мой дев: правило A, в бою; копии: включить с экрана метода, правило R
@@ -444,10 +444,11 @@ async def test_method_screen_shows_shadow_result_of_every_exit_rule(db):
                    now(), 'take_profit', $2, $3)""", rule, pnl, pnl / 0.05)
     await db.kv_set("sol_usd", {"price": 100.0})
     text, _kb = await UI.method_view(db, {}, "g", "trend")
-    assert "все 4 правила сразу" in text
-    assert "тень: 1 сд., в плюс 100%, в среднем +20.0%, итог +$1.00" in text          # A
-    assert "тень: 1 сд., в плюс 0%, в среднем -4.0%, итог −$0.20" in text             # B
-    assert "тень: проб ещё нет" in text                                                # R
+    table = text.split("<pre>")[1].split("</pre>")[0].splitlines()
+    assert table[0].split() == ["выход", "сд", "плюс", "итог"]
+    assert table[1].split() == ["A", "1", "100%", "+$1.00"] and table[2].split() == ["B", "1", "0%", "−$0.20"]
+    assert table[3].split() == ["G", "●", "1", "100%", "+$0.40"] and table[4].split() == ["R", "—", "нет"]
+    assert "</pre>\n\n<b>Бумага</b>" in text and "G → портфель T: сделок нет" in text
 
 
 async def test_trial_w_sells_before_trader(db, monkeypatch):
