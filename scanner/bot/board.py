@@ -290,3 +290,6 @@ async def set_follow(db: Any, addr: str, mode: str | None) -> None:
     else:
         cur.pop(addr, None)
     await db.kv_set(FOLLOW_KEY, cur)
+    auto = list(await db.kv_get("real:follow_auto") or [])
+    if addr in auto:                     # нажал сам — теперь это твой выбор, авто-тень его не снимет
+        await db.kv_set("real:follow_auto", [a for a in auto if a != addr])

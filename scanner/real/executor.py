@@ -149,6 +149,7 @@ class RealTrader:
         # «за ним» с доски кошельков (kv real:follow): адрес → shadow | live — его покупки берём, даже если метод
         # сигнала выключен; live — только когда сам кошелёк бота в бою
         self.follow: dict[str, str] = {}
+        self.follow_auto: set[str] = set()          # кого «тень за ним» включил сам бот (wallet_rules.autofollow)
         self._follow_at = 0.0
         self.balance: int | None = None             # лампорты на кошельке (кэш)
         self._balance_at = 0.0
@@ -296,6 +297,7 @@ class RealTrader:
         self._roll_day()
         try:
             self.follow = dict(await self.db.kv_get("real:follow") or {})
+            self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
         except Exception:  # noqa: BLE001
             self.follow = {}
         for r in await self.db.fetch("SELECT * FROM real_positions WHERE closed_at IS NULL AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
@@ -406,6 +408,8 @@ class RealTrader:
         f = (getattr(self, "follow", None) or {}).get(wallet or "")
         if not f or self.mode() == "off":
             return None
+        if self.get("real_only_follow") and wallet in (getattr(self, "follow_auto", None) or set()):
+            return None                  # «только выбранные мной»: тень, которую бот включил сам, — не в счёт
         return "live" if f == "live" and self.mode() == "live" else "shadow"
 
     async def on_signal(self, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
@@ -415,6 +419,8 @@ class RealTrader:
         followed = self.follow_mode(wallet)
         if not self.accept_new or (data.get("paper_only") and not followed):
             return                       # paper_only — копия только на бумагу (свой кошелёк вне рамок smart), не деньги
+        if not followed and self.get("real_only_follow"):
+            return                       # «только выбранные мной кошельки»: методы и замер тени не торгуют
         _SIGNAL.set((mint, alert_id))
         if followed:
             kind = next(iter(kinds_of(data, targets)), None)
@@ -1355,6 +1361,7 @@ class RealTrader:
             self._follow_at = now
             try:
                 self.follow = dict(await self.db.kv_get("real:follow") or {})
+                self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
             except Exception:  # noqa: BLE001
                 pass
         if self.trials and now - self._trials_saved >= 60:
