@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 import time
 from typing import Any
@@ -104,7 +105,10 @@ async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> di
     trips = list({id(t): t for t in month + day}.values())
     pos = float(cfg.get("position_sol", 0.5))
     hold = float(s30.median_hold_s or 0)
-    out: dict[str, Any] = {"rules": {}, "rules_1d": {}, "best": None, "hold": hold, "n": len(month), "n_1d": len(day)}
+    # сколько дней его истории в базе: у добавленного вчера «30 дней» — на деле сутки (6d7y: 44 сделки и там, и там)
+    days = min(30, math.ceil((time.time() - all_trips[0].entry_ts) / 86400)) if all_trips else 0
+    out: dict[str, Any] = {"rules": {}, "rules_1d": {}, "best": None, "hold": hold, "n": len(month), "n_1d": len(day),
+                           "days": days}
     if not trips:
         return out
     win: dict[str, list[float]] = {}             # по монете — только её окно (сделки за 30 дней разбросаны)
@@ -187,8 +191,8 @@ def top_line(rules: dict[str, dict[str, Any]], best: str | None, limit: int = 3)
 
 
 async def save(db: Any, address: str, res: dict[str, Any]) -> None:
-    await db.execute("UPDATE traders SET rules_30d=$2, best_rule=$3, rules_1d=$4 WHERE address=$1", address,
-                     res["rules"], res["best"], res.get("rules_1d") or {})
+    await db.execute("UPDATE traders SET rules_30d=$2, best_rule=$3, rules_1d=$4, rules_days=$5 WHERE address=$1",
+                     address, res["rules"], res["best"], res.get("rules_1d") or {}, int(res.get("days") or 0))
 
 
 def usd(rules: dict[str, Any] | None, rule: str | None, stake: float = 10.0) -> tuple[float, int] | None:
@@ -213,7 +217,7 @@ async def top_text(db: Any, limit: int = 15) -> tuple[str, list[tuple[str, str]]
     """Кошельки с устойчивым лучшим выходом: итог при $10 на сделку за 30 дней и за сутки; лучшие сейчас — сверху.
     Возвращает текст и [(адрес, имя)] для кнопок карточек."""
     rows = await db.fetch(
-        """SELECT address, label, best_rule, rules_30d, rules_1d FROM traders
+        """SELECT address, label, best_rule, rules_30d, rules_1d, rules_days FROM traders
            WHERE best_rule IS NOT NULL AND (active OR address IN (SELECT address FROM watchlist WHERE kind = 'trader'))""")
     items = []
     for r in rows:
@@ -227,15 +231,17 @@ async def top_text(db: Any, limit: int = 15) -> tuple[str, list[tuple[str, str]]
             "бота (~1 с), с комиссиями. Это расчёт по его сделкам, не деньги. Сверху — лучшие за последние сутки.")
     if not items:
         return head + "\n\nПока ни у кого нет устойчивого лучшего выхода (8+ сделок, плюс не случайность).", []
-    table = [f"{'кошелёк':<9}{'выход':>7}{'30 дн':>8}{'сутки':>8}{'сд':>4}"]
+    table = [f"{'кошелёк':<9}{'выход':>7}{'30 дн':>7}{'сутки':>7}{'сд':>4}{'дн':>3}"]
     out = []
     for d_usd, m_usd, d_n, r in items:
         name = (r["label"] or f"{r['address'][:4]}…{r['address'][-4:]}")[:9]
-        table.append(f"{name:<9}{RULE_NAMES[r['best_rule']]:>7}{_m(m_usd):>8}{_m(d_usd) if d_n else '—':>8}"
-                     f"{d_n if d_n else '':>4}")
+        days = r["rules_days"] if r.get("rules_days") is not None else "?"
+        table.append(f"{name:<9}{RULE_NAMES[r['best_rule']]:>7}{_m(m_usd):>7}{_m(d_usd) if d_n else '—':>7}"
+                     f"{d_n if d_n else '':>4}{days:>3}")
         out.append((r["address"], name))
-    tail = ("сд — его сделок за сутки. Тень (без денег) за кошельками «Сейчас» и за своими с устойчивым плюсом бот "
-            "включает сам и сам снимает. В бой — только твоей кнопкой в карточке.")
+    tail = ("сд — его сделок за сутки; дн — сколько дней его истории в базе (1 — «30 дн» на деле сутки). Тень (без "
+            "денег) за кошельками «Сейчас» и за своими с устойчивым плюсом бот включает сам и сам снимает. В бой — "
+            "только твоей кнопкой в карточке.")
     return head + "\n<pre>" + "\n".join(table) + "</pre>\n" + tail, out
 
 

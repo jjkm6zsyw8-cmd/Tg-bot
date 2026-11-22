@@ -62,7 +62,7 @@ async def test_board_sections_buttons_card_and_follow():
                    pnl_pct) VALUES ('shadow', 'copy', 'Q', $1, now(), now(), 0.05, 1, 0.01, 0.2)""", star)
         await db.kv_set("sol_usd", {"price": 100.0})
         card, _ = await B.card_view(db, {}, star)
-        assert "тень за 14 дн: 1 сд., в плюсе 1, в среднем +20.0%, итог +$1.00" in card
+        assert "тень за 14 дн · копия: 1 сд., в плюсе 1, в среднем +20.0%, итог +$1.00" in card
         await B.set_follow(db, star, "live")
         card, _ = await B.card_view(db, {}, star)
         assert "💵 бой за ним" in card and (await db.kv_get(B.FOLLOW_KEY)) == {star: "live"}
@@ -142,8 +142,19 @@ async def test_now_section_30d_and_day_money_and_top():
         assert "Итог при $10 на сделку по G: 30 дн <b>+$48</b> · сутки <b>+$12</b> (6 сд.)" in card
         top, tkb = await B.top_view(db)
         rows = top.split("<pre>")[1].split("</pre>")[0].splitlines()
-        assert rows[1].split() == ["HoTw…aaaa", "G", "+$48", "+$12", "6"]
-        assert rows[2].split() == ["CoLd…bbbb", "G", "+$48", "−$5", "5"] and len(rows) == 3   # без лучшего — нет
+        assert rows[1].split() == ["HoTw…aaaa", "G", "+$48", "+$12", "6", "?"]
+        assert rows[2].split() == ["CoLd…bbbb", "G", "+$48", "−$5", "5", "?"] and len(rows) == 3   # без лучшего — нет
+        await db.execute("UPDATE traders SET rules_days = 1 WHERE address = $1", hot)   # история — только сутки
+        assert (await B.top_view(db))[0].split("<pre>")[1].splitlines()[1].split()[-1] == "1"
+        card, _ = await B.card_view(db, {}, hot)
+        assert "Выходы за 1 дн истории в базе" in card and "по G: 1 дн <b>+$48</b>" in card
+        await db.execute(
+            """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, pnl_sol,
+                   pnl_pct, extra) VALUES ('shadow', 'mydev', 'Q1', $1, now(), now(), 0.05, 1, -0.01, -0.2, '{}'),
+                   ('shadow', 'copy', 'Q2', $1, now(), now(), 0.05, 1, 0.01, 0.2, '{"followed": true}')""", hot)
+        card, _ = await B.card_view(db, {}, hot)
+        assert "тень за 14 дн · мой дев: 1 сд., в плюсе 0" in card
+        assert "тень за 14 дн · копия: 1 сд., из них «за ним» 1, в плюсе 1" in card
         assert tkb[0][0]["callback"] == f"bd:w:{hot}" and tkb[-1][1]["callback"] == "bd:t"
     finally:
         await db.close()

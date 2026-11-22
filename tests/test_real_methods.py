@@ -499,6 +499,16 @@ async def test_follow_wallet_from_board(db, monkeypatch):
     lv.follow = {"STAR": "shadow"}                             # тень за ним — даже у кошелька в бою без денег
     await copy(lv, m3, 3)
     assert [p.extra["mode"] for p in lv.positions.values() if p.mint == str(m3)] == ["shadow"]
+    assert (await db.fetchval("SELECT count(*) FROM real_positions WHERE (extra->>'followed')::boolean")) >= 3
+    # покупка мимо анти-PVP (shadow_only) — только тень, даже если за ним бой
+    m4 = pk("f-4")
+    chain.add_curve(m4, 40.0)
+    lv.follow = {"STAR": "live"}
+    data = {"modes": ["copy"], "symbol": "C", "trigger_at": time.time(), "trigger_slot": chain.slot - 2,
+            "trigger_mc": chain.mc(m4), "trigger_sig": "s", "copy_wallet": "STAR", "paper_only": True,
+            "shadow_only": True}
+    await lv.on_signal(str(m4), "normal", 4, data, "STAR", {"H"})
+    assert [p.extra["mode"] for p in lv.positions.values() if p.mint == str(m4)] == ["shadow"]
 
 
 async def test_followed_wallet_exits_by_its_best_rule(db):
@@ -516,3 +526,40 @@ async def test_followed_wallet_exits_by_its_best_rule(db):
     p = only(tr)
     assert p.extra["best_exit"] == "G" and tr.scheme_of(p)["stop"] == 0.08
     assert (await db.fetchval("SELECT extra->>'rule' FROM real_positions")) == "G"
+
+
+async def test_engine_followed_fast_wallet_goes_to_shadow_not_skipped():
+    """22.11: анти-PVP не пускает покупку быстрого кошелька (Arkd держит 3 с), но за ним тень — копия на бумагу H и
+    в тень (shadow_only, без алерта); без «за ним» — пропуск, как раньше."""
+    from types import SimpleNamespace
+    from scanner.analytics.engine import Engine
+    logged, alerts = [], []
+
+    class Guard:
+        async def log(self, *a, **k):
+            logged.append(a)
+
+    class Paper:
+        async def on_alert(self, mint, level, aid, data, trader):
+            alerts.append(data)
+
+    class Lane:
+        def __init__(self, f):
+            self.f = f
+
+        def follow_mode(self, w):
+            return self.f.get(w)
+
+    e = Engine.__new__(Engine)
+    e.copyguard, e.paper = Guard(), Paper()
+    e.real = SimpleNamespace(lanes={None: Lane({}), 7: Lane({"ARKD": "shadow"})})
+    assert e._follow_of("ARKD") == "shadow" and e._follow_of("OTHER") is None
+    e.real = None
+    assert e._follow_of("ARKD") is None
+    st = SimpleNamespace(mint="M", symbol="S", mc=40.0)
+    r = {"trader": "ARKD", "sol_amount": 1.0, "mc_sol": 39.0, "slot": 5, "ts": __import__("datetime").datetime.now(),
+         "signature": "sig"}
+    await e._follow_shadow_copy(st, r, "анти-PVP: продаёт быстрее 20 с")
+    await asyncio.sleep(0)
+    assert alerts and alerts[0]["shadow_only"] and alerts[0]["paper_only"] and alerts[0]["copy_wallet"] == "ARKD"
+    assert logged and "только бумага H и тень" in logged[0][7]

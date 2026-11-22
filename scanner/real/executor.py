@@ -418,7 +418,7 @@ class RealTrader:
         _SIGNAL.set((mint, alert_id))
         if followed:
             kind = next(iter(kinds_of(data, targets)), None)
-            mode = followed
+            mode = "shadow" if data.get("shadow_only") else followed   # мимо анти-PVP — только тень
             data = {**data, "_followed": wallet}
         else:
             kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
@@ -688,7 +688,7 @@ class RealTrader:
                 "stake": stake, "min_out": min_out, "slip": slip, "mc": st["mc"],
                 "rule": self.get(S.SCHEME_KEYS[kind]),
                 "filter": self.get("real_smart_filter") if kind == "smart" else "all",
-                "best_exit": self.best_exit(data.get("_followed"))}
+                "best_exit": self.best_exit(data.get("_followed")), "followed": bool(data.get("_followed"))}
         if base["best_exit"]:
             base["rule"] = base["best_exit"]       # «за ним» — продаём по его лучшему выходу (wallet_rules)
         if mode == "live":
@@ -866,7 +866,8 @@ class RealTrader:
             base["token_program"], datetime.now(timezone.utc), base.get("trigger_slot"), base.get("trigger_mc"),
             base.get("lag_s"), entry_mc, slot, cost_sol, tokens_raw / 1e6, tokens_raw, rent_sol, sig,
             {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9, "rule": base.get("rule"),
-             "filter": base.get("filter"), "best_exit": base.get("best_exit")}, self.wid)
+             "filter": base.get("filter"), "best_exit": base.get("best_exit"),
+             "followed": base.get("followed", False)}, self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
                                    tokens_raw=tokens_raw, position_id=pid, note=note)

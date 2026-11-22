@@ -851,6 +851,9 @@ class Engine:
                 return
         else:
             why = g.pause_reason(r["trader"]) or g.delta_reason(r["trader"])
+            if why and self._follow_of(r["trader"]) and r["sol_amount"] >= float(cfg.get("copy_min_buy_sol", 0.1)) \
+                    and not blacklisted:
+                return await self._follow_shadow_copy(st, r, why)
             if why:
                 return await skip(why)
             min_buy = float(cfg.get("copy_min_buy_sol", 0.1))
@@ -933,6 +936,27 @@ class Engine:
             return f"рост за минуту {g1:+.0%} больше {cap:.0%}"
         return None
 
+    def _follow_of(self, wallet: str) -> str | None:
+        """«За ним» реального бота (доска / авто-тень): shadow | live | None."""
+        for lane in (getattr(getattr(self, "real", None), "lanes", None) or {}).values():
+            mode = lane.follow_mode(wallet)
+            if mode:
+                return mode
+        return None
+
+    async def _follow_shadow_copy(self, st: TokenState, r: Any, why: str) -> None:
+        """22.11: за кошельком включена «тень за ним», а анти-PVP (продаёт быстрее 20 с) или дельта цены его покупку не
+        пускают. Расчёт выходов уже считает его копию со скоростью бота (~1 с) — а тень без таких покупок его не
+        проверит: у Arkd (держит 3 с) за 14 дней 2 копии в тени. Такие покупки — на бумагу H и в тень реального бота
+        (shadow_only: без денег, даже если за ним бой — бой по-прежнему с этой защитой). Без алерта в чат."""
+        await self.copyguard.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"], "copied",
+                                 f"только бумага H и тень: за ним, хотя {why}", ref_mc=r["mc_sol"])
+        data = {"modes": ["copy"], "symbol": st.symbol, "mc": st.mc, "signal": "single", "trader": r["trader"],
+                "source_wallet": r["trader"], "copy_wallet": r["trader"], "copy_sol": r["sol_amount"],
+                "copy_ref_mc": r["mc_sol"], "paper_only": True, "shadow_only": True,
+                "note": f"за ним (тень), хотя {why}", **trigger_of(r)}
+        asyncio.create_task(self.paper.on_alert(st.mint, "normal", None, data, r["trader"]))
+
     async def _smart_fallback(self, st: TokenState, r: Any, why: str, blacklisted: bool) -> None:
         """Свой кошелёк, которого бот ведёт как smart (или smart-money с копируемостью от порога), купил вне рамок
         smart: копия только на бумагу H (наблюдение: вход через 2 блока, выход как у копий) — без алерта в чат и без
@@ -947,6 +971,8 @@ class Engine:
             return await note("skipped", f"smart не взял: {why}")
         block = g.pause_reason(r["trader"]) or g.delta_reason(r["trader"])
         min_buy = float(cfg.get("copy_min_buy_sol", 0.1))
+        if block and self._follow_of(r["trader"]) and r["sol_amount"] >= min_buy and not blacklisted:
+            return await self._follow_shadow_copy(st, r, f"smart не взял ({why}); {block}")
         if block is None and r["sol_amount"] < min_buy:
             block = f"мелкая покупка {r['sol_amount']:.3f} SOL < {min_buy:g}"
         if block is None and blacklisted:

@@ -58,7 +58,7 @@ async def test_evaluate_and_autofollow():
         assert res["n"] == 10 and res["rules"]["F"]["avg"] > 0.2 and res["best"] in ("F", "R", "W")
         # за сутки — только сделки последних 24 ч (монеты, начатые не раньше чем сутки назад)
         day_n = sum(1 for i in range(10) if now + timedelta(hours=i) >= datetime.now(timezone.utc) - timedelta(days=1))
-        assert res["n_1d"] == day_n and res["rules_1d"]["F"]["n"] == day_n
+        assert res["n_1d"] == day_n and res["rules_1d"]["F"]["n"] == day_n and res["days"] == 2
         assert res["rules"]["G"]["avg"] < res["rules"][res["best"]]["avg"]   # G режет держателя
         count, events = await WR.refresh(db, {}, Costs())
         assert count == 1 and events and "тень за ним включена" in events[0]
@@ -66,6 +66,7 @@ async def test_evaluate_and_autofollow():
         row = await db.fetchrow("SELECT rules_30d, rules_1d, best_rule FROM traders WHERE address='HOLDER'")
         assert row["best_rule"] == res["best"] and row["rules_30d"]["F"]["n"] == 10
         assert row["rules_1d"]["F"]["n"] == day_n
+        assert await db.fetchval("SELECT rules_days FROM traders WHERE address='HOLDER'") == 2
         # перестал — своя тень снимается; включённое вручную — не трогается
         events = await WR.autofollow(db, {"HOLDER": {"best": None, "rules": {}}}, {"HOLDER"})
         assert events and (await db.kv_get(WR.FOLLOW_KEY)) == {}
