@@ -167,6 +167,12 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
     if w is None:
         return "Кошелька нет в списке (убран).", [[{"text": "← Доска", "callback": "bd:s:best"}]]
     follow = (await db.kv_get(FOLLOW_KEY) or {}).get(addr)
+    real = await db.fetch(
+        """SELECT mode, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w, COALESCE(avg(pnl_pct), 0) a,
+                  COALESCE(sum(pnl_sol), 0) s
+           FROM real_positions WHERE trader = $1 AND closed_at IS NOT NULL
+             AND closed_at > now() - interval '14 days' GROUP BY mode""", addr)
+    sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
     now = datetime.now(timezone.utc)
     last = f"{fmt.ago((now - w['last']).total_seconds())} назад" if w.get("last") else "нет в базе"
     hold = fmt.ago(w["median_hold_s"]) if w.get("median_hold_s") else "—"
@@ -192,6 +198,9 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
              + (f", устойчивость t={float(w['copy_t_30d']):.1f} (от 1.645 — не случайность)"
                 if w.get("copy_t_30d") is not None else ""),
              f"Реальный бот за ним: {FOLLOW_NAME.get(follow, '⚪ нет')}"]
+    for r in real:                       # 22.11: подтверждает ли бумагу реальный бот (тень — настоящие транзакции)
+        lines.append(f"   {'тень' if r['mode'] == 'shadow' else 'бой'} за 14 дн: {r['n']} сд., в плюсе {r['w']}, "
+                     f"в среднем {float(r['a']):+.1%}, итог {money(float(r['s']) * sol_usd)}")
     kb = [[{"text": ("● " if follow == "shadow" else "") + "👻 Тень за ним", "callback": f"bd:f:{addr}:shadow"},
            {"text": ("● " if follow == "live" else "") + "💵 В бой за ним…", "callback": f"bd:f:{addr}:live"}],
           [{"text": ("● " if not follow else "") + "⚪ Не торговать за ним", "callback": f"bd:f:{addr}:off"}],

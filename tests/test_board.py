@@ -55,6 +55,12 @@ async def test_board_sections_buttons_card_and_follow():
         assert "твой кошелёк (ставка $5) ≈ +$2.25" in card and "t=2.1" in card and "⚪ нет" in card
         cbs = [b.get("callback") for row in ckb for b in row]
         assert f"bd:f:{star}:shadow" in cbs and f"bd:f:{star}:live" in cbs and all(len(c.encode()) <= 64 for c in cbs if c)
+        await db.execute(
+            """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, pnl_sol,
+                   pnl_pct) VALUES ('shadow', 'copy', 'Q', $1, now(), now(), 0.05, 1, 0.01, 0.2)""", star)
+        await db.kv_set("sol_usd", {"price": 100.0})
+        card, _ = await B.card_view(db, {}, star)
+        assert "тень за 14 дн: 1 сд., в плюсе 1, в среднем +20.0%, итог +$1.00" in card
         await B.set_follow(db, star, "live")
         card, _ = await B.card_view(db, {}, star)
         assert "💵 бой за ним" in card and (await db.kv_get(B.FOLLOW_KEY)) == {star: "live"}
