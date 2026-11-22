@@ -6,6 +6,8 @@ Pump.fun/PumpSwap этого кошелька. Копия оценивается
 """
 from __future__ import annotations
 
+import asyncio
+
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -170,82 +172,107 @@ def dev_line(name: str, prof: dict[str, Any], sol_usd: float) -> str:
             f"через ~{fmt.ago(prof['med_sell_s'])} · по схеме ×1.5+ {prof['hit_rate']:.0%}")
 
 
+IMPORT_CHUNK = 5                     # отчёт импорта — по 5 кошельков
+IMPORT_WALLET_S = 240.0              # не дольше 4 мин на кошелёк
+
+
 async def import_report(e: "Engine", wallets: list[list[Any]]) -> None:
-    """Фоновая задача после импорта: история каждого кошелька → дев или трейдер → отчёт в «Копитрейд»."""
+    """Фоновая задача после импорта: история каждого кошелька → дев или трейдер → отчёт в «Копитрейд».
+    22.11: отчёт частями — по IMPORT_CHUNK кошельков (раньше ждал всех: 17 кошельков ≈ 10+ минут тишины), и не
+    больше IMPORT_WALLET_S на кошелёк — завис один (RPC) — остальные не ждут."""
     cfg, costs = e.cfg, e.costs()
     sol_usd = e.price.value or 150
     dev_lines: list[str] = []
     trader_lines: list[str] = []
     good = 0
+    done = 0
     from . import wallet_rules as WR
     rule_res: dict[str, dict[str, Any]] = {}
-    for item in wallets:
-        addr, label = item[0], (item[1] if len(item) > 1 else None)
-        name = fmt.esc(label or f"{addr[:4]}…{addr[-4:]}")
-        try:
-            events: list[Any] = []
-            _added, oldest = await backfill_wallet(e, addr, collect=events)
-            creates = [x for x in events if isinstance(x, TokenCreated)]
-            trades = [x for x in events if isinstance(x, Trade)]
-            prof = dev_profile(addr, creates, trades)
-            if is_dev(label, prof):
-                await save_dev(e, addr, label, prof)
-                dev_lines.append(dev_line(name, prof, sol_usd) + " · покупки чужих монет тоже копирую")
-                # дев — заодно и трейдер: алерт придёт и при его запуске, и при его покупке чужой монеты
-                await e.db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $2) "
-                                   "ON CONFLICT (kind, address) DO NOTHING", addr, label)
-            s7, s30, _trips = await compute_trader(e.db, addr, cfg, costs)
-            linked = await linked_to_dev(e.db, addr)
-            ok, _fails = qualifies(s7, s30, linked, cfg)
-            await save_trader(e.db, addr, s7, s30, ok, linked, label=label, manual=True)
-            await e.db.execute("UPDATE traders SET active=true WHERE address=$1", addr)
-            try:                                  # 21.11: сразу — через все выходы (за ним, A, B, G, R, W)
-                rr = await WR.evaluate(e.db, addr, cfg, costs)
-                if rr["n"]:
-                    await WR.save(e.db, addr, rr)
-                    rule_res[addr] = rr
-            except Exception:  # noqa: BLE001
-                log.exception("выходы кошелька %s", addr)
+
+    async def check(addr: str, label: str | None, name: str) -> str:
+        """Строка отчёта о кошельке (дев — ещё и строка в dev_lines)."""
+        nonlocal good
+        events: list[Any] = []
+        _added, oldest = await backfill_wallet(e, addr, collect=events)
+        creates = [x for x in events if isinstance(x, TokenCreated)]
+        trades = [x for x in events if isinstance(x, Trade)]
+        prof = dev_profile(addr, creates, trades)
+        if is_dev(label, prof):
+            await save_dev(e, addr, label, prof)
+            dev_lines.append(dev_line(name, prof, sol_usd) + " · покупки чужих монет тоже копирую")
+            # дев — заодно и трейдер: алерт придёт и при его запуске, и при его покупке чужой монеты
+            await e.db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, $2) "
+                               "ON CONFLICT (kind, address) DO NOTHING", addr, label)
+        s7, s30, _trips = await compute_trader(e.db, addr, cfg, costs)
+        linked = await linked_to_dev(e.db, addr)
+        ok, _fails = qualifies(s7, s30, linked, cfg)
+        await save_trader(e.db, addr, s7, s30, ok, linked, label=label, manual=True)
+        await e.db.execute("UPDATE traders SET active=true WHERE address=$1", addr)
+        try:                                      # 21.11: сразу — через все выходы (за ним, A, B, G, R, W)
+            rr = await WR.evaluate(e.db, addr, cfg, costs)
+            if rr["n"]:
+                await WR.save(e.db, addr, rr)
+                rule_res[addr] = rr
         except Exception:  # noqa: BLE001
-            log.exception("проверка кошелька %s", addr)
-            trader_lines.append(f"❔ {name}: не удалось проверить")
-            continue
+            log.exception("выходы кошелька %s", addr)
         mark, why = verdict(s30.trades, s30.copyability, s30.median_hold_s)
-        good += mark == "✅"
         span = ""
         if oldest:
             days = (datetime.now(timezone.utc).timestamp() - oldest) / 86400
             span = f" · история {days:.0f} д" if days >= 1 else f" · история {days * 24:.0f} ч"
-        if s30.trades:
-            rr = rule_res.get(addr)
-            if rr and rr.get("best"):
-                mark, why = "✅", "копировать"
-            elif rr and mark == "✅":
-                mark, why = "⚪", "по выходам плюс неустойчивый — решит бумага"
-            trader_lines.append(f"{mark} <b>{name}</b> · {s30.trades} сд · прибыльных {s30.win_rate:.0%} · "
-                                f"держит ~{fmt.ago(s30.median_hold_s)}{span} — {why}"
-                                + (f"\n   ↳ {fmt.esc(WR.top_line(rr['rules'], rr['best']))}" if rr else ""))
-        else:
-            trader_lines.append(f"{mark} <b>{name}</b> · сделок Pump.fun не найдено{span} — {why}")
+        if not s30.trades:
+            good += mark == "✅"
+            return f"{mark} <b>{name}</b> · сделок Pump.fun не найдено{span} — {why}"
+        rr = rule_res.get(addr)
+        if rr and rr.get("best"):
+            mark, why = "✅", "копировать"
+        elif rr and mark == "✅":
+            mark, why = "⚪", "по выходам плюс неустойчивый — решит бумага"
+        good += mark == "✅"
+        money = ""
+        if rr and rr.get("best"):
+            money = f"\n   💰 $10 на сделку (≈): {WR.periods_text(rr.get('periods') or {}, rr['best'], rr.get('days'))}"
+        return (f"{mark} <b>{name}</b> · {s30.trades} сд · прибыльных {s30.win_rate:.0%} · "
+                f"держит ~{fmt.ago(s30.median_hold_s)}{span} — {why}"
+                + (f"\n   ↳ {fmt.esc(WR.top_line(rr['rules'], rr['best']))}" if rr else "") + money)
+
+    sent_dev = sent_tr = 0
+
+    async def flush(final: bool = False) -> None:
+        nonlocal sent_dev, sent_tr
+        new_dev, new_tr = dev_lines[sent_dev:], trader_lines[sent_tr:]
+        if not new_dev and not new_tr and not final:
+            return
+        sent_dev, sent_tr = len(dev_lines), len(trader_lines)
+        head = (f"📥 <b>Импорт: проверено {done} из {len(wallets)}</b>" if not final else
+                f"📥 <b>Импорт: {len(wallets)} — готово</b> · девов {len(dev_lines)}, трейдеров {len(trader_lines)} "
+                f"(стоит копировать {good}). Итог по деньгам — /top")
+        body = ([("<b>Девы</b>\n" + "\n".join(new_dev))] if new_dev else []) + (["\n".join(new_tr)] if new_tr else [])
+        for part in fmt.split_html("\n".join([head, *body]), 3800):
+            await e.db.enqueue("text", {"topic": "copy", "text": part}, priority=4)
+
+    for item in wallets:
+        addr, label = item[0], (item[1] if len(item) > 1 else None)
+        name = fmt.esc(label or f"{addr[:4]}…{addr[-4:]}")
+        try:
+            line = await asyncio.wait_for(check(addr, label, name), timeout=IMPORT_WALLET_S)
+            if line:
+                trader_lines.append(line)
+        except asyncio.TimeoutError:
+            trader_lines.append(f"❔ {name}: не успел проверить за {IMPORT_WALLET_S // 60:.0f} мин — досчитает "
+                                "пересчёт раз в 6 ч")
+        except Exception:  # noqa: BLE001
+            log.exception("проверка кошелька %s", addr)
+            trader_lines.append(f"❔ {name}: не удалось проверить")
+        done += 1
+        if done % IMPORT_CHUNK == 0 and done < len(wallets):
+            await flush()
     try:
         follow_events = await WR.autofollow(e.db, rule_res, {str(i[0]) for i in wallets})
     except Exception:  # noqa: BLE001
         log.exception("авто-тень после импорта")
         follow_events = []
     await e._load_traders()
-    parts = [f"📥 <b>Импорт: {len(wallets)}</b> · девов {len(dev_lines)}, трейдеров {len(trader_lines)} "
-             f"(стоит копировать {good})"]
-    if dev_lines:
-        parts.append("\n<b>Девы</b> — алерт в момент запуска монеты: вход и цель по почерку дева, "
-                     "выход при его первой продаже\n" + "\n".join(dev_lines))
-    if trader_lines:
-        parts.append("\n<b>Трейдеры</b> — алерт и бумажная копия при покупке от "
-                     f"{float(cfg.get('copy_min_buy_sol', 0.1)):g} SOL, выход при их продаже\n" + "\n".join(trader_lines)
-                     + "\n<i>↳ выходы — его сделки, прогнанные через все наши способы выхода со скоростью бота (вход через ~1 с) и "
-                       "комиссиями: «за ним» — продать, когда он; A / B / G / R — наши правила; W — раньше него. Лучший "
-                       "— если 8+ сделок и плюс устойчивый (t от 1.645).</i>")
+    await flush(final=True)
     if follow_events:
-        parts.append("\n" + "\n".join(fmt.esc(x) for x in follow_events))
-    text = "\n".join(parts)
-    for part in fmt.split_html(text, 3800):      # по строкам, теги разметки целые
-        await e.db.enqueue("text", {"topic": "copy", "text": part}, priority=4)
+        await e.db.enqueue("text", {"topic": "copy", "text": "\n".join(fmt.esc(x) for x in follow_events)}, priority=4)
