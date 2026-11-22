@@ -196,9 +196,10 @@ async def run_tool(cmd: str, db: Database) -> None:
     elif cmd == "research":
         # выгрузка для исследования: python -m scanner research [--days 14] [--window 60] [--no-send]
         from .analytics.research import run as research_run
+        from .config import load_env as _load_env      # в run_tool load_env — локальное имя (импорты в ветках)
         days = float(args[args.index("--days") + 1]) if "--days" in args else 14.0
         window = float(args[args.index("--window") + 1]) if "--window" in args else 60.0
-        print(await research_run(db, load_env(), days=days, window_min=window, send="--no-send" not in args,
+        print(await research_run(db, _load_env(), days=days, window_min=window, send="--no-send" not in args,
                                  progress=lambda m: print(m, file=sys.stderr, flush=True)))
     elif cmd == "patterns":
         # паттерны монет: python -m scanner patterns [--days 3] [--at 30,60] [--slots] [--no-send] — итог и CSV в Telegram
