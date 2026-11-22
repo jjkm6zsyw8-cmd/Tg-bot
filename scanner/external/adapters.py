@@ -155,7 +155,7 @@ def parse_rugcheck(d: Any) -> dict[str, Any] | None:
 class Gmgn(ExternalSource):
     name = "gmgn"
     needs_key = True
-    rate_per_s = 5.0     # Free: leaky bucket 5/5 (веса: security 1, holders 5, wallet_stats 3)
+    rate_per_s = 4.0     # Free: leaky bucket 5/5 (веса: security 1, holders 5, wallet_stats 3); 23.11: 4 — с запасом
     capacity = 5
     host = "https://openapi.gmgn.ai"
 

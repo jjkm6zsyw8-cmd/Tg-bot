@@ -44,6 +44,17 @@ class TokenBucket:
         self._refill()
         self.tokens -= min(cost, self.capacity)
 
+    def reserve(self, cost: float = 1.0) -> float:
+        """Занять вес сразу и вернуть, сколько ждать до своей очереди. 23.11: раньше параллельные запросы (проверка
+        алерта: GMGN security + 2 × holders + 3 × wallet_stats) все видели «вес есть», не ждали и уходили пачкой
+        больше лимита — GMGN отвечал 429 и банил ключ на 5 минут; разведка GMGN из-за этого стояла."""
+        self._refill()
+        self.tokens -= min(cost, self.capacity)
+        return 0.0 if self.tokens >= 0 else -self.tokens / self.rate
+
+    def refund(self, cost: float = 1.0) -> None:
+        self.tokens = min(self.capacity, self.tokens + min(cost, self.capacity))
+
     @property
     def remaining(self) -> float:
         self._refill()
@@ -151,12 +162,12 @@ class ExternalSource:
         if self.blocked_paths.get(path_key, 0) > now:
             raise Unavailable("эндпоинт недоступен на тарифе")
         timeout = timeout_s if timeout_s is not None else self.timeout_s
-        wait = self.bucket.wait_time(cost)
+        wait = self.bucket.reserve(cost)          # очередь по весу: параллельные запросы не уходят пачкой
         if wait > timeout:
+            self.bucket.refund(cost)
             raise Unavailable("лимит запросов")
         if wait:
             await asyncio.sleep(wait)
-        self.bucket.take(cost)
         self.stats.requests += 1
         s = await self.session()
         try:
@@ -166,7 +177,11 @@ class ExternalSource:
                 if rem is not None:
                     self.stats.remaining_header = rem
                 if r.status == 429:
-                    self._on_429(r.headers)
+                    try:                          # GMGN: {"error": "RATE_LIMIT_BANNED", "reset_at": <unix>} — бан ~5 мин
+                        body = await r.json(content_type=None)
+                    except Exception:  # noqa: BLE001
+                        body = None
+                    self._on_429(r.headers, body if isinstance(body, dict) else None)
                     raise Unavailable("429")
                 if r.status in (401, 403):
                     body = (await r.text())[:300]
@@ -192,11 +207,12 @@ class ExternalSource:
         self.stats.last_ok_at = time.monotonic()
         return data
 
-    def _on_429(self, headers: Any) -> None:
+    def _on_429(self, headers: Any, body: dict[str, Any] | None = None) -> None:
         self.stats.rate_limited += 1
         self.consecutive_429 += 1
         wait = 2.0 ** min(self.consecutive_429, 8)        # 2, 4, 8 … 256 с
-        reset = headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset")
+        reset = (headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset")
+                 or (str(body.get("reset_at")) if body and body.get("reset_at") else None))
         retry = headers.get("Retry-After")
         try:
             if reset:

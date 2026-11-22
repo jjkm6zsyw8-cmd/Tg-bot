@@ -192,3 +192,19 @@ def test_dex_pairs_ignore_fake_pumpswap_pool_older_than_curve():
     assert parse_dex_pairs(data, "M")["market_cap_usd"] == 37061
     data[0]["pairCreatedAt"] = 9000                       # пул после кривой — миграция, берём его
     assert parse_dex_pairs(data, "M")["market_cap_usd"] == 1725
+
+
+def test_parallel_requests_queue_by_weight_not_burst():
+    """23.11: параллельные запросы занимают вес сразу — второй и третий ждут своей очереди, а не уходят пачкой
+    больше лимита (GMGN: 429 и бан ключа на 5 минут)."""
+    b = TokenBucket(rate=5, capacity=5)
+    waits = [b.reserve(3) for _ in range(3)]               # 3 × wallet_stats (вес 3) при ёмкости 5
+    assert waits[0] == 0 and waits[1] == pytest.approx(0.2, abs=0.05) and waits[2] == pytest.approx(0.8, abs=0.05)
+    b.refund(3)
+    assert b.reserve(1) == pytest.approx(0.4, abs=0.05)            # −4 + 3 − 1 = −2 → 0.4 с
+
+
+def test_gmgn_ban_until_reset_at_from_body():
+    src = Dummy()
+    src._on_429({}, {"code": 429, "error": "RATE_LIMIT_BANNED", "reset_at": time.time() + 300})
+    assert src.ban_until - time.monotonic() > 290          # бан до reset_at (~5 мин), а не 2 с
