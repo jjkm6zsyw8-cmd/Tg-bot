@@ -45,7 +45,7 @@ async def main(cmd: str) -> None:
         await db.close()
         return
     if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-               "patterns", "dips", "whynot", "migration"):
+               "patterns", "dips", "whynot", "migration", "research"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -193,6 +193,13 @@ async def run_tool(cmd: str, db: Database) -> None:
             print(f"{r.get('trader')} | {describe(r)} | {'подходит' if good(r, cfg) else 'нет'}")
         for e in events:
             print(e)
+    elif cmd == "research":
+        # выгрузка для исследования: python -m scanner research [--days 14] [--window 60] [--no-send]
+        from .analytics.research import run as research_run
+        days = float(args[args.index("--days") + 1]) if "--days" in args else 14.0
+        window = float(args[args.index("--window") + 1]) if "--window" in args else 60.0
+        print(await research_run(db, load_env(), days=days, window_min=window, send="--no-send" not in args,
+                                 progress=lambda m: print(m, file=sys.stderr, flush=True)))
     elif cmd == "patterns":
         # паттерны монет: python -m scanner patterns [--days 3] [--at 30,60] [--slots] [--no-send] — итог и CSV в Telegram
         from .analytics.patterns import run as patterns_run
