@@ -140,14 +140,20 @@ async def test_now_section_30d_and_day_money_and_top():
         assert kb_best[2][0]["text"].startswith("🟢 CoLd…bbbb · G · 30д +$48 · 24ч −$5.00")
         card, _ = await B.card_view(db, {}, hot)
         assert "Итог при $10 на сделку по G: 30 дн <b>+$48</b> · сутки <b>+$12</b> (6 сд.)" in card
+        per = {"today": {"N": 3, "rules": {"G": {"n": 3, "avg": 0.1}}}, "yday": {"N": 0, "rules": {}},
+               "week": {"N": 40, "rules": {"G": {"n": 40, "avg": 0.12}}},
+               "month": {"N": 100, "rules": {"G": {"n": 40, "avg": 0.12}}}}
+        await db.execute("UPDATE traders SET rules_periods = $2, rules_days = 16 WHERE address = $1", hot, per)
         top, tkb = await B.top_view(db)
-        rows = top.split("<pre>")[1].split("</pre>")[0].splitlines()
-        assert rows[1].split() == ["HoTw…aaaa", "G", "+$48", "+$12", "6", "?"]
-        assert rows[2].split() == ["CoLd…bbbb", "G", "+$48", "−$5", "5", "?"] and len(rows) == 3   # без лучшего — нет
-        await db.execute("UPDATE traders SET rules_days = 1 WHERE address = $1", hot)   # история — только сутки
-        assert (await B.top_view(db))[0].split("<pre>")[1].splitlines()[1].split()[-1] == "1"
+        lines = top.splitlines()
+        assert lines[0].startswith("💰 <b>Если бы бот брал $10 на каждую его сделку</b>") and len(lines) == 3
+        assert lines[1] == "<b>HoTw…aaaa</b> · G: сегодня +$3 · вчера +$0 · 7д +$48 · 16д +$120"
+        assert lines[2] == "<b>CoLd…bbbb</b> · G: ещё не посчитано"            # без лучшего — нет в списке
+        _t, kb = await B.board_view(db)
+        assert kb[2][0]["text"] == "🔥 HoTw…aaaa · сег +$3.00 · вч +$0.00 · 30д +$120"
         card, _ = await B.card_view(db, {}, hot)
-        assert "Выходы за 1 дн истории в базе" in card and "по G: 1 дн <b>+$48</b>" in card
+        assert "💰 $10 на каждую его сделку (≈): <b>сегодня +$3 · вчера +$0 · 7д +$48 · 16д +$120</b>" in card
+        assert "Выходы за 16 дн истории в базе" in card
         await db.execute(
             """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, pnl_sol,
                    pnl_pct, extra) VALUES ('shadow', 'mydev', 'Q1', $1, now(), now(), 0.05, 1, -0.01, -0.2, '{}'),

@@ -25,10 +25,13 @@ import logging
 import math
 import statistics
 import time
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .copytrade import MIN_COPY_T, compute_trader, t_stat
 from .curve import trade_net_profit
+from ..alerts.format import esc
 from .paper import SCHEMES, Position, buy_fill, decide_exit, sell_fill
 
 log = logging.getLogger(__name__)
@@ -91,24 +94,45 @@ def simulate(path: list[tuple[float, float]], entry_at: float, entry_mc: float, 
     return p.proceeds_sol / p.cost_sol - 1
 
 
+def spread(trips: list[Any], limit: int) -> list[Any]:
+    """До limit сделок равномерно по времени (свежая — обязательно), порядок — по времени."""
+    step = max(1, len(trips) // limit) if limit else 1
+    return trips[::-1][::step][:limit][::-1]
+
+
+PERIOD_TRIPS = {"today": 60, "yday": 60, "week": 120}
+
+
 async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> dict[str, Any]:
-    """Последние сделки кошелька — через все выходы. {"rules": {правило: {n, w, avg, sum, t}}, "best", "hold", "n"}."""
+    """Сделки кошелька — через все выходы. {"rules": 30 дн, "rules_1d": 24 ч, "periods": сегодня / вчера / 7 дн /
+    30 дн, "best", "hold", "n", "n_1d", "days"}; правило → {n, w, avg, sum, t}."""
     # 22.11: вход — со скоростью бота (4 блока ≈ 1 с), а не «руками» через 5 с: у Arkd (держит ~3 с) при 5 с все
     # выходы выходили около нуля, а бумага (вход через 4 блока) дала +$162 на 162 копиях
     delay = float(cfg.get("rules_delay_s", BOT_DELAY_S))
     _s7, s30, all_trips = await compute_trader(db, address, {**cfg, "copy_delay_s": delay}, costs)
     all_trips = sorted(all_trips, key=lambda t: t.entry_ts)
-    step = max(1, len(all_trips) // LAST_TRIPS)
-    month = all_trips[::-1][::step][:LAST_TRIPS][::-1]        # равномерно по 30 дням, свежие — обязательно
-    day_cut = time.time() - 86400
-    day = [t for t in all_trips if t.entry_ts >= day_cut][-DAY_TRIPS:]
-    trips = list({id(t): t for t in month + day}.values())
+    now = time.time()
+    month = spread(all_trips, LAST_TRIPS)
+    day = [t for t in all_trips if t.entry_ts >= now - 86400][-DAY_TRIPS:]
+    # периоды для владельца (22.11): сегодня и вчера — по местному времени, неделя, месяц; всех его сделок периода
+    # может быть тысячи (Arkd — 158 в день), поэтому считается выборка, а итог = средний результат × сколько сделок
+    try:
+        tz = ZoneInfo(str(cfg.get("timezone") or "Asia/Tbilisi"))
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("Asia/Tbilisi")
+    d0 = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    bounds = {"today": (d0, math.inf), "yday": (d0 - 86400, d0), "week": (now - 7 * 86400, math.inf)}
+    p_all = {k: [t for t in all_trips if lo <= t.entry_ts < hi] for k, (lo, hi) in bounds.items()}
+    p_all["month"] = all_trips
+    samples = {k: spread(v, PERIOD_TRIPS[k]) for k, v in p_all.items() if k != "month"}
+    samples["month"] = month
+    trips = list({id(t): t for t in month + day + [x for v in samples.values() for x in v]}.values())
     pos = float(cfg.get("position_sol", 0.5))
     hold = float(s30.median_hold_s or 0)
     # сколько дней его истории в базе: у добавленного вчера «30 дней» — на деле сутки (6d7y: 44 сделки и там, и там)
-    days = min(30, math.ceil((time.time() - all_trips[0].entry_ts) / 86400)) if all_trips else 0
-    out: dict[str, Any] = {"rules": {}, "rules_1d": {}, "best": None, "hold": hold, "n": len(month), "n_1d": len(day),
-                           "days": days}
+    days = min(30, math.ceil((now - all_trips[0].entry_ts) / 86400)) if all_trips else 0
+    out: dict[str, Any] = {"rules": {}, "rules_1d": {}, "periods": {}, "best": None, "hold": hold, "n": len(month),
+                           "n_1d": len(day), "days": days}
     if not trips:
         return out
     win: dict[str, list[float]] = {}             # по монете — только её окно (сделки за 30 дней разбросаны)
@@ -125,36 +149,46 @@ async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> di
     paths: dict[str, list[tuple[float, float]]] = {}
     for r in rows:
         paths.setdefault(r["mint"], []).append((float(r["t"]), float(r["mc_sol"])))
-    res: dict[str, list[float]] = {k: [] for k in RULES}
-    res_day: dict[str, list[float]] = {k: [] for k in RULES}
-    month_ids, day_ids = {id(t) for t in month}, {id(t) for t in day}
+    per: dict[int, dict[str, float]] = {}        # результат каждой сделки по каждому выходу
     for t in trips:
-        dst = [d for d, ids in ((res, month_ids), (res_day, day_ids)) if id(t) in ids]
+        v: dict[str, float] = {}
         entry_at = t.entry_ts + delay
         entry_mc = float(t.copy_entry_mc or t.entry_mc or 0)
         sell_at = (t.sells[0][0] + delay) if t.sells else None
         if t.copy_exit_mc:
-            v = trade_net_profit(entry_mc, float(t.copy_exit_mc), pos, costs)
-            for d in dst:
-                d["F"].append(v)
+            v["F"] = trade_net_profit(entry_mc, float(t.copy_exit_mc), pos, costs)
         path = [x for x in paths.get(t.mint, []) if entry_at < x[0] <= entry_at + HORIZON_S]
-        if not path:
-            continue
-        for rule in RULES[1:]:
-            sc = scheme(rule, hold, delay)
-            if sc is None:
-                continue
-            v = simulate(path, entry_at, entry_mc, sell_at, sc, pos, costs.fee_bps, costs.priority_sol)
-            if v is not None:
-                for d in dst:
-                    d[rule].append(v)
-    for key, src in (("rules", res), ("rules_1d", res_day)):
-        for rule, vals in src.items():
+        if path:
+            for rule in RULES[1:]:
+                sc = scheme(rule, hold, delay)
+                if sc is None:
+                    continue
+                res = simulate(path, entry_at, entry_mc, sell_at, sc, pos, costs.fee_bps, costs.priority_sol)
+                if res is not None:
+                    v[rule] = res
+        per[id(t)] = v
+
+    def agg(group: list[Any]) -> dict[str, dict[str, float]]:
+        out_: dict[str, dict[str, float]] = {}
+        for rule in RULES:
+            vals = [per[id(t)][rule] for t in group if rule in per[id(t)]]
             if vals:
-                out[key][rule] = {"n": len(vals), "w": sum(1 for v in vals if v > 0), "avg": statistics.fmean(vals),
-                                  "sum": sum(vals), "t": t_stat(vals)}
+                out_[rule] = {"n": len(vals), "w": sum(1 for x in vals if x > 0), "avg": statistics.fmean(vals),
+                              "sum": sum(vals), "t": t_stat(vals)}
+        return out_
+    out["rules"], out["rules_1d"] = agg(month), agg(day)
+    out["periods"] = {k: {"N": len(p_all[k]), "rules": agg(samples[k])} for k in p_all}
     out["best"] = best_rule(out["rules"])
     return out
+
+
+def period_usd(periods: dict[str, Any] | None, rule: str | None, key: str, stake: float = 10.0) -> float | None:
+    """≈ итог периода при stake $ на каждую его сделку: средний результат выборки × сколько его сделок за период."""
+    p = (periods or {}).get(key) or {}
+    r = (p.get("rules") or {}).get(rule or "")
+    if not p.get("N"):
+        return 0.0 if p else None
+    return float(r["avg"]) * int(p["N"]) * stake if r else None
 
 
 def exit_scheme(rules_or_best: Any, hold_s: float = 0.0) -> tuple[str, dict[str, Any]] | None:
@@ -191,8 +225,9 @@ def top_line(rules: dict[str, dict[str, Any]], best: str | None, limit: int = 3)
 
 
 async def save(db: Any, address: str, res: dict[str, Any]) -> None:
-    await db.execute("UPDATE traders SET rules_30d=$2, best_rule=$3, rules_1d=$4, rules_days=$5 WHERE address=$1",
-                     address, res["rules"], res["best"], res.get("rules_1d") or {}, int(res.get("days") or 0))
+    await db.execute("UPDATE traders SET rules_30d=$2, best_rule=$3, rules_1d=$4, rules_days=$5, rules_periods=$6 "
+                     "WHERE address=$1", address, res["rules"], res["best"], res.get("rules_1d") or {},
+                     int(res.get("days") or 0), res.get("periods") or {})
 
 
 def usd(rules: dict[str, Any] | None, rule: str | None, stake: float = 10.0) -> tuple[float, int] | None:
@@ -214,35 +249,42 @@ def hot(results: dict[str, dict[str, Any]], limit: int = HOT_LIMIT) -> list[str]
 
 
 async def top_text(db: Any, limit: int = 15) -> tuple[str, list[tuple[str, str]]]:
-    """Кошельки с устойчивым лучшим выходом: итог при $10 на сделку за 30 дней и за сутки; лучшие сейчас — сверху.
+    """Коротко: кошелёк · выход: сегодня / вчера / 7д / 30д — ≈ итог, если бы бот брал $10 на каждую его сделку.
     Возвращает текст и [(адрес, имя)] для кнопок карточек."""
     rows = await db.fetch(
-        """SELECT address, label, best_rule, rules_30d, rules_1d, rules_days FROM traders
+        """SELECT address, label, best_rule, rules_periods, rules_days, rules_1d FROM traders
            WHERE best_rule IS NOT NULL AND (active OR address IN (SELECT address FROM watchlist WHERE kind = 'trader'))""")
     items = []
     for r in rows:
-        m = usd(_j(r["rules_30d"]), r["best_rule"])
-        d = usd(_j(r["rules_1d"]), r["best_rule"]) or (0.0, 0)
-        if m:
-            items.append((d[0], m[0], d[1], r))
-    items.sort(key=lambda x: (-x[0], -x[1]))
+        d = usd(_j(r["rules_1d"]), r["best_rule"])
+        items.append((d[0] if d else 0.0, r))
+    items.sort(key=lambda x: -x[0])
     items = items[:limit]
-    head = ("🏅 <b>Кошельки: итог при $10 на каждую его сделку</b>\nПродажа — по его лучшему выходу, вход со скоростью "
-            "бота (~1 с), с комиссиями. Это расчёт по его сделкам, не деньги. Сверху — лучшие за последние сутки.")
+    head = "💰 <b>Если бы бот брал $10 на каждую его сделку</b> (расчёт по истории, ≈)"
     if not items:
-        return head + "\n\nПока ни у кого нет устойчивого лучшего выхода (8+ сделок, плюс не случайность).", []
-    table = [f"{'кошелёк':<9}{'выход':>7}{'30 дн':>7}{'сутки':>7}{'сд':>4}{'дн':>3}"]
-    out = []
-    for d_usd, m_usd, d_n, r in items:
-        name = (r["label"] or f"{r['address'][:4]}…{r['address'][-4:]}")[:9]
-        days = r["rules_days"] if r.get("rules_days") is not None else "?"
-        table.append(f"{name:<9}{RULE_NAMES[r['best_rule']]:>7}{_m(m_usd):>7}{_m(d_usd) if d_n else '—':>7}"
-                     f"{d_n if d_n else '':>4}{days:>3}")
-        out.append((r["address"], name))
-    tail = ("сд — его сделок за сутки; дн — сколько дней его истории в базе (1 — «30 дн» на деле сутки). Тень (без "
-            "денег) за кошельками «Сейчас» и за своими с устойчивым плюсом бот включает сам и сам снимает. В бой — "
-            "только твоей кнопкой в карточке.")
-    return head + "\n<pre>" + "\n".join(table) + "</pre>\n" + tail, out
+        return head + "\nПока нет кошельков с устойчивым плюсом.", []
+    lines, out = [head], []
+    for _d, r in items:
+        name = r["label"] or f"{r['address'][:4]}…{r['address'][-4:]}"
+        lines.append(f"<b>{esc(name[:14])}</b> · {RULE_NAMES[r['best_rule']]}: " + periods_text(
+            _j(r["rules_periods"]), r["best_rule"], r["rules_days"]))
+        out.append((r["address"], name[:14]))
+    return "\n".join(lines), out
+
+
+def periods_text(periods: dict[str, Any], rule: str | None, days: int | None) -> str:
+    """«сегодня +$12 · вчера +$43 · 7д +$180 · 30д +$600»; истории меньше периода — «16д +$…»."""
+    if not periods:
+        return "ещё не посчитано"
+    parts = []
+    for key, name in (("today", "сегодня"), ("yday", "вчера"), ("week", "7д"), ("month", "30д")):
+        v = period_usd(periods, rule, key)
+        if key == "month" and days is not None and days < 30:
+            name = f"{days}д"
+        if key == "week" and days is not None and days < 7:
+            continue
+        parts.append(f"{name} {_m(v) if v is not None else '—'}")
+    return " · ".join(parts)
 
 
 def _j(v: Any) -> dict[str, Any]:
@@ -271,16 +313,12 @@ async def autofollow(db: Any, results: dict[str, dict[str, Any]], own: set[str],
         if want and addr not in follow:
             follow[addr] = "shadow"
             auto.add(addr)
-            why = top_line(res["rules"], res["best"])
-            if addr in now:
-                m = usd(res["rules"], res["best"])
-                why = f"сейчас в плюсе: при $10 — 30 дн {_m(m[0])}, сутки {_m(day_usd(res) or 0)} · " + why
-            events.append(f"👻 {name}: тень за ним включена — {why}")
+            events.append(f"👻 {name}: тень включена")
         elif not want and addr in auto and follow.get(addr) == "shadow":
             follow.pop(addr, None)
             auto.discard(addr)
-            why = "за сутки не в плюсе" if res.get("best") else top_line(res["rules"], None)
-            events.append(f"⚪ {name}: тень за ним снята — {why}")
+            why = "за сутки не в плюсе" if res.get("best") else "плюс пропал"
+            events.append(f"⚪ {name}: тень снята — {why}")
     await db.kv_set(FOLLOW_KEY, follow)
     await db.kv_set(AUTO_KEY, sorted(auto))
     return events

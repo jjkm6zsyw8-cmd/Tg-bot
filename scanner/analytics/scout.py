@@ -348,8 +348,7 @@ class Scout:
                                       "events": len(events)}
             await self.db.kv_set(CHANNELS_KEY, self.channels)
             top, _ = await WR.top_text(self.db, 10)
-            text = (f"🧮 <b>Кошельки через все выходы</b> (посчитано {n})\n" + "\n".join(events[:25])
-                    + ("\n\n" if events else "\n") + top)
+            text = top + ("\n\n" + "\n".join(events[:15]) if events else "")
             await self.db.enqueue("text", {"topic": "copy", "text": text}, priority=4)
         except Exception:  # noqa: BLE001
             log.exception("разведка: кошельки через все выходы")

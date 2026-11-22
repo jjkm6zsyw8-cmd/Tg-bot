@@ -53,7 +53,7 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
                SELECT address, label, COALESCE(qualified_at, updated_at) FROM traders
                WHERE active AND address NOT IN (SELECT address FROM watchlist WHERE kind = 'trader'))
            SELECT w.address, COALESCE(w.label, t.label) AS label, w.added, t.win_rate, t.trades_30d, t.median_hold_s,
-                  t.copy_30d, t.copy_t_30d, t.rules_30d, t.rules_1d, t.rules_days, t.best_rule, r.tier, r.manual_tier, r.copies,
+                  t.copy_30d, t.copy_t_30d, t.rules_30d, t.rules_1d, t.rules_days, t.rules_periods, t.best_rule, r.tier, r.manual_tier, r.copies,
                   r.wins
            FROM w LEFT JOIN traders t ON t.address = w.address LEFT JOIN wallet_rating r ON r.address = w.address""")
     out = {r["address"]: {**dict(r), "last": None, "today": 0, "own_pnl": None, "n": 0, "plus": 0, "sum_pct": 0.0}
@@ -89,7 +89,7 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
     for w in out.values():
         w["tier"] = w.get("manual_tier") or w.get("tier") or "new"
         w["section"] = section_of(w["tier"])
-        for key in ("rules_30d", "rules_1d"):
+        for key in ("rules_30d", "rules_1d", "rules_periods"):
             v = w.get(key) or {}
             if isinstance(v, str):
                 import json
@@ -107,7 +107,10 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
         # 22.11: итог при $10 на сделку по лучшему выходу — за 30 дней и за последние сутки
         best = w.get("best_rule")
         m, d = (rules.get(best) if best else None), (w["rules_1d"].get(best) if best else None)
-        w["usd_30d"] = float(m["sum"]) * COPY_USD if m else None
+        from ..analytics.wallet_rules import period_usd
+        per = w["rules_periods"]
+        w["usd_30d"] = (period_usd(per, best, "month") if per else float(m["sum"]) * COPY_USD) if m else None
+        w["usd_today"], w["usd_yday"] = period_usd(per, best, "today"), period_usd(per, best, "yday")
         w["usd_1d"] = float(d["sum"]) * COPY_USD if d else None
         w["n_1d"] = int(d["n"]) if d else 0
         # «🔥 Сейчас»: плюс устойчив за 30 дней и за сутки итог в плюсе (ручная пауза — не сюда)
@@ -135,7 +138,10 @@ def rules_line(w: dict[str, Any]) -> str:
     span = "30 дн" if days is None or days >= 30 else f"{days} дн истории в базе"
     line = f"Выходы за {span} ({n} его сделок, вход через ~1 с, как бот): " + " · ".join(parts) + tail
     day = w.get("rules_1d") or {}
-    if best and w.get("usd_30d") is not None:
+    if best and w.get("rules_periods"):
+        from ..analytics.wallet_rules import periods_text
+        line = (f"💰 $10 на каждую его сделку (≈): <b>{periods_text(w['rules_periods'], best, days)}</b>\n" + line)
+    elif best and w.get("usd_30d") is not None:
         line += (f"\nИтог при ${COPY_USD:g} на сделку по {RULE_NAMES[best]}: "
                  f"{'30 дн' if days is None or days >= 30 else f'{days} дн'} <b>{money(w['usd_30d'])}</b>"
                  + (f" · сутки <b>{money(w['usd_1d'])}</b> ({w['n_1d']} сд.)" if w.get("usd_1d") is not None
@@ -151,8 +157,12 @@ def button(w: dict[str, Any]) -> dict[str, Any]:
     last = fmt.ago((datetime.now(timezone.utc) - w["last"]).total_seconds()) if w.get("last") else "—"
     if w.get("usd_30d") is not None:               # посчитан через все выходы: 30 дн / сутки при $10
         from ..analytics.wallet_rules import RULE_NAMES
-        day = money(w["usd_1d"]) if w.get("usd_1d") is not None else "—"
         icon = "🔥" if w.get("section") == "now" else "🟢"      # лучший выход в устойчивом плюсе
+        if w.get("rules_periods"):                 # сегодня · вчера · 30 дней — ≈ при $10 на каждую его сделку
+            f = lambda v: money(v) if v is not None else "—"  # noqa: E731
+            return {"text": f"{icon} {name} · сег {f(w['usd_today'])} · вч {f(w['usd_yday'])} · 30д "
+                            f"{f(w['usd_30d'])}", "callback": f"bd:w:{w['address']}"}
+        day = money(w["usd_1d"]) if w.get("usd_1d") is not None else "—"
         return {"text": f"{icon} {name} · {RULE_NAMES[w['best_rule']]} · "
                         f"30д {money(w['usd_30d'])} · 24ч {day} · {last}",
                 "callback": f"bd:w:{w['address']}"}

@@ -61,7 +61,13 @@ async def test_evaluate_and_autofollow():
         assert res["n_1d"] == day_n and res["rules_1d"]["F"]["n"] == day_n and res["days"] == 2
         assert res["rules"]["G"]["avg"] < res["rules"][res["best"]]["avg"]   # G режет держателя
         count, events = await WR.refresh(db, {}, Costs())
-        assert count == 1 and events and "тень за ним включена" in events[0]
+        assert count == 1 and events and "тень включена" in events[0]
+        per = res["periods"]
+        assert per["month"]["N"] == 10 and per["week"]["N"] == 10 and per["today"]["N"] + per["yday"]["N"] <= 10
+        best = res["best"]
+        assert WR.period_usd(per, best, "month") == pytest.approx(per["month"]["rules"][best]["avg"] * 10 * 10)
+        txt = WR.periods_text(per, best, 2)
+        assert txt.startswith("сегодня ") and " · вчера " in txt and " · 2д +$" in txt and "7д" not in txt
         assert (await db.kv_get(WR.FOLLOW_KEY)) == {"HOLDER": "shadow"}
         row = await db.fetchrow("SELECT rules_30d, rules_1d, best_rule FROM traders WHERE address='HOLDER'")
         assert row["best_rule"] == res["best"] and row["rules_30d"]["F"]["n"] == 10
@@ -100,7 +106,7 @@ async def test_autofollow_hot_wallets_not_in_own_list():
         assert WR.hot({"A": up, "B": down}) == ["A"] and WR.day_usd(up) == 8.0
         events = await WR.autofollow(db, {"SMART": up, "LOSER": down}, set())
         assert (await db.kv_get(WR.FOLLOW_KEY)) == {"SMART": "shadow"}
-        assert "сейчас в плюсе: при $10 — 30 дн +$30, сутки +$8" in events[0]
+        assert events == ["👻 SMAR…MART: тень включена"]
         events = await WR.autofollow(db, {"SMART": down}, set())                # за сутки ушёл в минус — снять
         assert (await db.kv_get(WR.FOLLOW_KEY)) == {} and "за сутки не в плюсе" in events[0]
         await WR.autofollow(db, {"OWN": down}, {"OWN"})                         # свой — по 30 дням, как раньше
