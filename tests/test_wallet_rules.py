@@ -56,17 +56,53 @@ async def test_evaluate_and_autofollow():
         await db.execute("INSERT INTO traders(address, active) VALUES ('HOLDER', true)")
         res = await WR.evaluate(db, "HOLDER", {}, Costs())
         assert res["n"] == 10 and res["rules"]["F"]["avg"] > 0.2 and res["best"] in ("F", "R", "W")
+        # за сутки — только сделки последних 24 ч (монеты, начатые не раньше чем сутки назад)
+        day_n = sum(1 for i in range(10) if now + timedelta(hours=i) >= datetime.now(timezone.utc) - timedelta(days=1))
+        assert res["n_1d"] == day_n and res["rules_1d"]["F"]["n"] == day_n
         assert res["rules"]["G"]["avg"] < res["rules"][res["best"]]["avg"]   # G режет держателя
         count, events = await WR.refresh(db, {}, Costs())
         assert count == 1 and events and "тень за ним включена" in events[0]
         assert (await db.kv_get(WR.FOLLOW_KEY)) == {"HOLDER": "shadow"}
-        row = await db.fetchrow("SELECT rules_30d, best_rule FROM traders WHERE address='HOLDER'")
+        row = await db.fetchrow("SELECT rules_30d, rules_1d, best_rule FROM traders WHERE address='HOLDER'")
         assert row["best_rule"] == res["best"] and row["rules_30d"]["F"]["n"] == 10
+        assert row["rules_1d"]["F"]["n"] == day_n
         # перестал — своя тень снимается; включённое вручную — не трогается
         events = await WR.autofollow(db, {"HOLDER": {"best": None, "rules": {}}}, {"HOLDER"})
         assert events and (await db.kv_get(WR.FOLLOW_KEY)) == {}
         await db.kv_set(WR.FOLLOW_KEY, {"HOLDER": "live"})
         await WR.autofollow(db, {"HOLDER": {"best": None, "rules": {}}}, {"HOLDER"})
         assert (await db.kv_get(WR.FOLLOW_KEY)) == {"HOLDER": "live"}
+    finally:
+        await db.close()
+
+
+def test_month_sample_is_spread_and_day_separate():
+    """30 дней — до 120 сделок равномерно (свежие обязательно), сутки — отдельно."""
+    trips = list(range(300))
+    step = max(1, len(trips) // WR.LAST_TRIPS)
+    month = trips[::-1][::step][:WR.LAST_TRIPS][::-1]
+    assert len(month) == 120 and month[-1] == 299 and month[0] == 299 - 2 * 119
+
+
+async def test_autofollow_hot_wallets_not_in_own_list():
+    """Кошелёк не из своего списка: тень — только пока он «Сейчас» (плюс за 30 дн и за сутки)."""
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        m = {"G": {"n": 30, "w": 20, "avg": 0.1, "sum": 3.0, "t": 2.4}}
+        up = {"best": "G", "rules": m, "rules_1d": {"G": {"n": 4, "w": 3, "avg": 0.2, "sum": 0.8, "t": 1.0}}}
+        down = {**up, "rules_1d": {"G": {"n": 4, "w": 1, "avg": -0.1, "sum": -0.4, "t": -1.0}}}
+        assert WR.hot({"A": up, "B": down}) == ["A"] and WR.day_usd(up) == 8.0
+        events = await WR.autofollow(db, {"SMART": up, "LOSER": down}, set())
+        assert (await db.kv_get(WR.FOLLOW_KEY)) == {"SMART": "shadow"}
+        assert "сейчас в плюсе: при $10 — 30 дн +$30, сутки +$8" in events[0]
+        events = await WR.autofollow(db, {"SMART": down}, set())                # за сутки ушёл в минус — снять
+        assert (await db.kv_get(WR.FOLLOW_KEY)) == {} and "за сутки не в плюсе" in events[0]
+        await WR.autofollow(db, {"OWN": down}, {"OWN"})                         # свой — по 30 дням, как раньше
+        assert (await db.kv_get(WR.FOLLOW_KEY)) == {"OWN": "shadow"}
     finally:
         await db.close()

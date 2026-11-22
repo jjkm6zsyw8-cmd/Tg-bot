@@ -1276,6 +1276,13 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         else:
             await add_wallet(m, m.text or "", st.get("origin"), st.get("pick"))
 
+    @router.message(Command("top"))
+    async def cmd_top(m: Message) -> None:
+        """Кошельки с устойчивым лучшим выходом: итог при $10 на сделку за 30 дней и за сутки (bot/board.py)."""
+        from . import board
+        text, kb = await board.top_view(db)
+        await reply(m, text, kb)
+
     @router.message(Command("card"))
     async def cmd_card(m: Message, command: CommandObject) -> None:
         """Карточка кошелька доски по началу адреса или метке: /card 6d7y."""
@@ -1300,7 +1307,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         cfg = await reload()
         toast = None
         if act == "s":
-            text, kb = await board.board_view(db, arg or "best")
+            text, kb = await board.board_view(db, arg or None)
+        elif act == "t":
+            text, kb = await board.top_view(db)
         elif act == "w" and arg:
             text, kb = await board.card_view(db, cfg, arg)
         elif act == "f" and arg and len(parts) > 3:

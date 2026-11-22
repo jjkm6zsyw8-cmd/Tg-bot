@@ -20,7 +20,7 @@ from ..alerts.format import esc
 from ..real import settings as S
 
 FOLLOW_KEY = "real:follow"
-SECTIONS = {"best": "🟢 Лучшие", "mid": "🟡 Средние", "bad": "🔴 На вылет"}
+SECTIONS = {"now": "🔥 Сейчас", "best": "🟢 Лучшие", "mid": "🟡 Средние", "bad": "🔴 На вылет"}
 TIER_ICON = {"top": "🟢", "ok": "🟡", "new": "⚪", "weak": "🟠", "paused": "🔴"}
 TIER_NAME = {"top": "топ", "ok": "норм", "new": "новый", "weak": "слабый", "paused": "пауза"}
 FOLLOW_NAME = {"shadow": "👻 тень за ним", "live": "💵 бой за ним"}
@@ -53,7 +53,8 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
                SELECT address, label, COALESCE(qualified_at, updated_at) FROM traders
                WHERE active AND address NOT IN (SELECT address FROM watchlist WHERE kind = 'trader'))
            SELECT w.address, COALESCE(w.label, t.label) AS label, w.added, t.win_rate, t.trades_30d, t.median_hold_s,
-                  t.copy_30d, t.copy_t_30d, t.rules_30d, t.best_rule, r.tier, r.manual_tier, r.copies, r.wins
+                  t.copy_30d, t.copy_t_30d, t.rules_30d, t.rules_1d, t.best_rule, r.tier, r.manual_tier, r.copies,
+                  r.wins
            FROM w LEFT JOIN traders t ON t.address = w.address LEFT JOIN wallet_rating r ON r.address = w.address""")
     out = {r["address"]: {**dict(r), "last": None, "today": 0, "own_pnl": None, "n": 0, "plus": 0, "sum_pct": 0.0}
            for r in rows}
@@ -88,11 +89,13 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
     for w in out.values():
         w["tier"] = w.get("manual_tier") or w.get("tier") or "new"
         w["section"] = section_of(w["tier"])
-        rules = w.get("rules_30d") or {}
-        if isinstance(rules, str):
-            import json
-            rules = json.loads(rules)
-        w["rules_30d"] = rules
+        for key in ("rules_30d", "rules_1d"):
+            v = w.get(key) or {}
+            if isinstance(v, str):
+                import json
+                v = json.loads(v)
+            w[key] = v
+        rules = w["rules_30d"]
         # 21.11: его сделки через все выходы — главнее рейтинга по копиям одного правила: устойчивый плюс по
         # лучшему выходу — «лучшие»; все выходы в минусе на 8+ сделках — «на вылет»
         if w.get("best_rule") and not w.get("manual_tier"):
@@ -101,6 +104,15 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
                 and max(r["n"] for r in rules.values()) >= 8:
             w["section"] = "bad"
         w["copy_usd"] = w["sum_pct"] * COPY_USD
+        # 22.11: итог при $10 на сделку по лучшему выходу — за 30 дней и за последние сутки
+        best = w.get("best_rule")
+        m, d = (rules.get(best) if best else None), (w["rules_1d"].get(best) if best else None)
+        w["usd_30d"] = float(m["sum"]) * COPY_USD if m else None
+        w["usd_1d"] = float(d["sum"]) * COPY_USD if d else None
+        w["n_1d"] = int(d["n"]) if d else 0
+        # «🔥 Сейчас»: плюс устойчив за 30 дней и за сутки итог в плюсе (ручная пауза — не сюда)
+        if best and w["usd_1d"] is not None and w["usd_1d"] > 0 and w.get("manual_tier") not in ("weak", "paused"):
+            w["section"] = "now"
     return list(out.values())
 
 
@@ -119,38 +131,72 @@ def rules_line(w: dict[str, Any]) -> str:
     n = max(r["n"] for r in rules.values())
     best = w.get("best_rule")
     tail = (f" — лучший: <b>{RULE_NAMES[best]}</b>" if best else " — устойчивого плюса нет")
-    return f"Выходы ({n} его сделок, вход через ~1 с, как бот): " + " · ".join(parts) + tail
+    line = f"Выходы за 30 дн ({n} его сделок, вход через ~1 с, как бот): " + " · ".join(parts) + tail
+    day = w.get("rules_1d") or {}
+    if best and w.get("usd_30d") is not None:
+        line += (f"\nИтог при ${COPY_USD:g} на сделку по {RULE_NAMES[best]}: 30 дн <b>{money(w['usd_30d'])}</b>"
+                 + (f" · сутки <b>{money(w['usd_1d'])}</b> ({w['n_1d']} сд.)" if w.get("usd_1d") is not None
+                    else " · за сутки его сделок нет"))
+    elif day:
+        dn = max(r["n"] for r in day.values())
+        line += f"\nЗа сутки ({dn} сд.): " + " · ".join(f"{RULE_NAMES[k]} {day[k]['avg']:+.0%}" for k in RULES if k in day)
+    return line
 
 
 def button(w: dict[str, Any]) -> dict[str, Any]:
     name = (w.get("label") or short(w["address"]))[:14]
-    rate = f"{w['plus'] / w['n']:.0%}" if w["n"] else "—"
     last = fmt.ago((datetime.now(timezone.utc) - w["last"]).total_seconds()) if w.get("last") else "—"
+    if w.get("usd_30d") is not None:               # посчитан через все выходы: 30 дн / сутки при $10
+        from ..analytics.wallet_rules import RULE_NAMES
+        day = money(w["usd_1d"]) if w.get("usd_1d") is not None else "—"
+        icon = "🔥" if w.get("section") == "now" else "🟢"      # лучший выход в устойчивом плюсе
+        return {"text": f"{icon} {name} · {RULE_NAMES[w['best_rule']]} · "
+                        f"30д {money(w['usd_30d'])} · 24ч {day} · {last}",
+                "callback": f"bd:w:{w['address']}"}
+    rate = f"{w['plus'] / w['n']:.0%}" if w["n"] else "—"
     return {"text": f"{TIER_ICON.get(w['tier'], '⚪')} {name} · {rate} · {money(w['copy_usd'])} · {last}",
             "callback": f"bd:w:{w['address']}"}
 
 
-async def board_view(db: Any, section: str = "best") -> tuple[str, list[list[dict[str, Any]]]]:
-    section = section if section in SECTIONS else "best"
+async def board_view(db: Any, section: str | None = None) -> tuple[str, list[list[dict[str, Any]]]]:
     ws = await wallets(db)
     cnt = {s: sum(1 for w in ws if w["section"] == s) for s in SECTIONS}
+    if section not in SECTIONS:                    # по умолчанию — «🔥 Сейчас», если там кто-то есть
+        section = "now" if cnt["now"] else "best"
     rows = [w for w in ws if w["section"] == section]
-    if section == "bad":
+    if section == "now":
+        rows.sort(key=lambda w: (-float(w.get("usd_1d") or 0), -float(w.get("usd_30d") or 0)))
+    elif section == "bad":
         rows.sort(key=lambda w: w["copy_usd"])
     elif section == "mid":
         # новые — без копий на бумаге: первыми те, у кого копия по истории лучше (6d7y +21%, 7HcK +7% и т. п.)
         rows.sort(key=lambda w: (w.get("copy_30d") is None, -float(w.get("copy_30d") or 0), -(w["today"] or 0)))
     else:
-        rows.sort(key=lambda w: -w["copy_usd"])
+        rows.sort(key=lambda w: (w.get("usd_30d") is None, -float(w.get("usd_30d") or 0), -w["copy_usd"]))
     text = (f"🏆 <b>Доска кошельков</b> · {SECTIONS[section]} — {len(rows)} из {len(ws)}\n"
-            f"Кнопка: кошелёк · копий в плюсе · итог копий при ${COPY_USD:g} · последняя сделка. Нажми — карточка. "
-            "Найти любой: /card начало адреса (например /card 6d7y)."
+            + ("Сейчас — плюс устойчив за 30 дней и за последние сутки тоже в плюсе; лучшие за сутки — сверху.\n"
+               if section == "now" else "")
+            + f"Кнопка: кошелёк · лучший выход · итог при ${COPY_USD:g} на сделку за 30 дн и за 24 ч · последняя "
+            "сделка (не посчитанные: копий в плюсе · итог копий на бумаге). Нажми — карточка. "
+            "Найти любой: /card начало адреса (например /card 6d7y). Таблица — /top."
             + (" Средние — первыми лучшие по копируемости." if section == "mid" else "")
             + ("" if rows else "\n\nВ этой секции пока никого."))
-    kb: list[list[dict[str, Any]]] = [[{"text": ("● " if s == section else "") + f"{name} ({cnt[s]})",
-                                        "callback": f"bd:s:{s}"} for s, name in SECTIONS.items()]]
+    tabs = [{"text": ("● " if s == section else "") + f"{name} ({cnt[s]})", "callback": f"bd:s:{s}"}
+            for s, name in SECTIONS.items()]
+    kb: list[list[dict[str, Any]]] = [tabs[:2], tabs[2:]]
     kb += [[button(w)] for w in rows[:LIMIT]]
-    kb.append([{"text": "🔄 Обновить", "callback": f"bd:s:{section}"}])
+    kb.append([{"text": "🏅 Таблица 30 дн / сутки", "callback": "bd:t"},
+               {"text": "🔄 Обновить", "callback": f"bd:s:{section}"}])
+    return text, kb
+
+
+async def top_view(db: Any) -> tuple[str, list[list[dict[str, Any]]]]:
+    """/top: итог при $10 на сделку за 30 дней и за сутки + кнопки карточек."""
+    from ..analytics import wallet_rules as WR
+    text, items = await WR.top_text(db, 15)
+    btns = [{"text": name, "callback": f"bd:w:{addr}"} for addr, name in items]
+    kb = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    kb.append([{"text": "🏆 Доска", "callback": "bd:s:"}, {"text": "🔄 Обновить", "callback": "bd:t"}])
     return text, kb
 
 
@@ -165,7 +211,7 @@ async def find(db: Any, part: str) -> list[dict[str, Any]]:
 async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[list[dict[str, Any]]]]:
     w = next((x for x in await wallets(db) if x["address"] == addr), None)
     if w is None:
-        return "Кошелька нет в списке (убран).", [[{"text": "← Доска", "callback": "bd:s:best"}]]
+        return "Кошелька нет в списке (убран).", [[{"text": "← Доска", "callback": "bd:s:"}]]
     follow = (await db.kv_get(FOLLOW_KEY) or {}).get(addr)
     real = await db.fetch(
         """SELECT mode, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w, COALESCE(avg(pnl_pct), 0) a,

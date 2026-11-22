@@ -43,12 +43,14 @@ async def test_board_sections_buttons_card_and_follow():
                                     ts, pool) VALUES ($1, 'X', $2, $3, $4, 1000, 40, now(), 'pump')""",
                              f"t{i}", star, buy, sol)
         text, kb = await B.board_view(db, "best")
-        assert "🟢 Лучшие — 1 из 3" in text and kb[0][0]["text"].startswith("● 🟢 Лучшие (1)")
-        assert kb[1][0]["text"].startswith("🟢 звезда · 67% · +$4.50 · ") and kb[1][0]["callback"] == f"bd:w:{star}"
+        assert "🟢 Лучшие — 1 из 3" in text and kb[0][1]["text"].startswith("● 🟢 Лучшие (1)")
+        assert kb[0][0]["text"] == "🔥 Сейчас (0)" and len(kb[1]) == 2      # вкладки — в два ряда
+        assert kb[2][0]["text"].startswith("🟢 звезда · 67% · +$4.50 · ") and kb[2][0]["callback"] == f"bd:w:{star}"
+        assert (await B.board_view(db))[0].startswith("🏆 <b>Доска кошельков</b> · 🟢 Лучшие")   # «Сейчас» пуст
         _t, kb_bad = await B.board_view(db, "bad")
-        assert kb_bad[1][0]["text"].startswith("🔴 скальп")
+        assert kb_bad[2][0]["text"].startswith("🔴 скальп")
         _t, kb_mid = await B.board_view(db, "mid")
-        assert kb_mid[1][0]["callback"] == f"bd:w:{mid}"                  # новый — без копий
+        assert kb_mid[2][0]["callback"] == f"bd:w:{mid}"                  # новый — без копий
         card, ckb = await B.card_view(db, {"real_stake_usd": 5}, star)
         assert "удачных 79% · сегодня 2" in card and "держит ~3м" in card and "+0.50 SOL" in card
         assert "Копии на бумаге ($10): 3 сд., в плюсе 2 (67%), итог <b>+$4.50</b>" in card   # одна копия на монету
@@ -85,7 +87,7 @@ async def test_mid_section_sorted_by_copyability_and_find():
             if copy is not None:
                 await db.execute("INSERT INTO traders(address, copy_30d) VALUES ($1, $2)", a, copy)
         _t, kb = await B.board_view(db, "mid")
-        assert [r[0]["callback"][5:9] for r in kb[1:4]] == ["6d7y", "aaaa", "bbbb"]   # лучшие по копируемости — первыми
+        assert [r[0]["callback"][5:9] for r in kb[2:5]] == ["6d7y", "aaaa", "bbbb"]   # лучшие по копируемости — первыми
         assert [w["address"][:4] for w in await B.find(db, "6d7y")] == ["6d7y"]
         assert await B.find(db, "zzzz") and not await B.find(db, "nope")
     finally:
@@ -111,5 +113,37 @@ async def test_rating_of_holder_uses_follow_copies():
                 port, f"M{i}", pct, rule, float(i))
         r = (await rating.compute(db, {}))["HOLDER"]
         assert r["n"] == 3 and r["tier"] in ("ok", "top") and r["sum"] > 0
+    finally:
+        await db.close()
+
+
+async def test_now_section_30d_and_day_money_and_top():
+    """22.11: итог при $10 по лучшему выходу за 30 дней и за сутки; «🔥 Сейчас» — плюс за 30 дн и за сутки; /top."""
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        hot, cold, weak = "HoTw" + "1" * 36 + "aaaa", "CoLd" + "2" * 36 + "bbbb", "WeaK" + "3" * 36 + "cccc"
+        g = {"G": {"n": 40, "w": 25, "avg": 0.12, "sum": 4.8, "t": 2.5}}
+        for a, day in ((hot, {"G": {"n": 6, "w": 5, "avg": 0.2, "sum": 1.2, "t": 2.0}}),
+                       (cold, {"G": {"n": 5, "w": 1, "avg": -0.1, "sum": -0.5, "t": -1.0}}), (weak, {})):
+            await db.execute("INSERT INTO watchlist(kind, address) VALUES ('trader', $1)", a)
+            await db.execute("INSERT INTO traders(address, rules_30d, rules_1d, best_rule) VALUES ($1, $2, $3, $4)",
+                             a, g, day, None if a == weak else "G")
+        text, kb = await B.board_view(db)                                 # по умолчанию — «Сейчас»
+        assert "🔥 Сейчас — 1 из 3" in text and kb[0][0]["text"] == "● 🔥 Сейчас (1)"
+        assert kb[2][0]["text"].startswith("🔥 HoTw…aaaa · G · 30д +$48 · 24ч +$12 · ")
+        _t, kb_best = await B.board_view(db, "best")
+        assert kb_best[2][0]["text"].startswith("🟢 CoLd…bbbb · G · 30д +$48 · 24ч −$5.00")
+        card, _ = await B.card_view(db, {}, hot)
+        assert "Итог при $10 на сделку по G: 30 дн <b>+$48</b> · сутки <b>+$12</b> (6 сд.)" in card
+        top, tkb = await B.top_view(db)
+        rows = top.split("<pre>")[1].split("</pre>")[0].splitlines()
+        assert rows[1].split() == ["HoTw…aaaa", "G", "+$48", "+$12", "6"]
+        assert rows[2].split() == ["CoLd…bbbb", "G", "+$48", "−$5", "5"] and len(rows) == 3   # без лучшего — нет
+        assert tkb[0][0]["callback"] == f"bd:w:{hot}" and tkb[-1][1]["callback"] == "bd:t"
     finally:
         await db.close()

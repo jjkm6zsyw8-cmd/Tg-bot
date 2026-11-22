@@ -612,6 +612,7 @@ ALTER TABLE real_rule_trials ADD COLUMN IF NOT EXISTS hold_s double precision;
 -- 21.11: кошелёк через все выходы (analytics/wallet_rules.py): правило → {n, w, avg, sum, t}; лучший устойчивый выход
 ALTER TABLE traders ADD COLUMN IF NOT EXISTS rules_30d jsonb;
 ALTER TABLE traders ADD COLUMN IF NOT EXISTS best_rule text;
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS rules_1d jsonb;
 
 CREATE TABLE IF NOT EXISTS real_orders (
     id          bigserial PRIMARY KEY,
