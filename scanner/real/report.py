@@ -259,8 +259,72 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     kb.append([{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}, {"text": "📄 CSV сделок", "callback": "rl:csv"}])
     kb.append([{"text": "🎯 Методы", "callback": "rl:wme:g"}, {"text": "⚙️ Настройки", "callback": "rl:set"},
                {"text": "🧪 Проверка", "callback": "rl:check"}])
-    kb.append([{"text": "🔄 Считать с нуля", "callback": "rl:zero:view"}])
+    kb.append([{"text": "👛 Мои кошельки", "callback": "rl:mine"},
+               {"text": "🔄 Считать с нуля", "callback": "rl:zero:view"}])
     return "\n".join(lines), kb
+
+
+MINE_USD = 10.0
+MINE_RULES = ("A", "B", "G", "R", "W")
+
+
+async def mine_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
+    """22.11: «👛 Мои кошельки» — как торговал бы бот за кошельками «за ним» с момента «Считать с нуля»: итог бота
+    (его выход по лучшему правилу кошелька) и пробы всех наших выходов на тех же входах; $10 на сделку."""
+    follow = dict(await db.kv_get("real:follow") or {})
+    auto = set(await db.kv_get("real:follow_auto") or [])
+    zero = await stats_since(db)
+    since = zero or datetime(2000, 1, 1, tzinfo=timezone.utc)
+    head = (f"👛 <b>Мои кошельки</b> — реальный бот за ними, ${MINE_USD:g} на сделку, "
+            + (f"с {zero.astimezone(tz_of(cfg)):%d.%m %H:%M}" if zero else "за всё время"))
+    back = [[{"text": "🔄 Обновить", "callback": "rl:mine"}, {"text": "🔄 Считать с нуля", "callback": "rl:zero:mine"}],
+            [{"text": "← Назад", "callback": "rl:view"}]]
+    if not follow:
+        return (head + "\n\nПока ни за кем. Выбрать: /card начало адреса → «👻 Тень за ним» (без денег) или "
+                "«💵 Бой за ним»."), back
+    addrs = list(follow)
+    labels = {r["address"]: r["label"] for r in await db.fetch(
+        "SELECT address, label FROM watchlist WHERE kind = 'trader' AND address = ANY($1::text[])", addrs)}
+    pos: dict[str, dict[str, float]] = {}
+    for r in await db.fetch(
+            """SELECT trader, count(*) FILTER (WHERE closed_at IS NOT NULL) n,
+                      count(*) FILTER (WHERE closed_at IS NULL) open,
+                      count(*) FILTER (WHERE closed_at IS NOT NULL AND pnl_pct > 0) w,
+                      COALESCE(sum(pnl_pct) FILTER (WHERE closed_at IS NOT NULL), 0) s
+               FROM real_positions WHERE trader = ANY($1::text[]) AND opened_at >= $2 GROUP BY 1""", addrs, since):
+        pos[r["trader"]] = dict(r)
+    trials: dict[str, dict[str, float]] = {}
+    for r in await db.fetch(
+            """SELECT trader, rule, COALESCE(sum(pnl_pct), 0) s FROM real_rule_trials
+               WHERE trader = ANY($1::text[]) AND closed_at IS NOT NULL AND opened_at >= $2 GROUP BY 1, 2""",
+            addrs, since):
+        trials.setdefault(r["trader"], {})[r["rule"]] = float(r["s"])
+
+    def usd(v: float) -> str:
+        v *= MINE_USD
+        return f"{'+' if v >= 0 else '−'}${abs(v):.0f}" if abs(v) >= 10 else f"{'+' if v >= 0 else '−'}${abs(v):.2f}"
+
+    def line(a: str) -> str:
+        name = esc((labels.get(a) or f"{a[:4]}…{a[-4:]}")[:14])
+        icon = "💵" if follow[a] == "live" else "👻"
+        p = pos.get(a)
+        if not p:
+            return f"{icon} <b>{name}</b>: сделок пока нет"
+        opened = f" (+{p['open']} откр.)" if p["open"] else ""
+        rules = " · ".join(f"{k} {usd(trials[a][k])}" for k in MINE_RULES if k in trials.get(a, {}))
+        return (f"{icon} <b>{name}</b>: {p['n']} сд{opened}, в плюсе {p['w']} · бот <b>{usd(float(p['s']))}</b>"
+                + (f"\n   выходы: {rules}" if rules else ""))
+    mine = [a for a in addrs if a not in auto]
+    bot = [a for a in addrs if a in auto]
+    lines = [head]
+    if mine:
+        lines += ["", "👤 <b>Выбрал ты</b>", *[line(a) for a in mine]]
+    if bot:
+        lines += ["", "🤖 <b>Бот включил сам</b> (не торгуют, если включено «🎯 Только выбранные мной»)",
+                  *[line(a) for a in bot]]
+    lines += ["", "«бот» — как торговал бот (его выход); «выходы» — те же входы, если бы продавал по A / B / G / R / W. "
+              "👻 — тень (без денег), 💵 — бой."]
+    return "\n".join(lines), back
 
 
 def _since(iso: str | None, cfg: dict[str, Any]) -> str:
@@ -592,6 +656,8 @@ def zero_back(back: str) -> str:
     """Куда вернуться из подтверждения «Считать с нуля» по «Нет»."""
     if back == "cmp":
         return "rl:cmp"
+    if back == "mine":
+        return "rl:mine"
     if back[:1] == "m":
         return f"rl:wme:{back[1:]}"
     if back[:1] == "w" and back[1:].isdigit():
@@ -656,12 +722,15 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
         return await main("Продаю позицию")
     if action == "trades":
         return Reply(await trades_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]])
+    if action == "mine":
+        text, kb = await mine_view(db, cfg)
+        return Reply(text, kb, "Обновлено", True)
     if action == "cmp":
         return Reply(await compare_text(db, cfg), [[{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"},
                                                     {"text": "← Назад", "callback": "rl:view"}],
                                                    [{"text": "🔄 Считать с нуля", "callback": "rl:zero:cmp"}]])
     if action == "zero":
-        back = rest if rest in ("cmp", "view") or rest[:1] in ("m", "w") else "view"
+        back = rest if rest in ("cmp", "view", "mine") or rest[:1] in ("m", "w") else "view"
         return Reply("🔄 <b>Считать с нуля?</b>\nС этой минуты считаются все итоги реального бота: тень и бой "
                      "(главный экран, кошельки, сделки), «⚖️ Против бумаги» с пробами правил, итог бумаги на экранах "
                      "методов. Ничего не удаляется, деньги и открытые позиции не трогаются; дневной и общий стоп боя "
@@ -671,6 +740,9 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
                        {"text": "Нет", "callback": zero_back(back)}]], "", True)
     if action == "zero!":
         await db.kv_set(STATS_SINCE_KEY, datetime.now(timezone.utc).isoformat())
+        if rest == "mine":
+            text, kb = await mine_view(db, cfg)
+            return Reply(text, kb, "Считаю с нуля", True)
         if rest[:1] in ("m", "w"):
             from .wallets_ui import methods_view, wallet_view
             tag = rest[1:]

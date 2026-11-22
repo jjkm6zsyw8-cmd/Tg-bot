@@ -164,3 +164,42 @@ async def test_now_section_30d_and_day_money_and_top():
         assert tkb[0][0]["callback"] == f"bd:w:{hot}" and tkb[-1][1]["callback"] == "bd:t"
     finally:
         await db.close()
+
+
+async def test_mine_view_and_reset():
+    """22.11: «👛 Мои кошельки» — бот за выбранными и пробы выходов, $10 на сделку, с «Считать с нуля»."""
+    from scanner.real import report as R
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        text, _ = await R.mine_view(db, {})
+        assert "Пока ни за кем" in text
+        await db.kv_set("real:follow", {"MINEaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": "shadow",
+                                        "BOTzbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2": "shadow"})
+        await db.kv_set("real:follow_auto", ["BOTzbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2"])
+        me = "MINEaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"
+        await db.execute(
+            """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, pnl_sol,
+                   pnl_pct) VALUES ('shadow', 'copy', 'Q1', $1, now(), now(), 0.05, 1, 0.02, 0.4),
+                   ('shadow', 'copy', 'Q2', $1, now(), now(), 0.05, 1, -0.01, -0.1),
+                   ('shadow', 'copy', 'Q3', $1, now(), NULL, 0.05, 1, NULL, NULL)""", me)
+        for rule, pct in (("A", 0.2), ("R", 0.5)):
+            await db.execute(
+                """INSERT INTO real_rule_trials(mode, kind, rule, mint, trader, cost_sol, tokens_raw, closed_at, pnl_pct)
+                   VALUES ('shadow', 'copy', $1, 'Q1', $2, 0.05, 1, now(), $3)""", rule, me, pct)
+        text, kb = await R.mine_view(db, {})
+        assert "👤 <b>Выбрал ты</b>\n👻 <b>MINE…aaa1</b>: 2 сд (+1 откр.), в плюсе 1 · бот <b>+$3.00</b>" in text
+        assert "выходы: A +$2.00 · R +$5.00" in text and "🤖 <b>Бот включил сам</b>" in text
+        assert kb[0][1]["callback"] == "rl:zero:mine"
+        async def reload():
+            return {}
+        r = await R.on_callback(db, reload, "zero:mine")
+        assert r.kb[0][1]["callback"] == "rl:mine"
+        r = await R.on_callback(db, reload, "zero!:mine")
+        assert "сделок пока нет" in r.text and "с " in r.text.splitlines()[0]
+    finally:
+        await db.close()

@@ -198,7 +198,7 @@ async def board_view(db: Any, section: str | None = None) -> tuple[str, list[lis
             for s, name in SECTIONS.items()]
     kb: list[list[dict[str, Any]]] = [tabs[:2], tabs[2:]]
     kb += [[button(w)] for w in rows[:LIMIT]]
-    kb.append([{"text": "🏅 Таблица 30 дн / сутки", "callback": "bd:t"},
+    kb.append([{"text": "🏅 Таблица", "callback": "bd:t"}, {"text": "👛 Мои кошельки", "callback": "rl:mine"},
                {"text": "🔄 Обновить", "callback": f"bd:s:{section}"}])
     return text, kb
 

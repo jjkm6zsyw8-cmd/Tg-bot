@@ -1013,6 +1013,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         text, kb = await real_report.status_view(db, await reload())
         await reply(m, text, kb)
 
+    @router.message(Command("mine"))
+    async def cmd_mine(m: Message) -> None:
+        """Мои кошельки: как реальный бот торгует за выбранными кошельками (с «Считать с нуля»)."""
+        text, kb = await real_report.mine_view(db, await reload())
+        await reply(m, text, kb)
+
     @router.callback_query(F.data.startswith("rl:"))
     async def cb_real(c: CallbackQuery) -> None:
         r = await real_report.on_callback(db, reload, c.data[3:], balance_rpc)
