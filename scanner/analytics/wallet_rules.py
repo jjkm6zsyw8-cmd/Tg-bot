@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import statistics
@@ -45,6 +46,8 @@ LAST_TRIPS = 120                       # 30 дней: до 120 сделок, р�
 DAY_TRIPS = 60                         # сутки: последние до 60 сделок за 24 ч
 BOT_DELAY_S = 1.0                      # бот входит через 4 блока после трейдера (~0.8 с) + посадка
 HORIZON_S = 6 * 3600
+SELL_MARGIN_S = 300.0                  # путь цены — до его продажи + 5 мин (первая сделка после неё)
+REFRESH_PAUSE_S = 0.5                  # пауза между кошельками при пересчёте — база и бот не задыхаются
 MIN_N = 8
 FOLLOW_KEY = "real:follow"
 AUTO_KEY = "real:follow_auto"          # кого «тень за ним» включил сам бот (снимает только их)
@@ -135,9 +138,14 @@ async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> di
                            "n_1d": len(day), "days": days}
     if not trips:
         return out
-    win: dict[str, list[float]] = {}             # по монете — только её окно (сделки за 30 дней разбросаны)
+    # окно цены каждой сделки — от входа до его первой продажи (+5 мин запаса): все выходы продают, когда продал он,
+    # дальше путь не нужен (22.11: окно «+6 ч» на сотнях сделок грузило базу так, что бот переставал отвечать)
+    def until(t: Any) -> float:
+        end = (t.sells[0][0] + delay + SELL_MARGIN_S) if t.sells else t.entry_ts + HORIZON_S
+        return min(end, t.entry_ts + delay + HORIZON_S)
+    win: dict[str, list[float]] = {}             # по монете — только её окна (сделки за 30 дней разбросаны)
     for t in trips:
-        lo, hi = t.entry_ts, max(t.exit_ts or 0, t.entry_ts) + HORIZON_S
+        lo, hi = t.entry_ts, until(t)
         w = win.setdefault(t.mint, [lo, hi])
         w[0], w[1] = min(w[0], lo), max(w[1], hi)
     mints = list(win)
@@ -157,7 +165,8 @@ async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> di
         sell_at = (t.sells[0][0] + delay) if t.sells else None
         if t.copy_exit_mc:
             v["F"] = trade_net_profit(entry_mc, float(t.copy_exit_mc), pos, costs)
-        path = [x for x in paths.get(t.mint, []) if entry_at < x[0] <= entry_at + HORIZON_S]
+        end = until(t)
+        path = [x for x in paths.get(t.mint, []) if entry_at < x[0] <= end]
         if path:
             for rule in RULES[1:]:
                 sc = scheme(rule, hold, delay)
@@ -332,6 +341,7 @@ async def refresh(db: Any, cfg: dict[str, Any], costs: Any, limit: int = 300) ->
            UNION SELECT address FROM scout WHERE status = 'probation'""")})[:limit]
     results: dict[str, dict[str, Any]] = {}
     for a in addrs:
+        await asyncio.sleep(REFRESH_PAUSE_S)
         try:
             res = await evaluate(db, a, cfg, costs)
         except Exception:  # noqa: BLE001
