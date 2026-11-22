@@ -200,7 +200,7 @@ async def test_end_to_end(monkeypatch):
         assert await db.fetchval("SELECT blacklisted FROM clusters WHERE id=$1", cid)
 
         # --- разбор дня и бэктест
-        text, csv_bytes, _kb = await build_daily(db, settings, datetime.now(timezone.utc).date())
+        text, csv_bytes, _kb = await build_daily(db, settings, datetime.now(timezone.utc).date(), True)
         assert "Разбор дня" in text and "Итог сигналов" in text
         assert b"mint;symbol" in csv_bytes
         await db.execute("UPDATE clusters SET blacklisted=false, pattern_weight=1 WHERE id=$1", cid)

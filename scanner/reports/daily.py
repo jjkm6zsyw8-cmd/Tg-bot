@@ -24,8 +24,13 @@ MISSED_REASONS = {**REASONS, "": "нет решения (не оценивала
                   "outage": "сбой источника", "latency": "задержка"}
 
 
-async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str, bytes, list[list[dict[str, Any]]]]:
+async def build_daily(db: Database, settings: Settings, day: date,
+                      full: bool | None = None) -> tuple[str, bytes, list[list[dict[str, Any]]]]:
+    """Разбор дня. 23.11: сверху — реальные цифры (реальный бот: тень и бой); грубая оценка сигналов, упущенное, окна
+    входа, отсев трендов и бумага — только в полном разборе (full / настройка daily_extra, «/today full»)."""
     cfg = settings.effective()
+    if full is None:
+        full = bool(cfg.get("daily_extra", False))
     tz = ZoneInfo(cfg.get("timezone", "UTC"))
     start, end = utc_day_bounds(day, tz)
     price = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
@@ -39,6 +44,7 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
            WHERE a.created_at >= $1 AND a.created_at < $2 ORDER BY a.created_at""", start, end)
     lines = [f"📅 <b>Разбор дня {day.strftime('%d.%m.%Y')}</b>"]
 
+    rough_from = len(lines)
     # 1) итог сигналов
     # ВНИМАНИЕ: это оценка по своему потоку цен и без стопа (держим до цели, слива дева или 60 минут) — она сильно
     # оптимистичнее реальности: 11.11 «итог серии +15%» при бумаге по рыночным ценам −50…−92% на тех же сигналах
@@ -120,6 +126,7 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
         lines.append("\n<b>Лучшие окна входа</b>")
         lines += windows
 
+    rough_to = len(lines)
     # 4) новые кандидаты
     kb: list[list[dict[str, Any]]] = []
     new_cl = await db.fetch("SELECT id, profile FROM clusters WHERE qualified_at >= $1 AND qualified_at < $2 "
@@ -161,6 +168,7 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
         if other:
             lines.append(f"  без алерта: {other} сделок, PnL {sum(t.own_pnl for t in trips if t.mint not in alerted):+.2f} SOL")
 
+    tail_from = len(lines)
     # 5б) «Тренды»: что отсеяли фильтры и что с этими монетами было через час
     from ..analytics.trendcheck import shadow_summary
     lines += ["", *await shadow_summary(db, start, end)] if await db.fetchval(
@@ -181,6 +189,17 @@ async def build_daily(db: Database, settings: Settings, day: date) -> tuple[str,
             lines.append(f"  {p['name']}: сделок {r['n']}, удачных {r['w']}, итог {r['pnl']:+.4f} SOL "
                          f"(${r['pnl'] * price:+.2f}){odd}")
 
+    from ..real.stats import daily_block
+    try:
+        real = await daily_block(db, cfg)
+    except Exception:  # noqa: BLE001 — разбор важнее
+        log.exception("реальные цифры в разборе дня")
+        real = []
+    if full:
+        lines = lines[:rough_from] + real + lines[rough_from:]
+    else:
+        lines = (lines[:rough_from] + real + lines[rough_to:tail_from]
+                 + ["", "<i>Бумага, грубая оценка сигналов и окна входа — в полном разборе: /today full</i>"])
     # CSV: расширенные колонки (сделки, продажи кластера, причина склейки, окно входа, лучшие трейдеры)
     from .verify import extended_csv
     csv_bytes = await extended_csv(db, start, end)
@@ -196,9 +215,11 @@ async def send_daily(db: Database, settings: Settings, day: date) -> None:
     await db.enqueue("daily", {"text": text, "keyboard": kb or None,
                                "csv": csv_bytes.decode("utf-8"), "filename": f"day_{day.isoformat()}.csv"},
                      priority=5)
+    eff = settings.effective()
+    if not eff.get("daily_extra", False):
+        return                              # 23.11: smart-отчёт по бумаге — только по /smart, не каждый вечер
     try:                                    # отдельным сообщением — только smart-сигналы (то же, что /smart)
         from .smart import chunks, smart_report
-        eff = settings.effective()
         smart = await smart_report(db, 7, str(eff.get("timezone") or "Asia/Tbilisi"), int(eff.get("smart_accounts") or 2))
         for part in chunks(smart):
             await db.enqueue("text", {"text": part, "topic": "daily"}, priority=5)

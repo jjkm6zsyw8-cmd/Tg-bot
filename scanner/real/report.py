@@ -259,6 +259,7 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     kb.append([{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}, {"text": "📄 CSV сделок", "callback": "rl:csv"}])
     kb.append([{"text": "🎯 Методы", "callback": "rl:wme:g"}, {"text": "⚙️ Настройки", "callback": "rl:set"},
                {"text": "🧪 Проверка", "callback": "rl:check"}])
+    kb.append([{"text": "📊 Реальные цифры", "callback": "menu:pnl"}])
     kb.append([{"text": "👛 Мои кошельки", "callback": "rl:mine"},
                {"text": "🔄 Считать с нуля", "callback": "rl:zero:view"}])
     return "\n".join(lines), kb

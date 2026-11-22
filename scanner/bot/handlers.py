@@ -179,6 +179,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     def main_menu() -> list[list[dict[str, Any]]]:
         return [
+            [{"text": "📊 Реальные цифры", "callback": "menu:pnl"}],
             [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "⚖️ Бой против бумаги", "callback": "menu:cmp"}],
             [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "📊 Excel: весь отчёт", "callback": "menu:excel"}],
             [{"text": "💳 Кошельки бота", "callback": "rl:wl"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
@@ -674,10 +675,18 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await remove(ref)
         await reply(m, f"⛔ В чёрном списке: {esc(ref)}" + (f" (кластер #{cid})" if cid else ""))
 
+    @router.message(Command("pnl"))
+    async def cmd_pnl(m: Message) -> None:
+        """Реальные цифры: только реальный бот (тень и бой) по методам и кошелькам — без бумаги и расчётов."""
+        from ..real import stats as real_stats
+        text, kb = await real_stats.view(db, await reload())
+        await reply(m, text, kb)
+
     @router.message(Command("today"))
-    async def cmd_today(m: Message) -> None:
+    async def cmd_today(m: Message, command: CommandObject) -> None:
         cfg = await reload()
-        text, csv_bytes, kb = await build_daily(db, settings, today_in(cfg.get("timezone", "UTC")))
+        full = (command.args or "").strip().lower() in ("full", "полный", "все", "всё")
+        text, csv_bytes, kb = await build_daily(db, settings, today_in(cfg.get("timezone", "UTC")), full or None)
         await reply(m, text, kb)
         await send_doc(m, csv_bytes, "today.csv")
 
@@ -1096,6 +1105,10 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await paper_answer(m, "state")
         if what == "real":
             text, kb = await real_report.status_view(db, await reload())
+            return await show(m, text, kb)
+        if what == "pnl":
+            from ..real import stats as real_stats
+            text, kb = await real_stats.view(db, await reload())
             return await show(m, text, kb)
         if what == "cmp":
             return await show(m, await real_report.compare_text(db, await reload()),

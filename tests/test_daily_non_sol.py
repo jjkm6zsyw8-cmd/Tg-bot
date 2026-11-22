@@ -31,7 +31,7 @@ async def test_non_sol_pairs_are_not_in_rough_estimate():
                    RETURNING id""", f"M{i}", now)
             await db.execute("INSERT INTO alert_outcomes(alert_id, exit_reason, net_result) VALUES ($1, 'target', $2)",
                              aid, net)
-        text, _csv, _kb = await build_daily(db, Settings(YamlConfig("config/config.yaml")), now.date())
+        text, _csv, _kb = await build_daily(db, Settings(YamlConfig("config/config.yaml")), now.date(), True)
         line = next(ln for ln in text.split("\n") if ln.startswith("  · mydev"))
         assert "2 сделок" in line and "+21766" not in text
         assert "Не в оценке: 1 алертов по монетам в паре не к SOL" in text
