@@ -10,7 +10,7 @@ import heapq
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -34,6 +34,7 @@ from .scoring import LEVELS, Snapshot, bump, evaluate_dev
 from .state import TokenState, TradeRow
 
 log = logging.getLogger(__name__)
+DAILY_SENT_KEY = "daily:sent"                  # дата последнего разбора дня — не слать повторно после перезапуска
 AUTO_MARK_NAMES = {"great": "🚀 отлично", "good": "✅ успех", "fail": "❌ провал", "scam": "☠️ скам (дев слил сразу)"}
 
 
@@ -1513,6 +1514,11 @@ class Engine:
         """Разбор дня в заданное время + ночной пересчёт трейдеров и профилей."""
         from ..reports.daily import send_daily
         last_daily = last_nightly = None
+        try:                                     # 22.11: после перезапуска вечером разбор дня уходил второй раз
+            v = await self.db.kv_get(DAILY_SENT_KEY)
+            last_daily = date.fromisoformat(v) if v else None
+        except Exception:  # noqa: BLE001
+            last_daily = None
         while True:
             await asyncio.sleep(30)
             cfg = self.cfg
@@ -1522,6 +1528,10 @@ class Engine:
             if cfg.get("modes", {}).get("daily", True) and (now.hour, now.minute) >= (hh, mm) \
                     and last_daily != now.date():
                 last_daily = now.date()
+                try:
+                    await self.db.kv_set(DAILY_SENT_KEY, now.date().isoformat())
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     await send_daily(self.db, self.settings, now.date())
                 except Exception:  # noqa: BLE001
