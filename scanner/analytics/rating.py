@@ -94,10 +94,12 @@ async def compute(db: Any, cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     held: dict[str, list[float]] = {}
     for r in rows:                      # икс выше +100% считается как +100%: одна ракета не делает кошелёк «топом»
         by.setdefault(r["w"], []).append(capped(float(r["pnl_pct"] or 0)))
-        if r["rule"] == "hold":
+        if r["rule"] == "hold" or str(r["rule"] or "").startswith("best:"):
             held.setdefault(r["w"], []).append(capped(float(r["pnl_pct"] or 0)))
     for w, pcts in held.items():
-        # 21.11: держатели — по копиям «за трейдером»; старые копии по G (выход через 5 мин) их занижали
+        # 21.11: держатели — по копиям «за трейдером»; старые копии по G (выход через 5 мин) их занижали.
+        # 23.11: и по копиям с его лучшим выходом (best:A и т. п.) — C2qq (держит 2.5 ч) стоял на «паузе» из-за 12
+        # smart-копий по G (−$26), хотя по своему выходу в плюсе
         if len(pcts) >= int(cfg_get(cfg, "rating_min_copies")):
             by[w] = pcts
     manual = {r["address"]: r["manual_tier"] for r in await db.fetch(

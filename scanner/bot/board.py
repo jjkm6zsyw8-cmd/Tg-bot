@@ -119,6 +119,17 @@ async def wallets(db: Any) -> list[dict[str, Any]]:
     return list(out.values())
 
 
+def _paper_exit_line(w: dict[str, Any]) -> str:
+    """Как бумага H продаёт его копии сейчас: по его лучшему выходу, «за трейдером» (держатель) или по G."""
+    from ..analytics.wallet_rules import RULE_NAMES
+    best = w.get("best_rule")
+    if best:
+        return f"   новые копии на бумаге продаются по его лучшему выходу: {RULE_NAMES[best]}"
+    if float(w.get("median_hold_s") or 0) >= 180:
+        return "   новые копии на бумаге продаются «за трейдером» (когда продаёт он)"
+    return ""
+
+
 def rules_line(w: dict[str, Any]) -> str:
     """Его сделки через все выходы: за ним / A / B / G / R / W — средний результат копии и сколько сделок."""
     from ..analytics.wallet_rules import RULE_NAMES, RULES
@@ -250,9 +261,8 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
               f"<b>{money(w['copy_usd'])}</b> · твой кошелёк (ставка ${stake:g}) ≈ {money(w['sum_pct'] * stake)}")
              if w["n"] else "Копий на бумаге пока нет.",
              (f"   из них «за трейдером» (продаёт, когда он): {w['hold'][0]} сд., в плюсе {w['hold'][1]}, итог "
-              f"{money(w['hold'][2] * COPY_USD)}" if w.get("hold") else
-              ("   копии держателя теперь идут «за трейдером» (продаёт, когда он), а не по G"
-               if float(w.get("median_hold_s") or 0) >= 180 else "")),
+              f"{money(w['hold'][2] * COPY_USD)}" if w.get("hold") else ""),
+             _paper_exit_line(w),
              rules_line(w),
              "Копируемость 30 д: " + (f"{float(w['copy_30d']):+.0%} на сделку" if w.get("copy_30d") is not None else "—")
              + (f", устойчивость t={float(w['copy_t_30d']):.1f} (от 1.645 — не случайность)"

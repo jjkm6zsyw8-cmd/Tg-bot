@@ -113,6 +113,10 @@ async def test_rating_of_holder_uses_follow_copies():
                 port, f"M{i}", pct, rule, float(i))
         r = (await rating.compute(db, {}))["HOLDER"]
         assert r["n"] == 3 and r["tier"] in ("ok", "top") and r["sum"] > 0
+        # 23.11: копии по его лучшему выходу (best:A) — тоже его рейтинг, а не smart-копии по G
+        await db.execute("UPDATE paper_positions SET rule = 'best:A' WHERE rule = 'hold'")
+        r = (await rating.compute(db, {}))["HOLDER"]
+        assert r["n"] == 3 and r["tier"] in ("ok", "top")
     finally:
         await db.close()
 
