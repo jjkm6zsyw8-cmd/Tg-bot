@@ -570,14 +570,16 @@ class Receiver:
                     asyncio.create_task(self.backfill())
                 all_down_since, gap_id = None, None
             # подписки на сделки есть, а сделок нет — PumpPortal не принимает ключ (нет 0.02 SOL на кошельке)
-            watch_ok = self.watch is not None and self.watch.connected
-            if self.pp.has_key and self.pp.connected and now - self.pp.connected_since > 600 and not watch_ok:
+            # 23.11: и при работающей слежке Helius — она берёт только нужные кошельки и часть монет (лимит 250 МБ/сутки);
+            # без сделок PumpPortal база пишет обрывки: у монет, ушедших на PumpSwap за час, записана 1 сделка из сотен
+            if self.pp.has_key and self.pp.connected and now - self.pp.connected_since > 600:
                 trades = sum(self.pp.messages_by_pool.values())
                 if (len(self.pp.token_subs) >= 50 and trades == self._pp_trades_seen
                         and now - self._pp_warned > 6 * 3600):
                     self._pp_warned = now
-                    await self.db.system("⛔ PumpPortal: нет сделок — пополнить кошелёк ключа ≥0.02 SOL"
-                                         + (" (отказ по балансу)" if self.pp.refused else ""))
+                    await self.db.system("⛔ PumpPortal не отдаёт сделки монет — база собирает обрывки (бандлы, снайперы, "
+                                         "пики и анализ — по неполным данным). Пополнить кошелёк API-ключа PumpPortal "
+                                         "до 0.05 SOL" + (" (отказ по балансу)" if self.pp.refused else ""))
                 if now - self._pp_mark_at > 600:
                     self._pp_trades_seen, self._pp_mark_at = trades, now
             # всплеск ошибок парсинга → «Система»

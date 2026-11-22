@@ -278,15 +278,12 @@ async def health_view(db: Database) -> str:
                      f", событий {s['events']}, {s.get('mb_in', 0)} МБ, переподключений {s['reconnects']}, "
                      f"ошибок парсинга {s['parse_errors']}")
     if ing:
-        watch_on = bool((ing.get("watch") or {}).get("connected"))
-        if watch_on and (not ing.get("pumpportal_key") or ing.get("pumpportal_refused")):
-            lines.append("  ℹ️ PumpPortal отдаёт только новые монеты — это нормально: сделки нужных кошельков "
-                         "и монет идут через слежку Helius")
-        elif not ing.get("pumpportal_key"):
+        if not ing.get("pumpportal_key"):
             lines.append("  ⚠️ нет PUMPPORTAL_API_KEY — сделки не собираются (нужен ключ с 0.02 SOL)")
         elif ing.get("pumpportal_refused"):
+            # 23.11: раньше при слежке Helius здесь было «это нормально» — нет: без PumpPortal сделки монет — обрывки
             lines.append("  ⛔ PumpPortal отказал в сделках: «" + esc(ing["pumpportal_refused"][:150]) +
-                         "» — пополните кошелёк API-ключа до 0.02 SOL")
+                         "» — база пишет обрывки сделок; пополните кошелёк API-ключа до 0.05 SOL")
         elif ing.get("pumpportal_subs", 0) >= 50 and not ing.get("pumpportal_trades"):
             lines.append("  ⛔ подписки есть, а сделок от PumpPortal 0 — проверьте баланс кошелька API-ключа")
         wt = ing.get("watch")
