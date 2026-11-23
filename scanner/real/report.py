@@ -73,8 +73,8 @@ def money(sol: float, sol_usd: float) -> str:
 
 
 def scheme_text(name: str) -> str:
-    if name not in PAPER_SCHEMES:
-        return S.SCHEME_TEXT.get(name, name)        # L — правило только реального бота
+    if name not in PAPER_SCHEMES or name in ("D", "L", *S.EXTRA_RULES):
+        return S.SCHEME_TEXT.get(name, name)        # L, D, U, V, P, Q — правила только реального бота
     return str(PAPER_SCHEMES[name]["name"]).split(": ", 1)[-1].replace("smart — ", "")
 
 

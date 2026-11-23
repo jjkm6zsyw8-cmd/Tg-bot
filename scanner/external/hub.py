@@ -300,6 +300,14 @@ class ExternalHub:
         _ok, v = await self._call(self.jupiter, self.jupiter.prices(list(dict.fromkeys(mints))[:50], ttl), 3.0)
         return v or {}
 
+    async def jup_quote(self, input_mint: str, output_mint: str, amount: int) -> dict[str, Any] | None:
+        """Котировка Jupiter на точную сумму (реальная цена исполнения) или None."""
+        _ok, v = await self._call(self.jupiter, self.jupiter.quote(input_mint, output_mint, amount), 5.0)
+        return v
+
+    def jup_decimals(self, mint: str) -> int | None:
+        return self.jupiter.decimals.get(mint)
+
     async def sol_usd(self) -> float | None:
         _ok, v = await self._call(self.jupiter, self.jupiter.sol_usd(), 3.0)
         return v

@@ -279,26 +279,27 @@ async def test_rule_trials_measure_all_exit_rules_on_same_entry(db):
     await tr.start()
     await fire(tr, chain)
     main = only(tr)
-    assert sorted(t.extra["rule"] for t in tr.trials.values()) == ["A", "B", "G", "L", "R"]
+    assert sorted(t.extra["rule"] for t in tr.trials.values()) == ["A", "B", "G", "L", "P", "Q", "R", "U", "V"]
     assert all(t.entry_mc == main.entry_mc and t.extra["mode"] == "shadow" for t in tr.trials.values())
     chain.set_mc(MINT, 54.0)                                   # +35%: тейк A и G, B продаёт 70%, R держит
     await trade(tr, chain)
     await asyncio.sleep(0.05)
     assert not tr.positions                                    # позиция бота (правило A) закрылась тейком
     left = {t.extra["rule"]: t for t in tr.trials.values()}
-    assert set(left) == {"B", "R", "L"} and left["B"].tp_done      # L (лотерея) держит до ×3
+    assert set(left) == {"B", "R", "L", "U", "V", "P", "Q"} and left["B"].tp_done      # держат дальше
     # перезапуск: открытые пробы подхватываются из базы, вместе с пиком цены (его пишет цикл раз в минуту)
     await tr._flush_trials()
     tr2 = shadow(db, chain, real_max_open=10)
     await tr2.start()
-    assert sorted(t.extra["rule"] for t in tr2.trials.values()) == ["B", "L", "R"]
+    assert sorted(t.extra["rule"] for t in tr2.trials.values()) == ["B", "L", "P", "Q", "R", "U", "V"]
     chain.set_mc(MINT, 30.0)                                   # −44% от пика: трейлинг у B и R
     await trade(tr2, chain)
     await asyncio.sleep(0.05)
-    assert [t.extra["rule"] for t in tr2.trials.values()] == ["L"]   # лотерея без стопа держит дальше
+    assert sorted(t.extra["rule"] for t in tr2.trials.values()) == ["L", "Q", "V"]   # без стопа держат дальше
     rows = {r["rule"]: r for r in await db.fetch("SELECT * FROM real_rule_trials WHERE closed_at IS NOT NULL")}
     assert {k: r["exit_reason"] for k, r in rows.items()} == {"A": "take_profit", "B": "trailing",
-                                                              "G": "take_profit", "R": "trailing"}
+                                                              "G": "take_profit", "R": "trailing", "U": "stop",
+                                                              "P": "stop"}
     assert rows["A"]["pnl_pct"] > 0.25 and 0 < rows["B"]["pnl_pct"] < rows["A"]["pnl_pct"] and rows["R"]["pnl_pct"] < 0
     assert await db.fetchval("SELECT count(*) FROM real_positions") == 1    # пробы — не сделки бота
     main_pnl = await db.fetchval("SELECT pnl_sol FROM real_positions")
@@ -707,7 +708,7 @@ async def test_trend_on_other_dex_goes_to_jupiter_shadow(db, monkeypatch):
     other = pk("raydium-coin")                                 # нет ни кривой, ни пула PumpSwap
     from scanner.real import pump as _pump
     chain.programs[str(other)] = _pump.TOKEN                   # монета есть в сети, но торгуется на другой бирже
-    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=True)
+    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=True, real_scheme_trendj="G")
 
     class Ext:
         price = 0.0002                                         # $ за токен → MC = 0.0002 × 1e9 / 150 ≈ 1333 SOL
@@ -736,3 +737,93 @@ async def test_trend_on_other_dex_goes_to_jupiter_shadow(db, monkeypatch):
     row = await db.fetchrow("SELECT kind, venue, exit_reason, pnl_pct FROM real_positions")
     assert row["kind"] == "trendj" and row["venue"] == "jupiter" and row["exit_reason"] == "take_profit"
     assert 0.25 < row["pnl_pct"] < 0.40
+
+
+async def test_trendj_real_jupiter_quotes_and_rule_u(db):
+    """23.11: «тренды на других биржах» — вход и выход по настоящей котировке Jupiter на точную сумму (а не цена + 1%);
+    правило по умолчанию U (трейлинг 15% после +20%, стоп −20%)."""
+    chain = FakeChain()
+    other = pk("meteora-coin")
+    from scanner.real import pump as _pump
+    chain.programs[str(other)] = _pump.TOKEN
+    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=False)
+    calls = []
+
+    class Ext:
+        price = 0.0002
+
+        async def jup_price(self, mint, ttl=None):
+            return self.price
+
+        async def jup_prices(self, mints, ttl=3.0):
+            return {m: self.price for m in mints}
+
+        def jup_decimals(self, mint):
+            return 9
+
+        async def jup_quote(self, inp, out, amount):
+            calls.append((inp, out, amount))
+            if inp == ex.SOL_MINT:                       # покупка: за наши лампорты — токены (9 знаков), хуже цены на 2%
+                tokens = amount / 1e9 / (Ext.price * 1e9 / 150 / 1e9) / 1.02
+                return {"out": int(tokens * 1e9), "impact": 0.02}
+            sol = amount / 1e9 * (Ext.price * 1e9 / 150 / 1e9) * 0.98   # продажа: SOL за токены, хуже на 2%
+            return {"out": int(sol * 1e9), "impact": 0.02}
+    tr.e.ext = Ext()
+    await tr.start()
+    await tr.on_signal(str(other), "normal", 8, {"modes": ["trend"], "symbol": "MET", "trend_at": time.time(),
+                                                 "trigger_at": time.time()}, None, {"T"})
+    p = only(tr)
+    assert p.extra["kind"] == "trendj" and p.extra["dec"] == 9 and calls[0][0] == ex.SOL_MINT
+    assert 1355 < p.entry_mc < 1365                            # цена 1333 + 2% по котировке, а не «+1% наугад»
+    sc = tr.scheme_of(p)
+    assert sc["trail"] == 0.15 and sc["trail_after_net"] == 0.20 and sc["stop"] == 0.20
+    from scanner.real.desk import RealDesk
+    desk = RealDesk.__new__(RealDesk)
+    Ext.price = 0.0003                                       # +50% — трейлинг взведён
+    await desk._poll_jupiter([tr], [(tr, x) for x in tr.watched()])
+    Ext.price = 0.00024                                      # −20% от пика — трейлинг 15% продаёт
+    await desk._poll_jupiter([tr], [(tr, x) for x in tr.watched()])
+    await asyncio.sleep(0.1)
+    assert not tr.positions and calls[-1][1] == ex.SOL_MINT    # продажа — тоже по котировке
+    row = await db.fetchrow("SELECT exit_reason, pnl_pct FROM real_positions")
+    assert row["exit_reason"] == "trailing" and 0.10 < row["pnl_pct"] < 0.16
+
+
+async def test_profit_watch_notes_and_day_lock(db):
+    """23.11: короткие сообщения о крупном плюсе и плюсе за день; замок прибыли дня в бою."""
+    from types import SimpleNamespace
+    chain = FakeChain()
+    tr = shadow(db, chain)
+    said = []
+
+    async def say(text):
+        said.append(text)
+    tr._say = say
+    tr._roll_day()
+    tr.balance = 50 / 150 * 1e9                                 # $50 на начало дня
+    tr.day_start_balance = tr.balance
+    p = SimpleNamespace(symbol="WIN", extra={"kind": "trendj"})
+    for pnl_usd in (27, 20):                                    # +$27, потом +$20: за день +$47
+        pnl = pnl_usd / 150
+        tr.day_pnl["live"] = tr.day_pnl.get("live", 0.0) + pnl
+        await tr._profit_watch("live", pnl, p)
+    assert said[0] == "💰 💵 +$27 · $WIN · тренд (др. биржи)"
+    assert any(s.startswith("📈 💵 За сегодня +$47 · баланс ×1.94") for s in said)
+    tr.day_pnl["live"] -= 30 / 150                              # отдали обратно: +$17 < половины от +$47
+    await tr._profit_watch("live", -30 / 150, p)
+    assert said[-1].startswith("🔒 💵 Берегу прибыль: за день было +$47, сейчас +$17")
+    assert tr.entry_block("M", "trend", "live", {"trend_at": time.time()}) == \
+        "прибыль дня зафиксирована — новых входов до полуночи нет"
+
+
+async def test_reset_all_methods_button(db):
+    await db.kv_set("real:follow", {"MINE": "shadow", "AUTO": "shadow"})
+    await db.kv_set("real:follow_auto", ["AUTO"])
+    r = await UI.on_wallet_callback(db, {}, "wmz", "g")
+    assert "Сбросить всё?" in r.text and r.kb[0][0]["callback"] == "rl:wmz:g:!"
+    r = await UI.on_wallet_callback(db, {}, "wmz", "g:!")
+    ov = await db.get_overrides()
+    assert all(ov[S.METHODS[k][1]] is False for k in S.METHODS)
+    assert ov["real_shadow_all"] is False and ov["real_autofollow"] is False
+    assert await db.kv_get("real:follow") == {"MINE": "shadow"} and await db.kv_get("real:follow_auto") == []
+    assert "Методы торговли" in r.text

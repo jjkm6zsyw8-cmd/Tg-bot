@@ -316,14 +316,30 @@ class Jupiter(ExternalSource):
     def base(self) -> str:
         return "https://api.jup.ag/price/v3" if self.key else "https://lite-api.jup.ag/price/v3"
 
+    decimals: dict[str, int] = {}   # знаков у токена (из ответа цен v3) — нужен для котировок на точную сумму
+
     async def prices(self, mints: list[str], ttl: float = TTL_PRICE) -> dict[str, float]:
         """ttl — сколько секунд годится кеш (бумага для решений берёт 1–4 с, сверка — 15 с)."""
         key = ",".join(sorted(mints))[:500]
 
         async def fetch() -> dict[str, float]:
             d = await self.request("GET", self.base, path_key="price", params={"ids": ",".join(mints[:50])})
+            for m, v in (d or {}).items():
+                if isinstance(v, dict) and v.get("decimals") is not None:
+                    Jupiter.decimals[m] = int(v["decimals"])
             return {m: float(v["usdPrice"]) for m, v in (d or {}).items() if isinstance(v, dict) and v.get("usdPrice")}
         return await self.cached(f"prices{int(ttl)}", key, ttl, fetch)
+
+    async def quote(self, input_mint: str, output_mint: str, amount: int, slippage_bps: int = 500) -> dict[str, Any] | None:
+        """23.11: котировка обмена на точную сумму — сколько реально получишь (маршрут Jupiter, влияние своей сделки на
+        цену учтено). {"out": единиц выхода, "impact": доля}."""
+        swap = "https://api.jup.ag/swap/v1/quote" if self.key else "https://lite-api.jup.ag/swap/v1/quote"
+        d = await self.request("GET", swap, path_key="quote", params={
+            "inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount)),
+            "slippageBps": str(slippage_bps), "restrictIntermediateTokens": "true"}, timeout_s=4.0)
+        if not isinstance(d, dict) or not d.get("outAmount"):
+            return None
+        return {"out": int(d["outAmount"]), "impact": float(d.get("priceImpactPct") or 0)}
 
     async def sol_usd(self) -> float | None:
         return (await self.prices([SOL_MINT])).get(SOL_MINT)

@@ -406,6 +406,7 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
               "общий стоп $50 — как бумажный портфель A, давший +$710 за 14–17.11."]
     kb.append([{"text": "✅ Включить все методы", "callback": f"rl:wmall:{tag}:on"},
                {"text": "⬜ Выключить все", "callback": f"rl:wmall:{tag}:off"}])
+    kb.append([{"text": "🧹 Сбросить всё — выбрать заново", "callback": f"rl:wmz:{tag}"}])
     kb.append([{"text": "📋 Как бумага A ($10)", "callback": f"rl:wmp:{tag}"}])
     kb.append([{"text": "🔄 Считать с нуля", "callback": f"rl:zero:m{tag}"}])
     kb.append([{"text": "← Назад", "callback": back}])
@@ -466,10 +467,11 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
                   + (f" · бумага M: {n} сд · плюс {w / n:.0%} · {_usd(usd)}" if n else "")]
     lines += ["", "<b>Правила</b>"] + [f"{x} — {S.SCHEME_TEXT[x]}" + (" (только проба)" if x == "W" else "")
                                        for x in rules]
+    exits = [{"text": ("● " if rule == x else "") + f"Выход {x}", "callback": f"rl:wmr:{tag}:{kind}:{x}"}
+             for x in S.SCHEMES if x != "D" or kind == "mydev"]
     kb: Kb = [[{"text": "✅ Включён — выключить" if on else "⬜ Выключен — включить",
                 "callback": f"rl:wmo:{tag}:{kind}:{'off' if on else 'on'}"}],
-              [{"text": ("● " if rule == x else "") + f"Выход {x}", "callback": f"rl:wmr:{tag}:{kind}:{x}"}
-               for x in S.SCHEMES if x != "D" or kind == "mydev"]]
+              *[exits[i:i + 5] for i in range(0, len(exits), 5)]]
     if kind == "smart":
         kb.append([{"text": ("● " if filt == "all" else "") + "Все сигналы", "callback": f"rl:wmf:{tag}:all"},
                    {"text": ("● " if filt == "m" else "") + "Только отобранные (M)", "callback": f"rl:wmf:{tag}:m"}])
@@ -571,6 +573,21 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
                            {"text": "Нет", "callback": f"rl:wme:{tag}"}]], "", True)
         on = parts[1] != "off"
         patch = {S.METHODS[k][1]: on for k in S.METHODS}
+    elif action == "wmz":
+        if not (len(parts) == 2 and parts[1] == "!"):
+            return Reply("🧹 <b>Сбросить всё?</b>\nВыключаются все методы, замер всех методов в тени, тень, которую бот "
+                         "включал за кошельками сам, и авто-тень. Твои «за ним» (выбранные вручную) остаются. Дальше "
+                         "включаешь только то, чем хочешь торговать — и ничего лишнего не подключится.",
+                         [[{"text": "Да, сбросить", "callback": f"rl:wmz:{tag}:!", "style": "danger"},
+                           {"text": "Нет", "callback": f"rl:wme:{tag}"}]], "", True)
+        patch = {S.METHODS[k][1]: False for k in S.METHODS}
+        if tag == "g":
+            patch.update(real_shadow_all=False, real_autofollow=False)
+            follow = dict(await db.kv_get("real:follow") or {})
+            auto = set(await db.kv_get("real:follow_auto") or [])
+            await db.kv_set("real:follow", {a: m for a, m in follow.items() if a not in auto})
+            await db.kv_set("real:follow_auto", [])
+        action = "wme"
     elif action not in ("wme", "wmk"):
         return Reply(None, None, "Не понял кнопку")
     if patch or drop:
@@ -590,7 +607,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
 async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: str, rpc: Any = None) -> Reply:
     parts = rest.split(":") if rest else []
     wid = int(parts[0]) if parts and parts[0].isdigit() else None
-    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms", "wmp", "wmall"):
+    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms", "wmp", "wmall", "wmz"):
         r = await methods_callback(db, cfg, action, parts)
         if r is not None:
             return r

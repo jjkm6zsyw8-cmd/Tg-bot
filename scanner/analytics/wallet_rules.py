@@ -311,7 +311,13 @@ async def autofollow(db: Any, results: dict[str, dict[str, Any]], own: set[str],
                      hot_limit: int = HOT_LIMIT) -> list[str]:
     """«👻 тень за ним» (сам): свои кошельки с лучшим выходом в устойчивом плюсе и кошельки «Сейчас» (плюс за 30
     дней и за сутки, лучшие до hot_limit); перестали — снять ту тень, что включил сам. Бой и включённое вручную
-    не трогаются."""
+    не трогаются. Выключено в настройках (real_autofollow, «🧹 Сбросить всё») — ничего не включает."""
+    try:
+        overrides = await db.get_overrides()
+    except Exception:  # noqa: BLE001
+        overrides = {}
+    if overrides.get("real_autofollow") is False:
+        return []
     follow = dict(await db.kv_get(FOLLOW_KEY) or {})
     auto = set(await db.kv_get(AUTO_KEY) or [])
     now = set(hot(results, hot_limit))

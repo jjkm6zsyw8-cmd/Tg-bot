@@ -55,6 +55,7 @@ NEWDEV = "Z"                     # сигнал «новый дев с круп�
 JUP_VENUE = "jupiter"            # «тренды на других биржах»: позиция по котировке Jupiter (тень, без транзакции)
 JUP_SLIP = 0.01                  # проскальзывание входа и выхода по котировке Jupiter (сверх комиссии)
 OTHER_DEX = "не pump.fun и не PumpSwap"
+SOL_MINT = "So11111111111111111111111111111111111111112"
 NEWDEV_MAX_MC = 65.0             # дороже — лотерея не окупается (MC 65: окупаемость с 11% ухода на PumpSwap)
 NEWDEV_SHADOW_MAX = 150          # «новый дев» в тени: своих позиций одновременно (держит до 1 ч)
 NEWDEV_MAX_HOLD_S = 3600.0       # «новый дев»: любое правило — не дольше часа
@@ -234,9 +235,7 @@ class RealTrader:
         if rule == "W":
             return {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": None, "target": False, "time_stop_s": None,
                     "time_stop_gain": None, "max_hold_s": float(p.extra.get("w_hold") or 1.0)}
-        if rule == "L":
-            return S.LOTTERY
-        sc = SCHEMES[rule] if rule in S.SCHEMES and rule in SCHEMES else self.scheme_for(p.extra.get("kind"))
+        sc = self.rule_scheme(rule, p.extra.get("kind")) if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
         if p.extra.get("kind") == "newdev" and float(sc.get("max_hold_s") or 1e9) > NEWDEV_MAX_HOLD_S:
             # запуск: монета, которая за час не ушла на PumpSwap, почти наверняка мертва; у R стоп −50% ниже «пола»
             # кривой — без предела мёртвая монета висела бы сутки и тратила запросы цены
@@ -246,10 +245,19 @@ class RealTrader:
     def scheme_for(self, kind: str | None) -> dict[str, Any]:
         """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага): у smart и
         «мой дев» — выбранная (A / B / G), у копий, крупных копий и смарт-ракет — их портфелей H / K / R."""
-        name = self.get(S.SCHEME_KEYS[kind or "smart"])
+        return self.rule_scheme(self.get(S.SCHEME_KEYS[kind or "smart"]), kind)
+
+    @staticmethod
+    def rule_scheme(name: str, kind: str | None) -> dict[str, Any]:
+        """Схема продажи по букве правила: L — лотерея, D — почерк дева (только «мой дев»), U/V/P/Q — правила трендов,
+        A/B/G/R — схемы бумаги."""
+        if name == "L":
+            return S.LOTTERY
         if name == "D":
             return S.DEV_SCHEME if kind == "mydev" else SCHEMES["G"]
-        return S.LOTTERY if name == "L" else SCHEMES[name]
+        if name in S.EXTRA_RULES:
+            return S.EXTRA_RULES[name]
+        return SCHEMES[name]
 
     def paused(self) -> str:
         """Стоп-кран: общий (для всех кошельков) или этого кошелька."""
@@ -289,6 +297,9 @@ class RealTrader:
     def _roll_day(self) -> None:
         if self._day != self.day_key():
             self._day, self.day_pnl = self.day_key(), {}
+            # новый день — заново: лучший плюс дня, ступени сообщений, замок прибыли, баланс на начало дня
+            self.day_peak, self.day_note, self.day_locked = {}, {}, set()
+            self.day_start_balance = self.balance
 
     def _armed_at(self) -> datetime | None:
         """Когда включили бой (от этого момента считается общий стоп)."""
@@ -535,6 +546,8 @@ class RealTrader:
         sol_usd = self.sol_usd()
         if not free and -self.day_pnl.get(mode, 0.0) * sol_usd >= float(self.get("real_day_stop_usd")):
             return "дневной стоп"
+        if mode == "live" and mode in (getattr(self, "day_locked", None) or set()):
+            return "прибыль дня зафиксирована — новых входов до полуночи нет"
         hours = float(self.get("real_reentry_h"))
         if hours > 0 and time.time() - self.lost.get(mint, 0) < hours * 3600:
             return "монета уже дала убыток"
@@ -960,7 +973,16 @@ class RealTrader:
         mc = float(jp) * 1e9 / sol_usd                 # условная капитализация: цена × 1 млрд (как у бумаги T)
         usd = S.method_stake(self.cfg, kind) or S.method_stake(self.cfg, "trend") or float(self.get("real_stake_usd"))
         stake = int(usd / sol_usd * 1e9)
-        raw = int(stake * 1e6 / (mc * (1 + JUP_SLIP)))
+        # настоящая цена исполнения: котировка Jupiter на нашу сумму (маршрут и сдвиг цены своей покупкой учтены);
+        # котировки нет (лимит запросов) — цена Jupiter + 1%, с пометкой
+        dec = ext.jup_decimals(mint_s) if hasattr(ext, "jup_decimals") else None
+        q = await ext.jup_quote(SOL_MINT, mint_s, stake) if dec is not None and hasattr(ext, "jup_quote") else None
+        if q and q["out"] > 0:
+            raw = int(q["out"] / 10 ** dec * 1e6)       # в учёте бота — 6 знаков, как у pump.fun
+            how = f"котировка Jupiter (сдвиг цены {q['impact'] * 100:.2f}%)"
+        else:
+            raw = int(stake * 1e6 / (mc * (1 + JUP_SLIP)))
+            how = "котировки нет — цена Jupiter +1%"
         if raw <= 0:
             return self._skip("shadow", kind, "другая биржа: цена не разобрана")
         base = {"mint": mint_s, "kind": kind, "mode": "shadow", "alert_id": alert_id, "trader": trader,
@@ -969,16 +991,40 @@ class RealTrader:
                 "lag_s": round(time.time() - float(data.get("trend_at") or time.time()), 3), "stake": stake,
                 "min_out": raw, "slip": JUP_SLIP, "mc": mc, "rule": self.get(S.SCHEME_KEYS[kind]), "filter": "all",
                 "best_exit": None, "followed": False, "fast": False, "detect_ms": None, "age_s": None,
-                "target_mc": None}
+                "target_mc": None, "dec": dec}
         fee = self.fees_sol()
         await self._open(base, tokens_raw=raw, cost_sol=stake / 1e9 + fee, rent_sol=0.0, sig=None, slot=None,
-                         note="другая биржа: котировка Jupiter, без транзакции", cu=None, fee_sol=fee, wait_ms=None,
+                         note=f"другая биржа: {how}, без транзакции", cu=None, fee_sol=fee, wait_ms=None,
                          order_id=None)
+
+    async def _jup_sell(self, p: Position, raw6: int) -> tuple[float, float] | None:
+        """Продажа позиции «другая биржа» по котировке Jupiter на точное число токенов: (SOL выручки, условная
+        капитализация выхода) или None — котировки нет."""
+        dec = p.extra.get("dec")
+        ext = getattr(self.e, "ext", None)
+        if dec is None or ext is None or not hasattr(ext, "jup_quote") or raw6 <= 0:
+            return None
+        amount = int(raw6 / 1e6 * 10 ** int(dec))
+        key = (p.mint, amount)
+        hit = self._jq_cache.get(key) if hasattr(self, "_jq_cache") else None
+        if hit and time.time() - hit[0] < 2.0:
+            q = hit[1]
+        else:
+            q = await ext.jup_quote(p.mint, SOL_MINT, amount)
+            self._jq_cache = {k: v for k, v in (getattr(self, "_jq_cache", None) or {}).items()
+                              if time.time() - v[0] < 2.0}
+            self._jq_cache[key] = (time.time(), q)
+        if not q or q["out"] <= 0:
+            return None
+        sol = q["out"] / 1e9
+        return max(0.0, sol - self.fees_sol()), sol / (raw6 / 1e6) * 1e9
 
     async def _open(self, base: dict[str, Any], *, tokens_raw: int, cost_sol: float, rent_sol: float, sig: str | None,
                     slot: int | None, note: str | None, cu: int | None, fee_sol: float,
                     wait_ms: int | None, order_id: int | None) -> None:
         entry_mc = paid_mc(int(base["stake"]), tokens_raw)       # цена входа — средняя цена, по которой купили
+        if base.get("venue") == JUP_VENUE and tokens_raw > 0:
+            entry_mc = int(base["stake"]) * 1e6 / tokens_raw     # котировка Jupiter уже с комиссиями площадки
         blocks = (int(slot) - int(base["trigger_slot"])) if slot and base.get("trigger_slot") else None
         pid = await self.db.fetchval(
             """INSERT INTO real_positions(mode, kind, mint, symbol, trader, alert_id, venue, token_program, opened_at,
@@ -991,7 +1037,8 @@ class RealTrader:
             {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9, "rule": base.get("rule"),
              "filter": base.get("filter"), "best_exit": base.get("best_exit"),
              "followed": base.get("followed", False), "fast": base.get("fast", False),
-             "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s"), "target_mc": base.get("target_mc")},
+             "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s"), "target_mc": base.get("target_mc"),
+             "dec": base.get("dec")},
             self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
@@ -1007,7 +1054,8 @@ class RealTrader:
             symbol=base["symbol"], max_mc=entry_mc, alert_id=base["alert_id"],
             extra={"mode": base["mode"], "kind": base["kind"], "venue": base["venue"],
                    "token_program": base["token_program"], "tokens_raw": tokens_raw, "rent": rent_sol,
-                   "last_mc": entry_mc, "entry_slot": slot, "best_exit": base.get("best_exit")})
+                   "last_mc": entry_mc, "entry_slot": slot, "best_exit": base.get("best_exit"),
+                   "dec": base.get("dec")})
         if self.get("real_rule_trials"):
             try:
                 await self._open_trials(base, pid, entry_mc, cost_sol - rent_sol, tokens_raw, slot)
@@ -1103,7 +1151,10 @@ class RealTrader:
             st = await self._state(Pubkey.from_string(p.mint))
         except Exception:  # noqa: BLE001
             st = {"why": "сеть не ответила", "venue": None}
-        if st.get("venue") and not st.get("why"):
+        jq = await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE else None
+        if jq is not None:                           # другая биржа: настоящая котировка Jupiter на продажу
+            proceeds, mc = jq
+        elif st.get("venue") and not st.get("why"):
             proceeds = max(0.0, self._quote_sell(st, raw) / 1e9 - self.fees_sol())
             mc = st["mc"]
         else:                                        # состояние не получили — оценка по последней цене потока
@@ -1257,6 +1308,7 @@ class RealTrader:
             t.extra["entry_slot"] = slot
             if base.get("venue") == JUP_VENUE:
                 t.extra["venue"] = JUP_VENUE          # пробы тоже сопровождаются ценами Jupiter
+                t.extra["dec"] = base.get("dec")
             self.trials[t.id] = t
 
     def best_exit(self, wallet: str | None) -> str | None:
@@ -1303,12 +1355,15 @@ class RealTrader:
         have = int(p.extra["tokens_raw"])
         raw = int(have * share) if share < 1 else have
         st: dict[str, Any] = {}
-        if self.chain is not None:
+        jq = await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE else None
+        if jq is None and self.chain is not None and p.extra.get("venue") != JUP_VENUE:
             try:
                 st = await self._trial_state(p.mint)
             except Exception:  # noqa: BLE001
                 st = {}
-        if st.get("venue") and not st.get("why"):
+        if jq is not None:
+            proceeds, mc = jq
+        elif st.get("venue") and not st.get("why"):
             proceeds, mc = max(0.0, self._quote_sell(st, raw) / 1e9 - self.fees_sol()), float(st["mc"])
         else:
             mc = float(p.extra.get("last_mc") or p.entry_mc)
@@ -1390,8 +1445,38 @@ class RealTrader:
             await self._say(f"{'✅' if pnl > 0 else '❌'} {MODE_ICON.get(mode, '')} Продал "
                             f"${fmt.esc(p.symbol or '?')}: {pct:+.0%} ({pnl * sol_usd:+.2f}$) · {note} · "
                             f"за день {self.day_pnl[mode] * sol_usd:+.2f}$")
+        await self._profit_watch(mode, pnl, p)
         if mode == "live":
             await self._check_stops()
+
+    async def _profit_watch(self, mode: str, pnl: float, p: Position) -> None:
+        """23.11: крупный плюс со сделки и ступени плюса за день — короткими сообщениями; в бою — замок прибыли дня:
+        плюс дошёл до real_lock_after_usd и упал ниже real_lock_keep от лучшего за день — новых входов до полуночи нет."""
+        if mode != "live" and not self.get("real_notify_shadow"):
+            return
+        if not hasattr(self, "day_peak"):
+            self.day_peak, self.day_note, self.day_locked = {}, {}, set()
+        sol_usd = self.sol_usd()
+        usd, day = pnl * sol_usd, self.day_pnl.get(mode, 0.0) * sol_usd
+        icon = MODE_ICON.get(mode, "")
+        name = S.KIND_NAMES.get(str(p.extra.get("kind")), "")
+        if usd >= float(self.get("real_big_win_usd")):
+            await self._say(f"💰 {icon} +${usd:.0f} · ${fmt.esc(p.symbol or '?')} · {name}")
+        step = float(self.get("real_day_note_usd"))
+        level = int(day // step) if day > 0 else 0
+        if level > int(self.day_note.get(mode, 0)):
+            self.day_note[mode] = level
+            start = getattr(self, "day_start_balance", None)
+            grow = (f" · баланс ×{(start / 1e9 * sol_usd + day) / (start / 1e9 * sol_usd):.2f}"
+                    if mode == "live" and start else "")
+            await self._say(f"📈 {icon} За сегодня +${day:.0f}{grow}")
+        self.day_peak[mode] = max(float(self.day_peak.get(mode, 0.0)), day)
+        peak = self.day_peak[mode]
+        if (mode == "live" and mode not in self.day_locked and peak >= float(self.get("real_lock_after_usd"))
+                and day < float(self.get("real_lock_keep")) * peak):
+            self.day_locked.add(mode)
+            await self._say(f"🔒 {icon} Берегу прибыль: за день было +${peak:.0f}, сейчас +${day:.0f} — новых входов "
+                            "нет до полуночи, открытые закроются по правилам.")
 
     # ------------------------------------------------------------------ защита
     async def _check_stops(self) -> None:
