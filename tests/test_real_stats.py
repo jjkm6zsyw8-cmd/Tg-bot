@@ -43,3 +43,28 @@ async def test_real_numbers_by_method_and_wallet():
         assert block[1].startswith("📊 <b>Реальные цифры</b>") and any("<pre>" in x for x in block)
     finally:
         await db.close()
+
+
+async def test_newdev_buckets_by_entry_price():
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        await db.kv_set("sol_usd", {"price": 100.0})
+        for i, (mc, mig, pnl) in enumerate(((30.0, False, -0.02), (65.0, True, 0.4), (70.0, False, -0.05))):
+            await db.execute("""INSERT INTO tokens(mint, signature, deployer, current_owner, created_at, created_slot,
+                                    migrated_at) VALUES ($1, 's', 'D', 'D', now(), 100,
+                                    CASE WHEN $2 THEN now() END)""", f"N{i}", mig)
+            await db.execute(
+                """INSERT INTO real_positions(mode, kind, mint, opened_at, closed_at, cost_sol, tokens, entry_mc,
+                       entry_slot, pnl_sol, pnl_pct, extra) VALUES ('shadow', 'newdev', $1, now(), now(), 0.1, 1, $2,
+                       104, $3::float8, $3::float8 * 10, '{"detect_ms": 1}')""", f"N{i}", mc, pnl)
+        lines = await RS.newdev_lines(db)
+        table = next(x for x in lines if x.startswith("<pre>")).split("<pre>")[1].split("</pre>")[0].splitlines()
+        assert table[1].split() == ["<35", "1", "0", "−$2.00"] and table[2].split() == ["57–80", "2", "1", "+$35"]
+        assert "через 4 блок. после запуска" in lines[1]
+    finally:
+        await db.close()

@@ -54,6 +54,7 @@ SHADOW_SKIP = {"copy"}
 NEWDEV = "Z"                     # сигнал «новый дев с крупной покупкой» (бумажного портфеля нет — только реальный бот)
 NEWDEV_MAX_MC = 65.0             # дороже — лотерея не окупается (MC 65: окупаемость с 11% ухода на PumpSwap)
 NEWDEV_SHADOW_MAX = 150          # «новый дев» в тени: своих позиций одновременно (держит до 1 ч)
+NEWDEV_MAX_HOLD_S = 3600.0       # «новый дев»: любое правило — не дольше часа
 KINDS = S.KIND_NAMES
 SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
 # тренд — без покупки трейдера в блоке: возраст сигнала считаем от алерта (DexScreener опрашивается раз в 5 с,
@@ -232,7 +233,12 @@ class RealTrader:
                     "time_stop_gain": None, "max_hold_s": float(p.extra.get("w_hold") or 1.0)}
         if rule == "L":
             return S.LOTTERY
-        return SCHEMES[rule] if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
+        sc = SCHEMES[rule] if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
+        if p.extra.get("kind") == "newdev" and float(sc.get("max_hold_s") or 1e9) > NEWDEV_MAX_HOLD_S:
+            # запуск: монета, которая за час не ушла на PumpSwap, почти наверняка мертва; у R стоп −50% ниже «пола»
+            # кривой — без предела мёртвая монета висела бы сутки и тратила запросы цены
+            sc = {**sc, "max_hold_s": NEWDEV_MAX_HOLD_S}
+        return sc
 
     def scheme_for(self, kind: str | None) -> dict[str, Any]:
         """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага): у smart и

@@ -113,6 +113,21 @@ async def newdev_lines(db: Any) -> list[str]:
                    + f" · закрыто {r['closed']}, в плюсе {r['w']}")
     if skips:
         out.append(f"не купили — цена уже убежала: {skips}")
+    # по цене входа: где плюс — сколько дошли до PumpSwap и итог закрытых (тень, $ по ставке)
+    sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
+    rows = await db.fetch(
+        """SELECT CASE WHEN p.entry_mc < 35 THEN 1 WHEN p.entry_mc < 45 THEN 2 WHEN p.entry_mc < 57 THEN 3
+                       WHEN p.entry_mc < 80 THEN 4 ELSE 5 END b, count(*) n,
+                  count(*) FILTER (WHERE t.migrated_at IS NOT NULL) mig,
+                  COALESCE(sum(p.pnl_sol) FILTER (WHERE p.closed_at IS NOT NULL), 0) s
+           FROM real_positions p LEFT JOIN tokens t ON t.mint = p.mint
+           WHERE p.kind = 'newdev' AND p.opened_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1""")
+    if rows:
+        names = {1: "<35", 2: "35–45", 3: "45–57", 4: "57–80", 5: "80+"}
+        table = [f"{'MC входа':<9}{'сд':>5}{'PumpSwap':>9}{'итог':>9}"]
+        for r in rows:
+            table.append(f"{names[r['b']]:<9}{r['n']:>5}{r['mig']:>9}{_usd(float(r['s']) * sol_usd):>9}")
+        out.append("<pre>" + "\n".join(table) + "</pre>")
     return out
 
 
