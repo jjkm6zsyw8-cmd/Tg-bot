@@ -608,7 +608,7 @@ async def test_newdev_lottery_method(db):
     p = only(tr)
     assert p.extra["kind"] == "newdev" and p.extra["mode"] == "shadow"
     sc = tr.scheme_of(p)
-    assert sc["stop"] is None and sc["trail"] == 0.40 and sc["ignore_emergency"] and sc["max_hold_s"] == 3 * 3600
+    assert sc["stop"] is None and sc["trail"] == 0.40 and sc["ignore_emergency"] and sc["max_hold_s"] == 3600
     assert any(t.extra.get("rule") == "L" for t in tr.trials.values())          # проба L — на каждом входе
     # дев и его кластер продают — позиция остаётся (лотерея до PumpSwap)
     await trade(tr, chain, cheap, trader="DEV", is_buy=False, eff=SimpleNamespace(cluster_sell=True))

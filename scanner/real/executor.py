@@ -53,6 +53,7 @@ SHADOW_MAX_OPEN = 30                  # тень-замер: столько по
 SHADOW_SKIP = {"copy"}
 NEWDEV = "Z"                     # сигнал «новый дев с крупной покупкой» (бумажного портфеля нет — только реальный бот)
 NEWDEV_MAX_MC = 65.0             # дороже — лотерея не окупается (MC 65: окупаемость с 11% ухода на PumpSwap)
+NEWDEV_SHADOW_MAX = 150          # «новый дев» в тени: своих позиций одновременно (держит до 1 ч)
 KINDS = S.KIND_NAMES
 SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
 # тренд — без покупки трейдера в блоке: возраст сигнала считаем от алерта (DexScreener опрашивается раз в 5 с,
@@ -473,11 +474,19 @@ class RealTrader:
             return "сигнал опоздал"
         if mint in self._busy or any(p.mint == mint for p in self.positions.values()):
             return "уже есть позиция по монете"
-        taken = sum(1 for p in self.positions.values() if p.extra.get("mode") == mode) \
-            + sum(1 for m in self._busy.values() if m == mode)
         free = mode == "shadow" and bool(self.get("real_shadow_free"))   # тень — замер: все сигналы, без стопа
-        if taken >= (SHADOW_MAX_OPEN if free else int(self.get("real_max_open"))):
-            return "лимит открытых позиций"
+        if kind == "newdev" and mode == "shadow":
+            # свой лимит: лотерея — десятки позиций сразу, места остальных методов не занимает
+            taken = sum(1 for p in self.positions.values() if p.extra.get("mode") == mode
+                        and p.extra.get("kind") == "newdev")
+            if taken >= NEWDEV_SHADOW_MAX:
+                return "лимит открытых позиций"
+        else:
+            taken = sum(1 for p in self.positions.values() if p.extra.get("mode") == mode
+                        and not (mode == "shadow" and p.extra.get("kind") == "newdev")) \
+                + sum(1 for m in self._busy.values() if m == mode)
+            if taken >= (SHADOW_MAX_OPEN if free else int(self.get("real_max_open"))):
+                return "лимит открытых позиций"
         self._roll_day()
         sol_usd = self.sol_usd()
         if not free and -self.day_pnl.get(mode, 0.0) * sol_usd >= float(self.get("real_day_stop_usd")):
