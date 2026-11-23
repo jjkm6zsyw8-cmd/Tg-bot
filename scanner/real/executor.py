@@ -669,9 +669,10 @@ class RealTrader:
         if user is not None and st["extra"]:
             self.balance = st["extra"][0].lamports if st["extra"][0] is not None else 0
             self._balance_at = time.time()
-        if kind == "newdev" and float(st["mc"] or 0) > NEWDEV_MAX_MC:
-            # окупается, только если вход дешёвый: при MC 65 нужна доля ухода на PumpSwap 11%, при 45 — 5%
-            return self._skip(mode, kind, f"цена уже убежала: MC {float(st['mc']):.0f} SOL > {NEWDEV_MAX_MC:.0f}")
+        cap = float(data.get("newdev_cap") or NEWDEV_MAX_MC)
+        if kind == "newdev" and float(st["mc"] or 0) > cap:
+            # окупается, только если вход дешёвый (лотерея до PumpSwap: потеря до «пола» кривой ~28 SOL)
+            return self._skip(mode, kind, f"цена уже убежала: MC {float(st['mc']):.0f} SOL > {cap:.0f}")
         trend = kind == "trend"
         # у тренда нет покупки трейдера: блок и цена сигнала от другого алерта этой монеты ему не судьи
         trig_slot = 0 if trend else int(data.get("trigger_slot") or 0)
@@ -705,7 +706,10 @@ class RealTrader:
                 "stake": stake, "min_out": min_out, "slip": slip, "mc": st["mc"],
                 "rule": self.get(S.SCHEME_KEYS[kind]),
                 "filter": self.get("real_smart_filter") if kind == "smart" else "all",
-                "best_exit": self.best_exit(data.get("_followed")), "followed": bool(data.get("_followed"))}
+                "best_exit": self.best_exit(data.get("_followed")), "followed": bool(data.get("_followed")),
+                "fast": bool(data.get("fast")), "detect_ms": data.get("detect_ms"),
+                "age_s": (round(time.time() - float(data["trigger_ts"]), 3) if data.get("trigger_create")
+                          and data.get("trigger_ts") else None)}
         if base["best_exit"]:
             base["rule"] = base["best_exit"]       # «за ним» — продаём по его лучшему выходу (wallet_rules)
         if mode == "live":
@@ -884,7 +888,8 @@ class RealTrader:
             base.get("lag_s"), entry_mc, slot, cost_sol, tokens_raw / 1e6, tokens_raw, rent_sol, sig,
             {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9, "rule": base.get("rule"),
              "filter": base.get("filter"), "best_exit": base.get("best_exit"),
-             "followed": base.get("followed", False)}, self.wid)
+             "followed": base.get("followed", False), "fast": base.get("fast", False),
+             "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s")}, self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
                                    tokens_raw=tokens_raw, position_id=pid, note=note)

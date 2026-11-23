@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import heapq
 import logging
 import time
@@ -35,7 +36,8 @@ from .state import TokenState, TradeRow
 
 log = logging.getLogger(__name__)
 DAILY_SENT_KEY = "daily:sent"
-NEWDEV_MIN_BUY = 10.0                          # «новый дев»: покупка дева на запуске от 10 SOL                  # дата последнего разбора дня — не слать повторно после перезапуска
+# «новый дев»: (покупка дева на запуске от, до, SOL; максимум капитализации входа, SOL — дороже не окупается)
+NEWDEV_RANGES = ((0.5, 2.0, 35.0), (10.0, 1e9, 57.0))                  # дата последнего разбора дня — не слать повторно после перезапуска
 AUTO_MARK_NAMES = {"great": "🚀 отлично", "good": "✅ успех", "fail": "❌ провал", "scam": "☠️ скам (дев слил сразу)"}
 
 
@@ -127,6 +129,8 @@ class Engine:
         self.cur_token = 0
         self.cur_trade = 0
         self.wake = asyncio.Event()
+        self._dev_last: dict[str, float] | None = None     # «новый дев»: деплоер → последний запуск (7 дней)
+        self._newdev_done: set[str] = set()
         self.slots_dirty = asyncio.Event()
         self.timers: list[tuple[float, int, str, str]] = []
         self._tseq = 0
@@ -255,6 +259,8 @@ class Engine:
             await conn.add_listener("meta", lambda _c, _p, _ch, payload: asyncio.create_task(self._on_meta(payload)))
             await conn.add_listener("settings", lambda *_: asyncio.create_task(self.reload_settings()))
             await conn.add_listener("jobs", lambda *_: self.wake.set())
+            await conn.add_listener("fastcreate", lambda _c, _p, _ch, payload: asyncio.create_task(
+                self._fast_create(payload)))
             while True:
                 await asyncio.sleep(3600)
         finally:
@@ -701,13 +707,67 @@ class Engine:
         await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev",
                                   trader=dev_addr)
 
+    def newdev_cap(self, buy: float) -> float | None:
+        """«Новый дев»: подходит ли покупка дева на запуске и до какой капитализации входа метод окупается.
+        Диапазоны (анализ 8–22.11, вход в первом блоке): 0.5–2 SOL — уходят на PumpSwap ~2.4%, окупается при входе
+        до ~35 SOL; 10+ SOL — ~9%, до ~57 SOL. 5–10 SOL в минусе при любом входе — не берём."""
+        for lo, hi, cap in self.cfg.get("newdev_ranges") or NEWDEV_RANGES:
+            if float(lo) <= buy < float(hi):
+                return float(cap)
+        return None
+
+    async def _dev_seen(self) -> dict[str, float]:
+        """Девы, запускавшие монеты за 7 дней: деплоер → время последнего запуска (в памяти — решение за микросекунды)."""
+        if self._dev_last is None:
+            if getattr(self, "_dev_load", None) is None:        # один запрос, даже если запусков пришло сразу несколько
+                async def load() -> dict[str, float]:
+                    rows = await self.db.fetch(
+                        """SELECT deployer, extract(epoch FROM max(created_at)) AS t FROM tokens
+                           WHERE created_at > now() - interval '7 days' GROUP BY deployer""")
+                    return {r["deployer"]: float(r["t"]) for r in rows}
+                self._dev_load = asyncio.create_task(load())
+            loaded = await self._dev_load
+            if self._dev_last is None:
+                self._dev_last = loaded
+        return self._dev_last
+
+    async def _fast_create(self, payload: str) -> None:
+        """23.11: быстрый вход «новый дев» — запуск приходит из приёмника сразу (NOTIFY), решение без запросов
+        к базе, сигнал реальному боту в тот же миг. Обычный путь (_newdev_launch) остаётся запасным."""
+        try:
+            ev = json.loads(payload)
+            mint, dev = ev["mint"], ev.get("deployer") or ""
+            seen = await self._dev_seen()
+            last = seen.get(dev)
+            seen[dev] = time.time()
+            if self.real is None or mint in self._newdev_done or ev.get("quote"):
+                return
+            buy = float(ev.get("buy") or 0)
+            cap = self.newdev_cap(buy)
+            mc = float(ev.get("v_sol") or 30) / float(ev.get("v_tokens") or 1.073e9) * 1e9
+            if cap is None or mc > 100 or (last is not None and time.time() - last < 7 * 86400):
+                return
+            self._newdev_done.add(mint)
+            rx = float(ev.get("rx") or time.time())
+            data = {"modes": ["newdev"], "symbol": ev.get("symbol") or "", "mc": mc, "signal": "новый дев",
+                    "source_wallet": dev, "note": f"новый дев купил на запуске {buy:.2f} SOL · быстрый вход",
+                    "trigger_slot": int(ev.get("slot") or 0), "trigger_sig": ev.get("sig"), "trigger_mc": mc,
+                    "trigger_at": rx, "trigger_create": True, "trigger_ts": rx, "newdev_cap": cap, "fast": True,
+                    "detect_ms": round((time.time() - rx) * 1000)}
+            await self.real.on_signal(mint, "normal", None, data, dev, {"Z"})
+        except Exception:  # noqa: BLE001
+            log.exception("быстрый вход «новый дев»")
+
     async def _newdev_launch(self, st: TokenState, rec: Any) -> None:
         """23.11: метод «новый дев с крупной покупкой» (только реальный бот, тень). Анализ 128 тыс. запусков
         (поиск 11–16.11, проверка 17–22.11): монеты дева без монет за 7 дней, купившего на запуске 10+ SOL, уходят на
         PumpSwap в 8.5–9.8% случаев против 1.6–2.3% у всех. Вход сразу на запуске, выход — правило L."""
         try:
+            if st.mint in self._newdev_done:
+                return                               # уже вошли быстрым путём
             buy = float(rec["initial_buy_sol"] or 0)
-            if buy < float(self.cfg.get("newdev_min_buy_sol", NEWDEV_MIN_BUY)) or float(rec["initial_mc_sol"] or 0) > 100:
+            cap = self.newdev_cap(buy)
+            if cap is None or float(rec["initial_mc_sol"] or 0) > 100:
                 return
             created = rec["created_at"]
             if time.time() - created.timestamp() > float(self.cfg.get("newdev_max_age_s", 15)):
@@ -722,7 +782,8 @@ class Engine:
                     "source_wallet": st.deployer, "note": f"новый дев купил на запуске {buy:.1f} SOL",
                     "trigger_slot": int(rec["created_slot"] or 0), "trigger_sig": rec["signature"],
                     "trigger_mc": float(st.mc or 0) or 1.0, "trigger_at": time.time(), "trigger_create": True,
-                    "trigger_ts": created.timestamp()}
+                    "trigger_ts": created.timestamp(), "newdev_cap": cap}
+            self._newdev_done.add(st.mint)
             await self.real.on_signal(st.mint, "normal", None, data, st.deployer, {"Z"})
         except Exception:  # noqa: BLE001 — метод-проба не должен мешать остальному
             log.exception("новый дев: %s", st.mint)

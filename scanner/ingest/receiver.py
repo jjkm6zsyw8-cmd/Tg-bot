@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -134,6 +135,19 @@ class Receiver:
         except asyncio.QueueFull:
             self.dropped += 1
 
+    async def _fast_create(self, ev: TokenCreated) -> None:
+        """23.11: запуск — сразу в аналитику (NOTIFY с данными события), мимо пакетной записи в базу: метод
+        «новый дев» покупает на запуске, и каждые 0.4 с — это блок, за который снайперы поднимают цену."""
+        try:
+            payload = json.dumps({
+                "mint": ev.mint, "deployer": ev.deployer, "creator": ev.creator, "symbol": ev.symbol[:30],
+                "sig": ev.signature, "slot": ev.slot, "buy": ev.initial_buy_sol, "v_sol": ev.v_sol,
+                "v_tokens": ev.v_tokens, "src": ev.source, "rx": ev.received_at.timestamp(),
+                "quote": ev.quote_mint})
+            await self.db.execute("SELECT pg_notify('fastcreate', $1)", payload)
+        except Exception as exc:  # noqa: BLE001 — быстрый путь не должен мешать записи
+            log.debug("fastcreate: %s", exc)
+
     async def worker(self) -> None:
         while True:
             ev = await self.queue.get()
@@ -198,6 +212,7 @@ class Receiver:
             self.last_signature = ev.signature
         if isinstance(ev, TokenCreated):
             self.buf_tokens.append(ev)
+            asyncio.create_task(self._fast_create(ev))
             self.created_mono[ev.mint] = time.monotonic()
             self.known_mints[ev.mint] = time.time()
             if ev.slot is None:

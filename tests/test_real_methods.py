@@ -633,13 +633,38 @@ async def test_engine_newdev_launch_signal():
             return self.prev
     e = Engine.__new__(Engine)
     e.settings, e.real = SimpleNamespace(effective=lambda: {}), Real()
+    e._newdev_done = set()
     st = SimpleNamespace(mint="M", deployer="DEV", symbol="S", mc=38.0)
     rec = {"initial_buy_sol": 12.0, "initial_mc_sol": 28.0, "created_at": datetime.now(timezone.utc),
            "created_slot": 100, "signature": "sig"}
     e.db = Db(0)
     await e._newdev_launch(st, rec)
     assert sent and sent[0][2] == {"Z"} and sent[0][1]["modes"] == ["newdev"] and sent[0][1]["trigger_create"]
-    e.db = Db(3)                                                    # у дева уже были монеты за 7 дней
+    e.db, e._newdev_done = Db(3), set()                             # у дева уже были монеты за 7 дней
     await e._newdev_launch(st, rec)
     await e._newdev_launch(st, {**rec, "initial_buy_sol": 2.0})     # мелкая покупка
     assert len(sent) == 1
+
+
+async def test_fast_create_newdev_decision():
+    """23.11: быстрый вход — запуск из приёмника (NOTIFY) → решение без базы → сигнал реальному боту."""
+    import json as _json
+    from types import SimpleNamespace
+    from scanner.analytics.engine import Engine
+    sent = []
+
+    class Real:
+        async def on_signal(self, mint, level, aid, data, trader, targets):
+            sent.append((mint, data))
+    e = Engine.__new__(Engine)
+    e.settings, e.real = SimpleNamespace(effective=lambda: {}), Real()
+    e._dev_last, e._newdev_done = {"OLD": time.time() - 3600}, set()
+    ev = {"mint": "M1", "deployer": "NEW", "buy": 1.0, "v_sol": 31.0, "v_tokens": 1.04e9, "rx": time.time(), "sig": "s"}
+    await e._fast_create(_json.dumps(ev))
+    assert sent and sent[0][1]["newdev_cap"] == 35.0 and sent[0][1]["fast"] and sent[0][1]["trigger_create"]
+    await e._fast_create(_json.dumps({**ev, "mint": "M2"}))          # тот же дев второй раз — уже не новый
+    await e._fast_create(_json.dumps({**ev, "mint": "M3", "deployer": "OLD"}))
+    await e._fast_create(_json.dumps({**ev, "mint": "M4", "deployer": "X", "buy": 7.0}))   # 5–10 SOL — не берём
+    assert len(sent) == 1
+    await e._fast_create(_json.dumps({**ev, "mint": "M5", "deployer": "BIG", "buy": 12.0}))
+    assert sent[-1][1]["newdev_cap"] == 57.0 and "M1" in e._newdev_done

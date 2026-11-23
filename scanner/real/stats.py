@@ -88,6 +88,34 @@ async def follow_lines(db: Any, sol_usd: float, limit: int = 12) -> list[str]:
     return out
 
 
+async def newdev_lines(db: Any) -> list[str]:
+    """«Новый дев» (быстрый вход на запуске): по какой цене бот реально успевает купить — от этого зависит, окупается
+    ли метод (0.5–2 SOL — вход до ~35 SOL MC, 10+ SOL — до ~57)."""
+    r = await db.fetchrow(
+        """SELECT count(*) n, percentile_cont(0.5) WITHIN GROUP (ORDER BY p.entry_mc) mc,
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY p.entry_slot - t.created_slot) blocks,
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY (p.extra->>'detect_ms')::float) det,
+                  count(*) FILTER (WHERE p.closed_at IS NOT NULL AND p.pnl_sol > 0) w,
+                  count(*) FILTER (WHERE p.closed_at IS NOT NULL) closed
+           FROM real_positions p LEFT JOIN tokens t ON t.mint = p.mint
+           WHERE p.kind = 'newdev' AND p.opened_at > now() - interval '7 days'""")
+    skips = await db.fetchval(
+        """SELECT count(*) FROM real_skips WHERE kind = 'newdev' AND why LIKE 'цена уже убежала%'
+           AND at > now() - interval '7 days'""")
+    if not (r and r["n"]) and not skips:
+        return []
+    out = ["<b>Новый дев</b> (вход на запуске, 7 дн)"]
+    if r and r["n"]:
+        out.append(f"входов {r['n']} · MC входа медиана <b>{float(r['mc'] or 0):.0f} SOL</b> (окупается: до ~35 при "
+                   f"покупке дева 0.5–2 SOL, до ~57 при 10+)"
+                   + (f" · через {float(r['blocks']):.0f} блок. после запуска" if r["blocks"] is not None else "")
+                   + (f" · узнали о запуске → решили за {float(r['det']):.0f} мс" if r["det"] is not None else "")
+                   + f" · закрыто {r['closed']}, в плюсе {r['w']}")
+    if skips:
+        out.append(f"не купили — цена уже убежала: {skips}")
+    return out
+
+
 async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
     lines = ["📊 <b>Реальные цифры</b> — только реальный бот, $ по твоей ставке", ""]
@@ -99,6 +127,9 @@ async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     fol = await follow_lines(db, sol_usd)
     if fol:
         lines += ["", *fol]
+    nd = await newdev_lines(db)
+    if nd:
+        lines += ["", *nd]
     opened = await db.fetchval("SELECT count(*) FROM real_positions WHERE closed_at IS NULL")
     lines += ["", f"Открыто сейчас: {opened}"]
     if S.get(cfg, "real_only_follow"):
