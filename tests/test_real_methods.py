@@ -131,7 +131,7 @@ async def test_trend_method_in_real_bot(db):
     await send(m2, time.time() - 60)
     assert skipped(tr, "тренд: сигнал опоздал")
     await send(m3, time.time())
-    assert skipped(tr, "тренд: не pump.fun и не PumpSwap")
+    assert skipped(tr, "метод «тренды на других биржах» выключен")      # другие биржи — метод trendj
     await send(m2, None)
     assert skipped(tr, "тренд: нет времени сигнала") and len(tr.positions) == 1
     chain.set_mc(m1, 36.0)                                    # −10%: стоп G −8%
@@ -697,3 +697,42 @@ async def test_mydev_by_dev_signature(db):
     await asyncio.sleep(0.05)
     assert not tr.positions
     assert (await db.fetchval("SELECT exit_reason FROM real_positions")) == "target"
+
+
+async def test_trend_on_other_dex_goes_to_jupiter_shadow(db, monkeypatch):
+    """23.11: тренд на монете не с pump.fun (Raydium, Meteora…) — тень по котировке Jupiter (метод trendj), выход —
+    по ценам Jupiter; тренд pump.fun — как раньше."""
+    from types import SimpleNamespace
+    chain = FakeChain()
+    other = pk("raydium-coin")                                 # нет ни кривой, ни пула PumpSwap
+    from scanner.real import pump as _pump
+    chain.programs[str(other)] = _pump.TOKEN                   # монета есть в сети, но торгуется на другой бирже
+    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=True)
+
+    class Ext:
+        price = 0.0002                                         # $ за токен → MC = 0.0002 × 1e9 / 150 ≈ 1333 SOL
+
+        async def jup_price(self, mint, ttl=None):
+            return self.price
+
+        async def jup_prices(self, mints, ttl=3.0):
+            return {m: self.price for m in mints}
+    tr.e.ext = Ext()
+    await tr.start()
+    data = {"modes": ["trend"], "symbol": "RAY", "trend_at": time.time(), "trigger_at": time.time()}
+    await tr.on_signal(str(other), "normal", 7, data, None, {"T"})
+    assert tr.positions, dict(tr.skips)
+    p = only(tr)
+    assert p.extra["kind"] == "trendj" and p.extra["venue"] == "jupiter" and p.extra["mode"] == "shadow"
+    assert 1330 < p.entry_mc < 1360                            # котировка + 1% проскальзывания
+    assert all(t.extra.get("venue") == "jupiter" for t in tr.trials.values()) and tr.trials
+    # цена Jupiter +40% → G продаёт на +25%
+    from scanner.real.desk import RealDesk
+    desk = RealDesk.__new__(RealDesk)
+    Ext.price = 0.00028
+    await desk._poll_jupiter([tr], [(tr, x) for x in tr.watched()])
+    await asyncio.sleep(0.1)
+    assert not tr.positions
+    row = await db.fetchrow("SELECT kind, venue, exit_reason, pnl_pct FROM real_positions")
+    assert row["kind"] == "trendj" and row["venue"] == "jupiter" and row["exit_reason"] == "take_profit"
+    assert 0.25 < row["pnl_pct"] < 0.40

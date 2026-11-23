@@ -35,9 +35,10 @@ LOTTERY = {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": 0.40, "trail_
            "ignore_trader_sell": True}
 SCHEME_KEYS = {"smart": "real_scheme", "mydev": "real_scheme_mydev", "bigcopy": "real_scheme_bigcopy",
                "copy": "real_scheme_copy", "swing": "real_scheme_swing", "trend": "real_scheme_trend",
-               "newdev": "real_scheme_newdev"}
+               "newdev": "real_scheme_newdev", "trendj": "real_scheme_trendj"}
 DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "D", "real_scheme_bigcopy": "G", "real_scheme_copy": "G",
-                   "real_scheme_swing": "R", "real_scheme_trend": "G", "real_scheme_newdev": "L"}
+                   "real_scheme_swing": "R", "real_scheme_trend": "G", "real_scheme_newdev": "L",
+                   "real_scheme_trendj": "G"}
 SCHEME_TEXT = {"A": "всё на +25%, без стопа, до 30 мин", "B": "70% на +25%, остаток трейлинг 15%, до 30 мин",
                "G": "всё на +25%, стоп −8%, нет +10% за 5 мин — выход", "R": "трейлинг 35% после +30%, стоп −50%, до суток",
                "L": "лотерея до PumpSwap: держать до ×3, дальше трейлинг 40%, без стопа, до 1 ч",
@@ -114,6 +115,9 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
                     "Дев без монет за 7 дней купил на запуске 0.5–2 SOL или от 10 SOL — вход сразу (быстрый путь), "
                     "только если цена ещё низкая; держать до роста ×3 (дальше трейлинг 40%), без стопа, до 1 ч. "
                     "Пока проверяется в тени."),
+    "real_trendj": ("Тренды на других биржах (Raydium, Meteora…) — только тень", False,
+                    "Монеты трендов не с pump.fun: вход и выход по котировке Jupiter, без транзакции. По бумаге "
+                    "20–22.11 — +10.7% на сделку на 85 сделках. Покупки на деньги через Jupiter пока нет."),
     "real_mev_protect": ("Обходить валидаторов-«сэндвичеров»", True, "Параметр mev-protect у Helius Sender."),
     "real_close_ata": ("Закрывать пустые счета токенов (возврат залога)", True, "≈0.0015 SOL с каждой монеты."),
     "real_notify_shadow": ("Сообщения о сделках тени", False, ""),
@@ -183,7 +187,7 @@ def method_name(cfg: dict[str, Any], kind: str) -> str:
             return "Smart M" if rule == "A" else f"Smart (отбор M) → {rule}"
         return f"Smart {rule}"
     base = {"mydev": "Мой дев", "bigcopy": "Крупные копии", "copy": "Копии", "swing": "Смарт-ракеты",
-            "trend": "Тренды", "newdev": "Новый дев"}[kind]
+            "trend": "Тренды", "newdev": "Новый дев", "trendj": "Тренды (др. биржи)"}[kind]
     default = DEFAULT_SCHEMES[SCHEME_KEYS[kind]]
     out = f"{base} {rule}" if kind == "mydev" else (base if rule == default else f"{base} → {rule}")
     if kind == "mydev" and not get(cfg, "real_live_mydev"):
@@ -241,15 +245,19 @@ METHODS: dict[str, tuple[str, str, str]] = {
     # уходят на PumpSwap в 8.5–9.8% случаев (все монеты — 1.6–2.3%); вход сразу на запуске, выход L. Только тень,
     # пока нет результата на реальных ценах; бой — только по выключателю владельца
     "newdev": ("Новый дев с крупной покупкой (лотерея до PumpSwap)", "real_newdev", "Z"),
+    # 23.11: тренды на монетах НЕ с pump.fun (Raydium, Meteora и др.) — бумага T 20–22.11: 85 сделок, в плюсе каждый
+    # день, +$91 (+10.7% на сделку), а на pump.fun −$26 на 76. Реальный бот там не торгует — тень по котировке
+    # Jupiter (без транзакции), бой — только когда появится покупка через Jupiter
+    "trendj": ("Тренды на других биржах (Raydium, Meteora…) — тень по Jupiter", "real_trendj", "TJ"),
 }
 KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", "bigcopy": "крупная копия",
-              "swing": "смарт-ракета", "trend": "тренд", "newdev": "новый дев"}
+              "swing": "смарт-ракета", "trend": "тренд", "newdev": "новый дев", "trendj": "тренд (др. биржи)"}
 
 
 def methods_summary(cfg: dict[str, Any]) -> str:
     """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»; своя ставка — в скобках."""
     out = []
-    for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev"):
+    for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj"):
         if get(cfg, METHODS[kind][1]):
             stake = method_stake(cfg, kind)
             out.append(method_name(cfg, kind) + (f" ${stake:g}" if stake else ""))

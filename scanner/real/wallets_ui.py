@@ -298,12 +298,13 @@ async def create_and_wait(db: Any, cfg: dict[str, Any], name: str, rpc: Any = No
 
 # ---------------------------------------------------------------------- методы торговли
 PAPER_DAYS = 7
-ORDER = ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev")
+ORDER = ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj")
 ABOUT = {"smart": "покупка smart-кошелька", "mydev": "запуск монеты девом из вашего списка",
          "bigcopy": "трейдер из списка зашёл от 5 SOL", "copy": "покупка кошелька из списка или кандидата разведки",
          "swing": "покупка держателя (кошелёк, который держит монеты часами)",
          "trend": "монета уже растёт (DexScreener), вход после отката; только pump.fun и PumpSwap",
-         "newdev": "дев без монет за 7 дней купил на запуске 0.5–2 или от 10 SOL — вход сразу на запуске, пока цена низкая"}
+         "newdev": "дев без монет за 7 дней купил на запуске 0.5–2 или от 10 SOL — вход сразу на запуске, пока цена низкая",
+         "trendj": "тренд (DexScreener) на монете не с pump.fun — Raydium, Meteora и др.; цена — котировка Jupiter"}
 
 
 async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float]]:

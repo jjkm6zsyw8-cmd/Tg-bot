@@ -147,6 +147,21 @@ class RealDesk:
         except Exception:  # noqa: BLE001 — автонастройка не должна мешать торговле
             log.exception("автонастройка")
 
+    async def _poll_jupiter(self, lanes: list[Any], jup: list[tuple[Any, Any]]) -> None:
+        ext = getattr(lanes[0].e, "ext", None)
+        if ext is None:
+            return
+        try:
+            prices = await ext.jup_prices(list({p.mint for _, p in jup}))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("реальный бот: цены Jupiter: %s", str(exc)[:120])
+            return
+        sol_usd = lanes[0].sol_usd()
+        for lane, p in jup:
+            v = prices.get(p.mint)
+            if v:
+                lane.on_state(p, {"venue": "jupiter", "mc": float(v) * 1e9 / sol_usd})
+
     async def poll_prices(self) -> None:
         """Цена открытых позиций всех кошельков — из сети, одним запросом на 16 монет (а не запрос на кошелёк)."""
         lanes = [lane for lane in self.lanes.values() if lane.watched()]
@@ -156,7 +171,12 @@ class RealDesk:
         if time.time() - self._last_poll < every:
             return
         self._last_poll = time.time()
-        mints = list(dict.fromkeys(p.mint for lane in lanes for p in lane.watched()))
+        # тренды на других биржах — цены Jupiter (у таких монет нет кривой pump.fun и пула PumpSwap)
+        jup = [(lane, p) for lane in lanes for p in lane.watched() if p.extra.get("venue") == "jupiter"]
+        if jup:
+            await self._poll_jupiter(lanes, jup)
+        mints = list(dict.fromkeys(p.mint for lane in lanes for p in lane.watched()
+                                   if p.extra.get("venue") != "jupiter"))
         for i in range(0, len(mints), 16):
             chunk = mints[i:i + 16]
             try:

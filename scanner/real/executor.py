@@ -52,6 +52,9 @@ SHADOW_MAX_OPEN = 30                  # тень-замер: столько по
 # тень тратила на них ~1700 симуляций в сутки из бесплатных запросов Helius
 SHADOW_SKIP = {"copy"}
 NEWDEV = "Z"                     # сигнал «новый дев с крупной покупкой» (бумажного портфеля нет — только реальный бот)
+JUP_VENUE = "jupiter"            # «тренды на других биржах»: позиция по котировке Jupiter (тень, без транзакции)
+JUP_SLIP = 0.01                  # проскальзывание входа и выхода по котировке Jupiter (сверх комиссии)
+OTHER_DEX = "не pump.fun и не PumpSwap"
 NEWDEV_MAX_MC = 65.0             # дороже — лотерея не окупается (MC 65: окупаемость с 11% ухода на PumpSwap)
 NEWDEV_SHADOW_MAX = 150          # «новый дев» в тени: своих позиций одновременно (держит до 1 ч)
 NEWDEV_MAX_HOLD_S = 3600.0       # «новый дев»: любое правило — не дольше часа
@@ -457,9 +460,10 @@ class RealTrader:
         followed = self.follow_mode(wallet)
         if not self.accept_new or (data.get("paper_only") and not followed):
             return                       # paper_only — копия только на бумагу (свой кошелёк вне рамок smart), не деньги
-        if not followed and self.get("real_only_follow") and "newdev" not in (data.get("modes") or []):
+        probe = not followed and bool(self.get("real_only_follow"))
+        if probe and not {"newdev", "trend"} & set(data.get("modes") or []):
             return                       # «только выбранные мной кошельки»: методы и замер тени не торгуют
-                                         # (кроме пробы «новый дев» — она в тени, пока проверяется)
+                                         # (кроме проб «новый дев» и трендов — они только в тени, пока проверяются)
         _SIGNAL.set((mint, alert_id))
         if followed:
             kind = next(iter(kinds_of(data, targets)), None)
@@ -469,10 +473,14 @@ class RealTrader:
             kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
                          and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
             mode = self.mode_for(kind) if kind else "off"
+            if probe and mode == "live":
+                mode = "shadow"
         if kind is None:
             return
         manual = followed and wallet not in (getattr(self, "follow_auto", None) or set())
-        tb = None if manual else self.tune_block(kind, data.get("source_wallet") or trader)
+        # тренд: биржа станет известна после запроса состояния — его стоп проверяется в _enter (pump.fun — «trend»,
+        # другие биржи — «trendj»)
+        tb = None if manual or kind == "trend" else self.tune_block(kind, data.get("source_wallet") or trader)
         if tb:
             return self._skip(mode, kind, tb)
         if kind == "mydev" and level != "strong" and self.get("real_mydev_strong_only") and not manual:
@@ -709,6 +717,12 @@ class RealTrader:
                 break
             await asyncio.sleep(STATE_RETRY_S)
             st = await self._state(mint, [user] if user is not None else None)
+        if kind == "trend":
+            if st.get("venue") is None and OTHER_DEX in str(st.get("why") or ""):
+                return await self._enter_jupiter(mint_s, alert_id, data, trader)
+            tb = self.tune_block("trend", None)
+            if tb:
+                return self._skip(mode, kind, tb)
         if st["why"]:
             return self._skip(mode, kind, st["why"])
         if user is not None and st["extra"]:
@@ -927,6 +941,40 @@ class RealTrader:
         await self._open(base, tokens_raw=tokens, cost_sol=cost, rent_sol=rent, sig=sig, slot=slot,
                          note=note, cu=None, fee_sol=fee, wait_ms=wait_ms, order_id=oid)
 
+    async def _enter_jupiter(self, mint_s: str, alert_id: int | None, data: dict[str, Any],
+                             trader: str | None) -> None:
+        """23.11: тренд на монете не с pump.fun (Raydium, Meteora…) — только тень: цена входа — котировка Jupiter + 1%
+        проскальзывания, сопровождение — цены Jupiter (desk.poll_prices), выход — по правилу метода «trendj»."""
+        kind = "trendj"
+        mode = self.mode_for(kind)
+        if mode == "off":
+            return self._skip("shadow", kind, "метод «тренды на других биржах» выключен")
+        tb = self.tune_block(kind, None)
+        if tb:
+            return self._skip("shadow", kind, tb)
+        ext = getattr(self.e, "ext", None)
+        jp = await ext.jup_price(mint_s) if ext is not None else None
+        if not jp:
+            return self._skip("shadow", kind, "другая биржа: нет цены Jupiter")
+        sol_usd = self.sol_usd()
+        mc = float(jp) * 1e9 / sol_usd                 # условная капитализация: цена × 1 млрд (как у бумаги T)
+        usd = S.method_stake(self.cfg, kind) or S.method_stake(self.cfg, "trend") or float(self.get("real_stake_usd"))
+        stake = int(usd / sol_usd * 1e9)
+        raw = int(stake * 1e6 / (mc * (1 + JUP_SLIP)))
+        if raw <= 0:
+            return self._skip("shadow", kind, "другая биржа: цена не разобрана")
+        base = {"mint": mint_s, "kind": kind, "mode": "shadow", "alert_id": alert_id, "trader": trader,
+                "symbol": str(data.get("symbol") or "")[:40], "venue": JUP_VENUE, "token_program": "",
+                "trigger_slot": None, "trigger_mc": None,
+                "lag_s": round(time.time() - float(data.get("trend_at") or time.time()), 3), "stake": stake,
+                "min_out": raw, "slip": JUP_SLIP, "mc": mc, "rule": self.get(S.SCHEME_KEYS[kind]), "filter": "all",
+                "best_exit": None, "followed": False, "fast": False, "detect_ms": None, "age_s": None,
+                "target_mc": None}
+        fee = self.fees_sol()
+        await self._open(base, tokens_raw=raw, cost_sol=stake / 1e9 + fee, rent_sol=0.0, sig=None, slot=None,
+                         note="другая биржа: котировка Jupiter, без транзакции", cu=None, fee_sol=fee, wait_ms=None,
+                         order_id=None)
+
     async def _open(self, base: dict[str, Any], *, tokens_raw: int, cost_sol: float, rent_sol: float, sig: str | None,
                     slot: int | None, note: str | None, cu: int | None, fee_sol: float,
                     wait_ms: int | None, order_id: int | None) -> None:
@@ -1060,7 +1108,8 @@ class RealTrader:
             mc = st["mc"]
         else:                                        # состояние не получили — оценка по последней цене потока
             mc = float(p.extra.get("last_mc") or p.entry_mc)
-            proceeds = sell_fill(mc, raw / 1e6, pump.FEE_BPS, self.fees_sol()).sol
+            sell_mc = mc * (1 - JUP_SLIP) if p.extra.get("venue") == JUP_VENUE else mc
+            proceeds = sell_fill(sell_mc, raw / 1e6, pump.FEE_BPS, self.fees_sol()).sol
         await self._settle(p, reason, share, raw, proceeds, mc, sig=None, slot=st.get("slot") or None, wait_ms=None,
                            fee=self.fees_sol())
 
@@ -1206,6 +1255,8 @@ class RealTrader:
                 base["alert_id"], entry_mc, cost_sol, tokens_raw, w_hold if rule == "W" else None)
             t = self._trial_position(r)
             t.extra["entry_slot"] = slot
+            if base.get("venue") == JUP_VENUE:
+                t.extra["venue"] = JUP_VENUE          # пробы тоже сопровождаются ценами Jupiter
             self.trials[t.id] = t
 
     def best_exit(self, wallet: str | None) -> str | None:
@@ -1261,7 +1312,8 @@ class RealTrader:
             proceeds, mc = max(0.0, self._quote_sell(st, raw) / 1e9 - self.fees_sol()), float(st["mc"])
         else:
             mc = float(p.extra.get("last_mc") or p.entry_mc)
-            proceeds = sell_fill(mc, raw / 1e6, pump.FEE_BPS, self.fees_sol()).sol
+            sell_mc = mc * (1 - JUP_SLIP) if p.extra.get("venue") == JUP_VENUE else mc
+            proceeds = sell_fill(sell_mc, raw / 1e6, pump.FEE_BPS, self.fees_sol()).sol
         p.proceeds_sol += proceeds
         p.extra["tokens_raw"] = have - raw
         p.tokens = p.extra["tokens_raw"] / 1e6
