@@ -30,7 +30,8 @@ async def test_research_export(tmp_path):
         await db.migrate()
         t0 = datetime.now(timezone.utc) - timedelta(hours=3)
         await db.execute("""INSERT INTO tokens(mint, signature, deployer, current_owner, created_at, created_slot,
-                                initial_mc_sol, twitter) VALUES ('M1', 's', 'DEV', 'DEV', $1, 1000, 28, 'x')""", t0)
+                                initial_mc_sol, twitter, name, symbol, image) VALUES ('M1', 's', 'DEV', 'DEV', $1, 1000,
+                                28, 'x', 'Doge; Moon', 'DOGE', 'https://i/1.png')""", t0)
         await db.execute("""INSERT INTO launches(mint, deployer, created_at, peak_mc, bundle_wallets, bundle_share,
                                 features) VALUES ('M1', 'DEV', $1, 90, 4, 0.3, '{"snipers": 5}')""", t0)
         for k, (who, buy, dt) in enumerate((("DEV", True, 0), ("SNIPE", True, 0.4), ("SNIPE", False, 3),
@@ -50,6 +51,7 @@ async def test_research_export(tmp_path):
         h = coins[0]
         c = dict(zip(h, coins[1]))
         assert c["mint"] == "M1" and c["socials"] == "1" and c["bundle_wallets"] == "4" and '"snipers":5' in c["features"]
+        assert c["name"] == "Doge, Moon" and c["symbol"] == "DOGE" and c["image"] == "https://i/1.png"
         tr = rows(folder / "trades_001.csv.gz")
         assert tr[0] == ["c", "t", "s", "w", "b", "sol", "tok", "mc", "vsol", "amm", "nb"] and len(tr) == 4
         assert tr[2][1] == "0.40" and tr[2][2] == "1" and tr[3][4] == "0"       # снайпер: блок +1, потом продажа

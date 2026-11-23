@@ -43,7 +43,8 @@ coins.csv.gz — одна строка на монету (созданы за п
   cl_repeat (кластер дева: чёрный список, запусков, повторяемость), а также поля разбора запуска (launches):
   peak_mc, dump_mc, time_to_dump_s, sold_share, cluster_share_start, early_buyers, achievable_profit, entry_mc,
   mc_30s, mc_60s, mc_120s, dev_buy_sol, bundle_wallets, bundle_share, l_migrated, features (json), а ещё
-  alerts (сколько алертов), alert_modes, alert_first_s (через сколько секунд после создания первый алерт).
+  alerts (сколько алертов), alert_modes, alert_first_s (через сколько секунд после создания первый алерт),
+  name, symbol, image (ссылка на картинку), twitter, website, desc_len (длина описания).
 
 trades_NNN.csv.gz — сделки первых N минут монеты, по времени:
   c — номер монеты, t — секунды от создания, s — блоков от блока создания (пусто — неизвестно), w — номер кошелька,
@@ -112,6 +113,11 @@ def _n(v: Any, nd: int = 6) -> str:
     return s
 
 
+def _clean(v: Any, limit: int = 120) -> str:
+    """Текст для CSV одной строкой: без «;» и переводов строк."""
+    return "" if v is None else str(v).replace(";", ",").replace("\n", " ").replace("\r", " ")[:limit]
+
+
 def _ts(v: Any) -> str:
     return "" if v is None else str(int(v.timestamp()))
 
@@ -140,7 +146,8 @@ async def run(db: Any, env: Any = None, days: float = 14.0, window_min: float = 
     coins = await db.fetch(
         """SELECT * FROM (
                SELECT t.mint, t.created_at, t.created_slot, t.deployer, t.cluster_id, t.initial_mc_sol,
-                      t.initial_buy_sol, (t.twitter IS NOT NULL)::int + (t.telegram IS NOT NULL)::int
+                      t.initial_buy_sol, t.name, t.symbol, t.image, t.twitter, t.website,
+                      length(t.description) AS desc_len, (t.twitter IS NOT NULL)::int + (t.telegram IS NOT NULL)::int
                           + (t.website IS NOT NULL)::int AS socials,
                       extract(epoch FROM t.migrated_at - t.created_at) AS migrated_s,
                       count(*) OVER (PARTITION BY t.deployer ORDER BY t.created_at
@@ -160,7 +167,8 @@ async def run(db: Any, env: Any = None, days: float = 14.0, window_min: float = 
              "bundle_share"]
     cw = GzCsv(folder, "coins", ["i", "mint", "created", "created_slot", "dev", "cluster", "init_mc", "init_buy",
                                  "socials", "migrated_s", "dev_prev7d", "cl_blacklisted", "cl_launches", "cl_repeat",
-                                 *lcols, "l_migrated", "features", "alerts", "alert_modes", "alert_first_s"])
+                                 *lcols, "l_migrated", "features", "alerts", "alert_modes", "alert_first_s",
+                                 "name", "symbol", "image", "twitter", "website", "desc_len"])
     cidx: dict[str, tuple[int, datetime, int | None]] = {}
     for i, r in enumerate(coins, 1):
         cidx[r["mint"]] = (i, r["created_at"], r["created_slot"])
@@ -179,7 +187,9 @@ async def run(db: Any, env: Any = None, days: float = 14.0, window_min: float = 
                   json.dumps(feats if isinstance(feats, dict) else json.loads(feats), ensure_ascii=False,
                              separators=(",", ":")) if feats else "",
                   len(al), ",".join(sorted({a["mode"] for a in al})),
-                  _n((al[0]["created_at"] - r["created_at"]).total_seconds(), 7) if al else ""])
+                  _n((al[0]["created_at"] - r["created_at"]).total_seconds(), 7) if al else "",
+                  _clean(r["name"]), _clean(r["symbol"]), _clean(r["image"]), _clean(r["twitter"]),
+                  _clean(r["website"]), r["desc_len"] or 0])
     cw.close()
     progress(f"монет: {len(coins)}")
 
