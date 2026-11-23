@@ -312,6 +312,7 @@ class RealTrader:
         try:
             self.follow = dict(await self.db.kv_get("real:follow") or {})
             self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
+            await self.load_autotune()
         except Exception:  # noqa: BLE001
             self.follow = {}
         for r in await self.db.fetch("SELECT * FROM real_positions WHERE closed_at IS NULL AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
@@ -417,6 +418,26 @@ class RealTrader:
             log.warning("баланс кошелька: %s", str(exc)[:160])
 
     # ------------------------------------------------------------------ вход
+    async def load_autotune(self) -> None:
+        """Решения автонастройки (scanner/real/autotune.py): остановленные методы и источники, окно цены «нового дева»."""
+        from .autotune import BAND_KEY, BLOCK_KEY
+        bl = await self.db.kv_get(BLOCK_KEY) or {}
+        now = time.time()
+        self.tune_kinds = {k: v for k, v in (bl.get("kinds") or {}).items() if float(v.get("until", 0)) > now}
+        self.tune_sources = {k: v for k, v in (bl.get("sources") or {}).items() if float(v.get("until", 0)) > now}
+        band = await self.db.kv_get(BAND_KEY)
+        self.newdev_band = tuple(band) if isinstance(band, list) and len(band) == 2 else None
+
+    def tune_block(self, kind: str, wallet: str | None) -> str | None:
+        """Причина не входить по решению автонастройки или None."""
+        k = (getattr(self, "tune_kinds", None) or {}).get(kind)
+        if k:
+            return f"автонастройка: метод остановлен — {k.get('why')}"
+        s = (getattr(self, "tune_sources", None) or {}).get(wallet or "")
+        if s:
+            return f"автонастройка: источник в минусе — {s.get('why')}"
+        return None
+
     def follow_mode(self, wallet: str | None) -> str | None:
         """«За ним» с доски кошельков: режим для его сигналов (live — только если этот кошелёк бота в бою)."""
         f = (getattr(self, "follow", None) or {}).get(wallet or "")
@@ -447,6 +468,10 @@ class RealTrader:
             mode = self.mode_for(kind) if kind else "off"
         if kind is None:
             return
+        manual = followed and wallet not in (getattr(self, "follow_auto", None) or set())
+        tb = None if manual else self.tune_block(kind, data.get("source_wallet") or trader)
+        if tb:
+            return self._skip(mode, kind, tb)
         if kind == "smart" and mode == "live" and data.get("unsteady") and not followed:
             # 20.11: на деньги — только кошельки с устойчивым плюсом копий; тень такие сигналы меряет
             return self._skip(mode, kind, str(data["unsteady"]))
@@ -685,6 +710,10 @@ class RealTrader:
             self.balance = st["extra"][0].lamports if st["extra"][0] is not None else 0
             self._balance_at = time.time()
         cap = float(data.get("newdev_cap") or NEWDEV_MAX_MC)
+        band = getattr(self, "newdev_band", None)
+        if kind == "newdev" and band and not (band[0] <= float(st["mc"] or 0) < band[1]):
+            return self._skip(mode, kind, f"вне окна цены автонастройки {band[0]:g}–{band[1]:g} SOL "
+                                          f"(MC {float(st['mc'] or 0):.0f})")
         if kind == "newdev" and float(st["mc"] or 0) > cap:
             # окупается, только если вход дешёвый (лотерея до PumpSwap: потеря до «пола» кривой ~28 SOL)
             return self._skip(mode, kind, f"цена уже убежала: MC {float(st['mc']):.0f} SOL > {cap:.0f}")
@@ -1394,6 +1423,7 @@ class RealTrader:
             try:
                 self.follow = dict(await self.db.kv_get("real:follow") or {})
                 self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
+                await self.load_autotune()
             except Exception:  # noqa: BLE001
                 pass
         if self.trials and now - self._trials_saved >= 60:

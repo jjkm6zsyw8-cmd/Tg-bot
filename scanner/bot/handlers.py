@@ -675,6 +675,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await remove(ref)
         await reply(m, f"⛔ В чёрном списке: {esc(ref)}" + (f" (кластер #{cid})" if cid else ""))
 
+    @router.message(Command("autotune"))
+    async def cmd_autotune(m: Message) -> None:
+        """Автонастройка: что бот сам поменял по тени и почему (последний проход)."""
+        from ..real import autotune as AT
+        await reply(m, await AT.last_text(db))
+
     @router.message(Command("pnl"))
     async def cmd_pnl(m: Message) -> None:
         """Реальные цифры: только реальный бот (тень и бой) по методам и кошелькам — без бумаги и расчётов."""

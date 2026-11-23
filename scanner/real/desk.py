@@ -124,6 +124,28 @@ class RealDesk:
         await self.poll_prices()
         if time.time() - self._last_status >= 5:
             await self.publish_status()
+        if time.time() >= getattr(self, "_tune_at", 0):
+            await self.autotune()
+
+    async def autotune(self) -> None:
+        """Автонастройка по тени раз в 6 ч (первый раз — через 10 мин после старта): отчёт в тему «Реальный бот»."""
+        from . import autotune as AT
+        first = getattr(self, "_tune_at", None) is None
+        self._tune_at = time.time() + (600 if first else AT.EVERY_S)
+        if first:
+            return
+        lanes = list(self.lanes.values())
+        if not lanes:
+            return
+        live = {k for lane in lanes for k in S.METHODS if lane.mode_for(k) == "live"}
+        try:
+            out = await AT.run(self.db, lanes[0].e.cfg, live)
+            for lane in lanes:
+                await lane.load_autotune()
+            for text in out:
+                await self.db.enqueue("text", {"topic": "real", "text": text}, priority=4)
+        except Exception:  # noqa: BLE001 — автонастройка не должна мешать торговле
+            log.exception("автонастройка")
 
     async def poll_prices(self) -> None:
         """Цена открытых позиций всех кошельков — из сети, одним запросом на 16 монет (а не запрос на кошелёк)."""

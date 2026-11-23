@@ -147,6 +147,10 @@ async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
         lines += ["", *nd]
     opened = await db.fetchval("SELECT count(*) FROM real_positions WHERE closed_at IS NULL")
     lines += ["", f"Открыто сейчас: {opened}"]
+    tune = await db.kv_get("real:autotune_block") or {}
+    if tune.get("kinds") or tune.get("sources"):
+        lines.append(f"🤖 Автонастройка остановила: методов {len(tune.get('kinds') or {})}, источников "
+                     f"{len(tune.get('sources') or {})} — почему: /autotune")
     if S.get(cfg, "real_only_follow"):
         lines.append("Режим «🎯 Только выбранные мной кошельки»: методы не торгуют, только кошельки «за ним».")
     kb: Kb = [[{"text": "🔄 Обновить", "callback": "menu:pnl"}, {"text": "👛 Мои кошельки", "callback": "rl:mine"}],
