@@ -2,13 +2,14 @@
 отчёт, почему он это сделал; говно должен фильтровать сам»).
 
 Раз в 6 часов — только по тени (настоящие цены в сети) за последние 3 дня:
-  1. Метод в минусе при любом правиле продажи (пробы A/B/G/R/W/L на тех же входах) — новые входы метода
-     останавливаются на 3 дня (и в тени, и в бою), потом метод снова проверяется: «а вдруг пойдёт».
+  1. Метод в минусе при любом правиле продажи (пробы A/B/G/R/W/L на тех же входах) — на деньги метод не пускается
+     3 дня, потом снова проверка. Тень его мерит дальше (24.11, владелец: «пока всё пускай работает»).
   2. Источник в минусе — дев («мой дев») или кошелёк (копии, smart, ракеты) с 8+ закрытыми сделками, итог < 0 и в
-     среднем хуже −5% — его сигналы не берутся 3 дня. Кошельки, за которыми ты сам включил «за ним», не трогаются.
+     среднем хуже −5% — его сигналы 3 дня не идут на деньги (тень мерит). Кошельки, за которыми ты сам включил
+     «за ним», не трогаются.
   3. Правило продажи метода: если по пробам другое правило заметно лучше (на 2+ п.п. на сделку, 30+ сделок, в плюсе),
      метод переходит на него — только когда метод не торгует в бою (в бою — только совет в отчёте).
-  4. «Новый дев»: окно цены входа — из корзин капитализации, где итог закрытых сделок в плюсе.
+  4. «Новый дев»: окно цены входа — из корзин капитализации, где итог закрытых сделок в плюсе (только для денег).
 Отчёт «что поменял и почему» — в тему «Реальный бот». Последний — /autotune.
 """
 from __future__ import annotations
@@ -79,9 +80,9 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
             best = max(tr.values(), key=lambda v: float(v["a"]))
             kinds_bl[kind] = {"until": now + BLOCK_S, "why": f"{m['n']} сд в среднем {_pct(float(m['a']))}, лучшее "
                               f"правило {best['rule']} {_pct(float(best['a']))}"}
-            lines.append(f"⛔ <b>{name}</b>: остановлен на 3 дня — в минусе при любом правиле продажи "
+            lines.append(f"⛔ <b>{name}</b>: на деньги не пускаю 3 дня — в минусе при любом правиле продажи "
                          f"({m['n']} сд, в среднем {_pct(float(m['a']))}; лучшее правило {best['rule']} "
-                         f"{_pct(float(best['a']))}). Через 3 дня — снова проверка.")
+                         f"{_pct(float(best['a']))}). В тени мерю дальше.")
             continue
         if not tr:
             continue
@@ -98,7 +99,7 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
                 await db.set_override(S.SCHEME_KEYS[kind], best["rule"])
                 lines.append(f"🔁 <b>{name}</b>: продаю по правилу {best['rule']} вместо {cur} — {why}.")
     for k in expired:
-        lines.append(f"🔄 <b>{S.KIND_NAMES.get(k, k)}</b>: 3 дня прошли — снова проверяется в тени.")
+        lines.append(f"🔄 <b>{S.KIND_NAMES.get(k, k)}</b>: 3 дня прошли — снова допускается на деньги.")
 
     # ---------------------------------------------------------------- 2: источники (девы и кошельки)
     follow = dict(await db.kv_get("real:follow") or {})
@@ -120,10 +121,10 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
         bad.sort(key=lambda r: float(r["s"]))
         shown = ", ".join(f"{r['trader'][:4]}…{r['trader'][-4:]} ({S.KIND_NAMES.get(r['kind'], r['kind'])}, "
                           f"{r['n']} сд, {_pct(float(r['a']))})" for r in bad[:8])
-        lines.append(f"🚫 Источники в минусе — не беру их сигналы 3 дня: {len(bad)}. {shown}"
+        lines.append(f"🚫 Источники в минусе — 3 дня не идут на деньги (тень мерит): {len(bad)}. {shown}"
                      + (f" и ещё {len(bad) - 8}" if len(bad) > 8 else ""))
     if expired_src > 0:
-        lines.append(f"🔄 Источников снова на проверке (3 дня прошли): {expired_src}")
+        lines.append(f"🔄 Источников снова допущено на деньги (3 дня прошли): {expired_src}")
 
     # ---------------------------------------------------------------- 4: окно цены входа «нового дева»
     rows = await db.fetch(
@@ -144,15 +145,15 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
             band = [min(g[0] for g in good), max(g[1] for g in good)]
             if band != old:
                 await db.kv_set(BAND_KEY, band)
-                lines.append(f"🎯 <b>Новый дев</b>: покупаю только при капитализации {band[0]}–{band[1]} SOL — там итог в "
-                             f"плюсе ({'; '.join(stats)}).")
+                lines.append(f"🎯 <b>Новый дев</b>: на деньги — только при капитализации {band[0]}–{band[1]} SOL, там "
+                             f"итог в плюсе ({'; '.join(stats)}). В тени мерю все цены входа.")
         elif stats and old:
             await db.kv_set(BAND_KEY, None)
             lines.append(f"🎯 <b>Новый дев</b>: окна в плюсе нет ({'; '.join(stats)}) — меряю все цены входа.")
 
     await db.kv_set(BLOCK_KEY, {"kinds": kinds_bl, "sources": srcs_bl})
-    head = (f"🤖 <b>Автонастройка</b> (тень за {WINDOW_D} дня): остановлено методов {len(kinds_bl)}, источников "
-            f"{len(srcs_bl)}")
+    head = (f"🤖 <b>Автонастройка</b> (тень за {WINDOW_D} дня): не пускаю на деньги методов {len(kinds_bl)}, "
+            f"источников {len(srcs_bl)}. Тень мерит всё.")
     text = "\n".join([head, *(lines or ["Изменений нет — данных для решений мало или всё в норме."])])
     await db.kv_set(LAST_KEY, {"at": datetime.fromtimestamp(now, timezone.utc).isoformat(), "text": text})
     return [text] if lines else []
@@ -166,6 +167,6 @@ async def last_text(db: Any) -> str:
     kinds = block.get("kinds") or {}
     tail = ""
     if kinds:
-        tail = "\n\nСейчас остановлены: " + "; ".join(
+        tail = "\n\nНа деньги сейчас не пускаю: " + "; ".join(
             f"{esc(S.KIND_NAMES.get(k, k))} — {esc(str(v.get('why')))}" for k, v in kinds.items())
     return f"{last.get('text', '')}\n\n<i>Последний проход: {str(last.get('at', ''))[:16].replace('T', ' ')} UTC</i>" + tail

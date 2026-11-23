@@ -829,6 +829,13 @@ async def test_reset_all_methods_button(db):
     assert ov["real_shadow_all"] is False and ov["real_autofollow"] is False
     assert await db.kv_get("real:follow") == {"MINE": "shadow"} and await db.kv_get("real:follow_auto") == []
     assert "Методы торговли" in r.text
+    # 24.11: «пока всё пускай работает» — одна кнопка возвращает замер всех методов в тени (без денег)
+    btn = next(b for row in r.kb for b in row if "Мерить всё в тени" in b["text"])
+    assert btn["callback"] == "rl:wmm:g:on" and btn["text"].startswith("⬜")
+    r = await UI.on_wallet_callback(db, {**ov}, "wmm", "g:on")
+    ov = await db.get_overrides()
+    assert ov["real_shadow_all"] is True and ov["real_autofollow"] is True
+    assert any("Мерить всё в тени" in b["text"] and b["text"].startswith("✅") for row in r.kb for b in row)
 
 
 async def test_only_trendj_enabled_still_gets_trend_signals(db):

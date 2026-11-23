@@ -56,13 +56,13 @@ async def test_autotune_decisions():
         cfg = {"real_scheme": "A", "real_scheme_trend": "A", "real_scheme_mydev": "G"}
         out = await AT.run(db, cfg, {"trend"})
         text = out[0]
-        assert "⛔ <b>мой дев</b>: остановлен на 3 дня" in text
+        assert "⛔ <b>мой дев</b>: на деньги не пускаю 3 дня" in text
         assert "🔁 <b>smart</b>: продаю по правилу G вместо A" in text
         assert (await db.get_overrides())["real_scheme"] == "G"
         assert "💡 <b>тренд</b>: правило продажи лучше B" in text
-        assert "🚫 Источники в минусе — не беру их сигналы 3 дня: 2." in text and "SCAL…CALP" in text
+        assert "🚫 Источники в минусе — 3 дня не идут на деньги (тень мерит): 2." in text and "SCAL…CALP" in text
         assert "MINE" not in text and "GOOD" not in text
-        assert "🎯 <b>Новый дев</b>: покупаю только при капитализации 57–80 SOL" in text
+        assert "🎯 <b>Новый дев</b>: на деньги — только при капитализации 57–80 SOL" in text
         bl = await db.kv_get(AT.BLOCK_KEY)
         assert set(bl["kinds"]) == {"mydev"} and set(bl["sources"]) == {"SCALP", "DEVX"}
         assert await db.kv_get(AT.BAND_KEY) == [57, 80]
@@ -86,3 +86,14 @@ def test_executor_tune_block():
     assert "метод остановлен" in tr.tune_block("mydev", "X")
     assert "источник в минусе" in tr.tune_block("copy", "SCALP")
     assert tr.tune_block("copy", "GOOD") is None
+
+
+def test_tune_block_only_for_money():
+    """24.11: автонастройка не пускает метод и источник только на деньги — тень мерит всё."""
+    from scanner.real.executor import RealTrader
+    tr = RealTrader.__new__(RealTrader)
+    tr.tune_kinds = {"mydev": {"why": "45 сд −10%"}}
+    tr.tune_sources = {"SCALP": {"why": "10 сд −8%"}}
+    assert tr.tune_block("mydev", "X", "shadow") is None
+    assert tr.tune_block("copy", "SCALP", "shadow") is None
+    assert "метод остановлен" in tr.tune_block("mydev", "X", "live")

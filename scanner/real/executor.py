@@ -445,8 +445,11 @@ class RealTrader:
         band = await self.db.kv_get(BAND_KEY)
         self.newdev_band = tuple(band) if isinstance(band, list) and len(band) == 2 else None
 
-    def tune_block(self, kind: str, wallet: str | None) -> str | None:
-        """Причина не входить по решению автонастройки или None."""
+    def tune_block(self, kind: str, wallet: str | None, mode: str = "live") -> str | None:
+        """Причина не входить по решению автонастройки или None. 24.11 (владелец: «пока всё пускай работает»):
+        автонастройка не пускает метод или источник только на деньги — тень продолжает мерить всё."""
+        if mode != "live":
+            return None
         k = (getattr(self, "tune_kinds", None) or {}).get(kind)
         if k:
             return f"автонастройка: метод остановлен — {k.get('why')}"
@@ -496,7 +499,7 @@ class RealTrader:
         manual = followed and wallet not in (getattr(self, "follow_auto", None) or set())
         # тренд: биржа станет известна после запроса состояния — его стоп проверяется в _enter (pump.fun — «trend»,
         # другие биржи — «trendj»)
-        tb = None if manual or kind == "trend" else self.tune_block(kind, data.get("source_wallet") or trader)
+        tb = None if manual or kind == "trend" else self.tune_block(kind, data.get("source_wallet") or trader, mode)
         if tb:
             return self._skip(mode, kind, tb)
         if kind == "mydev" and level != "strong" and self.get("real_mydev_strong_only") and not manual:
@@ -740,7 +743,7 @@ class RealTrader:
                 return await self._enter_jupiter(mint_s, alert_id, data, trader)
             if self.mode_for("trend") == "off":
                 return self._skip(mode, kind, "тренды на pump.fun выключены")
-            tb = self.tune_block("trend", None)
+            tb = self.tune_block("trend", None, mode)
             if tb:
                 return self._skip(mode, kind, tb)
         if st["why"]:
@@ -754,7 +757,7 @@ class RealTrader:
                                           f"{float(data['entry_max_mc']):.0f}")
         cap = float(data.get("newdev_cap") or NEWDEV_MAX_MC)
         band = getattr(self, "newdev_band", None)
-        if kind == "newdev" and band and not (band[0] <= float(st["mc"] or 0) < band[1]):
+        if kind == "newdev" and band and mode == "live" and not (band[0] <= float(st["mc"] or 0) < band[1]):
             return self._skip(mode, kind, f"вне окна цены автонастройки {band[0]:g}–{band[1]:g} SOL "
                                           f"(MC {float(st['mc'] or 0):.0f})")
         if kind == "newdev" and float(st["mc"] or 0) > cap:
@@ -969,7 +972,7 @@ class RealTrader:
         mode = self.mode_for(kind)
         if mode == "off":
             return self._skip("shadow", kind, "метод «тренды на других биржах» выключен")
-        tb = self.tune_block(kind, None)
+        tb = self.tune_block(kind, None, mode)
         if tb:
             return self._skip("shadow", kind, tb)
         ext = getattr(self.e, "ext", None)
