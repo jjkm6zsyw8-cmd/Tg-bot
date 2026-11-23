@@ -50,7 +50,7 @@ SCHEME_KEYS = {"smart": "real_scheme", "mydev": "real_scheme_mydev", "bigcopy": 
                "copy": "real_scheme_copy", "swing": "real_scheme_swing", "trend": "real_scheme_trend",
                "newdev": "real_scheme_newdev", "trendj": "real_scheme_trendj"}
 DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "D", "real_scheme_bigcopy": "G", "real_scheme_copy": "G",
-                   "real_scheme_swing": "R", "real_scheme_trend": "G", "real_scheme_newdev": "L",
+                   "real_scheme_swing": "R", "real_scheme_trend": "U", "real_scheme_newdev": "L",
                    "real_scheme_trendj": "U"}
 SCHEME_TEXT = {"A": "всё на +25%, без стопа, до 30 мин", "B": "70% на +25%, остаток трейлинг 15%, до 30 мин",
                "G": "всё на +25%, стоп −8%, нет +10% за 5 мин — выход", "R": "трейлинг 35% после +30%, стоп −50%, до суток",

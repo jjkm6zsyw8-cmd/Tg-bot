@@ -481,9 +481,14 @@ class RealTrader:
             mode = "shadow" if data.get("shadow_only") else followed   # мимо анти-PVP — только тень
             data = {**data, "_followed": wallet}
         else:
-            kind = next((k for k in kinds_of(data, targets) if self.mode_for(k) != "off"
+            # тренд: биржа станет известна после запроса состояния — сигнал нужен и когда включены только
+            # «тренды на других биржах» (trendj)
+            kind = next((k for k in kinds_of(data, targets)
+                         if (self.mode_for(k) != "off" or (k == "trend" and self.mode_for("trendj") != "off"))
                          and not (k == "smart" and self.get("real_smart_filter") == "m" and MAIN not in targets)), None)
             mode = self.mode_for(kind) if kind else "off"
+            if kind == "trend" and mode == "off":
+                mode = "shadow"                       # дальше решит биржа: pump.fun — выключено, другие — trendj
             if probe and mode == "live":
                 mode = "shadow"
         if kind is None:
@@ -733,6 +738,8 @@ class RealTrader:
         if kind == "trend":
             if st.get("venue") is None and OTHER_DEX in str(st.get("why") or ""):
                 return await self._enter_jupiter(mint_s, alert_id, data, trader)
+            if self.mode_for("trend") == "off":
+                return self._skip(mode, kind, "тренды на pump.fun выключены")
             tb = self.tune_block("trend", None)
             if tb:
                 return self._skip(mode, kind, tb)

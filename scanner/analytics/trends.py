@@ -30,6 +30,12 @@ if TYPE_CHECKING:
     from .engine import AlertEntry, Engine
 
 log = logging.getLogger(__name__)
+TREND_TARGET = "T"                     # портфель/цель «тренды» у реального бота (executor.kinds_of)
+
+
+def cfg_x_to_real(cfg: dict) -> bool:
+    """Тренды, отсеянные за «топ-10 держат много», на других биржах — в реальный бот (тень)."""
+    return bool(cfg.get("trend_x_to_real", True))
 
 DEX = "https://api.dexscreener.com"
 GECKO = "https://api.geckoterminal.com/api/v2/networks/solana"
@@ -571,11 +577,18 @@ class Trends:
                       "pullback": extra.get("pullback"), "holders": {k: v for k, v in hs.items() if k != "funder"}},
         }
         if extra.get("x"):
-            # опыт X: только бумага, без алерта, сопровождения и реального бота
+            # опыт X: только бумага, без алерта и сопровождения
             self.stats["x_signals"] = self.stats.get("x_signals", 0) + 1
             paper = getattr(self.e, "paper", None)
             if paper is not None:
                 asyncio.create_task(paper.on_alert(pi.mint, level, None, {**data, "modes": ["trendx"]}, None))
+            # 23.11: на других биржах фильтр «топ-10 держат много» отсеивает хорошие монеты — бумага X 20–22.11:
+            # 15 сд, +$22 (+14.6% на сделку), а на pump.fun −$24 на 7. Монеты не с pump.fun — и в реальный бот
+            # (тень «тренды на других биржах»)
+            real = getattr(self.e, "real", None)
+            if real is not None and not pi.mint.endswith("pump") and cfg_x_to_real(self.e.cfg):
+                asyncio.create_task(real.on_signal(pi.mint, level, None, {**data, "modes": ["trend"], "top10_x": True},
+                                                   None, {TREND_TARGET}))
             return
         await self.e.compose("trend", pi.mint, level, data, signal="impulse")
 

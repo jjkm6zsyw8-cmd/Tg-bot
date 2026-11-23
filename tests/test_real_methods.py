@@ -112,7 +112,7 @@ async def test_trend_method_in_real_bot(db):
     chain.add_curve(m1, 40.0)
     chain.add_curve(m2, 40.0)
     chain.programs[str(m3)] = pump.TOKEN                       # монета есть, но не на pump.fun и не в PumpSwap
-    tr = shadow(db, chain, real_max_open=10)
+    tr = shadow(db, chain, real_max_open=10, real_scheme_trend="G")    # старый тест — правило G
     await tr.start()
 
     async def send(mint, at, **kw):
@@ -123,11 +123,12 @@ async def test_trend_method_in_real_bot(db):
     tr.e.cfg["real_shadow_all"] = True
     assert tr.mode_for("trend") == "shadow"                   # выключенный метод — только тень, не деньги
     tr.e.cfg.update(real_shadow_all=False, real_trend=True)
-    assert S.methods_summary(tr.e.cfg) == "Smart A · Мой дев G (только тень) · Тренды"
+    assert S.methods_summary(tr.e.cfg) == "Smart A · Мой дев G (только тень) · Тренды → G"
     # блок и цена от прошлого алерта этой монеты (другой метод) тренду не мешают
     await send(m1, time.time(), trigger_slot=chain.slot - 500, trigger_mc=1.0)
     p = only(tr)
     assert p.extra["kind"] == "trend" and p.extra["mode"] == "shadow" and tr.scheme_for("trend") is pp.SCHEMES["G"]
+    assert S.get({}, "real_scheme_trend") == "U"                        # по умолчанию тренды — правило U
     await send(m2, time.time() - 60)
     assert skipped(tr, "тренд: сигнал опоздал")
     await send(m3, time.time())
@@ -448,7 +449,8 @@ async def test_method_screen_shows_shadow_result_of_every_exit_rule(db):
     table = text.split("<pre>")[1].split("</pre>")[0].splitlines()
     assert table[0].split() == ["выход", "сд", "плюс", "итог"]
     assert table[1].split() == ["A", "1", "100%", "+$1.00"] and table[2].split() == ["B", "1", "0%", "−$0.20"]
-    assert table[3].split() == ["G", "●", "1", "100%", "+$0.40"] and table[4].split() == ["R", "—", "нет"]
+    assert table[3].split() == ["G", "1", "100%", "+$0.40"] and table[4].split() == ["R", "—", "нет"]
+    assert any(row.split()[:2] == ["U", "●"] for row in table)     # тренды по умолчанию продаются по U
     assert "</pre>\n\n<b>Бумага</b>" in text and "G → портфель T: сделок нет" in text
 
 
@@ -827,3 +829,26 @@ async def test_reset_all_methods_button(db):
     assert ov["real_shadow_all"] is False and ov["real_autofollow"] is False
     assert await db.kv_get("real:follow") == {"MINE": "shadow"} and await db.kv_get("real:follow_auto") == []
     assert "Методы торговли" in r.text
+
+
+async def test_only_trendj_enabled_still_gets_trend_signals(db):
+    """23.11: «Сбросить всё» → включены только «тренды на других биржах»: тренд-сигнал доходит до trendj, а тренд на
+    pump.fun пропускается («выключены»)."""
+    chain = FakeChain()
+    other, pumpc = pk("other-only"), pk("pump-only")
+    from scanner.real import pump as _pump
+    chain.programs[str(other)] = _pump.TOKEN
+    chain.add_curve(pumpc, 40.0)
+    flags = {S.METHODS[k][1]: False for k in S.METHODS}
+    tr = shadow(db, chain, real_max_open=10, real_shadow_all=False, **{**flags, "real_trendj": True})
+
+    class Ext:
+        async def jup_price(self, mint, ttl=None):
+            return 0.0002
+    tr.e.ext = Ext()
+    await tr.start()
+    for m in (other, pumpc):
+        await tr.on_signal(str(m), "normal", 1, {"modes": ["trend"], "symbol": "X", "trend_at": time.time(),
+                                                 "trigger_at": time.time()}, None, {"T"})
+    assert [p.extra["kind"] for p in tr.positions.values()] == ["trendj"]
+    assert skipped(tr, "тренды на pump.fun выключены")
