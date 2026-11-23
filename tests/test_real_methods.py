@@ -570,9 +570,12 @@ async def test_engine_followed_fast_wallet_goes_to_shadow_not_skipped():
 
 
 async def test_only_my_wallets_switch(db):
-    """22.11: «🎯 Только выбранные мной кошельки» — методы, замер тени и авто-тень не торгуют; ручной «за ним» — да."""
+    """22.11: «🎯 Только выбранные мной кошельки»; 24.11: на деньги — только ручной «за ним», методы и авто-тень —
+    в тени (тень мерит всё)."""
     chain = FakeChain()
-    tr = shadow(db, chain, real_max_open=10, real_only_follow=True, real_smart=True)
+    tr = shadow(db, chain, real_max_open=10, real_only_follow=True, real_smart=True, real_mode="live",
+                real_scheme="A")
+    tr.mode = lambda: "live"
     await tr.start()
 
     async def sig(mint, wallet, modes=("smart",), targets=("M",)):
@@ -581,12 +584,10 @@ async def test_only_my_wallets_switch(db):
                 "trigger_mc": chain.mc(mint), "trigger_sig": "s", "copy_wallet": wallet}
         await tr.on_signal(str(mint), "normal", 1, data, wallet, set(targets))
     await sig(pk("o-1"), "RANDOM")
-    assert not tr.positions                                    # smart-сигнал — мимо
+    assert [p.extra["mode"] for p in tr.positions.values()] == ["shadow"]   # smart — в тени, не на деньги
     tr.follow, tr.follow_auto = {"AUTO": "shadow", "MINE": "shadow"}, {"AUTO"}
-    await sig(pk("o-2"), "AUTO", ("copy",), ("H",))
-    assert not tr.positions                                    # авто-тень — не в счёт
     await sig(pk("o-3"), "MINE", ("copy",), ("H",))
-    assert [p.mint for p in tr.positions.values()] == [str(pk("o-3"))]
+    assert str(pk("o-3")) in [p.mint for p in tr.positions.values()]       # ручной «за ним» — как выбран
 
 
 async def test_newdev_lottery_method(db):

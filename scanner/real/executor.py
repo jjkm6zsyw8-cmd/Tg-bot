@@ -474,10 +474,9 @@ class RealTrader:
         followed = self.follow_mode(wallet)
         if not self.accept_new or (data.get("paper_only") and not followed):
             return                       # paper_only — копия только на бумагу (свой кошелёк вне рамок smart), не деньги
+        # «только выбранные мной кошельки»: на деньги — только они; методы — в тени (24.11, владелец: «пока всё
+        # пускай работает» — тень мерит всё, деньги не трогает)
         probe = not followed and bool(self.get("real_only_follow"))
-        if probe and not {"newdev", "trend"} & set(data.get("modes") or []):
-            return                       # «только выбранные мной кошельки»: методы и замер тени не торгуют
-                                         # (кроме проб «новый дев» и трендов — они только в тени, пока проверяются)
         _SIGNAL.set((mint, alert_id))
         if followed:
             kind = next(iter(kinds_of(data, targets)), None)

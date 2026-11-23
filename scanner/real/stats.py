@@ -152,7 +152,7 @@ async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
         lines.append(f"🤖 Автонастройка не пускает на деньги: методов {len(tune.get('kinds') or {})}, источников "
                      f"{len(tune.get('sources') or {})} (тень их мерит) — почему: /autotune")
     if S.get(cfg, "real_only_follow"):
-        lines.append("Режим «🎯 Только выбранные мной кошельки»: методы не торгуют, только кошельки «за ним».")
+        lines.append("Режим «🎯 На деньги — только выбранные мной кошельки»: методы меряются в тени, без денег.")
     kb: Kb = [[{"text": "🔄 Обновить", "callback": "menu:pnl"}, {"text": "👛 Мои кошельки", "callback": "rl:mine"}],
               [{"text": "💵 Реальный бот", "callback": "menu:real"}]]
     return "\n".join(lines), kb
