@@ -51,6 +51,8 @@ SHADOW_MAX_OPEN = 30                  # тень-замер: столько по
 # в среднем −6.7%, а бумага H на тех же сигналах −7.6% (вход дороже лишь на +0.3%) — бумага их меряет так же, а
 # тень тратила на них ~1700 симуляций в сутки из бесплатных запросов Helius
 SHADOW_SKIP = {"copy"}
+NEWDEV = "Z"                     # сигнал «новый дев с крупной покупкой» (бумажного портфеля нет — только реальный бот)
+NEWDEV_MAX_MC = 65.0             # дороже — лотерея не окупается (MC 65: окупаемость с 11% ухода на PumpSwap)
 KINDS = S.KIND_NAMES
 SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
 # тренд — без покупки трейдера в блоке: возраст сигнала считаем от алерта (DexScreener опрашивается раз в 5 с,
@@ -79,6 +81,8 @@ def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
         out.append("swing")
     if TREND in targets and "trend" in modes:
         out.append("trend")
+    if NEWDEV in targets and "newdev" in modes:
+        out.append("newdev")
     return out
 MODE_ICON = {"live": "💵", "shadow": "👻"}
 MODE_SHORT_RU = {"live": "💵 бой", "shadow": "👻 тень", "off": "выкл"}
@@ -225,12 +229,15 @@ class RealTrader:
         if rule == "W":
             return {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": None, "target": False, "time_stop_s": None,
                     "time_stop_gain": None, "max_hold_s": float(p.extra.get("w_hold") or 1.0)}
+        if rule == "L":
+            return S.LOTTERY
         return SCHEMES[rule] if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
 
     def scheme_for(self, kind: str | None) -> dict[str, Any]:
         """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага): у smart и
         «мой дев» — выбранная (A / B / G), у копий, крупных копий и смарт-ракет — их портфелей H / K / R."""
-        return SCHEMES[self.get(S.SCHEME_KEYS[kind or "smart"])]
+        name = self.get(S.SCHEME_KEYS[kind or "smart"])
+        return S.LOTTERY if name == "L" else SCHEMES[name]
 
     def paused(self) -> str:
         """Стоп-кран: общий (для всех кошельков) или этого кошелька."""
@@ -419,8 +426,9 @@ class RealTrader:
         followed = self.follow_mode(wallet)
         if not self.accept_new or (data.get("paper_only") and not followed):
             return                       # paper_only — копия только на бумагу (свой кошелёк вне рамок smart), не деньги
-        if not followed and self.get("real_only_follow"):
+        if not followed and self.get("real_only_follow") and "newdev" not in (data.get("modes") or []):
             return                       # «только выбранные мной кошельки»: методы и замер тени не торгуют
+                                         # (кроме пробы «новый дев» — она в тени, пока проверяется)
         _SIGNAL.set((mint, alert_id))
         if followed:
             kind = next(iter(kinds_of(data, targets)), None)
@@ -661,6 +669,9 @@ class RealTrader:
         if user is not None and st["extra"]:
             self.balance = st["extra"][0].lamports if st["extra"][0] is not None else 0
             self._balance_at = time.time()
+        if kind == "newdev" and float(st["mc"] or 0) > NEWDEV_MAX_MC:
+            # окупается, только если вход дешёвый: при MC 65 нужна доля ухода на PumpSwap 11%, при 45 — 5%
+            return self._skip(mode, kind, f"цена уже убежала: MC {float(st['mc']):.0f} SOL > {NEWDEV_MAX_MC:.0f}")
         trend = kind == "trend"
         # у тренда нет покупки трейдера: блок и цена сигнала от другого алерта этой монеты ему не судьи
         trig_slot = 0 if trend else int(data.get("trigger_slot") or 0)
@@ -909,7 +920,8 @@ class RealTrader:
             if p.extra.get("retry_at"):
                 continue                              # продажа уже идёт повторами из цикла
             sc = self.scheme_of(p)
-            reason = "emergency" if eff is not None and getattr(eff, "cluster_sell", False) else None
+            reason = ("emergency" if eff is not None and getattr(eff, "cluster_sell", False)
+                      and not sc.get("ignore_emergency") else None)
             if (reason is None and p.trader and trader == p.trader and not is_buy and not sc.get("ignore_trader_sell")
                     and not (p.tp_done and sc.get("follow_runner") is False)):
                 reason = "trader_sell"

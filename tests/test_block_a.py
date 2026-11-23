@@ -64,7 +64,8 @@ async def test_recluster_splits_glued_clusters():
     from scanner.analytics import recluster
     try:
         glued = await db.fetchval("INSERT INTO clusters(label) VALUES ('glued') RETURNING id")
-        now = datetime.now(timezone.utc)
+        # полдень: 100 минут монет не должны переходить через полночь (отчёт считает запуски по суткам)
+        now = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
         exchange = addr("exchange-hot-wallet")
         small_funder = addr("small-funder")
         service_signer = addr("launch-service")

@@ -22,13 +22,21 @@ MODES = {"off": "выключен", "shadow": "тень (без денег)", "l
 #   B — 70% на +25%, остаток трейлинг 15%, без стопа, до 30 мин;
 #   G — всё на +25%, стоп −8%, нет +10% за 5 мин — выход, до 30 мин (как бумажные G, Y, H, K);
 #   R — трейлинг 35% после +30%, стоп −50%, до суток (как бумажный R, «смарт-ракеты»).
-SCHEMES = ("A", "B", "G", "R")
+SCHEMES = ("A", "B", "G", "R", "L")
+# 23.11: L — «лотерея до PumpSwap» (метод «новый дев»): без стопа и тейка, держать, пока монета не вырастет ×3, дальше
+# трейлинг 40%; продажа дева её не выкидывает; не дольше 3 ч. Потеря ограничена «полом» кривой pump.fun: при входе
+# на MC ~45–65 SOL монета, которую все бросили, возвращается к ~28 SOL — около −40…−57%
+LOTTERY = {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": 0.40, "trail_after_net": 2.0, "target": False,
+           "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 3 * 3600, "ignore_emergency": True,
+           "ignore_trader_sell": True}
 SCHEME_KEYS = {"smart": "real_scheme", "mydev": "real_scheme_mydev", "bigcopy": "real_scheme_bigcopy",
-               "copy": "real_scheme_copy", "swing": "real_scheme_swing", "trend": "real_scheme_trend"}
+               "copy": "real_scheme_copy", "swing": "real_scheme_swing", "trend": "real_scheme_trend",
+               "newdev": "real_scheme_newdev"}
 DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "G", "real_scheme_bigcopy": "G", "real_scheme_copy": "G",
-                   "real_scheme_swing": "R", "real_scheme_trend": "G"}
+                   "real_scheme_swing": "R", "real_scheme_trend": "G", "real_scheme_newdev": "L"}
 SCHEME_TEXT = {"A": "всё на +25%, без стопа, до 30 мин", "B": "70% на +25%, остаток трейлинг 15%, до 30 мин",
                "G": "всё на +25%, стоп −8%, нет +10% за 5 мин — выход", "R": "трейлинг 35% после +30%, стоп −50%, до суток",
+               "L": "лотерея до PumpSwap: держать до ×3, дальше трейлинг 40%, без стопа, до 3 ч",
                "W": "продать через его обычное время удержания − 2 с (раньше него), или когда он продал"}
 # пробы правил выхода: A / B / G / R + W (21.11, идея владельца: выйти раньше трейдера — не попасть под его продажу).
 # W — только проба (бот так не продаёт): у сигналов с трейдером, чьё обычное удержание известно (до 30 мин)
@@ -93,6 +101,10 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
     "real_trend": ("Тренды — монеты, которые уже растут (как T)", False,
                    "Вход после отката, выход как G. Только монеты на кривой pump.fun и в пуле PumpSwap: на других "
                    "биржах реальный бот не торгует."),
+    "real_newdev": ("Новый дев с крупной покупкой — лотерея до PumpSwap", False,
+                    "Дев без монет за 7 дней купил на запуске от 10 SOL — вход сразу, держать до роста ×3 (дальше "
+                    "трейлинг 40%), без стопа, до 3 ч. По анализу запусков такие монеты уходят на PumpSwap в ~9% "
+                    "случаев (все — ~2%). Пока проверяется в тени."),
     "real_mev_protect": ("Обходить валидаторов-«сэндвичеров»", True, "Параметр mev-protect у Helius Sender."),
     "real_close_ata": ("Закрывать пустые счета токенов (возврат залога)", True, "≈0.0015 SOL с каждой монеты."),
     "real_notify_shadow": ("Сообщения о сделках тени", False, ""),
@@ -162,7 +174,7 @@ def method_name(cfg: dict[str, Any], kind: str) -> str:
             return "Smart M" if rule == "A" else f"Smart (отбор M) → {rule}"
         return f"Smart {rule}"
     base = {"mydev": "Мой дев", "bigcopy": "Крупные копии", "copy": "Копии", "swing": "Смарт-ракеты",
-            "trend": "Тренды"}[kind]
+            "trend": "Тренды", "newdev": "Новый дев"}[kind]
     default = DEFAULT_SCHEMES[SCHEME_KEYS[kind]]
     out = f"{base} {rule}" if kind == "mydev" else (base if rule == default else f"{base} → {rule}")
     if kind == "mydev" and not get(cfg, "real_live_mydev"):
@@ -216,15 +228,19 @@ METHODS: dict[str, tuple[str, str, str]] = {
     # 20.11: тренды — монеты, которые уже растут (сигнал DexScreener, вход после отката). Без трейдера: вход по
     # времени сигнала, а не по блоку покупки. Только pump.fun и PumpSwap — другие биржи бот не умеет
     "trend": ("Тренды (монеты, которые уже растут)", "real_trend", "T"),
+    # 23.11: из анализа 128 тыс. запусков — монеты нового дева (0 монет за 7 дней), купившего на запуске 10+ SOL,
+    # уходят на PumpSwap в 8.5–9.8% случаев (все монеты — 1.6–2.3%); вход сразу на запуске, выход L. Только тень,
+    # пока нет результата на реальных ценах; бой — только по выключателю владельца
+    "newdev": ("Новый дев с крупной покупкой (лотерея до PumpSwap)", "real_newdev", "Z"),
 }
 KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", "bigcopy": "крупная копия",
-              "swing": "смарт-ракета", "trend": "тренд"}
+              "swing": "смарт-ракета", "trend": "тренд", "newdev": "новый дев"}
 
 
 def methods_summary(cfg: dict[str, Any]) -> str:
     """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»; своя ставка — в скобках."""
     out = []
-    for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend"):
+    for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev"):
         if get(cfg, METHODS[kind][1]):
             stake = method_stake(cfg, kind)
             out.append(method_name(cfg, kind) + (f" ${stake:g}" if stake else ""))

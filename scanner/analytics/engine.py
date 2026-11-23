@@ -34,7 +34,8 @@ from .scoring import LEVELS, Snapshot, bump, evaluate_dev
 from .state import TokenState, TradeRow
 
 log = logging.getLogger(__name__)
-DAILY_SENT_KEY = "daily:sent"                  # дата последнего разбора дня — не слать повторно после перезапуска
+DAILY_SENT_KEY = "daily:sent"
+NEWDEV_MIN_BUY = 10.0                          # «новый дев»: покупка дева на запуске от 10 SOL                  # дата последнего разбора дня — не слать повторно после перезапуска
 AUTO_MARK_NAMES = {"great": "🚀 отлично", "good": "✅ успех", "fail": "❌ провал", "scam": "☠️ скам (дев слил сразу)"}
 
 
@@ -309,6 +310,8 @@ class Engine:
         mine = self.my_devs.get(st.deployer) or (self.my_devs.get(st.creator) if st.creator else None)
         if mine is not None:
             asyncio.create_task(self._my_dev_launch(st, mine, rec))
+        elif getattr(self, "real", None) is not None:
+            asyncio.create_task(self._newdev_launch(st, rec))
         try:
             if not cfg.get("modes", {}).get("dev", True):
                 return
@@ -697,6 +700,32 @@ class Engine:
                 pass
         await self._compose_inner("mydev", st.mint, "strong" if strong else "normal", data, signal="my_dev",
                                   trader=dev_addr)
+
+    async def _newdev_launch(self, st: TokenState, rec: Any) -> None:
+        """23.11: метод «новый дев с крупной покупкой» (только реальный бот, тень). Анализ 128 тыс. запусков
+        (поиск 11–16.11, проверка 17–22.11): монеты дева без монет за 7 дней, купившего на запуске 10+ SOL, уходят на
+        PumpSwap в 8.5–9.8% случаев против 1.6–2.3% у всех. Вход сразу на запуске, выход — правило L."""
+        try:
+            buy = float(rec["initial_buy_sol"] or 0)
+            if buy < float(self.cfg.get("newdev_min_buy_sol", NEWDEV_MIN_BUY)) or float(rec["initial_mc_sol"] or 0) > 100:
+                return
+            created = rec["created_at"]
+            if time.time() - created.timestamp() > float(self.cfg.get("newdev_max_age_s", 15)):
+                return                               # монету увидели поздно — момент запуска прошёл
+            prev = await self.db.fetchval(
+                """SELECT count(*) FROM tokens WHERE deployer = $1 AND mint <> $2
+                   AND created_at > $3::timestamptz - interval '7 days' AND created_at <= $3""",
+                st.deployer, st.mint, created)
+            if prev:
+                return
+            data = {"modes": ["newdev"], "symbol": st.symbol, "mc": st.mc, "signal": "новый дев",
+                    "source_wallet": st.deployer, "note": f"новый дев купил на запуске {buy:.1f} SOL",
+                    "trigger_slot": int(rec["created_slot"] or 0), "trigger_sig": rec["signature"],
+                    "trigger_mc": float(st.mc or 0) or 1.0, "trigger_at": time.time(), "trigger_create": True,
+                    "trigger_ts": created.timestamp()}
+            await self.real.on_signal(st.mint, "normal", None, data, st.deployer, {"Z"})
+        except Exception:  # noqa: BLE001 — метод-проба не должен мешать остальному
+            log.exception("новый дев: %s", st.mint)
 
     async def _price_glitch(self, mint: str, mc_sol: float) -> bool:
         """Наш MC выше реального больше чем в 5 раз (по Jupiter сейчас, pump.fun: 1 млрд токенов)?

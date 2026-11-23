@@ -15,7 +15,7 @@ from . import settings as S
 
 Kb = list[list[dict[str, Any]]]
 SHORT = {"smart": "smart", "mydev": "мой дев", "copy": "копии", "bigcopy": "крупные", "swing": "ракеты",
-         "trend": "тренды"}
+         "trend": "тренды", "newdev": "новый дев"}
 
 
 def _usd(v: float) -> str:

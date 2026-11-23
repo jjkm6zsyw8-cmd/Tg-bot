@@ -279,24 +279,24 @@ async def test_rule_trials_measure_all_exit_rules_on_same_entry(db):
     await tr.start()
     await fire(tr, chain)
     main = only(tr)
-    assert sorted(t.extra["rule"] for t in tr.trials.values()) == ["A", "B", "G", "R"]
+    assert sorted(t.extra["rule"] for t in tr.trials.values()) == ["A", "B", "G", "L", "R"]
     assert all(t.entry_mc == main.entry_mc and t.extra["mode"] == "shadow" for t in tr.trials.values())
     chain.set_mc(MINT, 54.0)                                   # +35%: тейк A и G, B продаёт 70%, R держит
     await trade(tr, chain)
     await asyncio.sleep(0.05)
     assert not tr.positions                                    # позиция бота (правило A) закрылась тейком
     left = {t.extra["rule"]: t for t in tr.trials.values()}
-    assert set(left) == {"B", "R"} and left["B"].tp_done
+    assert set(left) == {"B", "R", "L"} and left["B"].tp_done      # L (лотерея) держит до ×3
     # перезапуск: открытые пробы подхватываются из базы, вместе с пиком цены (его пишет цикл раз в минуту)
     await tr._flush_trials()
     tr2 = shadow(db, chain, real_max_open=10)
     await tr2.start()
-    assert sorted(t.extra["rule"] for t in tr2.trials.values()) == ["B", "R"]
+    assert sorted(t.extra["rule"] for t in tr2.trials.values()) == ["B", "L", "R"]
     chain.set_mc(MINT, 30.0)                                   # −44% от пика: трейлинг у B и R
     await trade(tr2, chain)
     await asyncio.sleep(0.05)
-    assert not tr2.trials
-    rows = {r["rule"]: r for r in await db.fetch("SELECT * FROM real_rule_trials")}
+    assert [t.extra["rule"] for t in tr2.trials.values()] == ["L"]   # лотерея без стопа держит дальше
+    rows = {r["rule"]: r for r in await db.fetch("SELECT * FROM real_rule_trials WHERE closed_at IS NOT NULL")}
     assert {k: r["exit_reason"] for k, r in rows.items()} == {"A": "take_profit", "B": "trailing",
                                                               "G": "take_profit", "R": "trailing"}
     assert rows["A"]["pnl_pct"] > 0.25 and 0 < rows["B"]["pnl_pct"] < rows["A"]["pnl_pct"] and rows["R"]["pnl_pct"] < 0
@@ -584,3 +584,62 @@ async def test_only_my_wallets_switch(db):
     assert not tr.positions                                    # авто-тень — не в счёт
     await sig(pk("o-3"), "MINE", ("copy",), ("H",))
     assert [p.mint for p in tr.positions.values()] == [str(pk("o-3"))]
+
+
+async def test_newdev_lottery_method(db):
+    """23.11: «новый дев с крупной покупкой» — вход на запуске в тени, правило L (без стопа, трейлинг 40% после ×3),
+    продажа дева не выкидывает; дорогой вход (MC > 65) — пропуск; работает и при «только выбранные мной»."""
+    from types import SimpleNamespace
+    assert kinds_of({"modes": ["newdev"]}, {"Z"}) == ["newdev"]
+    chain = FakeChain()
+    cheap, dear = pk("nd-cheap"), pk("nd-dear")
+    chain.add_curve(cheap, 45.0)
+    chain.add_curve(dear, 80.0)
+    tr = shadow(db, chain, real_max_open=10, real_only_follow=True, real_shadow_all=True)
+    await tr.start()
+
+    async def launch(mint):
+        data = {"modes": ["newdev"], "symbol": "ND", "trigger_at": time.time(), "trigger_ts": time.time() - 0.5,
+                "trigger_slot": chain.slot - 2, "trigger_mc": chain.mc(mint), "trigger_sig": "s", "trigger_create": True}
+        await tr.on_signal(str(mint), "normal", None, data, "DEV", {"Z"})
+    await launch(dear)
+    assert not tr.positions and skipped(tr, "цена уже убежала"), tr.skips
+    await launch(cheap)
+    p = only(tr)
+    assert p.extra["kind"] == "newdev" and p.extra["mode"] == "shadow"
+    sc = tr.scheme_of(p)
+    assert sc["stop"] is None and sc["trail"] == 0.40 and sc["ignore_emergency"] and sc["max_hold_s"] == 3 * 3600
+    assert any(t.extra.get("rule") == "L" for t in tr.trials.values())          # проба L — на каждом входе
+    # дев и его кластер продают — позиция остаётся (лотерея до PumpSwap)
+    await trade(tr, chain, cheap, trader="DEV", is_buy=False, eff=SimpleNamespace(cluster_sell=True))
+    assert not p.closing and p.id in tr.positions
+
+
+async def test_engine_newdev_launch_signal():
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    from scanner.analytics.engine import Engine
+    sent = []
+
+    class Real:
+        async def on_signal(self, mint, level, aid, data, trader, targets):
+            sent.append((mint, data, targets))
+
+    class Db:
+        def __init__(self, prev):
+            self.prev = prev
+
+        async def fetchval(self, q, *a):
+            return self.prev
+    e = Engine.__new__(Engine)
+    e.settings, e.real = SimpleNamespace(effective=lambda: {}), Real()
+    st = SimpleNamespace(mint="M", deployer="DEV", symbol="S", mc=38.0)
+    rec = {"initial_buy_sol": 12.0, "initial_mc_sol": 28.0, "created_at": datetime.now(timezone.utc),
+           "created_slot": 100, "signature": "sig"}
+    e.db = Db(0)
+    await e._newdev_launch(st, rec)
+    assert sent and sent[0][2] == {"Z"} and sent[0][1]["modes"] == ["newdev"] and sent[0][1]["trigger_create"]
+    e.db = Db(3)                                                    # у дева уже были монеты за 7 дней
+    await e._newdev_launch(st, rec)
+    await e._newdev_launch(st, {**rec, "initial_buy_sol": 2.0})     # мелкая покупка
+    assert len(sent) == 1
