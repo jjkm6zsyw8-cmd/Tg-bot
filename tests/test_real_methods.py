@@ -35,11 +35,11 @@ def test_exit_rules_per_method():
     tr.e.cfg.update(real_scheme="R", real_scheme_mydev="A", real_scheme_copy="B", real_scheme_swing="G")
     assert tr.scheme_for("smart") is pp.SCHEMES["R"] and tr.scheme_for("mydev") is pp.SCHEMES["A"]
     assert tr.scheme_for("copy") is pp.SCHEMES["B"] and tr.scheme_for("swing") is pp.SCHEMES["G"]
-    assert S.methods_summary({}) == "Smart A · Мой дев G (только тень)"
+    assert S.methods_summary({}) == "Smart A · Мой дев D (только тень)"
     assert S.methods_summary({"real_smart": False, "real_mydev": False, "real_swing": True}) == "Смарт-ракеты"
     assert S.methods_summary({"real_smart": False, "real_mydev": False}) == "все выключены"
     assert S.methods_summary({"real_smart_filter": "m", "real_live_mydev": True, "real_stake_usd_smart": 30,
-                              "real_copy": True, "real_scheme_copy": "A"}) == "Smart M $30 · Мой дев G · Копии → A"
+                              "real_copy": True, "real_scheme_copy": "A"}) == "Smart M $30 · Мой дев D · Копии → A"
     assert S.method_name({"real_smart_filter": "m", "real_scheme": "G"}, "smart") == "Smart (отбор M) → G"
     assert S.method_stake({"real_stake_usd_smart": 500}, "smart") == 30.0       # не выше потолка сервера
     assert S.method_stake({"real_stake_usd_smart": 0}, "smart") is None and S.method_stake({}, None) is None
@@ -668,3 +668,32 @@ async def test_fast_create_newdev_decision():
     assert len(sent) == 1
     await e._fast_create(_json.dumps({**ev, "mint": "M5", "deployer": "BIG", "buy": 12.0}))
     assert sent[-1][1]["newdev_cap"] == 100.0 and "M1" in e._newdev_done
+
+
+async def test_mydev_by_dev_signature(db):
+    """23.11, как владелец торговал руками: «мой дев» — только девы с почерком; не входить дороже, чем дев даёт
+    заработать; продать раньше дева — на его обычной цене продажи (правило D)."""
+    chain = FakeChain()
+    a, b, c = pk("sig-a"), pk("sig-b"), pk("sig-c")
+    for m in (a, b, c):
+        chain.add_curve(m, 30.0)
+    tr = shadow(db, chain, real_max_open=10, real_scheme_mydev="D", real_mydev_strong_only=True, real_shadow_all=True)
+    await tr.start()
+
+    async def dev(mint, level, **kw):
+        data = {"modes": ["mydev"], "symbol": "D", "trigger_at": time.time(), "trigger_ts": time.time() - 0.5,
+                "trigger_slot": chain.slot - 2, "trigger_mc": chain.mc(mint), "trigger_sig": "s",
+                "trigger_create": True, **kw}
+        await tr.on_signal(str(mint), level, 1, data, "DEV", {"Y"})
+    await dev(a, "normal", target_mc=45.0, entry_max_mc=36.0)
+    assert not tr.positions and skipped(tr, "у дева нет почерка")
+    await dev(b, "strong", target_mc=45.0, entry_max_mc=25.0)
+    assert not tr.positions and skipped(tr, "дороже, чем этот дев даёт заработать")
+    await dev(c, "strong", target_mc=45.0, entry_max_mc=36.0)
+    p = only(tr)
+    assert p.target_mc == 45.0 and tr.scheme_of(p)["target"] and tr.scheme_of(p)["max_hold_s"] == 300
+    chain.set_mc(c, 46.0)                                     # дошла до его обычной цены продажи — продаём раньше него
+    await trade(tr, chain, c)
+    await asyncio.sleep(0.05)
+    assert not tr.positions
+    assert (await db.fetchval("SELECT exit_reason FROM real_positions")) == "target"

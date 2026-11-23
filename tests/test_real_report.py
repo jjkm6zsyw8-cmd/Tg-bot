@@ -51,7 +51,7 @@ async def test_status_before_first_start(db):
     text, kb = await report.status_view(db, {})
     assert "Исполнитель ещё не запускался" in text and "тень (без денег)" in text
     assert "Ставка <b>$5</b>" in text and "общий стоп $30" in text
-    assert "Методы: Smart A · Мой дев G (только тень)" in text
+    assert "Методы: Smart A · Мой дев D (только тень)" in text
     cbs = callbacks(kb)
     for c in ("rl:view", "rl:mode:off", "rl:mode:shadow", "rl:mode:live", "rl:pause", "rl:sellall", "rl:trades",
               "rl:cmp", "rl:csv", "rl:xlsx", "rl:set", "rl:check", "rl:wme:g", "rl:wl"):

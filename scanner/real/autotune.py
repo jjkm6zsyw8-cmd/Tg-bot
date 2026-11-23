@@ -54,9 +54,16 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
     lines: list[str] = []
 
     # ---------------------------------------------------------------- 1, 3: методы и правила продажи
-    main = {r["kind"]: r for r in await db.fetch(
-        """SELECT kind, count(*) n, COALESCE(avg(pnl_pct), 0) a, COALESCE(sum(pnl_sol), 0) s FROM real_positions
-           WHERE mode = 'shadow' AND closed_at IS NOT NULL AND closed_at > $1 GROUP BY kind""", since)}
+    # итог метода — только сделки по его нынешнему правилу продажи: сменили подход (например «мой дев» → D) —
+    # старый минус новый подход не останавливает
+    main = {}
+    for kind in S.METHODS:
+        r = await db.fetchrow(
+            """SELECT count(*) n, COALESCE(avg(pnl_pct), 0) a, COALESCE(sum(pnl_sol), 0) s FROM real_positions
+               WHERE mode = 'shadow' AND closed_at IS NOT NULL AND closed_at > $1 AND kind = $2
+                 AND COALESCE(extra->>'rule', '') = $3""", since, kind, S.get(cfg, S.SCHEME_KEYS[kind]))
+        if r and r["n"]:
+            main[kind] = r
     trials: dict[str, dict[str, Any]] = {}
     for r in await db.fetch(
             """SELECT kind, rule, count(*) n, COALESCE(avg(pnl_pct), 0) a FROM real_rule_trials

@@ -432,6 +432,8 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     sol_usd = await sol_price(db)
     # 22.11: экран по разделам — каждый с новой строки, тень таблицей, бумага отдельно (владелец: «всё наслоено»)
     rules = [x for x in S.TRIAL_RULES if x != "W" or kind in ("smart", "copy", "bigcopy", "swing")]
+    if kind == "mydev":
+        rules.append("D")
     stake_txt = (f"${stake:g}" if stake else f"как у кошелька ({S.fmt('real_stake_usd', S.get(wcfg, 'real_stake_usd'))})")
     state = f"{'✅ включён' if on else '⬜ выключен'} · ставка {stake_txt} · потолок ${S.max_stake_usd():g}"
     if kind == "mydev":
@@ -466,7 +468,7 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     kb: Kb = [[{"text": "✅ Включён — выключить" if on else "⬜ Выключен — включить",
                 "callback": f"rl:wmo:{tag}:{kind}:{'off' if on else 'on'}"}],
               [{"text": ("● " if rule == x else "") + f"Выход {x}", "callback": f"rl:wmr:{tag}:{kind}:{x}"}
-               for x in S.SCHEMES]]
+               for x in S.SCHEMES if x != "D" or kind == "mydev"]]
     if kind == "smart":
         kb.append([{"text": ("● " if filt == "all" else "") + "Все сигналы", "callback": f"rl:wmf:{tag}:all"},
                    {"text": ("● " if filt == "m" else "") + "Только отобранные (M)", "callback": f"rl:wmf:{tag}:m"}])

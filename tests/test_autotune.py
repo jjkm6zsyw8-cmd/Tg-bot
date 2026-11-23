@@ -13,12 +13,16 @@ from scanner.real import autotune as AT
 DSN = os.environ.get("TEST_DATABASE_URL", "postgresql://scanner:scanner@localhost:5432/scanner_test")
 
 
+RULES = {"mydev": "G", "copy": "G", "newdev": "L", "smart": "A", "trend": "A"}
+
+
 async def pos(db, kind, trader, pct, entry_mc=40.0, n=1):
     for _ in range(n):
         await db.execute(
             """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
-                   pnl_sol, pnl_pct) VALUES ('shadow', $1, 'M', $2, now(), now(), 0.1, 1, $3, $4::float8 * 0.1, $4)""",
-            kind, trader, entry_mc, pct)
+                   pnl_sol, pnl_pct, extra) VALUES ('shadow', $1, 'M', $2, now(), now(), 0.1, 1, $3, $4::float8 * 0.1, $4,
+                   jsonb_build_object('rule', $5::text))""",
+            kind, trader, entry_mc, pct, RULES[kind])
 
 
 async def trial(db, kind, rule, pct, n):
@@ -49,7 +53,8 @@ async def test_autotune_decisions():
         await trial(db, "trend", "B", 0.05, 30)
         for mc, pct in ((30, -0.1), (65, 0.3)):                        # новый дев: плюс только при 57–80
             await pos(db, "newdev", "D", pct, entry_mc=mc, n=12)
-        out = await AT.run(db, {"real_scheme": "A", "real_scheme_trend": "A"}, {"trend"})
+        cfg = {"real_scheme": "A", "real_scheme_trend": "A", "real_scheme_mydev": "G"}
+        out = await AT.run(db, cfg, {"trend"})
         text = out[0]
         assert "⛔ <b>мой дев</b>: остановлен на 3 дня" in text
         assert "🔁 <b>smart</b>: продаю по правилу G вместо A" in text
@@ -63,7 +68,11 @@ async def test_autotune_decisions():
         assert await db.kv_get(AT.BAND_KEY) == [57, 80]
         assert "Автонастройка" in await AT.last_text(db)
         # через 3 дня — снова проверка
-        out = await AT.run(db, {"real_scheme": "G"}, set(), now=time.time() + 4 * 86400)
+        out = await AT.run(db, {"real_scheme": "G", "real_scheme_mydev": "G"}, set(), now=time.time() + 4 * 86400)
+        # сменили подход «мой дев» на D — старый минус по G новый подход не останавливает
+        await db.kv_set(AT.BLOCK_KEY, {})
+        out2 = await AT.run(db, {"real_scheme": "G", "real_scheme_mydev": "D"}, set())
+        assert not out2 or "⛔ <b>мой дев</b>" not in out2[0]
         assert "🔄 <b>мой дев</b>: 3 дня прошли" in out[0]
     finally:
         await db.close()

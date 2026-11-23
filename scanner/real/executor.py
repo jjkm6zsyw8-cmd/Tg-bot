@@ -233,7 +233,7 @@ class RealTrader:
                     "time_stop_gain": None, "max_hold_s": float(p.extra.get("w_hold") or 1.0)}
         if rule == "L":
             return S.LOTTERY
-        sc = SCHEMES[rule] if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
+        sc = SCHEMES[rule] if rule in S.SCHEMES and rule in SCHEMES else self.scheme_for(p.extra.get("kind"))
         if p.extra.get("kind") == "newdev" and float(sc.get("max_hold_s") or 1e9) > NEWDEV_MAX_HOLD_S:
             # запуск: монета, которая за час не ушла на PumpSwap, почти наверняка мертва; у R стоп −50% ниже «пола»
             # кривой — без предела мёртвая монета висела бы сутки и тратила запросы цены
@@ -244,6 +244,8 @@ class RealTrader:
         """Правила выхода позиции — схема бумажного портфеля (та же, по которой считается бумага): у smart и
         «мой дев» — выбранная (A / B / G), у копий, крупных копий и смарт-ракет — их портфелей H / K / R."""
         name = self.get(S.SCHEME_KEYS[kind or "smart"])
+        if name == "D":
+            return S.DEV_SCHEME if kind == "mydev" else SCHEMES["G"]
         return S.LOTTERY if name == "L" else SCHEMES[name]
 
     def paused(self) -> str:
@@ -324,7 +326,8 @@ class RealTrader:
             self.positions[r["id"]] = Position(
                 id=r["id"], portfolio="REAL", mint=r["mint"], opened_ts=r["opened_at"].timestamp(),
                 entry_mc=float(r["entry_mc"] or 0), cost_sol=float(r["cost_sol"] or 0), tokens=float(r["tokens"] or 0),
-                tokens_initial=float(r["tokens"] or 0), target_mc=None, trader=r["trader"], symbol=r["symbol"] or "",
+                tokens_initial=float(r["tokens"] or 0), target_mc=ex.get("target_mc"), trader=r["trader"],
+                symbol=r["symbol"] or "",
                 proceeds_sol=float(r["proceeds_sol"] or 0), max_mc=float(r["max_mc"] or r["entry_mc"] or 0),
                 tp_done=bool(r["tp_done"]), alert_id=r["alert_id"], extra=ex)
         for r in await self.db.fetch("SELECT * FROM real_rule_trials WHERE closed_at IS NULL "
@@ -472,6 +475,8 @@ class RealTrader:
         tb = None if manual else self.tune_block(kind, data.get("source_wallet") or trader)
         if tb:
             return self._skip(mode, kind, tb)
+        if kind == "mydev" and level != "strong" and self.get("real_mydev_strong_only") and not manual:
+            return self._skip(mode, kind, "у дева нет почерка: мало продаж или ×1.5 раньше его продажи реже 60%")
         if kind == "smart" and mode == "live" and data.get("unsteady") and not followed:
             # 20.11: на деньги — только кошельки с устойчивым плюсом копий; тень такие сигналы меряет
             return self._skip(mode, kind, str(data["unsteady"]))
@@ -709,6 +714,10 @@ class RealTrader:
         if user is not None and st["extra"]:
             self.balance = st["extra"][0].lamports if st["extra"][0] is not None else 0
             self._balance_at = time.time()
+        if kind == "mydev" and data.get("entry_max_mc") and float(st["mc"] or 0) > float(data["entry_max_mc"]):
+            # как вручную: заходить на низах — дороже этой цены до его обычной продажи не остаётся запаса
+            return self._skip(mode, kind, f"дороже, чем этот дев даёт заработать: MC {float(st['mc'] or 0):.0f} > "
+                                          f"{float(data['entry_max_mc']):.0f}")
         cap = float(data.get("newdev_cap") or NEWDEV_MAX_MC)
         band = getattr(self, "newdev_band", None)
         if kind == "newdev" and band and not (band[0] <= float(st["mc"] or 0) < band[1]):
@@ -752,6 +761,7 @@ class RealTrader:
                 "filter": self.get("real_smart_filter") if kind == "smart" else "all",
                 "best_exit": self.best_exit(data.get("_followed")), "followed": bool(data.get("_followed")),
                 "fast": bool(data.get("fast")), "detect_ms": data.get("detect_ms"),
+                "target_mc": float(data["target_mc"]) if kind == "mydev" and data.get("target_mc") else None,
                 "age_s": (round(time.time() - float(data["trigger_ts"]), 3) if data.get("trigger_create")
                           and data.get("trigger_ts") else None)}
         if base["best_exit"]:
@@ -933,7 +943,8 @@ class RealTrader:
             {"note": note, "blocks_after": blocks, "stake_sol": base["stake"] / 1e9, "rule": base.get("rule"),
              "filter": base.get("filter"), "best_exit": base.get("best_exit"),
              "followed": base.get("followed", False), "fast": base.get("fast", False),
-             "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s")}, self.wid)
+             "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s"), "target_mc": base.get("target_mc")},
+            self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
                                    tokens_raw=tokens_raw, position_id=pid, note=note)
@@ -943,7 +954,8 @@ class RealTrader:
                               note=note)
         self.positions[pid] = Position(
             id=pid, portfolio="REAL", mint=base["mint"], opened_ts=time.time(), entry_mc=entry_mc, cost_sol=cost_sol,
-            tokens=tokens_raw / 1e6, tokens_initial=tokens_raw / 1e6, target_mc=None, trader=base["trader"],
+            tokens=tokens_raw / 1e6, tokens_initial=tokens_raw / 1e6, target_mc=base.get("target_mc"),
+            trader=base["trader"],
             symbol=base["symbol"], max_mc=entry_mc, alert_id=base["alert_id"],
             extra={"mode": base["mode"], "kind": base["kind"], "venue": base["venue"],
                    "token_program": base["token_program"], "tokens_raw": tokens_raw, "rent": rent_sol,

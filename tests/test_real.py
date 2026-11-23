@@ -195,7 +195,7 @@ def test_settings_limits_and_server_caps(monkeypatch):
     monkeypatch.delenv("REAL_MAX_STAKE_USD", raising=False)
     monkeypatch.delenv("REAL_LIVE", raising=False)
     assert S.get({}, "real_mode") == "shadow" and S.get({"real_mode": "хочу"}, "real_mode") == "off"
-    assert S.get({}, "real_scheme") == "A" and S.get({}, "real_scheme_mydev") == "G"       # как бумажные M и Y
+    assert S.get({}, "real_scheme") == "A" and S.get({}, "real_scheme_mydev") == "D"       # D — по почерку дева
     assert S.get({"real_scheme": "Z"}, "real_scheme") == "A"
     assert S.get({}, "real_stake_usd") == 5.0
     assert S.get({"real_stake_usd": 500}, "real_stake_usd") == 30.0      # потолок ставки с сервера
@@ -343,7 +343,9 @@ def engine(db, **cfg):
     paper = SimpleNamespace(rugged={}, rug_devs=set(), day_key=lambda: datetime.now(timezone.utc).date().isoformat(),
                             reset_tz=lambda: timezone.utc)
     # замер тенью (все методы, без стопа и лимита) — в своих тестах; здесь — правила как у боя
-    cfg = {"real_shadow_all": False, "real_shadow_free": False, **cfg}
+    # старые тесты — «мой дев» по правилу G и за любым девом (новое по умолчанию: D и только девы с почерком)
+    cfg = {"real_shadow_all": False, "real_shadow_free": False, "real_scheme_mydev": "G",
+           "real_mydev_strong_only": False, **cfg}
     return SimpleNamespace(db=db, cfg={"real_land_s": 0.0, **cfg}, price=SimpleNamespace(value=150.0), states={},
                            my_devs={}, paper=paper)
 
