@@ -122,6 +122,10 @@ LIVE_CHECK_N, LIVE_CHECK_MIN, LIVE_GAP = 12, 8, 0.05   # сверка боя Jup
 NO_ROUTE = "покупателей нет: Jupiter не находит маршрут (ликвидность убрали?)"
 NO_ROUTE_KEEP_S = 1800.0              # монета без маршрута: столько помним (пробы и тень — по нулю)
 RUG_WRITE_OFF_S = 600.0               # бой: покупателей нет столько — позиция списывается в ноль (токены остаются)
+# 24.11: плюс «заблокированных» пулов в бумаге дали клоны (JENSEN, Green cat, MARS…): пул PumpSwap с заблокированной
+# ликвидностью, но 9–31 держатель — создатель продаёт свои монеты в пул и выкачивает весь SOL. На деньги — только монеты
+# с живой аудиторией: держателей от TRENDJ_MIN_HOLDERS и топ-10 (без пулов и локеров) не больше TRENDJ_MAX_TOP10
+TRENDJ_MIN_HOLDERS, TRENDJ_MAX_TOP10 = 300, 0.5
 JUP_RETRY_S = 10.0                    # тень: котировки Jupiter нет (лимит, сеть) — повтор продажи через столько
 # «сторож» (24.11, просьба владельца): списанные в ноль боевые позиции (скам) — раз в DEAD_CHECK_S бот спрашивает
 # Jupiter, не появились ли покупатели; дают от DEAD_MIN_USD — продаёт остаток сам (это только продажа своих токенов)
@@ -1012,6 +1016,11 @@ class RealTrader:
                                  ("может допечатать токены", "mint_authority")) if (rc or {}).get(k)]
         if (rc or {}).get("rugged"):
             danger.append("RugCheck: монета уже слита")
+        holders, top10 = (rc or {}).get("total_holders"), (rc or {}).get("top10_pct")
+        if holders is None or int(holders) < TRENDJ_MIN_HOLDERS:
+            danger.append(f"мало держателей ({holders if holders is not None else '?'}) — может слить своё в пул")
+        if top10 is not None and float(top10) > TRENDJ_MAX_TOP10:
+            danger.append(f"топ-10 держат {float(top10):.0%}")
         if mode == "live" and danger:
             self._skip("live", kind, "создатель " + ", ".join(danger) + " — на деньги не беру, меряю в тени")
             mode = "shadow"
@@ -1048,6 +1057,7 @@ class RealTrader:
                 "best_exit": None, "followed": False, "fast": False, "detect_ms": None,
                 "age_s": round(float(age_s)) if age_s is not None else None,
                 "liq": (data.get("trend") or {}).get("liq"), "lp_locked": lp_locked,
+                "holders": holders, "top10": top10,
                 "market": (rc or {}).get("market_type"), "target_mc": None, "dec": dec}
         if mode == "live":
             if dec is None:
@@ -1547,7 +1557,7 @@ class RealTrader:
              "followed": base.get("followed", False), "fast": base.get("fast", False),
              "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s"), "target_mc": base.get("target_mc"),
              "dec": base.get("dec"), "liq": base.get("liq"), "lp_locked": base.get("lp_locked"),
-             "market": base.get("market")},
+             "market": base.get("market"), "holders": base.get("holders"), "top10": base.get("top10")},
             self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,

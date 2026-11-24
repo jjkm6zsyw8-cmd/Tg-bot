@@ -45,6 +45,7 @@ class Ext:
         self.bad_program = False
         self.rugged = False                     # ликвидность забрали: продать некому (Jupiter «маршрута нет»)
         self.lp_locked: float | None = 100.0    # RugCheck: заблокировано ликвидности главного пула, %
+        self.holders = 1500                     # RugCheck: держателей
         self.quotes: list[tuple[str, str, int]] = []
 
     def usd(self, mint: str) -> float:
@@ -57,7 +58,8 @@ class Ext:
         return self.usd(mint)
 
     async def rug_report(self, mint):
-        return {"lp_locked_pct": self.lp_locked, "market_type": "meteora_damm_v2"}
+        return {"lp_locked_pct": self.lp_locked, "market_type": "meteora_damm_v2", "total_holders": self.holders,
+                "top10_pct": 0.2}
 
     async def jup_prices(self, mints, ttl=3.0):
         return {m: self.usd(m) for m in mints}
@@ -489,7 +491,8 @@ async def test_live_only_when_pool_liquidity_is_locked(db, monkeypatch):
     assert rows[str(pk("locked"))]["market"] == "meteora_damm_v2"
     # ликвидность заблокирована, но у создателя право заморозки — тоже не на деньги
     async def frozen(mint):
-        return {"lp_locked_pct": 100.0, "market_type": "raydium_cpmm", "freeze_authority": "EVIL"}
+        return {"lp_locked_pct": 100.0, "market_type": "raydium_cpmm", "freeze_authority": "EVIL",
+                "total_holders": 1500, "top10_pct": 0.2}
     ext.rug_report = frozen
     await signal(tr, other_coin(chain, "freeze"), aid=3)
     assert next(p for p in tr.positions.values() if p.mint == str(pk("freeze"))).extra["mode"] == "shadow"
@@ -523,3 +526,21 @@ async def test_dead_watch_sells_written_off_tokens_when_buyers_return(db, monkey
     assert r["exit_reason"] == "rug_back" and r["proceeds_sol"] > 0 and r["pnl_pct"] > -0.1
     assert chain.tokens_of(tr.wallet.pubkey, coin) == 0 and len(chain.sent) == 2
     assert any("Сторож" in t for t in said)
+
+
+
+async def test_live_skips_clone_with_few_holders(db, monkeypatch):
+    """24.11: клон с заблокированной ликвидностью, но 9–31 держатель (создатель сливает своё в пул) — не на деньги."""
+    chain = FakeChain()
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_jup_dry_run=False)
+    tr.e.ext = ext = Ext(chain)
+    await tr.start()
+    ext.holders = 25
+    await signal(tr, other_coin(chain, "clone"), aid=1)
+    ext.holders = 1500
+    await signal(tr, other_coin(chain, "real"), aid=2)
+    modes = {p.mint: p.extra["mode"] for p in tr.positions.values()}
+    assert modes == {str(pk("clone")): "shadow", str(pk("real")): "live"}, dict(tr.skips)
+    assert skipped(tr, "мало держателей (25)")
+    row = await db.fetchrow("SELECT extra FROM real_positions WHERE mint = $1", str(pk("clone")))
+    assert row["extra"]["holders"] == 25 and row["extra"]["top10"] == 0.2
