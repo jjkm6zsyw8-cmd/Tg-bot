@@ -487,6 +487,13 @@ async def test_live_only_when_pool_liquidity_is_locked(db, monkeypatch):
     rows = {r["mint"]: dict(r["extra"]) for r in await db.fetch("SELECT mint, extra FROM real_positions")}
     assert rows[str(pk("unlocked"))]["lp_locked"] == 0.0 and rows[str(pk("locked"))]["lp_locked"] == 1.0
     assert rows[str(pk("locked"))]["market"] == "meteora_damm_v2"
+    # ликвидность заблокирована, но у создателя право заморозки — тоже не на деньги
+    async def frozen(mint):
+        return {"lp_locked_pct": 100.0, "market_type": "raydium_cpmm", "freeze_authority": "EVIL"}
+    ext.rug_report = frozen
+    await signal(tr, other_coin(chain, "freeze"), aid=3)
+    assert next(p for p in tr.positions.values() if p.mint == str(pk("freeze"))).extra["mode"] == "shadow"
+    assert skipped(tr, "создатель может заморозить токены — на деньги не беру")
 
 
 async def test_dead_watch_sells_written_off_tokens_when_buyers_return(db, monkeypatch):

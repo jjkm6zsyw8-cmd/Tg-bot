@@ -1007,6 +1007,14 @@ class RealTrader:
                                                                            else " (RugCheck не ответил)")
                        + " — создатель может вынуть деньги: на деньги не беру, меряю в тени")
             mode = "shadow"
+        # 24.11: и права у создателя: заморозка (запретит продать) и допечатка (обвалит цену) — тоже скам
+        danger = [n for n, k in (("может заморозить токены", "freeze_authority"),
+                                 ("может допечатать токены", "mint_authority")) if (rc or {}).get(k)]
+        if (rc or {}).get("rugged"):
+            danger.append("RugCheck: монета уже слита")
+        if mode == "live" and danger:
+            self._skip("live", kind, "создатель " + ", ".join(danger) + " — на деньги не беру, меряю в тени")
+            mode = "shadow"
         age_s = data.get("age_s")
         min_age = float(self.get("real_trendj_live_min_age_min"))
         if mode == "live" and age_s is not None and float(age_s) < min_age * 60:
