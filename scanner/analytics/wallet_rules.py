@@ -258,35 +258,27 @@ def hot(results: dict[str, dict[str, Any]], limit: int = HOT_LIMIT) -> list[str]
 
 
 async def top_text(db: Any, limit: int = 15) -> tuple[str, list[tuple[str, str]]]:
-    """Коротко: кошелёк · выход: сегодня / вчера / 7д / 30д — ≈ итог, если бы бот брал $10 на каждую его сделку.
+    """24.11 (владелец: «только реальные данные»): /top — что сделал РЕАЛЬНЫЙ бот за кошельками за 7 дней (тень —
+    настоящие цены, бой — деньги), лучшие сверху. Расчёты «если бы бот брал $10» здесь больше не показываются.
     Возвращает текст и [(адрес, имя)] для кнопок карточек."""
     rows = await db.fetch(
-        """SELECT address, label, best_rule, rules_periods, rules_days, rules_1d FROM traders
-           WHERE best_rule IS NOT NULL AND (active OR address IN (SELECT address FROM watchlist WHERE kind = 'trader'))""")
-    items = []
-    for r in rows:
-        d = usd(_j(r["rules_1d"]), r["best_rule"])
-        items.append((d[0] if d else 0.0, r))
-    items.sort(key=lambda x: -x[0])
-    items = items[:limit]
-    head = "💰 <b>Если бы бот брал $10 на каждую его сделку</b> (расчёт по истории, ≈)"
-    if not items:
-        return head + "\nПока нет кошельков с устойчивым плюсом.", []
-    # 25.11: рядом с расчётом — что на самом деле дал реальный бот за этим кошельком (тень и бой, настоящие цены,
-    # 7 дней): расчёт берёт цену трейдера, а бот входит позже и дороже — разница бывает в разы
-    real = {x["trader"]: x for x in await db.fetch(
-        """SELECT trader, count(*) n, COALESCE(sum(pnl_sol), 0) s FROM real_positions
-           WHERE trader = ANY($1::text[]) AND closed_at IS NOT NULL AND closed_at > now() - interval '7 days'
-           GROUP BY trader""", [r["address"] for _d, r in items])}
+        """SELECT p.trader, COALESCE(t.label, w.label) label, count(*) n, count(*) FILTER (WHERE p.pnl_sol > 0) win,
+                  COALESCE(sum(p.pnl_sol), 0) s, count(*) FILTER (WHERE p.mode = 'live') live
+           FROM real_positions p LEFT JOIN traders t ON t.address = p.trader
+           LEFT JOIN watchlist w ON w.address = p.trader AND w.kind = 'trader'
+           WHERE p.trader IS NOT NULL AND p.closed_at IS NOT NULL AND p.closed_at > now() - interval '7 days'
+             AND p.kind <> 'newdev'
+           GROUP BY p.trader, COALESCE(t.label, w.label) ORDER BY sum(p.pnl_sol) DESC LIMIT $1""", limit)
     sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
-    lines, out = [head, "👻 — что на самом деле дал реальный бот за ним (настоящие цены, 7 дн)"], []
-    for _d, r in items:
-        name = r["label"] or f"{r['address'][:4]}…{r['address'][-4:]}"
-        x = real.get(r["address"])
-        fact = f"👻 {_m(float(x['s']) * sol_usd)} ({x['n']} сд)" if x else "👻 бот за ним не торговал"
-        lines.append(f"<b>{esc(name[:14])}</b> · {RULE_NAMES[r['best_rule']]}: " + periods_text(
-            _j(r["rules_periods"]), r["best_rule"], r["rules_days"]) + f" · {fact}")
-        out.append((r["address"], name[:14]))
+    head = "📊 <b>Реальный бот за кошельками</b> — настоящие цены, 7 дн (👻 тень и 💵 бой вместе)"
+    if not rows:
+        return head + "\nЗа 7 дней бот ни за кем не торговал — реальных цифр нет.", []
+    lines, out = [head], []
+    for r in rows:
+        name = r["label"] or f"{r['trader'][:4]}…{r['trader'][-4:]}"
+        lines.append(f"<b>{esc(name[:14])}</b>: {_m(float(r['s']) * sol_usd)} · {r['n']} сд, в плюсе {r['win']}"
+                     + (f" · 💵 {r['live']}" if r["live"] else ""))
+        out.append((r["trader"], name[:14]))
     return "\n".join(lines), out
 
 

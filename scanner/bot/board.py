@@ -163,9 +163,16 @@ def rules_line(w: dict[str, Any]) -> str:
     return line
 
 
-def button(w: dict[str, Any]) -> dict[str, Any]:
+def button(w: dict[str, Any], real: dict[str, Any] | None = None, sol_usd: float = 150.0) -> dict[str, Any]:
     name = (w.get("label") or short(w["address"]))[:14]
     last = fmt.ago((datetime.now(timezone.utc) - w["last"]).total_seconds()) if w.get("last") else "—"
+    if real is not None:
+        # 24.11: на кнопке — только реальное: итог реального бота за ним за 7 дней (тень — настоящие цены, бой)
+        r = real.get(w["address"])
+        icon = TIER_ICON.get(w["tier"], "⚪")
+        txt = (f"{icon} {name} · реально 7д {money(float(r['s']) * sol_usd)} ({r['n']} сд)" if r
+               else f"{icon} {name} · реальных сделок нет · {last}")
+        return {"text": txt, "callback": f"bd:w:{w['address']}"}
     if w.get("usd_30d") is not None:               # посчитан через все выходы: 30 дн / сутки при $10
         from ..analytics.wallet_rules import RULE_NAMES
         icon = "🔥" if w.get("section") == "now" else "🟢"      # лучший выход в устойчивом плюсе
@@ -200,15 +207,19 @@ async def board_view(db: Any, section: str | None = None) -> tuple[str, list[lis
     text = (f"🏆 <b>Доска кошельков</b> · {SECTIONS[section]} — {len(rows)} из {len(ws)}\n"
             + ("Сейчас — плюс устойчив за 30 дней и за последние сутки тоже в плюсе; лучшие за сутки — сверху.\n"
                if section == "now" else "")
-            + f"Кнопка: кошелёк · лучший выход · итог при ${COPY_USD:g} на сделку за 30 дн и за 24 ч · последняя "
-            "сделка (не посчитанные: копий в плюсе · итог копий на бумаге). Нажми — карточка. "
+            + "Кнопка: кошелёк · итог реального бота за ним за 7 дней (настоящие цены). Нажми — карточка. "
             "Найти любой: /card начало адреса (например /card 6d7y). Таблица — /top."
             + (" Средние — первыми лучшие по копируемости." if section == "mid" else "")
             + ("" if rows else "\n\nВ этой секции пока никого."))
     tabs = [{"text": ("● " if s == section else "") + f"{name} ({cnt[s]})", "callback": f"bd:s:{s}"}
             for s, name in SECTIONS.items()]
     kb: list[list[dict[str, Any]]] = [tabs[:2], tabs[2:]]
-    kb += [[button(w)] for w in rows[:LIMIT]]
+    real = {r["trader"]: r for r in await db.fetch(
+        """SELECT trader, count(*) n, COALESCE(sum(pnl_sol), 0) s FROM real_positions
+           WHERE trader = ANY($1::text[]) AND closed_at IS NOT NULL AND closed_at > now() - interval '7 days'
+             AND kind <> 'newdev' GROUP BY trader""", [w["address"] for w in rows[:LIMIT]])}
+    sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
+    kb += [[button(w, real, sol_usd)] for w in rows[:LIMIT]]
     kb.append([{"text": "🏅 Таблица", "callback": "bd:t"}, {"text": "👛 Мои кошельки", "callback": "rl:mine"},
                {"text": "🔄 Обновить", "callback": f"bd:s:{section}"}])
     return text, kb
@@ -250,30 +261,24 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
     wr = f"{float(w['win_rate']):.0%}" if w.get("win_rate") is not None else "—"
     stake = float(S.get(cfg, "real_stake_usd"))
     added = w["added"].strftime("%d.%m") if w.get("added") else "—"
-    lines = [f"{TIER_ICON.get(w['tier'], '⚪')} <b>{esc(w.get('label') or short(addr))}</b> · "
-             f"{TIER_NAME.get(w['tier'], w['tier'])}",
+    # 24.11 (владелец: «нахуя ты мне не реальные данные показываешь»): в карточке — только реальное: что сделал
+    # реальный бот за этим кошельком (тень — настоящие цены, бой — деньги) и его собственное поведение. Расчёты по
+    # истории («если бы бот брал $10 на каждую его сделку», бумага, выходы) не показываются
+    lines = [f"{TIER_ICON.get(w['tier'], '⚪')} <b>{esc(w.get('label') or short(addr))}</b>",
              f"<code>{addr}</code>",
-             f"Его сделки: удачных {wr} · сегодня {w['today']} · последняя {last} · держит ~{hold}",
-             "Его итог с добавления (" + added + "): "
-             + (f"{w['own_pnl']:+.2f} SOL (грубо: незакрытые — в минусе)" if w.get("own_pnl") is not None
-                else "сделок в базе нет"),
-             (f"Копии на бумаге (${COPY_USD:g}): {w['n']} сд., в плюсе {w['plus']} ({w['plus'] / w['n']:.0%}), итог "
-              f"<b>{money(w['copy_usd'])}</b> · твой кошелёк (ставка ${stake:g}) ≈ {money(w['sum_pct'] * stake)}")
-             if w["n"] else "Копий на бумаге пока нет.",
-             (f"   из них «за трейдером» (продаёт, когда он): {w['hold'][0]} сд., в плюсе {w['hold'][1]}, итог "
-              f"{money(w['hold'][2] * COPY_USD)}" if w.get("hold") else ""),
-             _paper_exit_line(w),
-             rules_line(w),
-             "Копируемость 30 д: " + (f"{float(w['copy_30d']):+.0%} на сделку" if w.get("copy_30d") is not None else "—")
-             + (f", устойчивость t={float(w['copy_t_30d']):.1f} (от 1.645 — не случайность)"
-                if w.get("copy_t_30d") is not None else ""),
-             f"Реальный бот за ним: {FOLLOW_NAME.get(follow, '⚪ нет')}"]
-    for r in real:                       # 22.11: подтверждает ли бумагу реальный бот (тень — настоящие транзакции)
-        # по методам: у дева (Arkd) почти вся тень — «мой дев» (его запуски, выход «дев продаёт»), а не копии
-        fol = f", из них «за ним» {r['fol']}" if r["fol"] else ""
-        lines.append(f"   {'тень' if r['mode'] == 'shadow' else 'бой'} за 14 дн · {S.KIND_NAMES.get(r['kind'], r['kind'])}: "
-                     f"{r['n']} сд.{fol}, в плюсе {r['w']}, в среднем {float(r['a']):+.1%}, итог "
-                     f"{money(float(r['s']) * sol_usd)}")
+             "📊 <b>Реальный бот за ним</b> (настоящие цены, 14 дн):"]
+    if real:
+        for r in real:
+            fol = f", из них «за ним» {r['fol']}" if r["fol"] else ""
+            lines.append(f"   {'👻 тень' if r['mode'] == 'shadow' else '💵 бой'} · "
+                         f"{S.KIND_NAMES.get(r['kind'], r['kind'])}: {r['n']} сд.{fol}, в плюсе {r['w']}, "
+                         f"в среднем {float(r['a']):+.1%}, итог <b>{money(float(r['s']) * sol_usd)}</b>")
+    else:
+        lines.append("   сделок не было — реальных цифр по нему пока нет")
+    lines += [f"За ним сейчас: {FOLLOW_NAME.get(follow, '⚪ нет')}",
+              f"Как торгует он сам: удачных {wr} · сегодня {w['today']} · последняя {last} · держит ~{hold}"]
+    if w.get("median_hold_s") is not None and float(w["median_hold_s"]) < 20:
+        lines.append("⚠️ Держит меньше 20 с — бот-снайпер: копия покупает позже него и попадает под его продажу.")
     kb = [[{"text": ("● " if follow == "shadow" else "") + "👻 Тень за ним", "callback": f"bd:f:{addr}:shadow"},
            {"text": ("● " if follow == "live" else "") + "💵 В бой за ним…", "callback": f"bd:f:{addr}:live"}],
           [{"text": ("● " if not follow else "") + "⚪ Не торговать за ним", "callback": f"bd:f:{addr}:off"}],

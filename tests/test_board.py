@@ -45,16 +45,17 @@ async def test_board_sections_buttons_card_and_follow():
         text, kb = await B.board_view(db, "best")
         assert "🟢 Лучшие — 1 из 3" in text and kb[0][1]["text"].startswith("● 🟢 Лучшие (1)")
         assert kb[0][0]["text"] == "🔥 Сейчас (0)" and len(kb[1]) == 2      # вкладки — в два ряда
-        assert kb[2][0]["text"].startswith("🟢 звезда · 67% · +$4.50 · ") and kb[2][0]["callback"] == f"bd:w:{star}"
+        # 24.11: на кнопке — только реальное (итог реального бота за ним за 7 дней)
+        assert kb[2][0]["text"].startswith("🟢 звезда · реальных сделок нет · ") and kb[2][0]["callback"] == f"bd:w:{star}"
         assert (await B.board_view(db))[0].startswith("🏆 <b>Доска кошельков</b> · 🟢 Лучшие")   # «Сейчас» пуст
         _t, kb_bad = await B.board_view(db, "bad")
         assert kb_bad[2][0]["text"].startswith("🔴 скальп")
         _t, kb_mid = await B.board_view(db, "mid")
         assert kb_mid[2][0]["callback"] == f"bd:w:{mid}"                  # новый — без копий
         card, ckb = await B.card_view(db, {"real_stake_usd": 5}, star)
-        assert "удачных 79% · сегодня 2" in card and "держит ~3м" in card and "+0.50 SOL" in card
-        assert "Копии на бумаге ($10): 3 сд., в плюсе 2 (67%), итог <b>+$4.50</b>" in card   # одна копия на монету
-        assert "твой кошелёк (ставка $5) ≈ +$2.25" in card and "t=2.1" in card and "⚪ нет" in card
+        assert "удачных 79% · сегодня 2" in card and "держит ~3м" in card and "⚪ нет" in card
+        assert "📊 <b>Реальный бот за ним</b>" in card and "сделок не было — реальных цифр по нему пока нет" in card
+        assert "Копии на бумаге" not in card and "≈" not in card and "t=2.1" not in card     # расчётов нет
         cbs = [b.get("callback") for row in ckb for b in row]
         assert f"bd:f:{star}:shadow" in cbs and f"bd:f:{star}:live" in cbs and all(len(c.encode()) <= 64 for c in cbs if c)
         await db.execute(
@@ -62,7 +63,9 @@ async def test_board_sections_buttons_card_and_follow():
                    pnl_pct) VALUES ('shadow', 'copy', 'Q', $1, now(), now(), 0.05, 1, 0.01, 0.2)""", star)
         await db.kv_set("sol_usd", {"price": 100.0})
         card, _ = await B.card_view(db, {}, star)
-        assert "тень за 14 дн · копия: 1 сд., в плюсе 1, в среднем +20.0%, итог +$1.00" in card
+        assert "👻 тень · копия: 1 сд., в плюсе 1, в среднем +20.0%, итог <b>+$1.00</b>" in card
+        _t, kb = await B.board_view(db, "best")
+        assert kb[2][0]["text"] == "🟢 звезда · реально 7д +$1.00 (1 сд)"
         await B.set_follow(db, star, "live")
         card, _ = await B.card_view(db, {}, star)
         assert "💵 бой за ним" in card and (await db.kv_get(B.FOLLOW_KEY)) == {star: "live"}
@@ -139,34 +142,24 @@ async def test_now_section_30d_and_day_money_and_top():
                              a, g, day, None if a == weak else "G")
         text, kb = await B.board_view(db)                                 # по умолчанию — «Сейчас»
         assert "🔥 Сейчас — 1 из 3" in text and kb[0][0]["text"] == "● 🔥 Сейчас (1)"
-        assert kb[2][0]["text"].startswith("🔥 HoTw…aaaa · G · 30д +$48 · 24ч +$12 · ")
-        _t, kb_best = await B.board_view(db, "best")
-        assert kb_best[2][0]["text"].startswith("🟢 CoLd…bbbb · G · 30д +$48 · 24ч −$5.00")
+        assert kb[2][0]["text"].startswith("⚪ HoTw…aaaa · реальных сделок нет")       # 24.11: только реальное
         card, _ = await B.card_view(db, {}, hot)
-        assert "Итог при $10 на сделку по G: 30 дн <b>+$48</b> · сутки <b>+$12</b> (6 сд.)" in card
+        assert "Итог при $10" not in card and "≈" not in card
         per = {"today": {"N": 3, "rules": {"G": {"n": 3, "avg": 0.1}}}, "yday": {"N": 0, "rules": {}},
                "week": {"N": 40, "rules": {"G": {"n": 40, "avg": 0.12}}},
                "month": {"N": 100, "rules": {"G": {"n": 40, "avg": 0.12}}}}
         await db.execute("UPDATE traders SET rules_periods = $2, rules_days = 16 WHERE address = $1", hot, per)
         top, tkb = await B.top_view(db)
-        lines = top.splitlines()
-        assert lines[0].startswith("💰 <b>Если бы бот брал $10 на каждую его сделку</b>") and len(lines) == 4
-        assert lines[1].startswith("👻 — что на самом деле дал реальный бот за ним")
-        assert lines[2] == ("<b>HoTw…aaaa</b> · G: сегодня +$3 · вчера +$0 · 7д +$48 · 16д +$120 · "
-                            "👻 бот за ним не торговал")
-        assert lines[3].startswith("<b>CoLd…bbbb</b> · G: ещё не посчитано")    # без лучшего — нет в списке
-        _t, kb = await B.board_view(db)
-        assert kb[2][0]["text"] == "🔥 HoTw…aaaa · сег +$3.00 · вч +$0.00 · 30д +$120"
-        card, _ = await B.card_view(db, {}, hot)
-        assert "💰 $10 на каждую его сделку (≈): <b>сегодня +$3 · вчера +$0 · 7д +$48 · 16д +$120</b>" in card
-        assert "Выходы за 16 дн истории в базе" in card
+        assert top.startswith("📊 <b>Реальный бот за кошельками</b>") and "реальных цифр нет" in top
         await db.execute(
             """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, pnl_sol,
                    pnl_pct, extra) VALUES ('shadow', 'mydev', 'Q1', $1, now(), now(), 0.05, 1, -0.01, -0.2, '{}'),
                    ('shadow', 'copy', 'Q2', $1, now(), now(), 0.05, 1, 0.01, 0.2, '{"followed": true}')""", hot)
         card, _ = await B.card_view(db, {}, hot)
-        assert "тень за 14 дн · мой дев: 1 сд., в плюсе 0" in card
-        assert "тень за 14 дн · копия: 1 сд., из них «за ним» 1, в плюсе 1" in card
+        assert "👻 тень · мой дев: 1 сд., в плюсе 0" in card
+        assert "👻 тень · копия: 1 сд., из них «за ним» 1, в плюсе 1" in card
+        top, tkb = await B.top_view(db)
+        assert "<b>HoTw…aaaa</b>: +$0 · 2 сд, в плюсе 1" in top                      # реальный бот за 7 дней
         assert tkb[0][0]["callback"] == f"bd:w:{hot}" and tkb[-1][1]["callback"] == "bd:t"
     finally:
         await db.close()
