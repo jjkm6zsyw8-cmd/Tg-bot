@@ -100,7 +100,7 @@ _SIGNAL: contextvars.ContextVar[tuple[str, int | None] | None] = contextvars.Con
 EXIT_NAMES = {"take_profit": "тейк", "stop": "стоп", "trailing": "трейлинг", "time_stop": "нет роста",
               "max_hold": "время вышло", "trader_sell": "трейдер продал", "tiny_rebuy": "мелкая докупка",
               "emergency": "дев продаёт", "manual": "вручную", "sell_all": "продать всё", "gone": "токенов нет",
-              "rug": "покупателей нет (ликвидность убрали)"}
+              "rug": "покупателей нет (ликвидность убрали)", "rug_back": "скам, остаток продан сторожем"}
 SELL_SLIPPAGE_STEPS = (1.0, 2.0, 4.0, 6.0)      # множители лимита проскальзывания по попыткам продажи
 BUY_CONFIRM_S, BUY_RESEND_UNTIL_S = 20.0, 5.0   # покупку шлём 5 с, дальше только ждём, пока жив её блокхэш
 SELL_CONFIRM_S = 20.0
@@ -123,6 +123,9 @@ NO_ROUTE = "покупателей нет: Jupiter не находит марш�
 NO_ROUTE_KEEP_S = 1800.0              # монета без маршрута: столько помним (пробы и тень — по нулю)
 RUG_WRITE_OFF_S = 600.0               # бой: покупателей нет столько — позиция списывается в ноль (токены остаются)
 JUP_RETRY_S = 10.0                    # тень: котировки Jupiter нет (лимит, сеть) — повтор продажи через столько
+# «сторож» (24.11, просьба владельца): списанные в ноль боевые позиции (скам) — раз в DEAD_CHECK_S бот спрашивает
+# Jupiter, не появились ли покупатели; дают от DEAD_MIN_USD — продаёт остаток сам (это только продажа своих токенов)
+DEAD_CHECK_S, DEAD_MIN_USD, DEAD_DAYS = 1800.0, 1.0, 14
 
 
 def paid_mc(lamports: int, tokens_raw: int) -> float:
@@ -1331,6 +1334,55 @@ class RealTrader:
                         f"ликвидность (скам). Списал в ноль: −${p.cost_sol * self.sol_usd():.2f}. Токены остались на "
                         f"кошельке. Монета: <code>{p.mint}</code>")
 
+    async def _dead_watch_safe(self) -> None:
+        try:
+            await self._dead_watch()
+        except Exception:  # noqa: BLE001 — сторож не должен мешать торговле
+            log.exception("реальный бот: сторож списанных токенов")
+
+    async def _dead_watch(self) -> None:
+        """Списанные боевые позиции (скам): если у монеты снова есть покупатели и за остаток дают от DEAD_MIN_USD —
+        продать и дописать выручку в сделку (exit_reason rug_back)."""
+        if self.wallet is None or not self.wallet.can_sign or self.chain is None or not S.live_allowed():
+            return
+        ext = getattr(self.e, "ext", None)
+        if ext is None or not hasattr(ext, "jup_quote"):
+            return
+        rows = await self.db.fetch(
+            """SELECT id, mint, symbol, token_program FROM real_positions WHERE mode = 'live' AND venue = $1
+               AND exit_reason = 'rug' AND closed_at > now() - make_interval(days => $2)
+               AND wallet_id IS NOT DISTINCT FROM $3""", JUP_VENUE, DEAD_DAYS, self.wid)
+        for r in rows:
+            tp = pump.TOKEN_PROGRAMS.get(str(r["token_program"]))
+            if tp is None:
+                continue
+            ata = pump.ata(self.wallet.pubkey, Pubkey.from_string(r["mint"]), tp)
+            have = jupswap._amount((await self.chain.accounts([ata], "confirmed"))[0])
+            if have <= 0:
+                continue
+            q = await ext.jup_quote(r["mint"], SOL_MINT, have)
+            if not q or q.get("no_route") or q["out"] / 1e9 * self.sol_usd() < DEAD_MIN_USD:
+                continue
+            res = await self._jup_send("sell", r["mint"], SOL_MINT, have,
+                                       min(0.5, float(self.get("real_jup_slippage")) * 4), 0, ata,
+                                       {"mode": "live", "mint": r["mint"]}, position_id=r["id"],
+                                       payload={"reason": "dead_watch"})
+            if not res["ok"]:
+                continue
+            fill = rtx.fill_from_tx(res["info"], str(self.wallet.pubkey), []) if res["info"] else None
+            got = fill["sol_delta"] / 1e9 if fill else int(res["quote"].get("outAmount") or 0) / 1e9 - self.fees_sol()
+            await self.db.execute(
+                """UPDATE real_positions SET proceeds_sol = proceeds_sol + $2, pnl_sol = pnl_sol + $2,
+                       pnl_pct = (pnl_sol + $2) / NULLIF(cost_sol, 0), exit_reason = 'rug_back', sell_sig = $3
+                   WHERE id = $1""", r["id"], got, res["sig"])
+            self._roll_day()
+            self.day_pnl["live"] = self.day_pnl.get("live", 0.0) + got
+            self.live_total += got
+            self.to_close[r["mint"]] = (str(r["token_program"]), time.time() + 20, 1)
+            await self._say(f"💵 ✅ Сторож: у ${fmt.esc(r['symbol'] or '?')} снова появились покупатели — продал "
+                            f"остаток за {got:.4f} SOL (${got * self.sol_usd():.2f}).")
+            await self.refresh_balance(force=True)
+
     async def _jup_dry_run_safe(self, mint_s: str, stake: int, pid: int | None) -> None:
         try:
             await self._jup_dry_run(mint_s, stake, pid)
@@ -2084,6 +2136,9 @@ class RealTrader:
         if self.to_close and not self._sweeping and self.wallet is not None and self.wallet.can_sign \
                 and self.chain is not None:
             asyncio.create_task(self._sweep_safe())
+        if now - getattr(self, "_dead_at", 0.0) >= DEAD_CHECK_S and self.wallet is not None and self.wallet.can_sign:
+            self._dead_at = now
+            asyncio.create_task(self._dead_watch_safe())
         await self.refresh_balance()
         if now - self._last_status >= 5:
             await self.publish_status()

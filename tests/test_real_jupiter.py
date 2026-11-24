@@ -487,3 +487,32 @@ async def test_live_only_when_pool_liquidity_is_locked(db, monkeypatch):
     rows = {r["mint"]: dict(r["extra"]) for r in await db.fetch("SELECT mint, extra FROM real_positions")}
     assert rows[str(pk("unlocked"))]["lp_locked"] == 0.0 and rows[str(pk("locked"))]["lp_locked"] == 1.0
     assert rows[str(pk("locked"))]["market"] == "meteora_damm_v2"
+
+
+async def test_dead_watch_sells_written_off_tokens_when_buyers_return(db, monkeypatch):
+    """24.11: «сторож» — списанная в ноль (скам) боевая позиция: если у монеты снова есть покупатели и дают от $1,
+    бот продаёт остаток сам и дописывает выручку в сделку."""
+    monkeypatch.setattr(ex, "RUG_WRITE_OFF_S", 0.0)
+    chain = FakeChain()
+    coin = other_coin(chain, "dead-back")
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
+    tr.e.ext = ext = Ext(chain)
+    said = []
+
+    async def say(text):
+        said.append(text)
+    tr._say = say
+    await tr.start()
+    await signal(tr, coin)
+    p = only(tr)
+    ext.rugged = True
+    await tr._sell_jup_live(p, "max_hold", 1.0)
+    assert (await db.fetchval("SELECT exit_reason FROM real_positions")) == "rug"
+    await tr._dead_watch()                                     # покупателей всё ещё нет — ничего не делает
+    assert len(chain.sent) == 1
+    ext.rugged = False                                         # ликвидность вернули
+    await tr._dead_watch()
+    r = await db.fetchrow("SELECT exit_reason, proceeds_sol, pnl_pct FROM real_positions")
+    assert r["exit_reason"] == "rug_back" and r["proceeds_sol"] > 0 and r["pnl_pct"] > -0.1
+    assert chain.tokens_of(tr.wallet.pubkey, coin) == 0 and len(chain.sent) == 2
+    assert any("Сторож" in t for t in said)
