@@ -151,9 +151,13 @@ async def wallet_view(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) -
         lines.append(f"{name}: " + (" · ".join(parts) if parts else "сделок нет"))
     opened = ws.get("open") or [] if fresh else []
     if opened:
-        lines.append(f"Открыто: {len(opened)}")
-        lines += [f"• ${esc(o.get('symbol') or '?')} ({KINDS.get(o.get('kind'), o.get('kind'))}) "
-                  f"{float(o.get('net') or 0):+.0%} · {float(o.get('age_s') or 0) / 60:.0f} мин" for o in opened[:6]]
+        # 25.11: в бою у кошелька и тень-замер — сразу видно, что на деньги (💵), а что без денег (👻); деньги — первыми
+        n_live = sum(1 for o in opened if o.get("mode") == "live")
+        lines.append(f"Открыто: 💵 {n_live} на деньги · 👻 {len(opened) - n_live} в тени (без денег)")
+        opened = sorted(opened, key=lambda o: o.get("mode") != "live")
+        lines += [f"• {MODE_ICON.get(o.get('mode'), '')} ${esc(o.get('symbol') or '?')} "
+                  f"({KINDS.get(o.get('kind'), o.get('kind'))}) {float(o.get('net') or 0):+.0%} · "
+                  f"{float(o.get('age_s') or 0) / 60:.0f} мин" for o in opened[:6]]
     kb: Kb = [
         [{"text": "📥 Пополнить", "callback": f"rl:wd:{wid}"}, {"text": "📤 Вывести", "callback": f"rl:wo:{wid}"}],
         [{"text": ("● " if want == m else "") + f"{MODE_ICON[m]} {MODE_SHORT[m].capitalize()}"

@@ -420,3 +420,19 @@ async def test_mode_change_is_announced_with_its_source(db, monkeypatch):
     assert any("🔀 Режим: 👻 тень → <b>💵 бой</b> (кнопка «Да, включить бой» в Telegram)" in t for t in texts)
     assert any("🔀 Режим: 💵 бой → <b>👻 тень</b> (кнопка «Тень» в Telegram)" in t for t in texts)
     assert all("Мейныч" in t for t in texts if "🔀" in t)
+
+
+async def test_card_marks_money_and_shadow_positions(db):
+    """25.11: в карточке кошелька в бою — сразу видно, какие открытые позиции на деньги, какие — тень без денег."""
+    chain = FakeChain()
+    desk = make_desk(db, chain)
+    await desk.start()
+    wid = await desk.create_wallet("Мейныч")
+    from datetime import datetime, timezone
+    st = {"wallet_id": wid, "at": datetime.now(timezone.utc).isoformat(), "mode": "live", "want": "live",
+          "open": [{"symbol": "NEW", "kind": "newdev", "mode": "shadow", "net": 0.1, "age_s": 60},
+                   {"symbol": "RAY", "kind": "trendj", "mode": "live", "net": 0.2, "age_s": 120}]}
+    await db.kv_set(desk.lanes[wid].status_key(), st)
+    text, _kb = await UI.wallet_view(db, {}, wid)
+    assert "Открыто: 💵 1 на деньги · 👻 1 в тени (без денег)" in text
+    assert text.index("💵 $RAY") < text.index("👻 $NEW")
