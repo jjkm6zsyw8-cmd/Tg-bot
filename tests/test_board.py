@@ -150,9 +150,11 @@ async def test_now_section_30d_and_day_money_and_top():
         await db.execute("UPDATE traders SET rules_periods = $2, rules_days = 16 WHERE address = $1", hot, per)
         top, tkb = await B.top_view(db)
         lines = top.splitlines()
-        assert lines[0].startswith("💰 <b>Если бы бот брал $10 на каждую его сделку</b>") and len(lines) == 3
-        assert lines[1] == "<b>HoTw…aaaa</b> · G: сегодня +$3 · вчера +$0 · 7д +$48 · 16д +$120"
-        assert lines[2] == "<b>CoLd…bbbb</b> · G: ещё не посчитано"            # без лучшего — нет в списке
+        assert lines[0].startswith("💰 <b>Если бы бот брал $10 на каждую его сделку</b>") and len(lines) == 4
+        assert lines[1].startswith("👻 — что на самом деле дал реальный бот за ним")
+        assert lines[2] == ("<b>HoTw…aaaa</b> · G: сегодня +$3 · вчера +$0 · 7д +$48 · 16д +$120 · "
+                            "👻 бот за ним не торговал")
+        assert lines[3].startswith("<b>CoLd…bbbb</b> · G: ещё не посчитано")    # без лучшего — нет в списке
         _t, kb = await B.board_view(db)
         assert kb[2][0]["text"] == "🔥 HoTw…aaaa · сег +$3.00 · вч +$0.00 · 30д +$120"
         card, _ = await B.card_view(db, {}, hot)

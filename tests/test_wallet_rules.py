@@ -113,3 +113,10 @@ async def test_autofollow_hot_wallets_not_in_own_list():
         assert (await db.kv_get(WR.FOLLOW_KEY)) == {"OWN": "shadow"}
     finally:
         await db.close()
+
+
+def test_periods_text_no_duplicate_week():
+    """25.11: история ровно 7 дней — «7д +$230 · 7д +$230» писалось дважды."""
+    per = {k: {"N": 5, "rules": {"G": {"n": 5, "avg": 0.1}}} for k in ("today", "yday", "week", "month")}
+    txt = WR.periods_text(per, "G", 7)
+    assert txt.count("7д") == 1 and "30д" not in txt

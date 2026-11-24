@@ -272,11 +272,20 @@ async def top_text(db: Any, limit: int = 15) -> tuple[str, list[tuple[str, str]]
     head = "💰 <b>Если бы бот брал $10 на каждую его сделку</b> (расчёт по истории, ≈)"
     if not items:
         return head + "\nПока нет кошельков с устойчивым плюсом.", []
-    lines, out = [head], []
+    # 25.11: рядом с расчётом — что на самом деле дал реальный бот за этим кошельком (тень и бой, настоящие цены,
+    # 7 дней): расчёт берёт цену трейдера, а бот входит позже и дороже — разница бывает в разы
+    real = {x["trader"]: x for x in await db.fetch(
+        """SELECT trader, count(*) n, COALESCE(sum(pnl_sol), 0) s FROM real_positions
+           WHERE trader = ANY($1::text[]) AND closed_at IS NOT NULL AND closed_at > now() - interval '7 days'
+           GROUP BY trader""", [r["address"] for _d, r in items])}
+    sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
+    lines, out = [head, "👻 — что на самом деле дал реальный бот за ним (настоящие цены, 7 дн)"], []
     for _d, r in items:
         name = r["label"] or f"{r['address'][:4]}…{r['address'][-4:]}"
+        x = real.get(r["address"])
+        fact = f"👻 {_m(float(x['s']) * sol_usd)} ({x['n']} сд)" if x else "👻 бот за ним не торговал"
         lines.append(f"<b>{esc(name[:14])}</b> · {RULE_NAMES[r['best_rule']]}: " + periods_text(
-            _j(r["rules_periods"]), r["best_rule"], r["rules_days"]))
+            _j(r["rules_periods"]), r["best_rule"], r["rules_days"]) + f" · {fact}")
         out.append((r["address"], name[:14]))
     return "\n".join(lines), out
 
@@ -289,6 +298,8 @@ def periods_text(periods: dict[str, Any], rule: str | None, days: int | None) ->
     for key, name in (("today", "сегодня"), ("yday", "вчера"), ("week", "7д"), ("month", "30д")):
         v = period_usd(periods, rule, key)
         if key == "month" and days is not None and days < 30:
+            if days == 7:
+                continue                    # «7д» уже есть — второй раз то же самое не пишем
             name = f"{days}д"
         if key == "week" and days is not None and days < 7:
             continue
