@@ -991,6 +991,19 @@ class RealTrader:
             return self._skip("shadow", kind, "метод «тренды на других биржах» выключен")
         if mode == "live" and self.get("real_only_follow"):
             mode = "shadow"                            # «на деньги — только выбранные мной кошельки»
+        ext = getattr(self.e, "ext", None)
+        # 24.11: заблокирована ли ликвидность пула (RugCheck). 0% — создатель может вынуть деньги в любую секунду:
+        # так ушли обе боевые покупки ($b, Slingoor). Меряем у каждого входа (тень делит итог по этому признаку),
+        # на деньги — только от real_trendj_live_min_lp_locked
+        rc = await ext.rug_report(mint_s) if ext is not None and hasattr(ext, "rug_report") else None
+        lp_locked = (rc or {}).get("lp_locked_pct")
+        lp_locked = float(lp_locked) / 100 if lp_locked is not None else None
+        min_lp = float(self.get("real_trendj_live_min_lp_locked"))
+        if mode == "live" and min_lp > 0 and (lp_locked is None or lp_locked < min_lp):
+            self._skip("live", kind, "ликвидность пула не заблокирована" + (f" ({lp_locked:.0%})" if lp_locked is not None
+                                                                           else " (RugCheck не ответил)")
+                       + " — создатель может вынуть деньги: на деньги не беру, меряю в тени")
+            mode = "shadow"
         age_s = data.get("age_s")
         min_age = float(self.get("real_trendj_live_min_age_min"))
         if mode == "live" and age_s is not None and float(age_s) < min_age * 60:
@@ -1008,7 +1021,6 @@ class RealTrader:
         tb = self.tune_block(kind, None, mode)
         if tb:
             return self._skip(mode, kind, tb)
-        ext = getattr(self.e, "ext", None)
         jp = await ext.jup_price(mint_s) if ext is not None else None
         if not jp:
             return self._skip(mode, kind, "другая биржа: нет цены Jupiter")
@@ -1024,7 +1036,8 @@ class RealTrader:
                 "min_out": 0, "slip": JUP_SLIP, "mc": mc, "rule": self.get(S.SCHEME_KEYS[kind]), "filter": "all",
                 "best_exit": None, "followed": False, "fast": False, "detect_ms": None,
                 "age_s": round(float(age_s)) if age_s is not None else None,
-                "liq": (data.get("trend") or {}).get("liq"), "target_mc": None, "dec": dec}
+                "liq": (data.get("trend") or {}).get("liq"), "lp_locked": lp_locked,
+                "market": (rc or {}).get("market_type"), "target_mc": None, "dec": dec}
         if mode == "live":
             if dec is None:
                 return self._skip("live", kind, "другая биржа: Jupiter не сообщил знаки токена")
@@ -1473,7 +1486,8 @@ class RealTrader:
              "filter": base.get("filter"), "best_exit": base.get("best_exit"),
              "followed": base.get("followed", False), "fast": base.get("fast", False),
              "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s"), "target_mc": base.get("target_mc"),
-             "dec": base.get("dec"), "liq": base.get("liq")},
+             "dec": base.get("dec"), "liq": base.get("liq"), "lp_locked": base.get("lp_locked"),
+             "market": base.get("market")},
             self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,

@@ -317,6 +317,11 @@ class ExternalHub:
         _ok, v = await self._call(self.jupiter, self.jupiter.swap_instructions(quote, user), 9.0)
         return v
 
+    async def rug_report(self, mint: str) -> dict[str, Any] | None:
+        """Отчёт RugCheck (разобранный, с долей заблокированной ликвидности главного пула) или None."""
+        _ok, v = await self._call(self.rugcheck, self.rugcheck.report(mint), 6.0)
+        return v
+
     def jup_decimals(self, mint: str) -> int | None:
         return self.jupiter.decimals.get(mint)
 

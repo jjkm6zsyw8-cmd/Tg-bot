@@ -44,6 +44,7 @@ class Ext:
         self.thief: Pubkey | None = None
         self.bad_program = False
         self.rugged = False                     # ликвидность забрали: продать некому (Jupiter «маршрута нет»)
+        self.lp_locked: float | None = 100.0    # RugCheck: заблокировано ликвидности главного пула, %
         self.quotes: list[tuple[str, str, int]] = []
 
     def usd(self, mint: str) -> float:
@@ -54,6 +55,9 @@ class Ext:
 
     async def jup_price(self, mint, ttl=None):
         return self.usd(mint)
+
+    async def rug_report(self, mint):
+        return {"lp_locked_pct": self.lp_locked, "market_type": "meteora_damm_v2"}
 
     async def jup_prices(self, mints, ttl=3.0):
         return {m: self.usd(m) for m in mints}
@@ -463,3 +467,23 @@ async def test_live_only_for_coins_older_than_limit(db, monkeypatch):
     assert skipped(tr, "монета моложе 60 мин (3 мин) — на деньги не беру, меряю в тени")
     row = await db.fetchrow("SELECT extra FROM real_positions WHERE mint = $1", str(young))
     assert row["extra"]["age_s"] == 180 and row["extra"]["liq"] == 12_000.0
+
+
+
+async def test_live_only_when_pool_liquidity_is_locked(db, monkeypatch):
+    """24.11: обе боевые покупки ($b, Slingoor) — пулы Meteora DAMM v2 с ликвидностью, заблокированной на 0%: создатель
+    вынул деньги через секунды. На деньги — только если заблокировано от 90%; иначе — тень (меряем)."""
+    chain = FakeChain()
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_jup_dry_run=False)
+    tr.e.ext = ext = Ext(chain)
+    await tr.start()
+    ext.lp_locked = 0.0
+    await signal(tr, other_coin(chain, "unlocked"), aid=1)
+    ext.lp_locked = 100.0
+    await signal(tr, other_coin(chain, "locked"), aid=2)
+    modes = sorted(p.extra["mode"] for p in tr.positions.values())
+    assert modes == ["live", "shadow"], dict(tr.skips)
+    assert skipped(tr, "ликвидность пула не заблокирована (0%) — создатель может вынуть деньги")
+    rows = {r["mint"]: dict(r["extra"]) for r in await db.fetch("SELECT mint, extra FROM real_positions")}
+    assert rows[str(pk("unlocked"))]["lp_locked"] == 0.0 and rows[str(pk("locked"))]["lp_locked"] == 1.0
+    assert rows[str(pk("locked"))]["market"] == "meteora_damm_v2"

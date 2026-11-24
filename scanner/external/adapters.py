@@ -136,7 +136,15 @@ def parse_rugcheck(d: Any) -> dict[str, Any] | None:
     holders = [h for h in d.get("topHolders") or []
                if h.get("owner") not in service and h.get("address") not in service]
     risks = [{"name": r.get("name"), "level": r.get("level"), "value": r.get("value")} for r in d.get("risks") or []]
+    # 24.11: главный пул монеты (больше всего денег) — заблокирована ли ликвидность. 0% — создатель может вынуть
+    # деньги из пула в любую секунду (так ушли $b и Slingoor: Meteora DAMM v2, LP заблокирован 0%)
+    mk = max((m for m in d.get("markets") or [] if isinstance(m, dict)),
+             key=lambda m: _f((m.get("lp") or {}).get("quoteUSD")) or 0.0, default=None)
+    lp = (mk or {}).get("lp") or {}
     return {
+        "lp_locked_pct": _f(lp.get("lpLockedPct")),
+        "lp_quote_usd": _f(lp.get("quoteUSD")),
+        "market_type": (mk or {}).get("marketType"),
         "mint_authority": d.get("mintAuthority"),
         "freeze_authority": d.get("freezeAuthority"),
         "score_normalised": _f(d.get("score_normalised")),

@@ -531,6 +531,17 @@ async def trendj_live_lines(db: Any, wcfg: dict[str, Any], wid: int | None) -> l
                        "не идут")
     else:
         out.append("⬜ выключен — только тень. Включается только этой кнопкой, с подтверждением.")
+    # 24.11: итог тени по признаку «ликвидность пула заблокирована» (RugCheck) — на деньги идут только такие пулы
+    sol_usd = await sol_price(db)
+    by_lock = await db.fetch(
+        """SELECT (extra->>'lp_locked')::float >= $2 locked, count(*) n, COALESCE(sum(pnl_sol), 0) s,
+                  count(*) FILTER (WHERE exit_reason = 'rug') rugs
+           FROM real_positions WHERE kind = 'trendj' AND closed_at IS NOT NULL AND extra ? 'lp_locked'
+             AND extra->>'lp_locked' IS NOT NULL AND closed_at > now() - interval '7 days'
+             AND wallet_id IS NOT DISTINCT FROM $1 GROUP BY 1""", wid, float(S.get(wcfg, "real_trendj_live_min_lp_locked")))
+    for x in sorted(by_lock, key=lambda x: not x["locked"]):
+        out.append(f"{'🔒 ликвидность заблокирована' if x['locked'] else '🔓 не заблокирована'}: {x['n']} сд · "
+                   f"{money(float(x['s']), sol_usd)} · скам {x['rugs']} (7 дн)")
     r = await db.fetchrow(
         """SELECT count(*) n, count(*) FILTER (WHERE status = 'simulated') ok,
                   (array_agg(error ORDER BY id DESC) FILTER (WHERE status = 'failed'))[1] last_err
