@@ -122,6 +122,7 @@ LIVE_CHECK_N, LIVE_CHECK_MIN, LIVE_GAP = 12, 8, 0.05   # сверка боя Jup
 NO_ROUTE = "покупателей нет: Jupiter не находит маршрут (ликвидность убрали?)"
 NO_ROUTE_KEEP_S = 1800.0              # монета без маршрута: столько помним (пробы и тень — по нулю)
 RUG_WRITE_OFF_S = 600.0               # бой: покупателей нет столько — позиция списывается в ноль (токены остаются)
+JUP_RETRY_S = 10.0                    # тень: котировки Jupiter нет (лимит, сеть) — повтор продажи через столько
 
 
 def paid_mc(lamports: int, tokens_raw: int) -> float:
@@ -1032,12 +1033,11 @@ class RealTrader:
         # настоящая цена исполнения: котировка Jupiter на нашу сумму (маршрут и сдвиг цены своей покупкой учтены);
         # котировки нет (лимит запросов) — цена Jupiter + 1%, с пометкой
         q = await ext.jup_quote(SOL_MINT, mint_s, stake) if dec is not None and hasattr(ext, "jup_quote") else None
-        if q and q["out"] > 0:
-            raw = int(q["out"] / 10 ** dec * 1e6)       # в учёте бота — 6 знаков, как у pump.fun
-            how = f"котировка Jupiter (сдвиг цены {q['impact'] * 100:.2f}%)"
-        else:
-            raw = int(stake * 1e6 / (mc * (1 + JUP_SLIP)))
-            how = "котировки нет — цена Jupiter +1%"
+        if not q or q.get("no_route") or q["out"] <= 0:
+            # 24.11 (владелец: «только реальные цены»): без настоящей котировки тень не входит (раньше — цена +1%)
+            return self._skip("shadow", kind, "другая биржа: котировки Jupiter нет — без настоящей цены не вхожу")
+        raw = int(q["out"] / 10 ** dec * 1e6)           # в учёте бота — 6 знаков, как у pump.fun
+        how = f"котировка Jupiter (сдвиг цены {q['impact'] * 100:.2f}%)"
         if raw <= 0:
             return self._skip("shadow", kind, "другая биржа: цена не разобрана")
         base["min_out"] = raw
@@ -1590,6 +1590,12 @@ class RealTrader:
         except Exception:  # noqa: BLE001
             st = {"why": "сеть не ответила", "venue": None}
         jq = await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE else None
+        if p.extra.get("venue") == JUP_VENUE and jq is None:
+            # 24.11 (владелец: «только реальные цены»): котировки нет (лимит / сеть) — НЕ оцениваем по последней цене,
+            # а повторяем продажу через JUP_RETRY_S; «маршрута нет» — это не сюда, это выручка ноль (jq = 0)
+            p.closing = False
+            p.extra["retry_at"] = time.time() + JUP_RETRY_S
+            return
         if jq is not None:                           # другая биржа: настоящая котировка Jupiter на продажу
             proceeds, mc = jq
             if self.no_route(p.mint) and proceeds <= 0:
@@ -1795,10 +1801,12 @@ class RealTrader:
         have = int(p.extra["tokens_raw"])
         raw = int(have * share) if share < 1 else have
         st: dict[str, Any] = {}
-        # 25.11: пробы на входе БОЯ — оценка по цене Jupiter −1%, без котировки: запросы к Jupiter (1 в секунду с
-        # ключом) нужны самой боевой продаже, а пробы правил выходят пачкой на одном движении цены
-        jq = (await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE and p.extra.get("mode") != "live"
-              else None)
+        # 24.11 (владелец: «только реальные цены»): и пробы на входе боя — по настоящей котировке (одинаковые продажи
+        # проб в одну секунду — один запрос, кэш 2 с); котировки нет — проба ждёт и повторяет, а не оценивает
+        jq = await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE else None
+        if p.extra.get("venue") == JUP_VENUE and jq is None and not self.no_route(p.mint):
+            p.closing = False                        # решение о выходе сработает снова на следующем тике
+            return
         if jq is None and self.chain is not None and p.extra.get("venue") != JUP_VENUE:
             try:
                 st = await self._trial_state(p.mint)

@@ -727,6 +727,14 @@ async def test_trend_on_other_dex_goes_to_jupiter_shadow(db, monkeypatch):
 
         async def jup_prices(self, mints, ttl=3.0):
             return {m: self.price for m in mints}
+
+        def jup_decimals(self, mint):
+            return 9
+
+        async def jup_quote(self, inp, out, amount):           # котировка на 1% хуже цены в обе стороны
+            if inp == ex.SOL_MINT:
+                return {"out": int(amount / 1e9 / (Ext.price / 150) / 1.01 * 1e9), "impact": 0.01}
+            return {"out": int(amount / 1e9 * (Ext.price / 150) * 0.99 * 1e9), "impact": 0.01}
     tr.e.ext = Ext()
     await tr.start()
     data = {"modes": ["trend"], "symbol": "RAY", "trend_at": time.time(), "trigger_at": time.time()}
@@ -859,6 +867,12 @@ async def test_only_trendj_enabled_still_gets_trend_signals(db):
     class Ext:
         async def jup_price(self, mint, ttl=None):
             return 0.0002
+
+        def jup_decimals(self, mint):
+            return 6
+
+        async def jup_quote(self, inp, out, amount):
+            return {"out": 10**9, "impact": 0.0}
     tr.e.ext = Ext()
     await tr.start()
     for m in (other, pumpc):
