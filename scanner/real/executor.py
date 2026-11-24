@@ -34,7 +34,7 @@ from solders.pubkey import Pubkey
 from ..alerts import format as fmt
 from ..analytics.paper import (BIGCOPY, MAIN, MYDEV, SCHEMES, SCOUT, SMART_SET, SWING, TINY_REBUY_SOL, TREND,
                                Position, decide_exit, sell_fill)
-from . import pump, pumpswap, settings as S, tx as rtx
+from . import jupswap, pump, pumpswap, settings as S, tx as rtx
 from .keys import Wallet, load_wallet
 
 if TYPE_CHECKING:
@@ -111,6 +111,8 @@ SWEEP_TRIES = 3
 SIM_RETRY_ERRORS = ("IncorrectProgramId", "InvalidAccountData", "AccountNotFound")
 SIM_RETRIES, SIM_RETRY_S = 3, 0.4
 NO_FUNDS = "не хватает SOL или токенов на счёте"
+JUP_TEST_USD = 1.0                    # пробная сделка через Jupiter по кнопке: ~$1 SOL → USDC → SOL
+LIVE_CHECK_N, LIVE_CHECK_MIN, LIVE_GAP = 12, 8, 0.05   # сверка боя Jupiter с расчётом: сделок, минимум, допуск
 
 
 def paid_mc(lamports: int, tokens_raw: int) -> float:
@@ -221,6 +223,8 @@ class RealTrader:
             return "shadow" if measure else "off"
         if m == "live" and kind == "mydev" and not self.get("real_live_mydev"):
             return "shadow"                          # запуски девов в бою — только по отдельному разрешению
+        if m == "live" and kind == "trendj" and not self.get("real_live_trendj"):
+            return "shadow"                          # тренды других бирж в бою — только кнопкой владельца
         return m
 
     def scheme_of(self, p: Position) -> dict[str, Any]:
@@ -525,7 +529,7 @@ class RealTrader:
         """Причина не входить (до запросов к сети) или None."""
         if self.paused():
             return f"входы остановлены: {self.paused()}"
-        if kind == "trend":
+        if kind in ("trend", "trendj"):
             if not data.get("trend_at"):
                 return "нет времени сигнала"
             if time.time() - float(data["trend_at"]) > TREND_MAX_AGE_S:
@@ -928,6 +932,8 @@ class RealTrader:
     async def _adopt_buy(self, base: dict[str, Any], sig: str, info: dict[str, Any] | None, oid: int | None,
                          wait_ms: int | None, expected: int = 0, slot: int | None = None, late: bool = False) -> None:
         """Покупка легла: считаем по самой транзакции, сколько токенов пришло и сколько SOL ушло, и открываем позицию."""
+        if base.get("venue") == JUP_VENUE:
+            return await self._adopt_jup_buy(base, sig, info, oid, wait_ms, expected, slot, late)
         mint = Pubkey.from_string(base["mint"])
         tp = pump.TOKEN_PROGRAMS[base["token_program"]]
         user = str(self.wallet.pubkey)
@@ -965,26 +971,49 @@ class RealTrader:
 
     async def _enter_jupiter(self, mint_s: str, alert_id: int | None, data: dict[str, Any],
                              trader: str | None) -> None:
-        """23.11: тренд на монете не с pump.fun (Raydium, Meteora…) — только тень: цена входа — котировка Jupiter + 1%
-        проскальзывания, сопровождение — цены Jupiter (desk.poll_prices), выход — по правилу метода «trendj»."""
+        """23.11: тренд на монете не с pump.fun (Raydium, Meteora…). Тень — по котировке Jupiter (без транзакции) и
+        сухой прогон настоящей транзакции; сопровождение — цены Jupiter (desk.poll_prices), выход — по правилу метода
+        «trendj». 24.11: бой — только если владелец сам включил у метода «💵 Торговать и в бою» (real_live_trendj) и
+        кошелёк в бою."""
         kind = "trendj"
         mode = self.mode_for(kind)
         if mode == "off":
             return self._skip("shadow", kind, "метод «тренды на других биржах» выключен")
+        if mode == "live" and self.get("real_only_follow"):
+            mode = "shadow"                            # «на деньги — только выбранные мной кошельки»
+        if mode == "live":
+            # проверки боя (лимиты, дневной стоп, замок прибыли, покупок в час) — уже как у метода trendj
+            self._busy.pop(mint_s, None)
+            why = self.entry_block(mint_s, kind, "live", data)
+            self._busy[mint_s] = "live"
+            if why:
+                return self._skip("live", kind, why)
         tb = self.tune_block(kind, None, mode)
         if tb:
-            return self._skip("shadow", kind, tb)
+            return self._skip(mode, kind, tb)
         ext = getattr(self.e, "ext", None)
         jp = await ext.jup_price(mint_s) if ext is not None else None
         if not jp:
-            return self._skip("shadow", kind, "другая биржа: нет цены Jupiter")
+            return self._skip(mode, kind, "другая биржа: нет цены Jupiter")
         sol_usd = self.sol_usd()
         mc = float(jp) * 1e9 / sol_usd                 # условная капитализация: цена × 1 млрд (как у бумаги T)
         usd = S.method_stake(self.cfg, kind) or S.method_stake(self.cfg, "trend") or float(self.get("real_stake_usd"))
         stake = int(usd / sol_usd * 1e9)
+        dec = ext.jup_decimals(mint_s) if hasattr(ext, "jup_decimals") else None
+        base = {"mint": mint_s, "kind": kind, "mode": mode, "alert_id": alert_id, "trader": trader,
+                "symbol": str(data.get("symbol") or "")[:40], "venue": JUP_VENUE, "token_program": "",
+                "trigger_slot": None, "trigger_mc": None,
+                "lag_s": round(time.time() - float(data.get("trend_at") or time.time()), 3), "stake": stake,
+                "min_out": 0, "slip": JUP_SLIP, "mc": mc, "rule": self.get(S.SCHEME_KEYS[kind]), "filter": "all",
+                "best_exit": None, "followed": False, "fast": False, "detect_ms": None, "age_s": None,
+                "target_mc": None, "dec": dec}
+        if mode == "live":
+            if dec is None:
+                return self._skip("live", kind, "другая биржа: Jupiter не сообщил знаки токена")
+            base["slip"] = float(self.get("real_jup_slippage"))
+            return await self._buy_jup_live(base, int(dec))
         # настоящая цена исполнения: котировка Jupiter на нашу сумму (маршрут и сдвиг цены своей покупкой учтены);
         # котировки нет (лимит запросов) — цена Jupiter + 1%, с пометкой
-        dec = ext.jup_decimals(mint_s) if hasattr(ext, "jup_decimals") else None
         q = await ext.jup_quote(SOL_MINT, mint_s, stake) if dec is not None and hasattr(ext, "jup_quote") else None
         if q and q["out"] > 0:
             raw = int(q["out"] / 10 ** dec * 1e6)       # в учёте бота — 6 знаков, как у pump.fun
@@ -994,17 +1023,336 @@ class RealTrader:
             how = "котировки нет — цена Jupiter +1%"
         if raw <= 0:
             return self._skip("shadow", kind, "другая биржа: цена не разобрана")
-        base = {"mint": mint_s, "kind": kind, "mode": "shadow", "alert_id": alert_id, "trader": trader,
-                "symbol": str(data.get("symbol") or "")[:40], "venue": JUP_VENUE, "token_program": "",
-                "trigger_slot": None, "trigger_mc": None,
-                "lag_s": round(time.time() - float(data.get("trend_at") or time.time()), 3), "stake": stake,
-                "min_out": raw, "slip": JUP_SLIP, "mc": mc, "rule": self.get(S.SCHEME_KEYS[kind]), "filter": "all",
-                "best_exit": None, "followed": False, "fast": False, "detect_ms": None, "age_s": None,
-                "target_mc": None, "dec": dec}
+        base["min_out"] = raw
         fee = self.fees_sol()
-        await self._open(base, tokens_raw=raw, cost_sol=stake / 1e9 + fee, rent_sol=0.0, sig=None, slot=None,
-                         note=f"другая биржа: {how}, без транзакции", cu=None, fee_sol=fee, wait_ms=None,
-                         order_id=None)
+        pid = await self._open(base, tokens_raw=raw, cost_sol=stake / 1e9 + fee, rent_sol=0.0, sig=None, slot=None,
+                               note=f"другая биржа: {how}, без транзакции", cu=None, fee_sol=fee, wait_ms=None,
+                               order_id=None)
+        if self.get("real_jup_dry_run") and self.wallet is not None and self.chain is not None:
+            asyncio.create_task(self._jup_dry_run_safe(mint_s, stake, pid))
+
+    # ------------------------------------------------------------------ бой через Jupiter (jupswap.py)
+    async def _token_program(self, mint: Pubkey) -> Pubkey | None:
+        acc = (await self.chain.accounts([mint], "confirmed"))[0]
+        return pump.TOKEN_PROGRAMS.get(acc.owner) if acc is not None else None
+
+    async def _jup_build(self, in_mint: str, out_mint: str, amount: int, slip: float, spend: int, blockhash: Any,
+                         signed: bool) -> tuple[Any, Any]:
+        """Котировка + инструкции Jupiter → транзакция, проверенная белым списком: (транзакция, котировка) или
+        (None, причина). Инструкция не из белого списка — исключение rtx.Forbidden (не подписываем)."""
+        ext = getattr(self.e, "ext", None)
+        if ext is None or not hasattr(ext, "jup_quote_full"):
+            return None, "нет доступа к Jupiter"
+        q = await ext.jup_quote_full(in_mint, out_mint, int(amount), int(round(slip * 10_000)))
+        if not q or int(q.get("outAmount") or 0) <= 0:
+            return None, "Jupiter не дал котировку"
+        if (q.get("inputMint") not in (None, in_mint) or q.get("outputMint") not in (None, out_mint)
+                or int(q.get("inAmount") or amount) != int(amount)):
+            return None, "котировка Jupiter не совпала с запросом"
+        resp = await ext.jup_swap_ixs(q, str(self.wallet.pubkey))
+        if not resp:
+            return None, "Jupiter не дал инструкции обмена"
+        prio = int(float(self.get("real_priority_sol")) * 1e9)
+        tip = int(float(self.get("real_tip_sol")) * 1e9)
+        ixs = jupswap.build_ixs(resp, self.wallet.pubkey, prio, tip)
+        jupswap.check(ixs, self.wallet.pubkey, int(spend))
+        if not hasattr(self, "_alt_cache"):
+            self._alt_cache: dict[str, tuple[float, Any]] = {}
+        alts = await jupswap.lookup_tables(self.chain, list(resp.get("addressLookupTableAddresses") or []),
+                                           self._alt_cache)
+        msg = jupswap.compile_message(self.wallet.pubkey, ixs, alts, blockhash)
+        tx = self.wallet.sign(msg) if signed else self.wallet.unsigned(msg)
+        if len(bytes(tx)) > jupswap.TX_MAX:
+            return None, "транзакция Jupiter больше лимита сети"
+        return tx, q
+
+    async def _jup_verify(self, tx: Any, side: str, ata: Pubkey, amount: int, min_out: int) -> str | None:
+        """Симуляция той же транзакции и проверка итога на своих счетах (jupswap.verify). None — можно отправлять."""
+        user = self.wallet.pubkey
+        try:
+            pre = await self.chain.accounts([user, ata], "processed")
+            sim = await self.chain.simulate(tx, watch=[user, ata])
+        except Exception as exc:  # noqa: BLE001
+            return f"симуляция не ответила: {type(exc).__name__}"
+        if sim.err is not None:
+            return f"симуляция: {jupswap.err_text(sim.err)}"
+        return jupswap.verify(side, pre, sim.accounts, int(amount), int(min_out), int(self.fees_sol() * 1e9))
+
+    async def _jup_send(self, side: str, in_mint: str, out_mint: str, amount: int, slip: float, spend: int,
+                        ata: Pubkey, base: dict[str, Any], *, position_id: int | None = None, attempt: int = 1,
+                        tokens_raw: int | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Одна боевая сделка Jupiter: котировка → инструкции → белый список → подпись → проверка итога симуляцией →
+        заявка в журнал (до отправки) → отправка → подтверждение. Не сошлась проверка — ничего не отправляется."""
+        try:
+            blockhash, last_valid = await self.chain.blockhash()
+            tx, q = await self._jup_build(in_mint, out_mint, amount, slip, spend, blockhash, True)
+        except rtx.Forbidden as exc:
+            log.error("реальный бот: транзакция Jupiter не из белого списка — не подписана: %s", exc)
+            await self._order(position_id, base, side, "failed", tokens_raw=tokens_raw, slippage=slip,
+                              error=f"не из белого списка: {exc}", attempt=attempt)
+            return {"ok": False, "why": f"не из белого списка: {exc}"}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("реальный бот: сборка сделки Jupiter: %s", str(exc)[:160])
+            return {"ok": False, "why": f"сборка сделки Jupiter: {type(exc).__name__}"}
+        if tx is None:
+            return {"ok": False, "why": str(q)}
+        min_out = int(q.get("otherAmountThreshold") or 0)
+        why = await self._jup_verify(tx, side, ata, amount, min_out)
+        stake_sol = amount / 1e9 if side == "buy" and in_mint == SOL_MINT else None
+        if why:
+            await self._order(position_id, base, side, "failed", stake_sol=stake_sol, tokens_raw=tokens_raw,
+                              min_out=min_out, slippage=slip, error=why, attempt=attempt, note="проверка перед отправкой")
+            return {"ok": False, "why": f"проверка перед отправкой: {why}"}
+        sig = str(tx.signatures[0])
+        # заявка пишется ДО отправки (после перезапуска бот найдёт сделку по подписи); покупку без журнала не шлём
+        oid = await self._order(position_id, base, side, "sent", stake_sol=stake_sol, tokens_raw=tokens_raw,
+                                min_out=min_out, slippage=slip, signature=sig, attempt=attempt, payload=payload or {})
+        if oid is None and side == "buy":
+            return {"ok": False, "why": "журнал заявок недоступен — покупка не отправлена"}
+        if side == "buy":
+            self.buys.append(time.time())
+        urls = self._urls()
+        t_send = time.time()
+        await self.chain.send(tx, urls)
+        if side == "buy":
+            landed = await self.chain.confirm(tx, timeout_s=BUY_CONFIRM_S, resend_until_s=BUY_RESEND_UNTIL_S,
+                                              urls=urls, last_valid_height=last_valid or None)
+        else:
+            landed = await self.chain.confirm(tx, timeout_s=SELL_CONFIRM_S, urls=urls)
+        wait_ms = int((time.time() - t_send) * 1000)
+        if landed.state != "landed":
+            self.fails += 1
+            failed = landed.state == "failed"
+            err = jupswap.err_text(landed.err) if failed else "не легла в блок"
+            fee = self.failed_fee_sol() if failed else None
+            if failed:
+                self._fee_loss(fee)
+            await self._order_done(oid, landed.state, error=err, slot=landed.slot, wait_ms=wait_ms, fee_sol=fee)
+            return {"ok": False, "sent": True, "err": err,
+                    "why": f"{'покупка' if side == 'buy' else 'продажа'} не прошла: {err}"}
+        self.fails = 0
+        info = await self.chain.transaction(sig)
+        return {"ok": True, "sig": sig, "info": info, "oid": oid, "wait_ms": wait_ms, "quote": q, "slot": landed.slot,
+                "min_out": min_out}
+
+    async def _buy_jup_live(self, base: dict[str, Any], dec: int) -> None:
+        kind, stake = base["kind"], int(base["stake"])
+        if self.wallet is None or not self.wallet.can_sign or self.chain is None:
+            return self._skip("live", kind, "нет ключа")
+        await self.refresh_balance(force=True)
+        reserve = int(float(self.get("real_reserve_sol")) * 1e9)
+        if (self.balance or 0) - reserve - jupswap.BUY_MARGIN < stake:
+            return self._skip("live", kind, "на кошельке мало SOL")
+        mint = Pubkey.from_string(base["mint"])
+        tp = await self._token_program(mint)
+        if tp is None:
+            return self._skip("live", kind, "другая биржа: программа токена не разобрана")
+        base.update(token_program=str(tp), dec=dec)
+        ata = pump.ata(self.wallet.pubkey, mint, tp)
+        r = await self._jup_send("buy", SOL_MINT, base["mint"], stake, float(base["slip"]), stake, ata, base,
+                                 payload=dict(base))
+        if not r["ok"]:
+            if r.get("sent"):
+                await self._say(f"⚠️ 💵 Покупка ${fmt.esc(base['symbol'] or '?')} (Jupiter) не прошла: "
+                                f"{fmt.esc(r['err'])}")
+                await self.refresh_balance(force=True)
+                await self._check_fail_pause()
+            return self._skip("live", kind, r["why"])
+        base["min_out"] = r["min_out"]
+        await self._adopt_jup_buy(base, r["sig"], r["info"], r["oid"], r["wait_ms"],
+                                  int(r["quote"].get("outAmount") or 0), r["slot"])
+        await self.refresh_balance(force=True)
+
+    async def _adopt_jup_buy(self, base: dict[str, Any], sig: str, info: dict[str, Any] | None, oid: int | None,
+                             wait_ms: int | None, expected: int = 0, slot: int | None = None,
+                             late: bool = False) -> None:
+        """Покупка через Jupiter легла: по самой транзакции — сколько токенов пришло и сколько SOL ушло."""
+        user = str(self.wallet.pubkey)
+        mint = Pubkey.from_string(base["mint"])
+        tp = pump.TOKEN_PROGRAMS.get(str(base.get("token_program")))
+        dec = base.get("dec")
+        if tp is None or dec is None:
+            await self._order_done(oid, "failed", error="легла, но программа токена или знаки неизвестны")
+            await self._say(f"🆘 💵 Покупка ${fmt.esc(base.get('symbol') or '?')} легла, но учесть её не смог — "
+                            f"продайте вручную. Монета: <code>{base['mint']}</code>")
+            return
+        ata = pump.ata(self.wallet.pubkey, mint, tp)
+        ata_s = str(ata)
+        fill = rtx.fill_from_tx(info, user, [ata_s]) if info else None
+        stake = int(base["stake"])
+        if fill is not None and fill["tokens"].get(base["mint"], 0) > 0:
+            got = int(fill["tokens"][base["mint"]])
+            rent = fill["rents"].get(ata_s, 0) / 1e9
+            cost = (-fill["sol_delta"]) / 1e9 - rent
+            fee, slot = fill["fee"] / 1e9, fill["slot"] or slot
+        else:
+            got = 0
+            try:
+                got = jupswap._amount((await self.chain.accounts([ata], "confirmed"))[0])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("остаток токенов после покупки Jupiter: %s", str(exc)[:160])
+            got = got or expected
+            if got <= 0:
+                await self._order_done(oid, "failed", error="легла, но токены не пришли")
+                return
+            rent, fee = 0.0, self.fees_sol()
+            cost = stake / 1e9 + fee
+        raw6 = int(got / 10 ** int(dec) * 1e6)          # учёт — в 6 знаках, как у остальных позиций
+        note = "Jupiter" + (" · найдена после перезапуска" if late else "")
+        await self._open(base, tokens_raw=raw6, cost_sol=cost, rent_sol=rent, sig=sig, slot=slot, note=note, cu=None,
+                         fee_sol=fee, wait_ms=wait_ms, order_id=oid)
+
+    async def _sell_jup_live(self, p: Position, reason: str, share: float) -> None:
+        """Продажа позиции «другая биржа» в бою через Jupiter: столько токенов, сколько реально на счёте (или доля),
+        лимит проскальзывания расширяется по попыткам."""
+        if self.wallet is None or not self.wallet.can_sign:
+            return await self._sell_live(p, reason, share)       # там — сообщение «нет ключа» и повтор
+        mint = Pubkey.from_string(p.mint)
+        tp = pump.TOKEN_PROGRAMS.get(str(p.extra.get("token_program")))
+        dec = p.extra.get("dec")
+        if tp is None or dec is None:
+            p.closing = False
+            p.extra["retry_at"] = time.time() + 60
+            p.extra["stuck"] = int(p.extra.get("stuck") or 0) + 1
+            if p.extra["stuck"] in (1, 30):
+                await self._say(f"🆘 💵 Не могу продать ${fmt.esc(p.symbol or '?')}: неизвестна программа токена. "
+                                f"Продайте вручную. Монета: <code>{p.mint}</code>")
+            return
+        ata = pump.ata(self.wallet.pubkey, mint, tp)
+        base = {"mode": "live", "mint": p.mint}
+        meta = {"reason": reason, "share": share}
+        last_mc = float(p.extra.get("last_mc") or p.entry_mc)
+        if p.extra.get("stuck") and await self._prior_sell(p):
+            return
+        for attempt, k in enumerate(SELL_SLIPPAGE_STEPS, 1):
+            if attempt > 1 and await self._prior_sell(p):
+                return
+            try:
+                have = jupswap._amount((await self.chain.accounts([ata], "confirmed"))[0])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("реальный бот: остаток перед продажей %s: %s", p.mint, str(exc)[:160])
+                await asyncio.sleep(STATE_RETRY_S)
+                continue
+            if have <= 0:                              # токенов нет (проданы вручную) — закрываем без выручки
+                await self._settle(p, "gone", 1.0, int(p.extra["tokens_raw"]), 0.0, last_mc, sig=None, slot=None,
+                                   wait_ms=None, fee=0.0)
+                return
+            amount = have if share >= 1 else max(1, int(have * share))
+            raw6 = (int(p.extra["tokens_raw"]) if share >= 1
+                    else min(int(p.extra["tokens_raw"]), int(amount / 10 ** int(dec) * 1e6)))
+            slip = min(0.5, float(self.get("real_jup_slippage")) * k)
+            r = await self._jup_send("sell", p.mint, SOL_MINT, amount, slip, 0, ata, base, position_id=p.id,
+                                     attempt=attempt, tokens_raw=raw6, payload=meta)
+            if r["ok"]:
+                fill = rtx.fill_from_tx(r["info"], str(self.wallet.pubkey), []) if r["info"] else None
+                out = int(r["quote"].get("outAmount") or 0)
+                proceeds = fill["sol_delta"] / 1e9 if fill else out / 1e9 - self.fees_sol()
+                mc = out / (amount / 10 ** int(dec)) if amount and out else last_mc
+                await self._settle(p, reason, share, raw6, proceeds, mc, sig=r["sig"],
+                                   slot=(fill or {}).get("slot") or r["slot"], wait_ms=r["wait_ms"],
+                                   fee=fill["fee"] / 1e9 if fill else self.fees_sol(), order_id=r["oid"])
+                await self.refresh_balance(force=True)
+                return
+            if not r.get("sent"):
+                await asyncio.sleep(UNTRADABLE_RETRY_S)  # котировки нет / проверка не сошлась — повтор с лимитом шире
+        if await self._prior_sell(p):
+            return
+        p.closing = False
+        p.extra["retry_at"] = time.time() + 20
+        p.extra["stuck"] = int(p.extra.get("stuck") or 0) + 1
+        if p.extra["stuck"] in (1, 5, 20):
+            await self._say(f"🆘 💵 НЕ СМОГ ПРОДАТЬ ${fmt.esc(p.symbol or '?')} ({EXIT_NAMES.get(reason, reason)}, "
+                            f"Jupiter): {len(SELL_SLIPPAGE_STEPS)} попытки не прошли. Повторяю каждые 20 с. "
+                            f"Монета: <code>{p.mint}</code>")
+        await self._check_fail_pause()
+
+    async def _jup_dry_run_safe(self, mint_s: str, stake: int, pid: int | None) -> None:
+        try:
+            await self._jup_dry_run(mint_s, stake, pid)
+        except rtx.Forbidden as exc:
+            log.error("реальный бот: сухой прогон Jupiter — не из белого списка: %s", exc)
+            await self._order(pid, {"mode": "shadow", "mint": mint_s}, "buy", "failed",
+                              error=f"не из белого списка: {exc}", note="сухой прогон")
+        except Exception as exc:  # noqa: BLE001 — сухой прогон не должен мешать тени
+            log.warning("реальный бот: сухой прогон Jupiter %s: %s", mint_s, str(exc)[:160])
+
+    async def _jup_dry_run(self, mint_s: str, stake: int, pid: int | None) -> str:
+        """24.11: сухой прогон боя на входе тени — настоящая транзакция Jupiter собирается, проверяется белым списком
+        и симуляцией итога, но не подписывается и не отправляется. Итог — в real_orders (note «сухой прогон»)."""
+        await self.refresh_balance()
+        amount = min(stake, (self.balance or 0) - SIM_RESERVE)
+        if amount < 1_000_000:
+            return "сухой прогон: на кошельке мало SOL"
+        base = {"mode": "shadow", "mint": mint_s}
+        note = "сухой прогон" + (f" на {amount / 1e9:.4f} SOL" if amount < stake else "")
+        mint = Pubkey.from_string(mint_s)
+        tp = await self._token_program(mint)
+        if tp is None:
+            await self._order(pid, base, "buy", "failed", error="программа токена не разобрана", note=note)
+            return "сухой прогон: программа токена не разобрана"
+        slip = float(self.get("real_jup_slippage"))
+        blockhash, _ = await self.chain.blockhash()
+        tx, q = await self._jup_build(SOL_MINT, mint_s, amount, slip, amount, blockhash, False)
+        if tx is None:
+            await self._order(pid, base, "buy", "failed", stake_sol=amount / 1e9, error=str(q), note=note)
+            return f"сухой прогон: {q}"
+        min_out = int(q.get("otherAmountThreshold") or 0)
+        why = await self._jup_verify(tx, "buy", pump.ata(self.wallet.pubkey, mint, tp), amount, min_out)
+        await self._order(pid, base, "buy", "simulated" if why is None else "failed", stake_sol=amount / 1e9,
+                          min_out=min_out, slippage=slip, error=why, note=note)
+        return f"сухой прогон: {why or 'прошёл'}"
+
+    async def _jup_test_safe(self) -> None:
+        try:
+            text = await self._jup_test()
+        except rtx.Forbidden as exc:
+            text = f"🧪 ❌ Пробная сделка: транзакция не из белого списка — не подписана ({fmt.esc(str(exc))})"
+        except Exception as exc:  # noqa: BLE001
+            log.exception("реальный бот: пробная сделка Jupiter")
+            text = f"🧪 ❌ Пробная сделка не выполнена: {type(exc).__name__}"
+        await self._say(text)
+
+    async def _jup_test(self) -> str:
+        """24.11: пробная сделка по кнопке владельца — ~$1: SOL → USDC → SOL через Jupiter на настоящие деньги
+        (теряются только комиссии, центы). Проверяет весь путь боя: котировку, белый список, подпись, проверку
+        симуляцией, отправку, подтверждение и учёт по факту."""
+        if not S.live_allowed():
+            return "🧪 Пробная сделка не выполнена: на сервере не задан REAL_LIVE=1 (бой запрещён)."
+        if self.wallet is None or not self.wallet.can_sign or self.chain is None:
+            return "🧪 Пробная сделка не выполнена: на сервере нет ключа кошелька REAL_PRIVATE_KEY."
+        sol_usd = self.sol_usd()
+        amount = int(JUP_TEST_USD / sol_usd * 1e9)
+        await self.refresh_balance(force=True)
+        bal0 = self.balance or 0
+        reserve = int(float(self.get("real_reserve_sol")) * 1e9)
+        if bal0 - reserve - jupswap.BUY_MARGIN < amount:
+            return (f"🧪 Пробная сделка не выполнена: на кошельке {bal0 / 1e9:.4f} SOL — нужно от "
+                    f"{(amount + reserve + jupswap.BUY_MARGIN) / 1e9:.3f} SOL.")
+        usdc = Pubkey.from_string(jupswap.USDC_MINT)
+        ata = pump.ata(self.wallet.pubkey, usdc, pump.TOKEN)
+        base = {"mode": "live", "mint": jupswap.USDC_MINT}
+        slip = float(self.get("real_jup_slippage"))
+        r1 = await self._jup_send("buy", SOL_MINT, jupswap.USDC_MINT, amount, slip, amount, ata, base,
+                                  payload={"test": True})
+        if not r1["ok"]:
+            return f"🧪 ❌ Пробная сделка: покупка USDC не прошла — {fmt.esc(r1['why'])}. Деньги на месте."
+        fill1 = rtx.fill_from_tx(r1["info"], str(self.wallet.pubkey), [str(ata)]) if r1["info"] else None
+        got = int((fill1 or {}).get("tokens", {}).get(jupswap.USDC_MINT, 0)) or int(r1["quote"].get("outAmount") or 0)
+        r2 = await self._jup_send("sell", jupswap.USDC_MINT, SOL_MINT, got, slip, 0, ata, base, payload={"test": True})
+        await self.refresh_balance(force=True)
+        if not r2["ok"]:
+            return (f"🧪 ⚠️ Купил {got / 1e6:.2f} USDC (<code>{r1['sig'][:16]}…</code>), а продать не вышло — "
+                    f"{fmt.esc(r2['why'])}. USDC лежат на кошельке бота.")
+        self.to_close[jupswap.USDC_MINT] = (str(pump.TOKEN), time.time() + 20, 1)   # залог счёта USDC — обратно
+        rent = int(((fill1 or {}).get("rents") or {}).get(str(ata), 0))
+        diff = (self.balance or 0) - bal0 + rent
+        return (f"🧪 ✅ <b>Пробная сделка через Jupiter прошла</b>\n"
+                f"SOL → USDC: {amount / 1e9:.4f} SOL → {got / 1e6:.2f} USDC · "
+                f"<a href=\"https://solscan.io/tx/{r1['sig']}\">покупка</a>\n"
+                f"USDC → SOL: обратно · <a href=\"https://solscan.io/tx/{r2['sig']}\">продажа</a>\n"
+                f"Итог: {diff / 1e9:+.5f} SOL ({diff / 1e9 * sol_usd:+.2f}$) — комиссии сети и маршрута"
+                + (f"; залог счёта USDC {rent / 1e9:.4f} SOL вернётся при закрытии счёта" if rent else "")
+                + ".\nВесь путь боя работает: котировка, белый список, подпись, проверка симуляцией, отправка, учёт.")
 
     async def _jup_sell(self, p: Position, raw6: int) -> tuple[float, float] | None:
         """Продажа позиции «другая биржа» по котировке Jupiter на точное число токенов: (SOL выручки, условная
@@ -1030,7 +1378,7 @@ class RealTrader:
 
     async def _open(self, base: dict[str, Any], *, tokens_raw: int, cost_sol: float, rent_sol: float, sig: str | None,
                     slot: int | None, note: str | None, cu: int | None, fee_sol: float,
-                    wait_ms: int | None, order_id: int | None) -> None:
+                    wait_ms: int | None, order_id: int | None) -> int | None:
         entry_mc = paid_mc(int(base["stake"]), tokens_raw)       # цена входа — средняя цена, по которой купили
         if base.get("venue") == JUP_VENUE and tokens_raw > 0:
             entry_mc = int(base["stake"]) * 1e6 / tokens_raw     # котировка Jupiter уже с комиссиями площадки
@@ -1076,6 +1424,7 @@ class RealTrader:
                             f"({KINDS[base['kind']]}) на ${cost_sol * sol_usd:.2f} · MC {fmt.mc_usd(entry_mc, sol_usd)}"
                             + (f" · через {blocks} бл. после сигнала" if blocks is not None else
                                f" · через {float(base.get('lag_s') or 0):.1f} с после сигнала"))
+        return pid
 
     # ------------------------------------------------------------------ сопровождение
     async def on_trade(self, st: Any, eff: Any, trader: str, is_buy: bool, slot: int | None = None,
@@ -1135,7 +1484,9 @@ class RealTrader:
 
     async def _exit_safe(self, p: Position, reason: str, share: float) -> None:
         try:
-            if p.extra.get("mode") == "live":
+            if p.extra.get("mode") == "live" and p.extra.get("venue") == JUP_VENUE:
+                await self._sell_jup_live(p, reason, share)
+            elif p.extra.get("mode") == "live":
                 await self._sell_live(p, reason, share)
             else:
                 await self._sell_shadow(p, reason, share)
@@ -1457,6 +1808,8 @@ class RealTrader:
         await self._profit_watch(mode, pnl, p)
         if mode == "live":
             await self._check_stops()
+            if p.extra.get("venue") == JUP_VENUE:
+                await self._check_live_vs_shadow()
 
     async def _profit_watch(self, mode: str, pnl: float, p: Position) -> None:
         """23.11: крупный плюс со сделки и ступени плюса за день — короткими сообщениями; в бою — замок прибыли дня:
@@ -1501,6 +1854,26 @@ class RealTrader:
             await self._say(f"🛑 💵 Дневной стоп: за сегодня {self.day_pnl['live'] * sol_usd:+.2f}$ — "
                             "новых входов нет до полуночи.")
 
+    async def _check_live_vs_shadow(self) -> None:
+        """24.11: сверка боя через Jupiter с расчётом на тех же входах (проба с тем же правилом выхода считает выход по
+        котировке, без транзакции). Бой в среднем хуже расчёта больше чем на LIVE_GAP на 8+ сделках — исполнение
+        съедает плюс: бой трендов других бирж выключается (только выключается — включить снова может только
+        владелец)."""
+        rows = await self.db.fetch(
+            """SELECT p.pnl_pct live, t.pnl_pct calc FROM real_positions p
+               JOIN real_rule_trials t ON t.position_id = p.id AND t.rule = COALESCE(p.extra->>'rule', '')
+               WHERE p.mode = 'live' AND p.venue = $1 AND p.closed_at IS NOT NULL AND t.closed_at IS NOT NULL
+                 AND p.wallet_id IS NOT DISTINCT FROM $2
+               ORDER BY p.closed_at DESC LIMIT $3""", JUP_VENUE, self.wid, LIVE_CHECK_N)
+        if len(rows) < LIVE_CHECK_MIN or not self.get("real_live_trendj"):
+            return
+        gap = sum(float(r["live"] or 0) - float(r["calc"] or 0) for r in rows) / len(rows)
+        if gap < -LIVE_GAP:
+            await self.set_setting("real_live_trendj", False)
+            await self._say(f"⛔ 💵 Бой «тренды на других биржах» выключен: на последних {len(rows)} сделках бой в "
+                            f"среднем хуже расчёта по котировке на {abs(gap) * 100:.1f}% за сделку — исполнение "
+                            "съедает плюс. Тень продолжает мерить; включить бой снова — только твоей кнопкой.")
+
     async def _check_fail_pause(self) -> None:
         if self.fails >= int(self.get("real_fail_pause")) and not self.paused():
             await self.set_setting("real_paused", f"{self.fails} неудачных транзакций подряд")
@@ -1525,6 +1898,8 @@ class RealTrader:
             self.fails = 0
         elif cmd == "check" and not self._checking:
             asyncio.create_task(self._selfcheck())
+        elif cmd == "jup_test" and not self._checking:
+            asyncio.create_task(self._jup_test_safe())
         await self.publish_status()
 
     async def _selfcheck(self) -> None:
@@ -1682,6 +2057,8 @@ class RealTrader:
     # ------------------------------------------------------------------ состояние и сообщения
     @staticmethod
     def _err_text(err: Any, venue: str) -> str:
+        if venue == JUP_VENUE:
+            return jupswap.err_text(err)
         code = None
         try:
             code = err["InstructionError"][1]["Custom"]

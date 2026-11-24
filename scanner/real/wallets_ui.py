@@ -421,7 +421,7 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
 
 
 PAPER_A_PRESET = {"real_smart": True, "real_scheme": "A", "real_smart_filter": "all", "real_mydev": False,
-                  "real_live_mydev": False, "real_copy": False, "real_bigcopy": False, "real_swing": False, "real_trend": False,
+                  "real_live_mydev": False, "real_live_trendj": False, "real_copy": False, "real_bigcopy": False, "real_swing": False, "real_trend": False,
                   "real_stake_usd": 10, "real_max_open": 3, "real_day_stop_usd": 30, "real_total_stop_usd": 50}
 
 
@@ -447,6 +447,8 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     state = f"{'✅ включён' if on else '⬜ выключен'} · ставка {stake_txt} · потолок ${S.max_stake_usd():g}"
     if kind == "mydev":
         state += " · в бою: " + ("да" if S.get(wcfg, "real_live_mydev") else "нет, только тень")
+    if kind == "trendj":
+        state += " · в бою: " + ("да" if S.get(wcfg, "real_live_trendj") else "нет, только тень")
     lines = [f"🎯 <b>{name}</b> — {title}", state, "",
              "<b>Покупает</b>", ABOUT[kind] + (f" — {S.SMART_FILTERS[filt]}" if kind == "smart" else ""), "",
              f"<b>Продаёт</b> по правилу ● <b>{rule}</b> (кнопки «Выход» внизу)", "",
@@ -487,6 +489,12 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
         dlive = S.get(wcfg, "real_live_mydev")
         kb.append([{"text": f"{'✅' if dlive else '⬜'} Торговать и в бою",
                     "callback": f"rl:wmo:{tag}:devlive:{0 if dlive else 1}"}])
+    if kind == "trendj":
+        lines += await trendj_live_lines(db, wcfg, None if tag == "g" else int(tag))
+        jlive = S.get(wcfg, "real_live_trendj")
+        kb.append([{"text": "✅ 💵 Бой включён — выключить" if jlive else "⬜ 💵 Торговать и в бою (Jupiter)",
+                    "callback": f"rl:wmo:{tag}:jlive:{0 if jlive else 1}"}])
+        kb.append([{"text": f"🧪 Пробная сделка ${JUP_TEST_USD:g} (SOL→USDC→SOL)", "callback": f"rl:wjt:{tag}"}])
     kb.append([{"text": "− $5", "callback": f"rl:wms:{tag}:{kind}:-"},
                {"text": f"Ставка: {'$%g' % stake if stake else 'как у кошелька'}", "callback": f"rl:wmk:{tag}:{kind}"},
                {"text": "+ $5", "callback": f"rl:wms:{tag}:{kind}:+"}])
@@ -494,6 +502,35 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
         kb.append([{"text": "↺ Ставка как у кошелька", "callback": f"rl:wms:{tag}:{kind}:0"}])
     kb.append([{"text": "← Методы", "callback": f"rl:wme:{tag}"}])
     return "\n".join(lines), kb
+
+
+JUP_TEST_USD = 1
+
+
+async def trendj_live_lines(db: Any, wcfg: dict[str, Any], wid: int | None) -> list[str]:
+    """Экран «тренды на других биржах»: бой (включён ли и что мешает) и сухой прогон настоящей транзакции за сутки."""
+    out = ["", "<b>Бой через Jupiter</b>"]
+    if S.get(wcfg, "real_live_trendj"):
+        out.append("✅ включён твоей кнопкой — " + ("работает, когда кошелёк в режиме «бой»"
+                                                   if S.get(wcfg, "real_mode") == "live" else
+                                                   "но кошелёк сейчас в тени: сделки идут в тень"))
+        if S.get(wcfg, "real_only_follow"):
+            out.append("⚠️ включено «🎯 На деньги — только выбранные мной кошельки» — пока оно включено, тренды в бой "
+                       "не идут")
+    else:
+        out.append("⬜ выключен — только тень. Включается только этой кнопкой, с подтверждением.")
+    r = await db.fetchrow(
+        """SELECT count(*) n, count(*) FILTER (WHERE status = 'simulated') ok,
+                  (array_agg(error ORDER BY id DESC) FILTER (WHERE status = 'failed'))[1] last_err
+           FROM real_orders WHERE note LIKE 'сухой прогон%' AND created_at > now() - interval '24 hours'
+             AND wallet_id IS NOT DISTINCT FROM $1""", wid)
+    if r and r["n"]:
+        out.append(f"🔍 Сухой прогон за сутки: {r['n']}, прошли проверку {r['ok']}"
+                   + (f" · последняя ошибка: {esc(str(r['last_err'])[:90])}" if r["last_err"] else ""))
+    elif S.get(wcfg, "real_jup_dry_run"):
+        out.append("🔍 Сухой прогон за сутки не шёл: нужен кошелёк бота с ~0.01+ SOL (транзакция собирается и "
+                   "проверяется в сети, но не отправляется)")
+    return out
 
 
 def method_patch(cfg: dict[str, Any], method: str, value: str) -> tuple[dict[str, Any], list[str]] | None:
@@ -509,6 +546,12 @@ def method_patch(cfg: dict[str, Any], method: str, value: str) -> tuple[dict[str
         return None
     if method == "devlive" and value in ("0", "1"):
         return {"real_live_mydev": value == "1"}, []
+    if method == "jlive" and value in ("0", "1!"):           # «1» без «!» — сначала подтверждение (methods_callback)
+        return {"real_live_trendj": value == "1!"}, []
+    if method == "jlive" and value == "only!":
+        # в бой — только тренды других бирж; остальные методы выключены и меряются в тени
+        return {**{m[1]: False for m in S.METHODS.values()}, "real_trendj": True, "real_shadow_all": True,
+                "real_live_trendj": True}, []
     return None
 
 
@@ -542,12 +585,40 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
     patch: dict[str, Any] = {}
     drop: list[str] = []
     kind = parts[1] if len(parts) > 1 else ""
+    if action == "wmo" and len(parts) == 3 and kind == "jlive" and parts[2] == "1":
+        sl = S.method_stake(wcfg, "trendj") or S.get(wcfg, "real_stake_usd")
+        others = S.live_methods(wcfg)
+        warn = (f"\n\n⚠️ Сейчас включены и другие методы — когда кошелёк в бою, на деньги пойдут и они: "
+                f"{', '.join(others)}. Чтобы на деньги шли только тренды других бирж — нижняя кнопка (остальные "
+                "методы выключатся и будут мериться в тени, без денег)." if others else "")
+        kb = [[{"text": "Да, включить бой", "callback": f"rl:wmo:{tag}:jlive:1!", "style": "danger"},
+               {"text": "Нет", "callback": f"rl:wmk:{tag}:trendj"}]]
+        if others:
+            kb.insert(1, [{"text": "💵 В бой только тренды др. бирж, остальное — в тень",
+                           "callback": f"rl:wmo:{tag}:jlive:only!", "style": "danger"}])
+        return Reply("💵 <b>Включить бой для «трендов на других биржах»?</b>\n"
+                     f"Бот будет покупать и продавать через Jupiter на настоящие деньги: ставка ${sl:g}, правило "
+                     f"{S.get(wcfg, S.SCHEME_KEYS['trendj'])}, дневной стоп ${S.get(wcfg, 'real_day_stop_usd'):g}, "
+                     f"до {S.get(wcfg, 'real_max_open')} позиций сразу. Работает, только когда сам кошелёк в режиме "
+                     "«бой». Каждая сделка перед отправкой проверяется симуляцией. Выключить — той же кнопкой." + warn,
+                     kb, "", True)
+    if action == "wjt":
+        if not (len(parts) == 2 and parts[1] == "!"):
+            return Reply(f"🧪 <b>Пробная сделка ${JUP_TEST_USD:g}?</b>\nБот купит USDC примерно на ${JUP_TEST_USD:g} "
+                         "через Jupiter и сразу продаст обратно в SOL — на настоящие деньги. Теряются только комиссии "
+                         "(центы). Так проверяется весь путь боя. Итог со ссылками на транзакции придёт в тему "
+                         "«Реальный бот».",
+                         [[{"text": "Да, сделать пробную", "callback": f"rl:wjt:{tag}:!", "style": "danger"},
+                           {"text": "Нет", "callback": f"rl:wmk:{tag}:trendj"}]], "", True)
+        await db.job("real", {"cmd": "jup_test", "wallet": None if tag == "g" else int(tag)})
+        text, kb = await method_view(db, cfg, tag, "trendj")
+        return Reply(text, kb, "Пробная сделка запущена — итог придёт в тему «Реальный бот»", True)
     if action in ("wmx", "wmo") and len(parts) == 3:
         res = method_patch(wcfg, kind, parts[2])
         if res is None:
             return Reply(None, None, "Не понял кнопку")
         patch, drop = res
-        kind = kind if kind in S.METHODS else "mydev"
+        kind = kind if kind in S.METHODS else ("trendj" if kind == "jlive" else "mydev")
     elif action == "wmr" and len(parts) == 3 and kind in S.METHODS and parts[2] in S.SCHEMES:
         patch = {S.SCHEME_KEYS[kind]: parts[2]}
     elif action == "wmf" and len(parts) == 2 and parts[1] in ("all", "m", "M"):
@@ -591,6 +662,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
                          [[{"text": "Да, сбросить", "callback": f"rl:wmz:{tag}:!", "style": "danger"},
                            {"text": "Нет", "callback": f"rl:wme:{tag}"}]], "", True)
         patch = {S.METHODS[k][1]: False for k in S.METHODS}
+        patch["real_live_trendj"] = False
         if tag == "g":
             patch.update(real_shadow_all=False, real_autofollow=False)
             follow = dict(await db.kv_get("real:follow") or {})
@@ -617,7 +689,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
 async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: str, rpc: Any = None) -> Reply:
     parts = rest.split(":") if rest else []
     wid = int(parts[0]) if parts and parts[0].isdigit() else None
-    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms", "wmp", "wmall", "wmz", "wmm"):
+    if action in ("wme", "wmk", "wmx", "wmo", "wmr", "wmf", "wms", "wmp", "wmall", "wmz", "wmm", "wjt"):
         r = await methods_callback(db, cfg, action, parts)
         if r is not None:
             return r
@@ -687,7 +759,7 @@ async def on_wallet_callback(db: Any, cfg: dict[str, Any], action: str, rest: st
             await set_wallet(db, wid, {parts[1]: v})
             wcfg[parts[1]] = v
             toast = f"{S.SETTINGS[parts[1]][0]}: {S.fmt(parts[1], v)}"
-        elif action == "wt" and len(parts) == 2 and parts[1] in S.TOGGLES:
+        elif action == "wt" and len(parts) == 2 and parts[1] in S.TOGGLES and parts[1] not in S.LIVE_TOGGLES:
             wcfg[parts[1]] = not S.get(wcfg, parts[1])
             await set_wallet(db, wid, {parts[1]: wcfg[parts[1]]})
         elif action == "wsc" and len(parts) == 3 and parts[1] in S.SCHEME_KEYS and parts[2] in S.SCHEMES:

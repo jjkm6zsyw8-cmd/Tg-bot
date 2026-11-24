@@ -16,7 +16,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from scanner.analytics.curve import reserves_for_mc
-from scanner.real import pump, pumpswap, tx as rtx
+from scanner.real import jupswap, pump, pumpswap, tx as rtx
 
 RENT_ATA = 1_513_840        # залог счёта токена (возвращается при закрытии)
 RENT_WSOL = 2_039_280
@@ -318,6 +318,26 @@ class FakeChain:
                         s["wsol"][u] += net
                         p["quote"] -= gross
                         p["base"] += a
+                elif pid == jupswap.JUP_PROGRAM:
+                    # поддельный обмен Jupiter: [кошелёк, откуда, куда, монета входа, монета выхода], данные — суммы;
+                    # «куда» — любой счёт токена: так тест проверяет подменённый ответ (выход на чужой счёт)
+                    a, b = struct.unpack_from("<QQ", data, 8)
+                    u, dst, in_mint = str(acc[0]), str(acc[2]), str(acc[3])
+                    if in_mint == str(pump.WSOL):
+                        if s["wsol"].get(u, -1) < a:
+                            raise ChainError(1)
+                        s["wsol"][u] -= a
+                    else:
+                        if s["tok"].get((u, in_mint), 0) < a:
+                            raise ChainError(1)
+                        s["tok"][(u, in_mint)] -= a
+                    if dst not in s["atas"]:
+                        raise ChainError(3012)
+                    owner, m = s["atas"][dst]
+                    if m == str(pump.WSOL):
+                        s["wsol"][owner] = s["wsol"].get(owner, 0) + b
+                    else:
+                        s["tok"][(owner, m)] = s["tok"].get((owner, m), 0) + b
                 else:
                     raise ChainError(9999)
             except ChainError as exc:
@@ -335,8 +355,16 @@ class FakeChain:
     async def simulate(self, tx: VersionedTransaction, watch: list[Any] | None = None) -> rtx.Sim:
         self.calls += 1
         self.simulated += 1
-        err, _s, _rec = self._run(tx)
-        return rtx.Sim(err, [], 74_000, [])
+        err, s, _rec = self._run(tx)
+        post: list[rtx.Account | None] = []
+        if watch and err is None and s:
+            saved = (self.lam, self.tok, self.wsol, self.curves, self.pools, self.atas)
+            self.lam, self.tok, self.wsol = s["lam"], s["tok"], s["wsol"]
+            self.curves, self.pools, self.atas = s["curves"], s["pools"], s["atas"]
+            accs = self._accounts()
+            self.lam, self.tok, self.wsol, self.curves, self.pools, self.atas = saved
+            post = [accs.get(str(k)) for k in watch]
+        return rtx.Sim(err, [], 74_000, post)
 
     def land(self, tx: VersionedTransaction | str) -> dict[str, Any]:
         """Транзакция попадает в блок (успешно или с отказом сети)."""

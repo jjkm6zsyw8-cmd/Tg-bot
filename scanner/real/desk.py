@@ -209,6 +209,16 @@ class RealDesk:
                 for lane in self.lanes.values():
                     if int(p.get("id") or 0) in lane.positions:
                         await lane.command(p)
+            elif cmd == "jup_test":
+                signers = [x for x in self.lanes.values() if x.wallet is not None and x.wallet.can_sign]
+                want = self.lanes.get(p.get("wallet"))
+                lane = want if want in signers else next(iter(signers), None)
+                if lane is not None:
+                    await lane.command(p)
+                else:
+                    first = next(iter(self.lanes.values()), None)
+                    if first is not None:
+                        await first.say_raw("🧪 Пробная сделка не выполнена: ни у одного кошелька бота нет ключа.")
             elif cmd == "check":
                 lane = self.lanes.get(p.get("wallet")) or next(
                     (x for x in self.wallet_lanes().values() if x.wallet is not None), None) or next(

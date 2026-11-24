@@ -305,6 +305,18 @@ class ExternalHub:
         _ok, v = await self._call(self.jupiter, self.jupiter.quote(input_mint, output_mint, amount), 5.0)
         return v
 
+    async def jup_quote_full(self, input_mint: str, output_mint: str, amount: int,
+                             slippage_bps: int) -> dict[str, Any] | None:
+        """Полная котировка Jupiter для сделки (бой, сухой прогон) или None."""
+        _ok, v = await self._call(self.jupiter, self.jupiter.quote_full(input_mint, output_mint, amount, slippage_bps),
+                                  9.0)
+        return v
+
+    async def jup_swap_ixs(self, quote: dict[str, Any], user: str) -> dict[str, Any] | None:
+        """Инструкции обмена Jupiter по котировке или None."""
+        _ok, v = await self._call(self.jupiter, self.jupiter.swap_instructions(quote, user), 9.0)
+        return v
+
     def jup_decimals(self, mint: str) -> int | None:
         return self.jupiter.decimals.get(mint)
 

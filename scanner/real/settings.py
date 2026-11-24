@@ -110,6 +110,7 @@ SETTINGS: dict[str, tuple[str, Any, float, float, float, str, str]] = {
                     "Цена открытых позиций (бой и тень) прямо из блокчейна — как бумага берёт её каждые 4 с."),
     "real_reserve_sol": ("Неприкосновенный остаток, SOL", 0.02, 0.01, 0.005, 1.0, "sol",
                          "На комиссии и залоги счетов; ниже остатка покупки не делаются."),
+    "real_jup_slippage": ("Jupiter: лимит проскальзывания", 0.05, 0.01, 0.01, 0.30, "pct", ""),
     "real_land_s": ("Тень: задержка «посадки» сделки, с", 0.8, 0.4, 0.0, 5.0, "sec",
                     "Через сколько секунд после решения тень берёт цену — как будто сделка легла в блок."),
 }
@@ -137,9 +138,15 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
                     "Дев без монет за 7 дней купил на запуске 0.5–2 SOL или от 10 SOL — вход сразу (быстрый путь), "
                     "только если цена ещё низкая; держать до роста ×3 (дальше трейлинг 40%), без стопа, до 1 ч. "
                     "Пока проверяется в тени."),
-    "real_trendj": ("Тренды на других биржах (Raydium, Meteora…) — только тень", False,
-                    "Монеты трендов не с pump.fun: вход и выход по котировке Jupiter, без транзакции. По бумаге "
-                    "20–22.11 — +10.7% на сделку на 85 сделках. Покупки на деньги через Jupiter пока нет."),
+    "real_trendj": ("Тренды на других биржах (Raydium, Meteora…)", False,
+                    "Монеты трендов не с pump.fun: вход и выход по котировке Jupiter. В бой — только отдельной "
+                    "кнопкой «💵 Торговать и в бою» на экране метода."),
+    # 24.11: бой через Jupiter — только по кнопке владельца (экран метода, с подтверждением); автонастройка, «включить
+    # все» и общий экран настроек его не трогают
+    "real_live_trendj": ("«Тренды на других биржах» в бою (иначе только в тени)", False,
+                         "Пока выключено, тренды других бирж — только тень, даже когда кошелёк в бою."),
+    "real_jup_dry_run": ("Сухой прогон Jupiter в тени", True,
+                         "На входе тени — настоящая транзакция Jupiter: собрать, проверить, симулировать, не отправлять."),
     "real_mev_protect": ("Обходить валидаторов-«сэндвичеров»", True, "Параметр mev-protect у Helius Sender."),
     "real_close_ata": ("Закрывать пустые счета токенов (возврат залога)", True, "≈0.0015 SOL с каждой монеты."),
     "real_notify_shadow": ("Сообщения о сделках тени", False, ""),
@@ -156,6 +163,8 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
                          "цене в сети: без транзакций и без денег. Итог — в «⚖️ Против бумаги»."),
 }
 DEFAULT_MODE = "shadow"
+# бой отдельного метода — только кнопкой на экране метода (с подтверждением у трендов других бирж)
+LIVE_TOGGLES = {"real_live_mydev", "real_live_trendj"}
 
 
 def get(cfg: dict[str, Any], key: str) -> Any:
@@ -213,6 +222,8 @@ def method_name(cfg: dict[str, Any], kind: str) -> str:
     default = DEFAULT_SCHEMES[SCHEME_KEYS[kind]]
     out = f"{base} {rule}" if kind == "mydev" else (base if rule == default else f"{base} → {rule}")
     if kind == "mydev" and not get(cfg, "real_live_mydev"):
+        out += " (только тень)"
+    if kind == "trendj" and not get(cfg, "real_live_trendj"):
         out += " (только тень)"
     return out
 
@@ -274,6 +285,20 @@ METHODS: dict[str, tuple[str, str, str]] = {
 }
 KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", "bigcopy": "крупная копия",
               "swing": "смарт-ракета", "trend": "тренд", "newdev": "новый дев", "trendj": "тренд (др. биржи)"}
+
+
+def live_methods(cfg: dict[str, Any]) -> list[str]:
+    """24.11: какие методы пойдут на деньги, если кошелёк в бою (у «мой дев» и трендов других бирж — ещё и своя
+    кнопка боя). «На деньги — только выбранные мной кошельки» — ни один метод."""
+    if get(cfg, "real_only_follow"):
+        return []
+    out = []
+    for k, (_name, on_key, _port) in METHODS.items():
+        if not get(cfg, on_key) or (k == "mydev" and not get(cfg, "real_live_mydev")) \
+                or (k == "trendj" and not get(cfg, "real_live_trendj")):
+            continue
+        out.append(KIND_NAMES.get(k, k))
+    return out
 
 
 def methods_summary(cfg: dict[str, Any]) -> str:

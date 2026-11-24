@@ -341,6 +341,25 @@ class Jupiter(ExternalSource):
             return None
         return {"out": int(d["outAmount"]), "impact": float(d.get("priceImpactPct") or 0)}
 
+    async def quote_full(self, input_mint: str, output_mint: str, amount: int, slippage_bps: int,
+                         max_accounts: int = 40) -> dict[str, Any] | None:
+        """24.11: полная котировка для сделки (её целиком передают в swap-instructions)."""
+        swap = "https://api.jup.ag/swap/v1/quote" if self.key else "https://lite-api.jup.ag/swap/v1/quote"
+        d = await self.request("GET", swap, path_key="quote", params={
+            "inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount)),
+            "slippageBps": str(int(slippage_bps)), "restrictIntermediateTokens": "true",
+            "maxAccounts": str(int(max_accounts))}, timeout_s=8.0)
+        return d if isinstance(d, dict) and d.get("outAmount") else None
+
+    async def swap_instructions(self, quote: dict[str, Any], user: str) -> dict[str, Any] | None:
+        """24.11: инструкции обмена по котировке (транзакцию собирает и проверяет сам бот — jupswap.py)."""
+        url = ("https://api.jup.ag/swap/v1/swap-instructions" if self.key
+               else "https://lite-api.jup.ag/swap/v1/swap-instructions")
+        d = await self.request("POST", url, path_key="swap_instructions", json_body={
+            "quoteResponse": quote, "userPublicKey": user, "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True}, timeout_s=8.0)
+        return d if isinstance(d, dict) and d.get("swapInstruction") else None
+
     async def sol_usd(self) -> float | None:
         return (await self.prices([SOL_MINT])).get(SOL_MINT)
 

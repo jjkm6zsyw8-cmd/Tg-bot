@@ -365,6 +365,10 @@ async def live_confirm_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
              f"{S.get(cfg, 'real_max_open')} позиций, дневной стоп "
              f"{S.fmt('real_day_stop_usd', S.get(cfg, 'real_day_stop_usd'))}, общий стоп "
              f"{S.fmt('real_total_stop_usd', S.get(cfg, 'real_total_stop_usd'))} (после него бой сам выключится)."]
+    money_kinds = S.live_methods(cfg)
+    lines.append("<b>На деньги пойдут методы:</b> " + (", ".join(money_kinds) if money_kinds else
+                                                      "ни один (только кошельки «💵 Бой за ним»)")
+                 + ". Остальное — только тень.")
     if not (allowed and can_sign):
         lines += ["", "Сейчас включить нельзя: не выполнены условия на сервере. Как их выполнить — docs/REAL_BOT.md, "
                       "раздел «Как включить бой»."]
@@ -390,7 +394,7 @@ def settings_view(cfg: dict[str, Any], wid: int | None = None, name: str = "") -
                    {"text": f"{label[:22]}: {shown}", "callback": back if one else "rl:set"},
                    {"text": "+", "callback": f"{pre}{key}:+"}])
     lines.append("")
-    method_keys = {m[1] for m in S.METHODS.values()} | {"real_live_mydev"}
+    method_keys = {m[1] for m in S.METHODS.values()} | S.LIVE_TOGGLES
     for key, (label, _default, desc) in S.TOGGLES.items():
         if key in method_keys:
             continue                                 # методы и их правила — на экране «🎯 Методы»
@@ -783,7 +787,7 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
             return await conf(f"{S.SETTINGS[key][0]}: {S.fmt(key, v)}")
         return await conf()
     if action == "t":
-        if rest in S.TOGGLES:
+        if rest in S.TOGGLES and rest not in S.LIVE_TOGGLES:     # бой метода — только на его экране, с подтверждением
             await db.set_override(rest, not S.get(cfg, rest))
         return await conf("Сохранено")
     if action == "sc":
