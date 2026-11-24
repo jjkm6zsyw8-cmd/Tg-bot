@@ -22,7 +22,7 @@ MODES = {"off": "выключен", "shadow": "тень (без денег)", "l
 #   B — 70% на +25%, остаток трейлинг 15%, без стопа, до 30 мин;
 #   G — всё на +25%, стоп −8%, нет +10% за 5 мин — выход, до 30 мин (как бумажные G, Y, H, K);
 #   R — трейлинг 35% после +30%, стоп −50%, до суток (как бумажный R, «смарт-ракеты»).
-SCHEMES = ("A", "B", "G", "R", "L", "D", "U", "V", "P", "Q")
+SCHEMES = ("A", "B", "G", "R", "L", "D", "U", "V", "P", "Q", "E", "F")
 # 23.11: правила по разбору трендов на других биржах (20–22.11, путь цены по свечам): U — трейлинг 15% после +20%,
 # стоп −20% (+41% на сделку); V — трейлинг 15% после +50%, без стопа (+42%); P — тейк +75%, стоп −20% (+24%);
 # Q — просто держать 30 мин (+33%). Все — не дольше 30 мин (столько видно в данных)
@@ -35,7 +35,15 @@ EXTRA_RULES: dict[str, dict[str, Any]] = {
           "time_stop_gain": None, "max_hold_s": 1800},
     "Q": {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": None, "target": False, "time_stop_s": None,
           "time_stop_gain": None, "max_hold_s": 1800},
+    # 24.11: «крупные монеты» (тысячи держателей, глубокий пул) движутся на проценты, а не в разы:
+    # E — всё на +8%, стоп −5%, до часа; F — трейлинг 4% после +6%, стоп −5%, до 2 ч
+    "E": {"stop": 0.05, "tp_net": 0.08, "tp_share": 1.0, "trail": None, "target": False, "time_stop_s": None,
+          "time_stop_gain": None, "max_hold_s": 3600},
+    "F": {"stop": 0.05, "tp_net": None, "tp_share": 0.0, "trail": 0.04, "trail_after_net": 0.06, "target": False,
+          "time_stop_s": None, "time_stop_gain": None, "max_hold_s": 7200},
 }
+MAJOR_ONLY_RULES = ("E", "F")                    # правила «крупных монет»: у остальных методов их нет
+MAJOR_RULES = ("A", "G", "U", "V", "Q", "E", "F")  # пробы «крупных монет» (без долгих R и L)
 # 23.11: D — «по почерку дева» (как владелец торговал руками): продать раньше дева — на цели из его истории (чуть ниже
 # нижней четверти его первых продаж), или сразу, когда дев начал продавать; стоп −30%, не дольше 5 мин. Только «мой дев»
 DEV_SCHEME = {"stop": 0.30, "tp_net": None, "tp_share": 0.0, "trail": None, "target": True, "time_stop_s": None,
@@ -48,10 +56,10 @@ LOTTERY = {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": 0.40, "trail_
            "ignore_trader_sell": True}
 SCHEME_KEYS = {"smart": "real_scheme", "mydev": "real_scheme_mydev", "bigcopy": "real_scheme_bigcopy",
                "copy": "real_scheme_copy", "swing": "real_scheme_swing", "trend": "real_scheme_trend",
-               "newdev": "real_scheme_newdev", "trendj": "real_scheme_trendj"}
+               "newdev": "real_scheme_newdev", "trendj": "real_scheme_trendj", "majorj": "real_scheme_majorj"}
 DEFAULT_SCHEMES = {"real_scheme": "A", "real_scheme_mydev": "D", "real_scheme_bigcopy": "G", "real_scheme_copy": "G",
                    "real_scheme_swing": "R", "real_scheme_trend": "U", "real_scheme_newdev": "L",
-                   "real_scheme_trendj": "U"}
+                   "real_scheme_trendj": "U", "real_scheme_majorj": "E"}
 SCHEME_TEXT = {"A": "всё на +25%, без стопа, до 30 мин", "B": "70% на +25%, остаток трейлинг 15%, до 30 мин",
                "G": "всё на +25%, стоп −8%, нет +10% за 5 мин — выход", "R": "трейлинг 35% после +30%, стоп −50%, до суток",
                "L": "лотерея до PumpSwap: держать до ×3, дальше трейлинг 40%, без стопа, до 1 ч",
@@ -61,10 +69,24 @@ SCHEME_TEXT = {"A": "всё на +25%, без стопа, до 30 мин", "B": 
                "V": "трейлинг 15% после +50%, без стопа, до 30 мин",
                "P": "всё на +75%, стоп −20%, до 30 мин",
                "Q": "просто держать 30 мин",
+               "E": "всё на +8%, стоп −5%, до часа (крупные монеты)",
+               "F": "трейлинг 4% после +6%, стоп −5%, до 2 ч (крупные монеты)",
                "W": "продать через его обычное время удержания − 2 с (раньше него), или когда он продал"}
 # пробы правил выхода: A / B / G / R + W (21.11, идея владельца: выйти раньше трейдера — не попасть под его продажу).
 # W — только проба (бот так не продаёт): у сигналов с трейдером, чьё обычное удержание известно (до 30 мин)
-TRIAL_RULES = (*(r for r in SCHEMES if r != "D"), "W")      # D — только у «мой дев», меряется самой позицией
+TRIAL_RULES = (*(r for r in SCHEMES if r != "D" and r not in ("E", "F")), "W")   # D — только «мой дев»; E/F — крупные
+
+
+def trial_rules(kind: str | None) -> tuple[str, ...]:
+    """Какие правила выхода меряют пробы метода: у «крупных монет» — свои (E/F под небольшие движения)."""
+    return MAJOR_RULES if kind == "majorj" else TRIAL_RULES
+
+
+def method_rules(kind: str) -> tuple[str, ...]:
+    """Правила, которые можно выбрать у метода (кнопки «Выход»)."""
+    if kind == "majorj":
+        return MAJOR_RULES
+    return tuple(x for x in SCHEMES if (x != "D" or kind == "mydev") and x not in MAJOR_ONLY_RULES)
 # Вход smart: «all» — все smart-сигналы (как бумажные A / B / G), «m» — только те, что бумага пустила в боевой
 # портфель M (автофильтр по истории сделок трейдеров и правила отбора M). M = вход «m» + правило A + до 3 позиций.
 SMART_FILTERS = {"all": "все smart-сигналы", "m": "только отобранные, как у M"}
@@ -145,6 +167,8 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
                     "кнопкой «💵 Торговать и в бою» на экране метода."),
     # 24.11: бой через Jupiter — только по кнопке владельца (экран метода, с подтверждением); автонастройка, «включить
     # все» и общий экран настроек его не трогают
+    "real_majorj": ("Крупные монеты (тренды Jupiter) — только тень", False,
+                    "От 1000 держателей, пул от $100k, старше суток; вход на росте, выход E/F. Без денег."),
     "real_live_trendj": ("«Тренды на других биржах» в бою (иначе только в тени)", False,
                          "Пока выключено, тренды других бирж — только тень, даже когда кошелёк в бою."),
     "real_jup_dry_run": ("Сухой прогон Jupiter в тени", True, "Собрать и проверить транзакцию, не отправляя."),
@@ -218,12 +242,13 @@ def method_name(cfg: dict[str, Any], kind: str) -> str:
             return "Smart M" if rule == "A" else f"Smart (отбор M) → {rule}"
         return f"Smart {rule}"
     base = {"mydev": "Мой дев", "bigcopy": "Крупные копии", "copy": "Копии", "swing": "Смарт-ракеты",
-            "trend": "Тренды", "newdev": "Новый дев", "trendj": "Тренды (др. биржи)"}[kind]
+            "trend": "Тренды", "newdev": "Новый дев", "trendj": "Тренды (др. биржи)",
+            "majorj": "Крупные монеты"}[kind]
     default = DEFAULT_SCHEMES[SCHEME_KEYS[kind]]
     out = f"{base} {rule}" if kind == "mydev" else (base if rule == default else f"{base} → {rule}")
     if kind == "mydev" and not get(cfg, "real_live_mydev"):
         out += " (только тень)"
-    if kind == "trendj" and not get(cfg, "real_live_trendj"):
+    if (kind == "trendj" and not get(cfg, "real_live_trendj")) or kind == "majorj":
         out += " (только тень)"
     return out
 
@@ -282,9 +307,12 @@ METHODS: dict[str, tuple[str, str, str]] = {
     # день, +$91 (+10.7% на сделку), а на pump.fun −$26 на 76. Реальный бот там не торгует — тень по котировке
     # Jupiter (без транзакции), бой — только когда появится покупка через Jupiter
     "trendj": ("Тренды на других биржах (Raydium, Meteora…) — тень по Jupiter", "real_trendj", "TJ"),
+    # 24.11: крупные монеты из трендов Jupiter (analytics/majors.py) — только тень, на деньги не идут
+    "majorj": ("Крупные монеты (тренды Jupiter) — только тень", "real_majorj", "MJ"),
 }
 KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", "bigcopy": "крупная копия",
-              "swing": "смарт-ракета", "trend": "тренд", "newdev": "новый дев", "trendj": "тренд (др. биржи)"}
+              "swing": "смарт-ракета", "trend": "тренд", "newdev": "новый дев", "trendj": "тренд (др. биржи)",
+              "majorj": "крупная монета"}
 
 
 def live_methods(cfg: dict[str, Any]) -> list[str]:
@@ -295,7 +323,7 @@ def live_methods(cfg: dict[str, Any]) -> list[str]:
     out = []
     for k, (_name, on_key, _port) in METHODS.items():
         if not get(cfg, on_key) or (k == "mydev" and not get(cfg, "real_live_mydev")) \
-                or (k == "trendj" and not get(cfg, "real_live_trendj")):
+                or (k == "trendj" and not get(cfg, "real_live_trendj")) or k == "majorj":
             continue
         out.append(KIND_NAMES.get(k, k))
     return out
@@ -304,7 +332,7 @@ def live_methods(cfg: dict[str, Any]) -> list[str]:
 def methods_summary(cfg: dict[str, Any]) -> str:
     """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»; своя ставка — в скобках."""
     out = []
-    for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj"):
+    for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj", "majorj"):
         if get(cfg, METHODS[kind][1]):
             stake = method_stake(cfg, kind)
             out.append(method_name(cfg, kind) + (f" ${stake:g}" if stake else ""))

@@ -385,6 +385,14 @@ class Jupiter(ExternalSource):
             "dynamicComputeUnitLimit": True}, timeout_s=8.0)
         return d if isinstance(d, dict) and d.get("swapInstruction") else None
 
+    async def tokens(self, category: str, interval: str, limit: int = 100) -> list[dict[str, Any]]:
+        """24.11: списки монет Jupiter (tokens/v2): toptrending / toporganicscore / toptraded за 5m / 1h / 6h / 24h —
+        с держателями, ликвидностью, органическим объёмом, аудитом и статистикой за 5 мин и час."""
+        base = "https://api.jup.ag/tokens/v2" if self.key else "https://lite-api.jup.ag/tokens/v2"
+        d = await self.request("GET", f"{base}/{category}/{interval}", path_key="tokens",
+                               params={"limit": str(int(limit))}, timeout_s=8.0)
+        return [x for x in d if isinstance(x, dict)] if isinstance(d, list) else []
+
     async def sol_usd(self) -> float | None:
         return (await self.prices([SOL_MINT])).get(SOL_MINT)
 

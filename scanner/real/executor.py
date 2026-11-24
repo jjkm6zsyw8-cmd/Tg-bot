@@ -55,6 +55,7 @@ SHADOW_MAX_OPEN = 30                  # тень-замер: столько по
 # тень тратила на них ~1700 симуляций в сутки из бесплатных запросов Helius
 SHADOW_SKIP = {"copy"}
 NEWDEV = "Z"                     # сигнал «новый дев с крупной покупкой» (бумажного портфеля нет — только реальный бот)
+MAJOR = "MJ"                     # «крупные монеты» (analytics/majors.py): только тень, по котировкам Jupiter
 JUP_VENUE = "jupiter"            # «тренды на других биржах»: позиция по котировке Jupiter (тень, без транзакции)
 JUP_SLIP = 0.01                  # проскальзывание входа и выхода по котировке Jupiter (сверх комиссии)
 OTHER_DEX = "не pump.fun и не PumpSwap"
@@ -62,6 +63,8 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 NEWDEV_MAX_MC = 65.0             # дороже — лотерея не окупается (MC 65: окупаемость с 11% ухода на PumpSwap)
 NEWDEV_SHADOW_MAX = 150          # «новый дев» в тени: своих позиций одновременно (держит до 1 ч)
 NEWDEV_MAX_HOLD_S = 3600.0       # «новый дев»: любое правило — не дольше часа
+MAJOR_SHADOW_MAX = 20            # «крупные монеты» в тени: своих позиций одновременно (места остальных не занимают)
+OWN_LIMIT = {"newdev": NEWDEV_SHADOW_MAX, "majorj": MAJOR_SHADOW_MAX}
 KINDS = S.KIND_NAMES
 SMART_TARGETS = {MAIN, *SMART_SET}         # smart-сигнал: в бумаге он идёт в боевой M и в A / B / G
 # тренд — без покупки трейдера в блоке: возраст сигнала считаем от алерта (DexScreener опрашивается раз в 5 с,
@@ -92,6 +95,8 @@ def kinds_of(data: dict[str, Any], targets: set[str]) -> list[str]:
         out.append("trend")
     if NEWDEV in targets and "newdev" in modes:
         out.append("newdev")
+    if MAJOR in targets and "major" in modes:
+        out.append("majorj")
     return out
 MODE_ICON = {"live": "💵", "shadow": "👻"}
 MODE_SHORT_RU = {"live": "💵 бой", "shadow": "👻 тень", "off": "выкл"}
@@ -242,6 +247,8 @@ class RealTrader:
             return "shadow"                          # запуски девов в бою — только по отдельному разрешению
         if m == "live" and kind == "trendj" and not self.get("real_live_trendj"):
             return "shadow"                          # тренды других бирж в бою — только кнопкой владельца
+        if kind == "majorj":
+            return "shadow"                          # 24.11: «крупные монеты» — только тень, на деньги не идут никогда
         return m
 
     def scheme_of(self, p: Position) -> dict[str, Any]:
@@ -546,7 +553,7 @@ class RealTrader:
         """Причина не входить (до запросов к сети) или None."""
         if self.paused():
             return f"входы остановлены: {self.paused()}"
-        if kind in ("trend", "trendj"):
+        if kind in ("trend", "trendj", "majorj"):
             if not data.get("trend_at"):
                 return "нет времени сигнала"
             if time.time() - float(data["trend_at"]) > TREND_MAX_AGE_S:
@@ -558,15 +565,15 @@ class RealTrader:
         if mint in self._busy or any(p.mint == mint for p in self.positions.values()):
             return "уже есть позиция по монете"
         free = mode == "shadow" and bool(self.get("real_shadow_free"))   # тень — замер: все сигналы, без стопа
-        if kind == "newdev" and mode == "shadow":
-            # свой лимит: лотерея — десятки позиций сразу, места остальных методов не занимает
+        if kind in OWN_LIMIT and mode == "shadow":
+            # свой лимит: лотерея «нового дева» и «крупные монеты» — много позиций сразу, места остальных не занимают
             taken = sum(1 for p in self.positions.values() if p.extra.get("mode") == mode
-                        and p.extra.get("kind") == "newdev")
-            if taken >= NEWDEV_SHADOW_MAX:
+                        and p.extra.get("kind") == kind)
+            if taken >= OWN_LIMIT[kind]:
                 return "лимит открытых позиций"
         else:
             taken = sum(1 for p in self.positions.values() if p.extra.get("mode") == mode
-                        and not (mode == "shadow" and p.extra.get("kind") == "newdev")) \
+                        and not (mode == "shadow" and p.extra.get("kind") in OWN_LIMIT)) \
                 + sum(1 for m in self._busy.values() if m == mode)
             if taken >= (SHADOW_MAX_OPEN if free else int(self.get("real_max_open"))):
                 return "лимит открытых позиций"
@@ -743,6 +750,8 @@ class RealTrader:
     # ------------------------------------------------------------------ покупка
     async def _enter(self, mint_s: str, kind: str, mode: str, alert_id: int | None, data: dict[str, Any],
                      trader: str | None) -> None:
+        if kind == "majorj":                         # крупные монеты — не pump.fun: сразу котировка Jupiter, тень
+            return await self._enter_jupiter(mint_s, alert_id, data, trader, kind="majorj")
         if self.chain is None:
             return self._skip(mode, kind, "нет доступа к сети")
         t0 = time.time()
@@ -987,15 +996,17 @@ class RealTrader:
                          note=note, cu=None, fee_sol=fee, wait_ms=wait_ms, order_id=oid)
 
     async def _enter_jupiter(self, mint_s: str, alert_id: int | None, data: dict[str, Any],
-                             trader: str | None) -> None:
+                             trader: str | None, kind: str = "trendj") -> None:
         """23.11: тренд на монете не с pump.fun (Raydium, Meteora…). Тень — по котировке Jupiter (без транзакции) и
         сухой прогон настоящей транзакции; сопровождение — цены Jupiter (desk.poll_prices), выход — по правилу метода
         «trendj». 24.11: бой — только если владелец сам включил у метода «💵 Торговать и в бою» (real_live_trendj) и
-        кошелёк в бою."""
-        kind = "trendj"
+        кошелёк в бою. «Крупные монеты» (majorj) — тот же путь, но только тень."""
         mode = self.mode_for(kind)
         if mode == "off":
-            return self._skip("shadow", kind, "метод «тренды на других биржах» выключен")
+            return self._skip("shadow", kind, "метод «крупные монеты» выключен" if kind == "majorj"
+                              else "метод «тренды на других биржах» выключен")
+        if kind == "majorj":
+            mode = "shadow"                            # на деньги — никогда
         if mode == "live" and self.get("real_only_follow"):
             mode = "shadow"                            # «на деньги — только выбранные мной кошельки»
         ext = getattr(self.e, "ext", None)
@@ -1046,7 +1057,8 @@ class RealTrader:
             return self._skip(mode, kind, "другая биржа: нет цены Jupiter")
         sol_usd = self.sol_usd()
         mc = float(jp) * 1e9 / sol_usd                 # условная капитализация: цена × 1 млрд (как у бумаги T)
-        usd = S.method_stake(self.cfg, kind) or S.method_stake(self.cfg, "trend") or float(self.get("real_stake_usd"))
+        usd = (S.method_stake(self.cfg, kind) or (S.method_stake(self.cfg, "trend") if kind == "trendj" else None)
+               or float(self.get("real_stake_usd")))
         stake = int(usd / sol_usd * 1e9)
         dec = ext.jup_decimals(mint_s) if hasattr(ext, "jup_decimals") else None
         base = {"mint": mint_s, "kind": kind, "mode": mode, "alert_id": alert_id, "trader": trader,
@@ -1825,7 +1837,7 @@ class RealTrader:
                            tokens_raw: int, slot: int | None) -> None:
         """На вход бота — по пробе на каждое правило выхода: тот же вход, те же токены и затраты."""
         w_hold = self.w_hold(base)
-        for rule in S.TRIAL_RULES:
+        for rule in S.trial_rules(base.get("kind")):
             if rule == "W" and w_hold is None:
                 continue                         # обычное удержание трейдера неизвестно (или это не копия)
             r = await self.db.fetchrow(

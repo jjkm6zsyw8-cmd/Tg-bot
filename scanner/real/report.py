@@ -480,7 +480,7 @@ async def trades_csv(db: Any, cfg: dict[str, Any]) -> tuple[str, int]:
 
 # ---------------------------------------------------------------------- сравнение с бумагой
 DEFAULT_RULE = {"smart": "A", "mydev": "G", "copy": "G", "bigcopy": "G", "swing": "R", "trend": "G", "newdev": "L",
-                "trendj": "G"}
+                "trendj": "G", "majorj": "E"}
 
 
 def paper_target(kind: str, extra: dict[str, Any]) -> str | None:
@@ -545,7 +545,7 @@ async def compare_text(db: Any, cfg: dict[str, Any], days: int = 14, last: int =
     head = f"{'':<17}{'сдел.':>5} {'в плюс':>6} {'средн.':>7} {'итог':>9}"
     table, notes = [head], []
     for mode in ("live", "shadow"):
-        for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj"):
+        for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj", "majorj"):
             rs = [x for x in pairs if x[0]["mode"] == mode and x[0]["kind"] == kind]
             if not rs:
                 continue
@@ -647,7 +647,7 @@ async def rules_lines(db: Any, since: datetime, sol_usd: float) -> list[str]:
                 continue
             best = max(rules, key=lambda x: float(rules[x]["s"]))
             table.append(f"{MODE_SHORT[mode]} {KINDS.get(kind, kind)}")
-            for rule in S.TRIAL_RULES:
+            for rule in S.trial_rules(kind):
                 r = rules.get(rule)
                 if r is None:
                     continue

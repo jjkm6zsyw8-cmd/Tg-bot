@@ -307,13 +307,16 @@ async def create_and_wait(db: Any, cfg: dict[str, Any], name: str, rpc: Any = No
 
 # ---------------------------------------------------------------------- методы торговли
 PAPER_DAYS = 7
-ORDER = ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj")
+ORDER = ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj", "majorj")
 ABOUT = {"smart": "покупка smart-кошелька", "mydev": "запуск монеты девом из вашего списка",
          "bigcopy": "трейдер из списка зашёл от 5 SOL", "copy": "покупка кошелька из списка или кандидата разведки",
          "swing": "покупка держателя (кошелёк, который держит монеты часами)",
          "trend": "монета уже растёт (DexScreener), вход после отката; только pump.fun и PumpSwap",
          "newdev": "дев без монет за 7 дней купил на запуске 0.5–2 или от 10 SOL — вход сразу на запуске, пока цена низкая",
-         "trendj": "тренд (DexScreener) на монете не с pump.fun — Raydium, Meteora и др.; цена — котировка Jupiter"}
+         "trendj": "тренд (DexScreener) на монете не с pump.fun — Raydium, Meteora и др.; цена — котировка Jupiter",
+         "majorj": "крупная монета из трендов Jupiter (от 1000 держателей, пул от $100k, старше суток, объём "
+                   "настоящий, без допечатки и заморозки) растёт за 5 мин на 1.5–10% и покупают больше, чем продают; "
+                   "только тень — на деньги не идёт"}
 
 
 async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float]]:
@@ -452,7 +455,7 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     trials = await trial_stats(db, kind, None if tag == "g" else int(tag))
     sol_usd = await sol_price(db)
     # 22.11: экран по разделам — каждый с новой строки, тень таблицей, бумага отдельно (владелец: «всё наслоено»)
-    rules = [x for x in S.TRIAL_RULES if x != "W" or kind in ("smart", "copy", "bigcopy", "swing")]
+    rules = [x for x in S.trial_rules(kind) if x != "W" or kind in ("smart", "copy", "bigcopy", "swing")]
     if kind == "mydev":
         rules.append("D")
     stake_txt = (f"${stake:g}" if stake else f"как у кошелька ({S.fmt('real_stake_usd', S.get(wcfg, 'real_stake_usd'))})")
@@ -489,7 +492,7 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     lines += ["", "<b>Правила</b>"] + [f"{x} — {S.SCHEME_TEXT[x]}" + (" (только проба)" if x == "W" else "")
                                        for x in rules]
     exits = [{"text": ("● " if rule == x else "") + f"Выход {x}", "callback": f"rl:wmr:{tag}:{kind}:{x}"}
-             for x in S.SCHEMES if x != "D" or kind == "mydev"]
+             for x in S.method_rules(kind)]
     kb: Kb = [[{"text": "✅ Включён — выключить" if on else "⬜ Выключен — включить",
                 "callback": f"rl:wmo:{tag}:{kind}:{'off' if on else 'on'}"}],
               *[exits[i:i + 5] for i in range(0, len(exits), 5)]]
@@ -642,7 +645,7 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
             return Reply(None, None, "Не понял кнопку")
         patch, drop = res
         kind = kind if kind in S.METHODS else ("trendj" if kind == "jlive" else "mydev")
-    elif action == "wmr" and len(parts) == 3 and kind in S.METHODS and parts[2] in S.SCHEMES:
+    elif action == "wmr" and len(parts) == 3 and kind in S.METHODS and parts[2] in S.method_rules(kind):
         patch = {S.SCHEME_KEYS[kind]: parts[2]}
     elif action == "wmf" and len(parts) == 2 and parts[1] in ("all", "m", "M"):
         kind = "smart"

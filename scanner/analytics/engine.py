@@ -25,6 +25,7 @@ from .curve import Costs, entry_cost_fraction, exit_cost_fraction, trade_net_pro
 from .features import launch_summary
 from .filters import check as check_filters
 from .newcoins import evaluate_new
+from .majors import Majors
 from .trends import Trends, Tracked
 from .paper import PaperTrader
 from ..external import ExternalHub
@@ -143,6 +144,7 @@ class Engine:
         self.watch_tokens: set[str] = set()
         self.new_eval_at: dict[str, float] = {}
         self.trends = Trends(self)
+        self.majors = Majors(self)          # 24.11: «крупные монеты» из трендов Jupiter → реальный бот (только тень)
         self.paper = PaperTrader(self)
         self.real: Any = None
         try:        # реальный бот (scanner/real) — отдельный модуль: если он не поднялся, остальной бот работает
@@ -273,7 +275,7 @@ class Engine:
         await self.start()
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
-                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.paper.tick_loop(),
+                 self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.majors.run(), self.paper.tick_loop(),
                  self.pricecheck.loop(), self.scout.loop(), self.ratings.loop(), self.filter.loop()]
         if self.real is not None:
             tasks.append(self.real.loop())
