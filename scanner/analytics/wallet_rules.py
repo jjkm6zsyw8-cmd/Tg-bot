@@ -261,24 +261,45 @@ async def top_text(db: Any, limit: int = 15) -> tuple[str, list[tuple[str, str]]
     """24.11 (владелец: «только реальные данные»): /top — что сделал РЕАЛЬНЫЙ бот за кошельками за 7 дней (тень —
     настоящие цены, бой — деньги), лучшие сверху. Расчёты «если бы бот брал $10» здесь больше не показываются.
     Возвращает текст и [(адрес, имя)] для кнопок карточек."""
-    rows = await db.fetch(
-        """SELECT p.trader, COALESCE(t.label, w.label) label, count(*) n, count(*) FILTER (WHERE p.pnl_sol > 0) win,
-                  COALESCE(sum(p.pnl_sol), 0) s, count(*) FILTER (WHERE p.mode = 'live') live
+    # 25.11 (разбор /top владельцем): все кошельки, а не только лучшие — иначе список выглядит «все в плюсе»
+    alls = await db.fetch(
+        """SELECT p.trader, (array_agg(COALESCE(t.label, w.label)) FILTER (WHERE COALESCE(t.label, w.label) IS NOT NULL))[1]
+                  label, count(*) n, count(*) FILTER (WHERE p.pnl_sol > 0) win, COALESCE(sum(p.pnl_sol), 0) s,
+                  count(*) FILTER (WHERE p.mode = 'live') live
            FROM real_positions p LEFT JOIN traders t ON t.address = p.trader
-           LEFT JOIN watchlist w ON w.address = p.trader AND w.kind = 'trader'
+           LEFT JOIN (SELECT DISTINCT ON (address) address, label FROM watchlist WHERE kind = 'trader'
+                      ORDER BY address, label NULLS LAST) w ON w.address = p.trader
            WHERE p.trader IS NOT NULL AND p.closed_at IS NOT NULL AND p.closed_at > now() - interval '7 days'
              AND p.kind <> 'newdev'
-           GROUP BY p.trader, COALESCE(t.label, w.label) ORDER BY sum(p.pnl_sol) DESC LIMIT $1""", limit)
+           GROUP BY p.trader ORDER BY sum(p.pnl_sol) DESC""")
+    rows = alls[:limit]
     sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
     head = "📊 <b>Реальный бот за кошельками</b> — настоящие цены, 7 дн (👻 тень и 💵 бой вместе)"
     if not rows:
         return head + "\nЗа 7 дней бот ни за кем не торговал — реальных цифр нет.", []
-    lines, out = [head], []
+    labels = [r["label"] for r in alls if r["label"]]
+
+    def name_of(r: Any) -> str:
+        short = f"{r['trader'][:4]}…{r['trader'][-4:]}"
+        if not r["label"]:
+            return short
+        return f"{r['label'][:14]} {r['trader'][:4]}" if labels.count(r["label"]) > 1 else r["label"][:14]
+
+    def line(r: Any) -> str:
+        return (f"<b>{esc(name_of(r))}</b>: {_m(float(r['s']) * sol_usd)} · {r['n']} сд, в плюсе {r['win']}"
+                + (f" · 💵 {r['live']}" if r["live"] else ""))
+    n_all, s_all = sum(int(r["n"]) for r in alls), sum(float(r["s"]) for r in alls)
+    minus = sum(1 for r in alls if float(r["s"]) < 0)
+    lines = [head, f"Всего: {len(alls)} кошельков · {n_all} сд · итог {_m(s_all * sol_usd)} · в плюсе "
+                   f"{len(alls) - minus}, в минусе {minus}", "", "Лучшие:"]
+    out = []
     for r in rows:
-        name = r["label"] or f"{r['trader'][:4]}…{r['trader'][-4:]}"
-        lines.append(f"<b>{esc(name[:14])}</b>: {_m(float(r['s']) * sol_usd)} · {r['n']} сд, в плюсе {r['win']}"
-                     + (f" · 💵 {r['live']}" if r["live"] else ""))
-        out.append((r["trader"], name[:14]))
+        lines.append(line(r))
+        out.append((r["trader"], name_of(r)))
+    worst = [r for r in alls[limit:][-3:] if float(r["s"]) < 0][::-1]
+    if worst:
+        lines += ["", "Худшие:"] + [line(r) for r in worst]
+    lines += ["", "Кошелёк с 1–5 сделками — это ещё случайность, смотреть стоит от 20–30 сделок."]
     return "\n".join(lines), out
 
 

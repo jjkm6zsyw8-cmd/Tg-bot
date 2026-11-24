@@ -202,3 +202,29 @@ async def test_mine_view_and_reset():
         assert "сделок пока нет" in r.text and "с " in r.text.splitlines()[0]
     finally:
         await db.close()
+
+
+async def test_top_shows_totals_worst_and_same_names_apart():
+    """25.11: /top — итог по всем кошелькам и худшие (а не только лучшие); одинаковые имена — с началом адреса."""
+    from scanner.analytics import wallet_rules as WR
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        a, b, c = "AAAA" + "1" * 36 + "aaaa", "BBBB" + "2" * 36 + "bbbb", "CCCC" + "3" * 36 + "cccc"
+        for addr in (a, b):
+            await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('trader', $1, 'топ на 3 монет')", addr)
+        for i, (addr, pnl) in enumerate(((a, 0.03), (b, 0.02), (c, -0.1))):
+            await db.execute(
+                """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, pnl_sol,
+                       pnl_pct, extra) VALUES ('shadow', 'copy', $1, $2, now(), now(), 0.05, 1, $3, 0.1, '{}')""",
+                f"M{i}", addr, pnl)
+        text, items = await WR.top_text(db, 2)
+        assert "Всего: 3 кошельков · 3 сд · итог −$8 · в плюсе 2, в минусе 1" in text, text
+        assert "<b>топ на 3 монет AAAA</b>" in text and "<b>топ на 3 монет BBBB</b>" in text
+        assert "Худшие:\n<b>CCCC…cccc</b>: −$15" in text and [x[0] for x in items] == [a, b]
+    finally:
+        await db.close()
