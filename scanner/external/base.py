@@ -194,7 +194,11 @@ class ExternalSource:
                     raise Unavailable(f"HTTP {r.status}")
                 if r.status >= 400:
                     self.stats.error(f"HTTP {r.status} {path_key}")
-                    raise Unavailable(f"HTTP {r.status}")
+                    try:                          # 24.11: Jupiter 400 «NO_ROUTES_FOUND» — у монеты нет покупателей
+                        body = (await r.text())[:200]
+                    except Exception:  # noqa: BLE001
+                        body = ""
+                    raise Unavailable(f"HTTP {r.status}" + (f": {body}" if body else ""))
                 data = await r.json(content_type=None)
         except asyncio.TimeoutError as exc:
             self.stats.error(f"тайм-аут {path_key}")

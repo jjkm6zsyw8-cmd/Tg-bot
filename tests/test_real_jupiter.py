@@ -43,6 +43,7 @@ class Ext:
         self.chain, self.price, self.dec = chain, price, dec
         self.thief: Pubkey | None = None
         self.bad_program = False
+        self.rugged = False                     # ликвидность забрали: продать некому (Jupiter «маршрута нет»)
         self.quotes: list[tuple[str, str, int]] = []
 
     def usd(self, mint: str) -> float:
@@ -62,10 +63,14 @@ class Ext:
 
     async def jup_quote(self, inp, out, amount):
         q = await self.jup_quote_full(inp, out, amount, 500)
+        if q.get("no_route"):
+            return {"out": 0, "impact": 0.0, "no_route": True}
         return {"out": int(q["outAmount"]), "impact": 0.0}
 
     async def jup_quote_full(self, inp, out, amount, slippage_bps):
         self.quotes.append((inp, out, amount))
+        if self.rugged and out == ex.SOL_MINT:
+            return {"no_route": True}
         if inp == ex.SOL_MINT:
             o = int(amount / 1e9 * SOL_USD / self.usd(out) * 10 ** self.decimals(out))
         else:
@@ -100,9 +105,11 @@ def other_coin(chain: FakeChain, seed: str = "ray-live") -> Pubkey:
     return m
 
 
-async def signal(tr, mint: Pubkey, aid: int = 9) -> None:
-    await tr.on_signal(str(mint), "normal", aid, {"modes": ["trend"], "symbol": "RAY", "trend_at": time.time(),
-                                                   "trigger_at": time.time()}, None, {"T"})
+async def signal(tr, mint: Pubkey, aid: int = 9, age_s: float | None = None) -> None:
+    data = {"modes": ["trend"], "symbol": "RAY", "trend_at": time.time(), "trigger_at": time.time()}
+    if age_s is not None:
+        data.update(age_s=age_s, trend={"liq": 12_000.0})
+    await tr.on_signal(str(mint), "normal", aid, data, None, {"T"})
 
 
 def jlive(db, chain, monkeypatch, **cfg):
@@ -387,3 +394,72 @@ async def test_money_messages_go_to_their_own_topic(db):
     assert [dict(r["payload"])["topic"] for r in rows] == ["money", "real"]
     from scanner.config import Settings, YamlConfig
     assert Settings(YamlConfig("config/config.yaml")).topics()["money"] == "💵 Деньги (бой)"
+
+
+
+async def test_rug_in_shadow_is_counted_as_zero(db):
+    """24.11: ликвидность забрали — Jupiter «маршрута нет»: тень пишет выручку ноль (−100%), а не выход по последней
+    цене (так тень завышала итог)."""
+    chain = FakeChain()
+    coin = other_coin(chain, "rug-shadow")
+    tr = shadow(db, chain, real_trendj=True, real_max_open=5, real_rule_trials=True, real_jup_dry_run=False,
+                real_scheme_trendj="Q")
+    tr.e.ext = ext = Ext(chain)
+    await tr.start()
+    await signal(tr, coin)
+    p = only(tr)
+    ext.rugged = True
+    p.opened_ts -= 31 * 60                                     # Q: держать 30 мин — время вышло
+    for t in tr.trials.values():
+        t.opened_ts -= 31 * 60
+    await tr.tick()
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if not tr.positions and not tr.trials:
+            break
+    r = await db.fetchrow("SELECT exit_reason, pnl_pct FROM real_positions")
+    assert r["exit_reason"] == "rug" and r["pnl_pct"] < -0.99
+    trials = await db.fetch("SELECT rule, exit_reason, pnl_pct FROM real_rule_trials WHERE closed_at IS NOT NULL")
+    assert trials and all(t["exit_reason"] == "rug" and t["pnl_pct"] < -0.99 for t in trials)
+
+
+async def test_live_rug_is_written_off_after_no_buyers(db, monkeypatch):
+    """Бой: покупателей нет (маршрута нет) — бот не повторяет продажу вечно: через RUG_WRITE_OFF_S списывает позицию в
+    ноль с сообщением; токены остаются на кошельке, счёт не закрывается."""
+    monkeypatch.setattr(ex, "RUG_WRITE_OFF_S", 0.0)
+    chain = FakeChain()
+    coin = other_coin(chain, "rug-live")
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
+    tr.e.ext = ext = Ext(chain)
+    said = []
+
+    async def say(text):
+        said.append(text)
+    tr._say = say
+    await tr.start()
+    await signal(tr, coin)
+    p = only(tr)
+    assert p.extra["mode"] == "live"
+    ext.rugged = True
+    await tr._sell_jup_live(p, "max_hold", 1.0)
+    assert not tr.positions and len(chain.sent) == 1          # продажа не отправлялась — продать некому
+    r = await db.fetchrow("SELECT exit_reason, pnl_pct FROM real_positions")
+    assert r["exit_reason"] == "rug" and r["pnl_pct"] < -0.99
+    assert any("покупателей нет" in t and "Списал в ноль" in t for t in said)
+    assert chain.tokens_of(tr.wallet.pubkey, coin) > 0 and str(coin) not in tr.to_close
+
+
+async def test_live_only_for_coins_older_than_limit(db, monkeypatch):
+    """Свежий пул (минуты от создания) — на деньги не берём, меряем в тени; старше лимита — бой."""
+    chain = FakeChain()
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_jup_dry_run=False)
+    tr.e.ext = Ext(chain)
+    await tr.start()
+    young, old = other_coin(chain, "young"), other_coin(chain, "old")
+    await signal(tr, young, aid=1, age_s=180)
+    await signal(tr, old, aid=2, age_s=3 * 3600)
+    modes = {p.mint: p.extra["mode"] for p in tr.positions.values()}
+    assert modes == {str(young): "shadow", str(old): "live"}, dict(tr.skips)
+    assert skipped(tr, "монета моложе 60 мин (3 мин) — на деньги не беру, меряю в тени")
+    row = await db.fetchrow("SELECT extra FROM real_positions WHERE mint = $1", str(young))
+    assert row["extra"]["age_s"] == 180 and row["extra"]["liq"] == 12_000.0

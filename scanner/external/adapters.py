@@ -15,7 +15,7 @@ import time
 import uuid
 from typing import Any
 
-from .base import ExternalSource
+from .base import ExternalSource, Unavailable
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 # надёжные котировки: у пар к экзотическим токенам (токенизированные акции, мемы) DexScreener
@@ -304,6 +304,13 @@ class Birdeye(ExternalSource):
 
 
 # ====================================================================== Jupiter
+def no_route(exc: Exception) -> bool:
+    """Jupiter ответил «маршрута нет» (400 NO_ROUTES_FOUND / COULD_NOT_FIND_ANY_ROUTE): у монеты не осталось
+    ликвидности — продать некому. Это ответ, а не сбой связи."""
+    t = str(exc)
+    return "NO_ROUTES_FOUND" in t or "No routes found" in t or "COULD_NOT_FIND_ANY_ROUTE" in t
+
+
 class Jupiter(ExternalSource):
     name = "jupiter"
     rate_per_s = 0.5     # без ключа; с ключом 1 rps
@@ -334,9 +341,14 @@ class Jupiter(ExternalSource):
         """23.11: котировка обмена на точную сумму — сколько реально получишь (маршрут Jupiter, влияние своей сделки на
         цену учтено). {"out": единиц выхода, "impact": доля}."""
         swap = "https://api.jup.ag/swap/v1/quote" if self.key else "https://lite-api.jup.ag/swap/v1/quote"
-        d = await self.request("GET", swap, path_key="quote", params={
-            "inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount)),
-            "slippageBps": str(slippage_bps), "restrictIntermediateTokens": "true"}, timeout_s=4.0)
+        try:
+            d = await self.request("GET", swap, path_key="quote", params={
+                "inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount)),
+                "slippageBps": str(slippage_bps), "restrictIntermediateTokens": "true"}, timeout_s=4.0)
+        except Unavailable as exc:
+            if no_route(exc):
+                return {"out": 0, "impact": 0.0, "no_route": True}
+            raise
         if not isinstance(d, dict) or not d.get("outAmount"):
             return None
         return {"out": int(d["outAmount"]), "impact": float(d.get("priceImpactPct") or 0)}
@@ -345,10 +357,15 @@ class Jupiter(ExternalSource):
                          max_accounts: int = 40) -> dict[str, Any] | None:
         """24.11: полная котировка для сделки (её целиком передают в swap-instructions)."""
         swap = "https://api.jup.ag/swap/v1/quote" if self.key else "https://lite-api.jup.ag/swap/v1/quote"
-        d = await self.request("GET", swap, path_key="quote", params={
-            "inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount)),
-            "slippageBps": str(int(slippage_bps)), "restrictIntermediateTokens": "true",
-            "maxAccounts": str(int(max_accounts))}, timeout_s=8.0)
+        try:
+            d = await self.request("GET", swap, path_key="quote", params={
+                "inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount)),
+                "slippageBps": str(int(slippage_bps)), "restrictIntermediateTokens": "true",
+                "maxAccounts": str(int(max_accounts))}, timeout_s=8.0)
+        except Unavailable as exc:
+            if no_route(exc):
+                return {"no_route": True}
+            raise
         return d if isinstance(d, dict) and d.get("outAmount") else None
 
     async def swap_instructions(self, quote: dict[str, Any], user: str) -> dict[str, Any] | None:

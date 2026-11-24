@@ -99,7 +99,8 @@ MODE_SHORT_RU = {"live": "💵 бой", "shadow": "👻 тень", "off": "вы�
 _SIGNAL: contextvars.ContextVar[tuple[str, int | None] | None] = contextvars.ContextVar("real_signal", default=None)
 EXIT_NAMES = {"take_profit": "тейк", "stop": "стоп", "trailing": "трейлинг", "time_stop": "нет роста",
               "max_hold": "время вышло", "trader_sell": "трейдер продал", "tiny_rebuy": "мелкая докупка",
-              "emergency": "дев продаёт", "manual": "вручную", "sell_all": "продать всё", "gone": "токенов нет"}
+              "emergency": "дев продаёт", "manual": "вручную", "sell_all": "продать всё", "gone": "токенов нет",
+              "rug": "покупателей нет (ликвидность убрали)"}
 SELL_SLIPPAGE_STEPS = (1.0, 2.0, 4.0, 6.0)      # множители лимита проскальзывания по попыткам продажи
 BUY_CONFIRM_S, BUY_RESEND_UNTIL_S = 20.0, 5.0   # покупку шлём 5 с, дальше только ждём, пока жив её блокхэш
 SELL_CONFIRM_S = 20.0
@@ -116,6 +117,11 @@ SIM_RETRIES, SIM_RETRY_S = 3, 0.4
 NO_FUNDS = "не хватает SOL или токенов на счёте"
 JUP_TEST_USD = 1.0                    # пробная сделка через Jupiter по кнопке: ~$1 SOL → USDC → SOL
 LIVE_CHECK_N, LIVE_CHECK_MIN, LIVE_GAP = 12, 8, 0.05   # сверка боя Jupiter с расчётом: сделок, минимум, допуск
+# 24.11, первая боевая сделка: $b (Meteora) куплена через 3 мин после создания пула, через минуты ликвидность забрали —
+# Jupiter «маршрута нет», продать некому. Тень в таком случае писала выход по последней цене (завышала итог) — теперь:
+NO_ROUTE = "покупателей нет: Jupiter не находит маршрут (ликвидность убрали?)"
+NO_ROUTE_KEEP_S = 1800.0              # монета без маршрута: столько помним (пробы и тень — по нулю)
+RUG_WRITE_OFF_S = 600.0               # бой: покупателей нет столько — позиция списывается в ноль (токены остаются)
 
 
 def paid_mc(lamports: int, tokens_raw: int) -> float:
@@ -984,6 +990,13 @@ class RealTrader:
             return self._skip("shadow", kind, "метод «тренды на других биржах» выключен")
         if mode == "live" and self.get("real_only_follow"):
             mode = "shadow"                            # «на деньги — только выбранные мной кошельки»
+        age_s = data.get("age_s")
+        min_age = float(self.get("real_trendj_live_min_age_min"))
+        if mode == "live" and age_s is not None and float(age_s) < min_age * 60:
+            # 24.11: свежий пул (минуты от создания) — частый скам: ликвидность забирают через минуты ($b)
+            self._skip("live", kind, f"монета моложе {min_age:g} мин ({float(age_s) / 60:.0f} мин) — на деньги не "
+                                     "беру, меряю в тени")
+            mode = "shadow"
         if mode == "live":
             # проверки боя (лимиты, дневной стоп, замок прибыли, покупок в час) — уже как у метода trendj
             self._busy.pop(mint_s, None)
@@ -1008,8 +1021,9 @@ class RealTrader:
                 "trigger_slot": None, "trigger_mc": None,
                 "lag_s": round(time.time() - float(data.get("trend_at") or time.time()), 3), "stake": stake,
                 "min_out": 0, "slip": JUP_SLIP, "mc": mc, "rule": self.get(S.SCHEME_KEYS[kind]), "filter": "all",
-                "best_exit": None, "followed": False, "fast": False, "detect_ms": None, "age_s": None,
-                "target_mc": None, "dec": dec}
+                "best_exit": None, "followed": False, "fast": False, "detect_ms": None,
+                "age_s": round(float(age_s)) if age_s is not None else None,
+                "liq": (data.get("trend") or {}).get("liq"), "target_mc": None, "dec": dec}
         if mode == "live":
             if dec is None:
                 return self._skip("live", kind, "другая биржа: Jupiter не сообщил знаки токена")
@@ -1047,6 +1061,9 @@ class RealTrader:
         if ext is None or not hasattr(ext, "jup_quote_full"):
             return None, "нет доступа к Jupiter"
         q = await ext.jup_quote_full(in_mint, out_mint, int(amount), int(round(slip * 10_000)))
+        if q and q.get("no_route"):
+            self._mark_no_route(in_mint if out_mint == SOL_MINT else out_mint)
+            return None, NO_ROUTE
         if not q or int(q.get("outAmount") or 0) <= 0:
             return None, "Jupiter не дал котировку"
         if (q.get("inputMint") not in (None, in_mint) or q.get("outputMint") not in (None, out_mint)
@@ -1270,6 +1287,11 @@ class RealTrader:
                                    fee=fill["fee"] / 1e9 if fill else self.fees_sol(), order_id=r["oid"])
                 await self.refresh_balance(force=True)
                 return
+            if r.get("why") == NO_ROUTE:
+                since = float(p.extra.setdefault("no_route_since", time.time()))
+                if time.time() - since >= RUG_WRITE_OFF_S:
+                    await self._write_off_rug(p, last_mc)
+                    return
             if not r.get("sent"):
                 await asyncio.sleep(UNTRADABLE_RETRY_S)  # котировки нет / проверка не сошлась — повтор с лимитом шире
         if await self._prior_sell(p):
@@ -1278,10 +1300,23 @@ class RealTrader:
         p.extra["retry_at"] = time.time() + 20
         p.extra["stuck"] = int(p.extra.get("stuck") or 0) + 1
         if p.extra["stuck"] in (1, 5, 20):
+            why = ("покупателей нет — Jupiter не находит маршрут (похоже, ликвидность убрали); через "
+                   f"{RUG_WRITE_OFF_S / 60:.0f} мин без покупателей спишу в ноль" if p.extra.get("no_route_since")
+                   else f"{len(SELL_SLIPPAGE_STEPS)} попытки не прошли")
             await self._say(f"🆘 💵 НЕ СМОГ ПРОДАТЬ ${fmt.esc(p.symbol or '?')} ({EXIT_NAMES.get(reason, reason)}, "
-                            f"Jupiter): {len(SELL_SLIPPAGE_STEPS)} попытки не прошли. Повторяю каждые 20 с. "
-                            f"Монета: <code>{p.mint}</code>")
+                            f"Jupiter): {why}. Повторяю каждые 20 с. Монета: <code>{p.mint}</code>")
         await self._check_fail_pause()
+
+    async def _write_off_rug(self, p: Position, last_mc: float) -> None:
+        """Бой: покупателей нет RUG_WRITE_OFF_S — позиция закрывается в учёте с выручкой ноль (ликвидность убрали).
+        Токены остаются на кошельке: если покупатели вернутся, продать можно вручную."""
+        mins = (time.time() - float(p.extra.get("no_route_since") or time.time())) / 60
+        await self._settle(p, "rug", 1.0, int(p.extra["tokens_raw"]), 0.0, 0.0, sig=None, slot=None, wait_ms=None,
+                           fee=0.0)
+        self.to_close.pop(p.mint, None)              # счёт с токенами не закрыть — и не пытаемся
+        await self._say(f"⛔ 💵 ${fmt.esc(p.symbol or '?')}: покупателей нет {mins:.0f} мин — у монеты забрали "
+                        f"ликвидность (скам). Списал в ноль: −${p.cost_sol * self.sol_usd():.2f}. Токены остались на "
+                        f"кошельке. Монета: <code>{p.mint}</code>")
 
     async def _jup_dry_run_safe(self, mint_s: str, stake: int, pid: int | None) -> None:
         try:
@@ -1395,13 +1430,29 @@ class RealTrader:
             q = hit[1]
         else:
             q = await ext.jup_quote(p.mint, SOL_MINT, amount)
+            if q and q.get("no_route"):                # один повтор: маршрут мог пропасть на секунду
+                await asyncio.sleep(1.5)
+                q = await ext.jup_quote(p.mint, SOL_MINT, amount)
             self._jq_cache = {k: v for k, v in (getattr(self, "_jq_cache", None) or {}).items()
                               if time.time() - v[0] < 2.0}
             self._jq_cache[key] = (time.time(), q)
+        if q and q.get("no_route"):
+            self._mark_no_route(p.mint)
+            return 0.0, 0.0                            # продать некому — выручка ноль (честно, а не «по последней цене»)
         if not q or q["out"] <= 0:
             return None
         sol = q["out"] / 1e9
         return max(0.0, sol - self.fees_sol()), sol / (raw6 / 1e6) * 1e9
+
+    def _mark_no_route(self, mint: str) -> None:
+        if not hasattr(self, "_no_route"):
+            self._no_route: dict[str, float] = {}
+        self._no_route.setdefault(mint, time.time())
+
+    def no_route(self, mint: str) -> bool:
+        """Jupiter недавно не нашёл покупателей этой монеты (ликвидность убрали)."""
+        t = (getattr(self, "_no_route", None) or {}).get(mint)
+        return t is not None and time.time() - t < NO_ROUTE_KEEP_S
 
     async def _open(self, base: dict[str, Any], *, tokens_raw: int, cost_sol: float, rent_sol: float, sig: str | None,
                     slot: int | None, note: str | None, cu: int | None, fee_sol: float,
@@ -1422,7 +1473,7 @@ class RealTrader:
              "filter": base.get("filter"), "best_exit": base.get("best_exit"),
              "followed": base.get("followed", False), "fast": base.get("fast", False),
              "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s"), "target_mc": base.get("target_mc"),
-             "dec": base.get("dec")},
+             "dec": base.get("dec"), "liq": base.get("liq")},
             self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
@@ -1541,6 +1592,8 @@ class RealTrader:
         jq = await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE else None
         if jq is not None:                           # другая биржа: настоящая котировка Jupiter на продажу
             proceeds, mc = jq
+            if self.no_route(p.mint) and proceeds <= 0:
+                reason = "rug"                       # покупателей нет — выручка ноль
         elif st.get("venue") and not st.get("why"):
             proceeds = max(0.0, self._quote_sell(st, raw) / 1e9 - self.fees_sol())
             mc = st["mc"]
@@ -1751,8 +1804,12 @@ class RealTrader:
                 st = await self._trial_state(p.mint)
             except Exception:  # noqa: BLE001
                 st = {}
+        if p.extra.get("venue") == JUP_VENUE and self.no_route(p.mint):
+            jq, reason = (0.0, 0.0), "rug"           # покупателей нет (видно по продаже позиции или котировке)
         if jq is not None:
             proceeds, mc = jq
+            if proceeds <= 0 and self.no_route(p.mint):
+                reason = "rug"
         elif st.get("venue") and not st.get("why"):
             proceeds, mc = max(0.0, self._quote_sell(st, raw) / 1e9 - self.fees_sol()), float(st["mc"])
         else:
