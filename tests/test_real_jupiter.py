@@ -152,6 +152,12 @@ def test_verify_outcome_on_own_accounts():
     assert "больше токенов" in jupswap.verify("sell", [acc(10**9), acc(0, 5000)], [acc(10**9 + 70_000_000), acc(0, 0)],
                                               1000, 65_000_000, fee)
     assert "не вернула" in jupswap.verify("buy", [acc(1), None], [], 1, 1, fee)
+    # 25.11, настоящая сеть: продажа 1 USDC — пришло бы 0.0124 SOL при минимуме 0.01353 (законный расход ~0.001 SOL
+    # сверх комиссии) — проходит; подменённый выход (почти ничего не пришло) — нет
+    assert jupswap.verify("sell", [acc(10**9), acc(0, 10**6)], [acc(10**9 + 12_400_000), acc(0, 0)], 10**6,
+                          13_530_806, 315_000) is None
+    assert "SOL пришло бы" in jupswap.verify("sell", [acc(10**9), acc(0, 10**6)], [acc(10**9 - 315_000), acc(0, 0)],
+                                             10**6, 13_530_806, 315_000)
 
 
 async def test_lookup_tables_compile_into_v0_message():
@@ -243,8 +249,10 @@ async def test_substituted_jupiter_answer_is_never_sent(db, monkeypatch):
     await signal(tr, coin)
     assert not tr.positions and not chain.sent and chain.tokens_of(thief, coin) == 0
     assert skipped(tr, "проверка перед отправкой: токенов пришло бы меньше минимума"), dict(tr.skips)
-    row = await db.fetchrow("SELECT status, note, signature FROM real_orders")
+    row = await db.fetchrow("SELECT status, note, signature, base FROM real_orders")
     assert row["status"] == "failed" and row["note"] == "проверка перед отправкой" and row["signature"] is None
+    d = dict(row["base"])["diag"]                              # разбор в журнале: что показали свои счета
+    assert d["side"] == "buy" and d["tok_post"] == d["tok_pre"] == 0 and d["sol_pre"] > d["sol_post"] and d["ixs"]
     ext.thief, ext.bad_program = None, True
     await signal(tr, other_coin(chain, "ray-3"), aid=11)
     assert not tr.positions and not chain.sent and skipped(tr, "не из белого списка: в транзакции чужой подписант")

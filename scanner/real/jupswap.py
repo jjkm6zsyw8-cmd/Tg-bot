@@ -37,6 +37,10 @@ MAX_ACCOUNTS = 40                   # маршрут Jupiter — не больш
 # допуск при проверке итога покупки сверх ставки: залог нового счёта токена (~0.00204 SOL), временный счёт wSOL
 # (возвращается в той же транзакции) и комиссия сети
 BUY_MARGIN = 3_000_000
+# допуск итога продажи: 25.11 пробная продажа USDC → SOL на настоящей сети показала на ~0.0011 SOL меньше, чем
+# «минимум котировки − комиссия» (разбор — в журнале заявки). Подменённый ответ (выход на чужой счёт) — это весь
+# выход, а не 0.003 SOL: проверка его по-прежнему ловит
+SELL_MARGIN = 3_000_000
 ALT_TTL_S = 600.0
 ERRORS = {6000: "маршрут Jupiter пуст", 6001: "цена ушла дальше лимита проскальзывания",
           6008: "Jupiter: не хватает счетов маршрута", 6014: "Jupiter: не та программа токена",
@@ -129,9 +133,18 @@ def verify(side: str, pre: list[rtx.Account | None], post: list[rtx.Account | No
         return None
     if tok0 - tok1 > amount:
         return "ушло бы больше токенов, чем продаём"
-    if sol1 - sol0 < min_out - fee_lamports:
+    if sol1 - sol0 < min_out - fee_lamports - SELL_MARGIN:
         return f"SOL пришло бы {(sol1 - sol0) / 1e9:.4f} при минимуме {min_out / 1e9:.4f}"
     return None
+
+
+def diag(pre: list[rtx.Account | None], post: list[rtx.Account | None]) -> dict[str, Any]:
+    """Что показала проверка на своих счетах — в журнал заявки (разбор, если итог не сошёлся)."""
+    def lam(a: rtx.Account | None) -> int | None:
+        return a.lamports if a is not None else None
+    return {"sol_pre": lam(pre[0]) if pre else None, "sol_post": lam(post[0]) if post else None,
+            "tok_pre": _amount(pre[1]) if len(pre) > 1 else None, "tok_post": _amount(post[1]) if len(post) > 1 else None,
+            "acc_pre": lam(pre[1]) if len(pre) > 1 else None, "acc_post": lam(post[1]) if len(post) > 1 else None}
 
 
 def err_text(err: Any) -> str:

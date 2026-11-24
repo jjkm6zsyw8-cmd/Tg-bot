@@ -1056,6 +1056,8 @@ class RealTrader:
         tip = int(float(self.get("real_tip_sol")) * 1e9)
         ixs = jupswap.build_ixs(resp, self.wallet.pubkey, prio, tip)
         jupswap.check(ixs, self.wallet.pubkey, int(spend))
+        q = {**q, "_ixs": [f"{str(ix.program_id)[:6]}:{bytes(ix.data)[:1].hex()}:{len(ix.accounts)}" for ix in ixs],
+             "_fee": int(self.fees_sol() * 1e9)}
         if not hasattr(self, "_alt_cache"):
             self._alt_cache: dict[str, tuple[float, Any]] = {}
         alts = await jupswap.lookup_tables(self.chain, list(resp.get("addressLookupTableAddresses") or []),
@@ -1066,8 +1068,10 @@ class RealTrader:
             return None, "транзакция Jupiter больше лимита сети"
         return tx, q
 
-    async def _jup_verify(self, tx: Any, side: str, ata: Pubkey, amount: int, min_out: int) -> str | None:
-        """Симуляция той же транзакции и проверка итога на своих счетах (jupswap.verify). None — можно отправлять."""
+    async def _jup_verify(self, tx: Any, side: str, ata: Pubkey, amount: int, min_out: int,
+                          diag: dict[str, Any] | None = None) -> str | None:
+        """Симуляция той же транзакции и проверка итога на своих счетах (jupswap.verify). None — можно отправлять.
+        diag — сюда пишется, что показали свои счета до и после (для журнала, если итог не сошёлся)."""
         user = self.wallet.pubkey
         try:
             pre = await self.chain.accounts([user, ata], "processed")
@@ -1075,7 +1079,11 @@ class RealTrader:
         except Exception as exc:  # noqa: BLE001
             return f"симуляция не ответила: {type(exc).__name__}"
         if sim.err is not None:
+            if diag is not None:
+                diag["logs"] = sim.logs[-8:]
             return f"симуляция: {jupswap.err_text(sim.err)}"
+        if diag is not None:
+            diag.update(jupswap.diag(pre, sim.accounts), units=sim.units)
         return jupswap.verify(side, pre, sim.accounts, int(amount), int(min_out), int(self.fees_sol() * 1e9))
 
     async def _jup_send(self, side: str, in_mint: str, out_mint: str, amount: int, slip: float, spend: int,
@@ -1097,11 +1105,17 @@ class RealTrader:
         if tx is None:
             return {"ok": False, "why": str(q)}
         min_out = int(q.get("otherAmountThreshold") or 0)
-        why = await self._jup_verify(tx, side, ata, amount, min_out)
+        diag: dict[str, Any] = {}
+        why = await self._jup_verify(tx, side, ata, amount, min_out, diag)
         stake_sol = amount / 1e9 if side == "buy" and in_mint == SOL_MINT else None
         if why:
+            diag.update(side=side, amount=int(amount), out=int(q.get("outAmount") or 0), min_out=min_out,
+                        fee=q.get("_fee"), ixs=q.get("_ixs"), route=[(r.get("swapInfo") or {}).get("label")
+                                                                     for r in q.get("routePlan") or []])
+            log.warning("реальный бот: проверка Jupiter не сошлась: %s · %s", why, diag)
             await self._order(position_id, base, side, "failed", stake_sol=stake_sol, tokens_raw=tokens_raw,
-                              min_out=min_out, slippage=slip, error=why, attempt=attempt, note="проверка перед отправкой")
+                              min_out=min_out, slippage=slip, error=why, attempt=attempt, note="проверка перед отправкой",
+                              payload={**(payload or {}), "diag": diag})
             return {"ok": False, "why": f"проверка перед отправкой: {why}"}
         sig = str(tx.signatures[0])
         # заявка пишется ДО отправки (после перезапуска бот найдёт сделку по подписи); покупку без журнала не шлём
@@ -1338,6 +1352,12 @@ class RealTrader:
             return f"🧪 ❌ Пробная сделка: покупка USDC не прошла — {fmt.esc(r1['why'])}. Деньги на месте."
         fill1 = rtx.fill_from_tx(r1["info"], str(self.wallet.pubkey), [str(ata)]) if r1["info"] else None
         got = int((fill1 or {}).get("tokens", {}).get(jupswap.USDC_MINT, 0)) or int(r1["quote"].get("outAmount") or 0)
+        # продаём весь USDC кошелька бота (и остаток прошлой пробы, если продажа тогда не прошла)
+        try:
+            have = jupswap._amount((await self.chain.accounts([ata], "confirmed"))[0])
+        except Exception:  # noqa: BLE001
+            have = 0
+        got = max(got, have)
         r2 = await self._jup_send("sell", jupswap.USDC_MINT, SOL_MINT, got, slip, 0, ata, base, payload={"test": True})
         await self.refresh_balance(force=True)
         if not r2["ok"]:
