@@ -667,7 +667,7 @@ async def test_live_buy_and_sell_are_booked_from_the_chain(db, monkeypatch):
     assert tr.live_total == pytest.approx(row["pnl_sol"]) and tr.day_pnl["live"] == pytest.approx(row["pnl_sol"])
     assert tr.balance == chain.lam[str(user)] and tr.fails == 0
     msgs = [r["payload"] for r in await db.fetch("SELECT payload FROM outbox ORDER BY id")]
-    assert all(m["topic"] == "real" for m in msgs)
+    assert all(m["topic"] == "money" for m in msgs)            # 25.11: всё про настоящие деньги — тема «💵 Деньги»
     assert "Купил $TST" in msgs[0]["text"] and "через 4 бл." in msgs[0]["text"] and "Продал $TST" in msgs[1]["text"]
     # пустой счёт токена закрывается, залог возвращается
     tr.to_close[str(MINT)] = (str(pump.TOKEN_2022), 0.0, 1)

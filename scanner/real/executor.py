@@ -44,6 +44,9 @@ log = logging.getLogger(__name__)
 
 STATUS_KEY = "real:status"
 TOPIC = "real"                        # отдельная тема Telegram «Реальный бот»
+# 25.11 (владелец: «как понять, когда на реальных бабках, — запутаюсь»): всё про настоящие деньги (💵 — покупки,
+# продажи, стопы, сбои боя, смена режима) — в своей теме «💵 Деньги»; тень (👻) — в «Реальном боте»
+MONEY_TOPIC = "money"
 BASE_FEE = 5_000                      # лампортов за подпись
 SIM_RESERVE = 6_000_000               # лампортов оставляем кошельку при симуляции (залоги счетов и комиссия)
 SHADOW_MAX_OPEN = 30                  # тень-замер: столько позиций одновременно (это только симуляция)
@@ -2102,10 +2105,11 @@ class RealTrader:
         await self._say(text)
 
     async def _say(self, text: str) -> None:
+        topic = MONEY_TOPIC if "💵" in text else TOPIC
         if self.name:
             text = f"👛 <b>{fmt.esc(self.name)}</b> · {text}"
         try:
-            await self.db.enqueue("text", {"topic": TOPIC, "text": text}, priority=8)
+            await self.db.enqueue("text", {"topic": topic, "text": text}, priority=8)
         except Exception:  # noqa: BLE001
             log.exception("реальный бот: сообщение")
 

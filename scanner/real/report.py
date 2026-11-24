@@ -225,7 +225,9 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     lines.append(("Методы по умолчанию: " if wallets else "Методы: ") + S.methods_summary(cfg))
     opened = [(name, o) for name, x in statuses for o in (x.get("open") or [])]
     if opened:
-        lines.append(f"\n<b>Открыто: {len(opened)}</b>")
+        n_live = sum(1 for _n, o in opened if o.get("mode") == "live")
+        lines.append(f"\n<b>Открыто: 💵 {n_live} на деньги · 👻 {len(opened) - n_live} в тени (без денег)</b>")
+        opened = sorted(opened, key=lambda x: x[1].get("mode") != "live")
         for name, o in opened[:10]:
             lines.append(f"• {MODE_ICON.get(o.get('mode'), '')} ${esc(o.get('symbol') or '?')} "
                          f"({KINDS.get(o.get('kind'), o.get('kind'))}) {float(o.get('net') or 0):+.0%} · "

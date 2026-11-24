@@ -76,7 +76,7 @@ async def test_status_trades_file_and_comparison(db):
     await tr.publish_status()
     text, kb = await report.status_view(db, {})
     assert "👻 <b>тень (без денег)</b>" in text and f"<code>{USER}</code>" in text and "ключ не задан" in text
-    assert "<b>Открыто: 1</b>" in text and "$TST (smart)" in text
+    assert "<b>Открыто: 💵 0 на деньги · 👻 1 в тени (без денег)</b>" in text and "$TST (smart)" in text
     assert "Тень сегодня     1   100%" in text and "Бой всего        0      —" in text
     assert "монета не найдена в сети — 1" in text
     open_id = next(iter(tr.positions))

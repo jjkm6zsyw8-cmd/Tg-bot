@@ -374,3 +374,16 @@ async def test_live_only_trendj_button_moves_other_methods_to_shadow(db):
     assert ov["real_smart"] is False and ov["real_copy"] is False and ov["real_trendj"] is True
     assert ov["real_shadow_all"] is True and ov["real_live_trendj"] is True
     assert S.live_methods(dict(ov)) == ["тренд (др. биржи)"]
+
+
+async def test_money_messages_go_to_their_own_topic(db):
+    """25.11: всё про настоящие деньги (💵) — в теме «💵 Деньги», тень (👻) — в «Реальном боте»."""
+    chain = FakeChain()
+    tr = shadow(db, chain)
+    tr.name = "Мейныч"
+    await tr._say("💵 Купил $RAY (тренд (др. биржи)) на $10.00")
+    await tr._say("👻 Купил $NEW (новый дев) на $10.00")
+    rows = await db.fetch("SELECT payload FROM outbox ORDER BY id")
+    assert [dict(r["payload"])["topic"] for r in rows] == ["money", "real"]
+    from scanner.config import Settings, YamlConfig
+    assert Settings(YamlConfig("config/config.yaml")).topics()["money"] == "💵 Деньги (бой)"
