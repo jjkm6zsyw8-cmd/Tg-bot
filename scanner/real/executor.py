@@ -1715,7 +1715,10 @@ class RealTrader:
         have = int(p.extra["tokens_raw"])
         raw = int(have * share) if share < 1 else have
         st: dict[str, Any] = {}
-        jq = await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE else None
+        # 25.11: пробы на входе БОЯ — оценка по цене Jupiter −1%, без котировки: запросы к Jupiter (1 в секунду с
+        # ключом) нужны самой боевой продаже, а пробы правил выходят пачкой на одном движении цены
+        jq = (await self._jup_sell(p, raw) if p.extra.get("venue") == JUP_VENUE and p.extra.get("mode") != "live"
+              else None)
         if jq is None and self.chain is not None and p.extra.get("venue") != JUP_VENUE:
             try:
                 st = await self._trial_state(p.mint)
