@@ -33,8 +33,19 @@ def _bounds(cfg: dict[str, Any]) -> dict[str, datetime]:
     return {"today": d0, "yday": d0 - timedelta(days=1), "week": datetime.now(timezone.utc) - timedelta(days=7)}
 
 
-async def mode_lines(db: Any, cfg: dict[str, Any], mode: str, sol_usd: float) -> list[str]:
-    """Таблица одного режима (тень / бой): метод × сегодня / вчера / 7 дн. Пусто — сделок за 7 дней нет."""
+def shadow_kinds() -> list[str] | None:
+    """25.11: в таблице тени — только оставшиеся методы (убранные не торгуют; сделки «за ним» — в «За кошельками»).
+    None — все (ничего не убрано)."""
+    return S.active_methods() if S.RETIRED else None
+
+
+RETIRED_NOTE = "Убраны 25.11 (в минусе): smart, мой дев, копии, крупные копии, тренды pump.fun, новый дев."
+
+
+async def mode_lines(db: Any, cfg: dict[str, Any], mode: str, sol_usd: float,
+                     kinds: list[str] | None = None) -> list[str]:
+    """Таблица одного режима (тень / бой): метод × сегодня / вчера / 7 дн. Пусто — сделок за 7 дней нет.
+    kinds — только эти методы (None — все). Бой показывается всегда целиком: это деньги."""
     b = _bounds(cfg)
     rows = await db.fetch(
         """SELECT kind,
@@ -44,7 +55,8 @@ async def mode_lines(db: Any, cfg: dict[str, Any], mode: str, sol_usd: float) ->
                   count(*) FILTER (WHERE closed_at >= $2) n0, count(*) FILTER (WHERE closed_at >= $2 AND pnl_sol > 0) w0,
                   count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w
            FROM real_positions WHERE mode = $1 AND closed_at IS NOT NULL AND closed_at >= $4
-           GROUP BY kind ORDER BY sum(pnl_sol)""", mode, b["today"], b["yday"], min(b["week"], b["yday"]))
+             AND ($5::text[] IS NULL OR (kind = ANY($5::text[]) AND NOT COALESCE((extra->>'followed')::boolean, false)))
+           GROUP BY kind ORDER BY sum(pnl_sol)""", mode, b["today"], b["yday"], min(b["week"], b["yday"]), kinds)
     if not rows:
         return []
     head = f"{'метод':<9}{'сегодня':>8}{'вчера':>8}{'7 дн':>8}"
@@ -134,7 +146,7 @@ async def newdev_lines(db: Any) -> list[str]:
 async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
     lines = ["📊 <b>Реальные цифры</b> — только реальный бот, $ по твоей ставке", ""]
-    shadow = await mode_lines(db, cfg, "shadow", sol_usd)
+    shadow = await mode_lines(db, cfg, "shadow", sol_usd, shadow_kinds())
     live = await mode_lines(db, cfg, "live", sol_usd)
     lines += shadow or ["👻 Тень: сделок за 7 дней нет"]
     if live:
@@ -142,9 +154,11 @@ async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     fol = await follow_lines(db, sol_usd)
     if fol:
         lines += ["", *fol]
-    nd = await newdev_lines(db)
+    nd = await newdev_lines(db) if "newdev" not in S.RETIRED else []
     if nd:
         lines += ["", *nd]
+    if S.RETIRED:
+        lines += ["", RETIRED_NOTE]
     opened = await db.fetchval("SELECT count(*) FROM real_positions WHERE closed_at IS NULL")
     lines += ["", f"Открыто сейчас: {opened}"]
     tune = await db.kv_get("real:autotune_block") or {}
@@ -161,7 +175,7 @@ async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
 async def daily_block(db: Any, cfg: dict[str, Any]) -> list[str]:
     """Блок «Реальные цифры» для разбора дня."""
     sol_usd = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 150)
-    out = await mode_lines(db, cfg, "shadow", sol_usd)
+    out = await mode_lines(db, cfg, "shadow", sol_usd, shadow_kinds())
     live = await mode_lines(db, cfg, "live", sol_usd)
     if live:
         out += live

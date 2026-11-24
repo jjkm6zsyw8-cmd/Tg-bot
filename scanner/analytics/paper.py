@@ -242,6 +242,14 @@ LEGEND = ("с 12.11 — только smart (по факту недели коп�
 START_MC_SOL = 32.0   # MC до ~32 SOL — стартовая цена кривой: источник ещё не видел сделок по монете
 REENTRY_COOLDOWN_MIN = 60   # после убыточного выхода в ту же монету этот портфель час не входит
 RUG_PCT = 0.5         # монета дала −50% и хуже — раг: больше не входим ни в неё, ни в монеты её дева (7 дней)
+# 25.11 (владелец: «бумажную торговлю убирай — она всё равно бесполезная»): бумага больше не торгует — ни позиций, ни
+# сообщений, ни отчётов, ни дневного сброса. Остаются маршрут сигналов (route): по нему сигнал уходит реальному боту,
+# как раньше, — и правила выхода (SCHEMES, decide_exit), которыми продаёт реальный бот. Раги (rugged, rug_devs) —
+# теперь по сделкам реального бота. Тесты механики бумагу включают (tests/conftest.py)
+PAPER_TRADING = False
+GONE_TEXT = ("📒 <b>Бумажная торговля убрана</b> (25.11): она больше не торгует и отчётов не шлёт. Вместе с ней убраны "
+             "«⚖️ Бой против бумаги», Smart-отчёт, рейтинг и разведка кошельков, архив выгрузки — они считались по "
+             "бумаге. Реальные цифры — /pnl, реальный бот — /real.")
 TICK_S = 2.0          # проверка открытых позиций (стоп/тейк/трейлинг) раз в 2 с
 # Рыночная цена для ВСЕХ решений бумаги (вход, стоп, цель, трейлинг, выход): Jupiter (текущее состояние пула) →
 # сделка своего потока не старше OWN_MAX_AGE_S → цена неизвестна, по ней ничего не решаем. DexScreener и старые
@@ -570,6 +578,16 @@ class PaperTrader:
         for r in await self.db.fetch("SELECT * FROM paper_portfolios"):
             self.balance[r["name"]] = r["balance_sol"]
             self.paused[r["name"]] = r["paused"]
+        if not PAPER_TRADING:
+            # бумага убрана: незакрытые позиции — в «сброс» (в итоги не входят), сопровождать их некому
+            await self.db.execute("UPDATE paper_positions SET closed_at=now(), exit_reason='reset' WHERE closed_at IS NULL")
+            for r in await self.db.fetch(
+                    """SELECT p.mint, min(p.pnl_pct) pct, max(t.deployer) dev FROM real_positions p
+                       LEFT JOIN tokens t ON t.mint = p.mint
+                       WHERE p.pnl_pct <= $1 AND p.closed_at > now() - interval '7 days' GROUP BY p.mint""", -RUG_PCT):
+                self.rugged[r["mint"]] = min(float(r["pct"]), self.rugged.get(r["mint"], 0.0))
+                if r["dev"]:
+                    self.rug_devs.add(r["dev"])
         for r in await self.db.fetch("SELECT * FROM paper_positions WHERE closed_at IS NULL"):
             self.positions[r["id"]] = Position(
                 id=r["id"], portfolio=r["portfolio"], mint=r["mint"], opened_ts=r["opened_at"].timestamp(),
@@ -632,7 +650,8 @@ class PaperTrader:
         if level not in self.levels():
             self.skipped.setdefault("*", f"уровень «{level}» не выбран для бумажной торговли")
             return
-        if data.get("trend") and not self.cfg.get("paper_trends", True):
+        if data.get("trend") and PAPER_TRADING and not self.cfg.get("paper_trends", True):
+            # без бумаги этот выключатель скрыт и сигналы трендов реальному боту не перекрывает
             self.skipped.setdefault("*", "«Тренды» не входят в бумажную торговлю (настройка)")
             return
         if (trader and not data.get("copy_wallet") and not data.get("source_wallet")
@@ -649,6 +668,8 @@ class PaperTrader:
         if real is not None and targets & ({MAIN, MYDEV, SCOUT, BIGCOPY, SWING, TREND} | set(SMART_SET)):
             # реальный бот получает сигнал одновременно с бумагой и сам решает, входить ли (scanner/real)
             asyncio.create_task(real.on_signal(mint, level, alert_id, dict(data), trader, set(targets)))
+        if not PAPER_TRADING:
+            return                                   # 25.11: бумага убрана — только маршрут сигнала реальному боту
         if self.realtime(data):
             await self._enter_realtime(mint, level, alert_id, data, trader, targets)
             return
@@ -1375,6 +1396,8 @@ class PaperTrader:
             await self._check(p, float(p.extra.get("last_mc") or p.entry_mc), reason)
 
     async def tick_loop(self) -> None:
+        if not PAPER_TRADING:
+            return                                   # 25.11: бумага убрана — позиций, отчётов и сброса нет
         last_report = time.time()
         while True:
             await asyncio.sleep(TICK_S)
@@ -1660,8 +1683,8 @@ class PaperTrader:
                 out.add(BIGCOPY)                     # трейдер зашёл крупно — отдельно смотрим в K
         if "mydev" in modes and self.cfg.get("paper_mydev", True):
             out.add(MYDEV)
-        if "trend" in modes and self.cfg.get("paper_trends", True):
-            out.add(TREND)                           # тренды — свой портфель наблюдения T
+        if "trend" in modes and (not PAPER_TRADING or self.cfg.get("paper_trends", True)):
+            out.add(TREND)                           # тренды — свой портфель наблюдения T (и сигнал реальному боту)
         if "trendx" in modes and self.cfg.get("paper_trend_x", True):
             out.add(TREND_X)                         # опыт: отсеянные за «топ-10 держат много»
         if {"dev", "new"} <= modes and level == "strong" and self.cfg.get("paper_dev_new", True):

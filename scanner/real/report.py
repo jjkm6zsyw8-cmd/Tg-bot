@@ -18,7 +18,8 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from ..alerts.format import esc
-from ..analytics.paper import ENTRY_BLOCKS, SCHEMES as PAPER_SCHEMES
+from ..analytics import paper as _paper
+from ..analytics.paper import ENTRY_BLOCKS, GONE_TEXT as PAPER_GONE, SCHEMES as PAPER_SCHEMES
 from . import settings as S
 
 STATUS_KEY = "real:status"
@@ -259,8 +260,12 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     kb.append([{"text": "▶️ Продолжить входы", "callback": "rl:resume"} if paused else
                {"text": "⛔ Стоп входов", "callback": "rl:pause"},
                {"text": "💰 Продать всё…", "callback": "rl:sellall"}])
-    kb.append([{"text": "📋 Сделки", "callback": "rl:trades"}, {"text": "⚖️ Против бумаги", "callback": "rl:cmp"}])
-    kb.append([{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}, {"text": "📄 CSV сделок", "callback": "rl:csv"}])
+    if _paper.PAPER_TRADING:
+        kb.append([{"text": "📋 Сделки", "callback": "rl:trades"}, {"text": "⚖️ Против бумаги", "callback": "rl:cmp"}])
+        kb.append([{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}, {"text": "📄 CSV сделок", "callback": "rl:csv"}])
+    else:                                        # 25.11: бумага убрана — сравнивать не с чем
+        kb.append([{"text": "📋 Сделки", "callback": "rl:trades"}, {"text": "📄 CSV сделок", "callback": "rl:csv"}])
+        kb.append([{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}])
     kb.append([{"text": "🎯 Методы", "callback": "rl:wme:g"}, {"text": "⚙️ Настройки", "callback": "rl:set"},
                {"text": "🧪 Проверка", "callback": "rl:check"}])
     kb.append([{"text": "📊 Реальные цифры", "callback": "menu:pnl"}])
@@ -396,7 +401,7 @@ def settings_view(cfg: dict[str, Any], wid: int | None = None, name: str = "") -
                    {"text": f"{label[:22]}: {shown}", "callback": back if one else "rl:set"},
                    {"text": "+", "callback": f"{pre}{key}:+"}])
     lines.append("")
-    method_keys = {m[1] for m in S.METHODS.values()} | S.LIVE_TOGGLES
+    method_keys = {m[1] for m in S.METHODS.values()} | S.LIVE_TOGGLES | S.RETIRED_TOGGLES
     for key, (label, _default, desc) in S.TOGGLES.items():
         if key in method_keys:
             continue                                 # методы и их правила — на экране «🎯 Методы»
@@ -735,17 +740,23 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
     if action == "mine":
         text, kb = await mine_view(db, cfg)
         return Reply(text, kb, "Обновлено", True)
+    if action == "cmp" and not _paper.PAPER_TRADING:   # 25.11: бумага убрана — старые кнопки «⚖️ Против бумаги»
+        return Reply(PAPER_GONE, [[{"text": "← Назад", "callback": "rl:view"}]], "", True)
     if action == "cmp":
         return Reply(await compare_text(db, cfg), [[{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"},
                                                     {"text": "← Назад", "callback": "rl:view"}],
                                                    [{"text": "🔄 Считать с нуля", "callback": "rl:zero:cmp"}]])
     if action == "zero":
         back = rest if rest in ("cmp", "view", "mine") or rest[:1] in ("m", "w") else "view"
-        return Reply("🔄 <b>Считать с нуля?</b>\nС этой минуты считаются все итоги реального бота: тень и бой "
-                     "(главный экран, кошельки, сделки), «⚖️ Против бумаги» с пробами правил, итог бумаги на экранах "
-                     "методов. Ничего не удаляется, деньги и открытые позиции не трогаются; дневной и общий стоп боя "
-                     "считаются как прежде (это защита). Бумажные портфели /paper сбрасываются сами в 00:00 "
-                     "и кнопкой «🔄 Сброс портфелей» в /paper.",
+        text = ("🔄 <b>Считать с нуля?</b>\nС этой минуты считаются все итоги реального бота: тень и бой "
+                "(главный экран, кошельки, сделки), «⚖️ Против бумаги» с пробами правил, итог бумаги на экранах "
+                "методов. Ничего не удаляется, деньги и открытые позиции не трогаются; дневной и общий стоп боя "
+                "считаются как прежде (это защита). Бумажные портфели /paper сбрасываются сами в 00:00 "
+                "и кнопкой «🔄 Сброс портфелей» в /paper." if _paper.PAPER_TRADING else
+                "🔄 <b>Считать с нуля?</b>\nС этой минуты считаются все итоги реального бота: тень и бой "
+                "(главный экран, кошельки, сделки, пробы правил на экранах методов). Ничего не удаляется, деньги "
+                "и открытые позиции не трогаются; дневной и общий стоп боя считаются как прежде (это защита).")
+        return Reply(text,
                      [[{"text": "Да, с нуля", "callback": f"rl:zero!:{back}"},
                        {"text": "Нет", "callback": zero_back(back)}]], "", True)
     if action == "zero!":
@@ -763,7 +774,7 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
             else:
                 return await main("Считаю с нуля")
             return Reply(text, kb, "Считаю с нуля", True)
-        if rest == "cmp":
+        if rest == "cmp" and _paper.PAPER_TRADING:
             return Reply(await compare_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]], "Считаю с нуля",
                          True)
         return await main("Считаю с нуля")
@@ -789,7 +800,8 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
             return await conf(f"{S.SETTINGS[key][0]}: {S.fmt(key, v)}")
         return await conf()
     if action == "t":
-        if rest in S.TOGGLES and rest not in S.LIVE_TOGGLES:     # бой метода — только на его экране, с подтверждением
+        if rest in S.TOGGLES and rest not in S.LIVE_TOGGLES and rest not in S.RETIRED_TOGGLES:
+            # бой метода — только на его экране, с подтверждением; выключатели убранного — не трогаем
             await db.set_override(rest, not S.get(cfg, rest))
         return await conf("Сохранено")
     if action == "sc":

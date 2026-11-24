@@ -238,8 +238,8 @@ class RealTrader:
 
     def mode_for(self, kind: str) -> str:
         m = self.mode()
-        if m == "off" or kind not in S.METHODS:
-            return "off"
+        if m == "off" or not S.active(kind):
+            return "off"                             # 25.11: убранные методы (S.RETIRED) — ни тени, ни боя
         measure = bool(self.get("real_shadow_all")) and kind not in SHADOW_SKIP   # выключенный метод — в тень, не на деньги
         if not self.get(S.METHODS[kind][1]):
             return "shadow" if measure else "off"
@@ -485,6 +485,19 @@ class RealTrader:
         if s:
             return f"автонастройка: источник в минусе — {s.get('why')}"
         return None
+
+    def _note_rug(self, mint: str, pct: float) -> None:
+        """25.11: бумага убрана — «монета рагнула» и «дев уже рагал» (entry_block) теперь по сделкам самого бота:
+        −50% и хуже — в ту монету и в монеты её дева 7 дней не входим."""
+        from ..analytics.paper import PAPER_TRADING, RUG_PCT
+        paper = getattr(self.e, "paper", None)
+        if PAPER_TRADING or paper is None or pct > -RUG_PCT or not hasattr(paper, "rugged"):
+            return
+        paper.rugged[mint] = min(pct, paper.rugged.get(mint, 0.0))
+        st = (getattr(self.e, "states", None) or {}).get(mint)
+        dev = getattr(st, "deployer", None)
+        if dev and hasattr(paper, "rug_devs"):
+            paper.rug_devs.add(dev)
 
     def follow_mode(self, wallet: str | None) -> str | None:
         """«За ним» с доски кошельков: режим для его сигналов (live — только если этот кошелёк бота в бою)."""
@@ -752,6 +765,8 @@ class RealTrader:
                      trader: str | None) -> None:
         if kind == "majorj":                         # крупные монеты — не pump.fun: сразу котировка Jupiter, тень
             return await self._enter_jupiter(mint_s, alert_id, data, trader, kind="majorj")
+        if kind == "trend" and "trend" in S.RETIRED and mint_s.endswith("pump"):
+            return                                   # 25.11: тренды pump.fun убраны — монету pump.fun сеть не спрашиваем
         if self.chain is None:
             return self._skip(mode, kind, "нет доступа к сети")
         t0 = time.time()
@@ -770,6 +785,8 @@ class RealTrader:
         if kind == "trend":
             if st.get("venue") is None and OTHER_DEX in str(st.get("why") or ""):
                 return await self._enter_jupiter(mint_s, alert_id, data, trader)
+            if "trend" in S.RETIRED:
+                return                               # 25.11: тренды pump.fun убраны — без записи в «Пропуски»
             if self.mode_for("trend") == "off":
                 return self._skip(mode, kind, "тренды на pump.fun выключены")
             tb = self.tune_block("trend", None, mode)
@@ -1987,6 +2004,7 @@ class RealTrader:
         self.day_pnl[mode] = self.day_pnl.get(mode, 0.0) + pnl
         if pnl < 0:
             self.lost[p.mint] = time.time()
+        self._note_rug(p.mint, pct)
         sol_usd = self.sol_usd()
         if mode == "live":
             self.live_total += pnl

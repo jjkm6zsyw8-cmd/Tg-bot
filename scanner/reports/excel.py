@@ -11,6 +11,8 @@
   Сделки бумаги         — все сделки бумаги за 7 дней
   Smart-кошельки        — кто даёт сделки бумаге A: сделок, в плюс, итог при $10, статус в списке
   Разведка              — кандидаты: откуда, статус, итог испытания в H
+25.11: бумага убрана (analytics/paper.py, PAPER_TRADING) — листы бумаги, сравнения с ней, Smart-кошельков и разведки
+не строятся; остаются сводка, бот по дням, сделки бота и пропуски.
 
 Время — по Батуми (часовой пояс дневного сброса бумаги), доллары — по текущему курсу SOL, итог бумаги «при $10» —
 процент сделки × $10 (как в разборах): так портфели с разным размером позиций сравниваются честно.
@@ -26,6 +28,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from ..analytics import paper as pp
 from ..real.report import EXIT_NAMES, KINDS, MODE_SHORT, paper_pairs, skip_text, sol_price
 
 PCT, USD, SOL, NUM, DT = "0.0%", '#,##0.00 "$"', "0.0000", "0", "dd.mm.yyyy hh:mm:ss"
@@ -126,9 +129,10 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
     real = await db.fetch(
         "SELECT * FROM real_positions WHERE opened_at > now() - make_interval(days => $1) ORDER BY opened_at",
         REAL_DAYS)
+    PAPER_TRADING = pp.PAPER_TRADING
     paper_rows = await db.fetch(
         """SELECT * FROM paper_positions WHERE opened_at > now() - make_interval(days => $1)
-             AND exit_reason IS DISTINCT FROM 'reset' ORDER BY opened_at""", PAPER_DAYS)
+             AND exit_reason IS DISTINCT FROM 'reset' ORDER BY opened_at""", PAPER_DAYS) if PAPER_TRADING else []
 
     def wname(wid: Any) -> str:
         w = wallets.get(wid)
@@ -137,7 +141,8 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
     # ------------------------------------------------------------------ Сводка
     s = Sheet(wb, "Сводка", tz, first=True)
     s.title(f"Отчёт на {now.astimezone(tz):%d.%m.%Y %H:%M} (Батуми) · курс SOL ${sol_usd:.2f}")
-    s.note("Каждый раздел — отдельный лист внизу. Итог бумаги «при $10» — процент сделки × $10.")
+    s.note("Каждый раздел — отдельный лист внизу." + (" Итог бумаги «при $10» — процент сделки × $10."
+                                                       if PAPER_TRADING else ""))
     s.title("Кошельки реального бота")
     rows = []
     for wid, w in sorted(wallets.items()):
@@ -172,18 +177,19 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
     s.table([("Режим", None), ("Метод", None), ("Сделок", NUM), ("В плюс", PCT), ("В среднем на сделку", PCT),
              ("Итог, $", USD)], rows, color_col=5)
 
-    s.title(f"Бумага за {PAPER_DAYS} дн. — при $10 на сделку (честные входы, без ⚠)")
-    by_port: dict[str, list[Any]] = {}
-    for p in paper_rows:
-        if p["closed_at"] is not None and not p["suspect"] and p["pnl_pct"] is not None:
-            by_port.setdefault(p["portfolio"], []).append(p)
-    rows = []
-    for port, ps in sorted(by_port.items()):
-        n = len(ps)
-        rows.append([port, n, sum(1 for p in ps if p["pnl_pct"] > 0) / n, sum(float(p["pnl_pct"]) for p in ps) / n,
-                     round(sum(float(p["pnl_pct"]) for p in ps) * 10, 2)])
-    s.table([("Портфель", None), ("Сделок", NUM), ("В плюс", PCT), ("В среднем на сделку", PCT),
-             ("Итог при $10, $", USD)], rows, color_col=4)
+    if PAPER_TRADING:                # 25.11: бумага убрана — её листов нет
+        s.title(f"Бумага за {PAPER_DAYS} дн. — при $10 на сделку (честные входы, без ⚠)")
+        by_port: dict[str, list[Any]] = {}
+        for p in paper_rows:
+            if p["closed_at"] is not None and not p["suspect"] and p["pnl_pct"] is not None:
+                by_port.setdefault(p["portfolio"], []).append(p)
+        rows = []
+        for port, ps in sorted(by_port.items()):
+            n = len(ps)
+            rows.append([port, n, sum(1 for p in ps if p["pnl_pct"] > 0) / n, sum(float(p["pnl_pct"]) for p in ps) / n,
+                         round(sum(float(p["pnl_pct"]) for p in ps) * 10, 2)])
+        s.table([("Портфель", None), ("Сделок", NUM), ("В плюс", PCT), ("В среднем на сделку", PCT),
+                 ("Итог при $10, $", USD)], rows, color_col=4)
 
     # ------------------------------------------------------------------ Бот по дням
     s = Sheet(wb, "Бот по дням", tz)
@@ -218,42 +224,43 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
              ("Итог, $", USD), ("Итог, %", PCT), ("Причина выхода", None), ("Примечание", None),
              ("Подпись покупки", None), ("Подпись продажи", None)], rows, freeze=True, color_col=17)
 
-    # ------------------------------------------------------------------ Бот против бумаги
-    s = Sheet(wb, "Бот против бумаги", tz)
-    closed = [r for r in real if r["closed_at"] is not None]
-    rows = []
-    for r, port, q in await paper_pairs(db, closed, REAL_DAYS):
-        prem = (float(r["entry_mc"]) / float(q["entry_mc"]) - 1) if q is not None and r["entry_mc"] and q["entry_mc"] \
-            else None
-        rows.append([r["closed_at"], wname(r["wallet_id"]), MODE_SHORT.get(r["mode"], r["mode"]),
-                     KINDS.get(r["kind"], r["kind"]), r["symbol"] or "", _f(r["pnl_pct"]), port or "—",
-                     _f(q["pnl_pct"]) if q is not None else None, prem, (r["extra"] or {}).get("blocks_after"),
-                     "нет сделки у бумаги" if q is None else ""])
-    s.table([("Закрыта", DT), ("Кошелёк", None), ("Режим", None), ("Метод", None), ("Монета", None), ("Бот, %", PCT),
-             ("Портфель бумаги", None), ("Бумага, %", PCT), ("Вход бота дороже бумаги на", PCT),
-             ("Блоков после сигнала (бумага: 2)", NUM), ("Примечание", None)], rows, freeze=True, color_col=5)
+    if PAPER_TRADING:                # 25.11: бумага убрана — её листов нет
+        # ------------------------------------------------------------------ Бот против бумаги
+        s = Sheet(wb, "Бот против бумаги", tz)
+        closed = [r for r in real if r["closed_at"] is not None]
+        rows = []
+        for r, port, q in await paper_pairs(db, closed, REAL_DAYS):
+            prem = (float(r["entry_mc"]) / float(q["entry_mc"]) - 1) if q is not None and r["entry_mc"] and q["entry_mc"] \
+                else None
+            rows.append([r["closed_at"], wname(r["wallet_id"]), MODE_SHORT.get(r["mode"], r["mode"]),
+                         KINDS.get(r["kind"], r["kind"]), r["symbol"] or "", _f(r["pnl_pct"]), port or "—",
+                         _f(q["pnl_pct"]) if q is not None else None, prem, (r["extra"] or {}).get("blocks_after"),
+                         "нет сделки у бумаги" if q is None else ""])
+        s.table([("Закрыта", DT), ("Кошелёк", None), ("Режим", None), ("Метод", None), ("Монета", None), ("Бот, %", PCT),
+                 ("Портфель бумаги", None), ("Бумага, %", PCT), ("Вход бота дороже бумаги на", PCT),
+                 ("Блоков после сигнала (бумага: 2)", NUM), ("Примечание", None)], rows, freeze=True, color_col=5)
 
-    # ------------------------------------------------------------------ Бумага без бота
-    s = Sheet(wb, "Бумага без бота", tz)
-    since = await db.fetchval("SELECT min(opened_at) FROM real_positions")
-    rows = []
-    if since is not None:
-        for m in await db.fetch(
-                """SELECT pp.portfolio, pp.symbol, pp.mint, pp.source_wallet, pp.opened_at, pp.pnl_pct,
-                          (SELECT s.mode || '|' || s.kind || '|' || s.why
-                           FROM real_skips s WHERE s.mint = pp.mint
-                             AND s.at BETWEEN pp.opened_at - interval '2 minutes' AND pp.opened_at + interval '2 minutes'
-                           ORDER BY (s.mode = 'live') DESC, s.at DESC LIMIT 1) why
-                   FROM paper_positions pp WHERE pp.portfolio IN ('A', 'Y') AND pp.opened_at >= $1
-                     AND pp.exit_reason IS DISTINCT FROM 'reset' AND NOT pp.suspect
-                     AND NOT EXISTS (SELECT 1 FROM real_positions r WHERE r.alert_id = pp.alert_id AND r.mint = pp.mint)
-                   ORDER BY pp.opened_at""", since):
-            rows.append([m["opened_at"], m["portfolio"], m["symbol"] or "", m["mint"],
-                         labels.get(m["source_wallet"]) or m["source_wallet"] or "", _f(m["pnl_pct"]),
-                         skip_text(m["why"]) if m["why"] else
-                         "причина не записана (сигнал до бота не дошёл или это было до 18.11)"])
-    s.table([("Бумага вошла", DT), ("Портфель", None), ("Монета", None), ("Адрес монеты", None), ("Чей сигнал", None),
-             ("Итог бумаги, %", PCT), ("Почему бот не вошёл", None)], rows, freeze=True, color_col=5)
+        # ------------------------------------------------------------------ Бумага без бота
+        s = Sheet(wb, "Бумага без бота", tz)
+        since = await db.fetchval("SELECT min(opened_at) FROM real_positions")
+        rows = []
+        if since is not None:
+            for m in await db.fetch(
+                    """SELECT pp.portfolio, pp.symbol, pp.mint, pp.source_wallet, pp.opened_at, pp.pnl_pct,
+                              (SELECT s.mode || '|' || s.kind || '|' || s.why
+                               FROM real_skips s WHERE s.mint = pp.mint
+                                 AND s.at BETWEEN pp.opened_at - interval '2 minutes' AND pp.opened_at + interval '2 minutes'
+                               ORDER BY (s.mode = 'live') DESC, s.at DESC LIMIT 1) why
+                       FROM paper_positions pp WHERE pp.portfolio IN ('A', 'Y') AND pp.opened_at >= $1
+                         AND pp.exit_reason IS DISTINCT FROM 'reset' AND NOT pp.suspect
+                         AND NOT EXISTS (SELECT 1 FROM real_positions r WHERE r.alert_id = pp.alert_id AND r.mint = pp.mint)
+                       ORDER BY pp.opened_at""", since):
+                rows.append([m["opened_at"], m["portfolio"], m["symbol"] or "", m["mint"],
+                             labels.get(m["source_wallet"]) or m["source_wallet"] or "", _f(m["pnl_pct"]),
+                             skip_text(m["why"]) if m["why"] else
+                             "причина не записана (сигнал до бота не дошёл или это было до 18.11)"])
+        s.table([("Бумага вошла", DT), ("Портфель", None), ("Монета", None), ("Адрес монеты", None), ("Чей сигнал", None),
+                 ("Итог бумаги, %", PCT), ("Почему бот не вошёл", None)], rows, freeze=True, color_col=5)
 
     # ------------------------------------------------------------------ Пропуски бота
     s = Sheet(wb, "Пропуски бота", tz)
@@ -271,82 +278,87 @@ async def build_xlsx(db: Any, cfg: dict[str, Any]) -> tuple[bytes, str]:
             [[k["at"], wname(k["wallet_id"]), MODE_SHORT.get(k["mode"], k["mode"]), KINDS.get(k["kind"], k["kind"]),
               k["mint"], k["why"]] for k in skips])
 
-    # ------------------------------------------------------------------ Бумага по дням
-    s = Sheet(wb, "Бумага по дням", tz)
-    pdays: dict[tuple[str, str], list[float]] = {}
-    for p in await db.fetch(
-            """SELECT portfolio, opened_at, pnl_pct FROM paper_positions WHERE opened_at > now() - interval '30 days'
-                 AND closed_at IS NOT NULL AND NOT suspect AND pnl_pct IS NOT NULL
-                 AND exit_reason IS DISTINCT FROM 'reset'"""):
-        pdays.setdefault((p["opened_at"].astimezone(tz).strftime("%Y-%m-%d"), p["portfolio"]), []).append(
-            float(p["pnl_pct"]))
-    rows = [[datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m.%Y"), port, len(v), sum(1 for x in v if x > 0) / len(v),
-             round(sum(v) * 10, 2)] for (day, port), v in sorted(pdays.items(), reverse=True)]
-    s.table([("День", None), ("Портфель", None), ("Сделок", NUM), ("В плюс", PCT), ("Итог при $10, $", USD)], rows,
-            freeze=True, color_col=4)
+    if PAPER_TRADING:                # 25.11: бумага убрана — её листов нет
+        # ------------------------------------------------------------------ Бумага по дням
+        s = Sheet(wb, "Бумага по дням", tz)
+        pdays: dict[tuple[str, str], list[float]] = {}
+        for p in await db.fetch(
+                """SELECT portfolio, opened_at, pnl_pct FROM paper_positions WHERE opened_at > now() - interval '30 days'
+                     AND closed_at IS NOT NULL AND NOT suspect AND pnl_pct IS NOT NULL
+                     AND exit_reason IS DISTINCT FROM 'reset'"""):
+            pdays.setdefault((p["opened_at"].astimezone(tz).strftime("%Y-%m-%d"), p["portfolio"]), []).append(
+                float(p["pnl_pct"]))
+        rows = [[datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m.%Y"), port, len(v), sum(1 for x in v if x > 0) / len(v),
+                 round(sum(v) * 10, 2)] for (day, port), v in sorted(pdays.items(), reverse=True)]
+        s.table([("День", None), ("Портфель", None), ("Сделок", NUM), ("В плюс", PCT), ("Итог при $10, $", USD)], rows,
+                freeze=True, color_col=4)
 
-    # ------------------------------------------------------------------ Сделки бумаги
-    s = Sheet(wb, "Сделки бумаги", tz)
-    rows = []
-    bulk_since = now - timedelta(days=BULK_DAYS)
-    for p in paper_rows:
-        if p["portfolio"] in BULK and p["opened_at"] < bulk_since:
-            continue      # испытание и копии — сотни сделок в сутки: построчно 2 дня (по дням — лист «Бумага по дням»)
-        pct = _f(p["pnl_pct"])
-        rows.append([p["portfolio"], p["symbol"] or "", p["mint"], labels.get(p["source_wallet"]) or "",
-                     p["source_wallet"] or "", p["opened_at"], p["closed_at"], _f(p["entry_mc"]), _f(p["max_mc"]),
-                     pct, round(pct * 10, 2) if pct is not None else None, p["exit_reason"] or "открыта",
-                     "⚠ не в итоге" if p["suspect"] else ""])
-    s.table([("Портфель", None), ("Монета", None), ("Адрес монеты", None), ("Кошелёк (метка)", None),
-             ("Кошелёк (адрес)", None), ("Открыта", DT), ("Закрыта", DT), ("MC входа, SOL", "0.0"),
-             ("MC макс., SOL", "0.0"), ("Итог, %", PCT), ("Итог при $10, $", USD), ("Причина выхода", None),
-             ("Проверка", None)], rows, freeze=True, color_col=9)
+        # ------------------------------------------------------------------ Сделки бумаги
+        s = Sheet(wb, "Сделки бумаги", tz)
+        rows = []
+        bulk_since = now - timedelta(days=BULK_DAYS)
+        for p in paper_rows:
+            if p["portfolio"] in BULK and p["opened_at"] < bulk_since:
+                continue      # испытание и копии — сотни сделок в сутки: построчно 2 дня (по дням — лист «Бумага по дням»)
+            pct = _f(p["pnl_pct"])
+            rows.append([p["portfolio"], p["symbol"] or "", p["mint"], labels.get(p["source_wallet"]) or "",
+                         p["source_wallet"] or "", p["opened_at"], p["closed_at"], _f(p["entry_mc"]), _f(p["max_mc"]),
+                         pct, round(pct * 10, 2) if pct is not None else None, p["exit_reason"] or "открыта",
+                         "⚠ не в итоге" if p["suspect"] else ""])
+        s.table([("Портфель", None), ("Монета", None), ("Адрес монеты", None), ("Кошелёк (метка)", None),
+                 ("Кошелёк (адрес)", None), ("Открыта", DT), ("Закрыта", DT), ("MC входа, SOL", "0.0"),
+                 ("MC макс., SOL", "0.0"), ("Итог, %", PCT), ("Итог при $10, $", USD), ("Причина выхода", None),
+                 ("Проверка", None)], rows, freeze=True, color_col=9)
 
-    # ------------------------------------------------------------------ Smart-кошельки
-    s = Sheet(wb, "Smart-кошельки", tz)
-    rows = []
-    for r in await db.fetch(
-            """SELECT p.source_wallet w, count(*) n, count(*) FILTER (WHERE p.pnl_pct > 0) wins,
-                      sum(p.pnl_pct) s, max(p.opened_at) last, max(t.label) label, bool_or(t.pinned) pinned,
-                      bool_or(t.manual) manual, bool_or(t.active) active, max(sc.status) scout
-               FROM paper_positions p LEFT JOIN traders t ON t.address = p.source_wallet
-                    LEFT JOIN scout sc ON sc.address = p.source_wallet
-               WHERE p.portfolio = 'A' AND p.source_wallet IS NOT NULL AND p.closed_at IS NOT NULL AND NOT p.suspect
-                 AND p.opened_at > now() - make_interval(days => $1) AND p.exit_reason IS DISTINCT FROM 'reset'
-               GROUP BY 1 ORDER BY sum(p.pnl_pct) DESC""", PAPER_DAYS):
-        status = ("в списке" if r["active"] else "снят") + (" · разведка" if r["scout"] else "") + \
-            (" · вручную" if r["manual"] else "")
-        rows.append([r["label"] or "", r["w"], int(r["n"]), int(r["wins"]) / int(r["n"]),
-                     round(float(r["s"] or 0) * 10, 2), r["last"], status])
-    s.title(f"Кто даёт сделки бумаге A за {PAPER_DAYS} дн. (итог при $10 на сделку)")
-    s.table([("Метка", None), ("Адрес", None), ("Сделок", NUM), ("В плюс", PCT), ("Итог при $10, $", USD),
-             ("Последняя сделка", DT), ("Статус", None)], rows, freeze=True, color_col=4)
+        # ------------------------------------------------------------------ Smart-кошельки
+        s = Sheet(wb, "Smart-кошельки", tz)
+        rows = []
+        for r in await db.fetch(
+                """SELECT p.source_wallet w, count(*) n, count(*) FILTER (WHERE p.pnl_pct > 0) wins,
+                          sum(p.pnl_pct) s, max(p.opened_at) last, max(t.label) label, bool_or(t.pinned) pinned,
+                          bool_or(t.manual) manual, bool_or(t.active) active, max(sc.status) scout
+                   FROM paper_positions p LEFT JOIN traders t ON t.address = p.source_wallet
+                        LEFT JOIN scout sc ON sc.address = p.source_wallet
+                   WHERE p.portfolio = 'A' AND p.source_wallet IS NOT NULL AND p.closed_at IS NOT NULL AND NOT p.suspect
+                     AND p.opened_at > now() - make_interval(days => $1) AND p.exit_reason IS DISTINCT FROM 'reset'
+                   GROUP BY 1 ORDER BY sum(p.pnl_pct) DESC""", PAPER_DAYS):
+            status = ("в списке" if r["active"] else "снят") + (" · разведка" if r["scout"] else "") + \
+                (" · вручную" if r["manual"] else "")
+            rows.append([r["label"] or "", r["w"], int(r["n"]), int(r["wins"]) / int(r["n"]),
+                         round(float(r["s"] or 0) * 10, 2), r["last"], status])
+        s.title(f"Кто даёт сделки бумаге A за {PAPER_DAYS} дн. (итог при $10 на сделку)")
+        s.table([("Метка", None), ("Адрес", None), ("Сделок", NUM), ("В плюс", PCT), ("Итог при $10, $", USD),
+                 ("Последняя сделка", DT), ("Статус", None)], rows, freeze=True, color_col=4)
 
-    # ------------------------------------------------------------------ Разведка
-    s = Sheet(wb, "Разведка", tz)
-    rows = []
-    for r in await db.fetch(
-            """SELECT s.*, (SELECT count(*) FROM paper_positions p WHERE p.source_wallet = s.address
-                              AND p.portfolio = 'S' AND p.closed_at IS NOT NULL AND NOT p.suspect
-                              AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) n,
-                           (SELECT count(*) FILTER (WHERE p.pnl_sol > 0) FROM paper_positions p
-                            WHERE p.source_wallet = s.address AND p.portfolio = 'S' AND p.closed_at IS NOT NULL
-                              AND NOT p.suspect AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) wins,
-                           (SELECT sum(p.pnl_pct) FROM paper_positions p WHERE p.source_wallet = s.address
-                              AND p.portfolio = 'S' AND p.closed_at IS NOT NULL AND NOT p.suspect
-                              AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) s_pct
-               FROM scout s ORDER BY s.found_at DESC"""):
-        rows.append([r["address"], r["status"], r["source"] or "", r["reason"] or "", r["found_at"], r["started_at"],
-                     int(r["n"] or 0), int(r["wins"] or 0), round(float(r["s_pct"] or 0) * 10, 2) if r["n"] else None,
-                     r["decided_at"], r["decision"] or "", r["cooldown_until"]])
-    s.table([("Адрес", None), ("Статус", None), ("Откуда", None), ("Почему попал", None), ("Найден", DT),
-             ("Начало испытания", DT), ("Копий в S (как бот)", NUM), ("В плюсе", NUM), ("Итог копий при $10, $", USD),
-             ("Решение", DT), ("Что решено", None), ("Вернуть не раньше", DT)], rows, freeze=True, color_col=8)
+        # ------------------------------------------------------------------ Разведка
+        s = Sheet(wb, "Разведка", tz)
+        rows = []
+        for r in await db.fetch(
+                """SELECT s.*, (SELECT count(*) FROM paper_positions p WHERE p.source_wallet = s.address
+                                  AND p.portfolio = 'S' AND p.closed_at IS NOT NULL AND NOT p.suspect
+                                  AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) n,
+                               (SELECT count(*) FILTER (WHERE p.pnl_sol > 0) FROM paper_positions p
+                                WHERE p.source_wallet = s.address AND p.portfolio = 'S' AND p.closed_at IS NOT NULL
+                                  AND NOT p.suspect AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) wins,
+                               (SELECT sum(p.pnl_pct) FROM paper_positions p WHERE p.source_wallet = s.address
+                                  AND p.portfolio = 'S' AND p.closed_at IS NOT NULL AND NOT p.suspect
+                                  AND s.started_at IS NOT NULL AND p.opened_at >= s.started_at) s_pct
+                   FROM scout s ORDER BY s.found_at DESC"""):
+            rows.append([r["address"], r["status"], r["source"] or "", r["reason"] or "", r["found_at"], r["started_at"],
+                         int(r["n"] or 0), int(r["wins"] or 0), round(float(r["s_pct"] or 0) * 10, 2) if r["n"] else None,
+                         r["decided_at"], r["decision"] or "", r["cooldown_until"]])
+        s.table([("Адрес", None), ("Статус", None), ("Откуда", None), ("Почему попал", None), ("Найден", DT),
+                 ("Начало испытания", DT), ("Копий в S (как бот)", NUM), ("В плюсе", NUM), ("Итог копий при $10, $", USD),
+                 ("Решение", DT), ("Что решено", None), ("Вернуть не раньше", DT)], rows, freeze=True, color_col=8)
 
     buf = io.BytesIO()
     wb.save(buf)
     n_real = sum(1 for r in real if r["closed_at"] is not None)
-    caption = (f"📊 Отчёт {now.astimezone(tz):%d.%m %H:%M}: реальный бот — {n_real} сделок за {REAL_DAYS} дн., "
-               f"бумага — {len(paper_rows)} сделок за {PAPER_DAYS} дн., пропусков {len(skips)}. "
-               "Листы внизу: сводка, бот, бот против бумаги, пропуски, бумага, smart-кошельки, разведка.")
+    if PAPER_TRADING:
+        caption = (f"📊 Отчёт {now.astimezone(tz):%d.%m %H:%M}: реальный бот — {n_real} сделок за {REAL_DAYS} дн., "
+                   f"бумага — {len(paper_rows)} сделок за {PAPER_DAYS} дн., пропусков {len(skips)}. "
+                   "Листы внизу: сводка, бот, бот против бумаги, пропуски, бумага, smart-кошельки, разведка.")
+    else:
+        caption = (f"📊 Отчёт {now.astimezone(tz):%d.%m %H:%M}: реальный бот — {n_real} сделок за {REAL_DAYS} дн., "
+                   f"пропусков {len(skips)}. Листы внизу: сводка, бот по дням, сделки бота, пропуски.")
     return buf.getvalue(), caption

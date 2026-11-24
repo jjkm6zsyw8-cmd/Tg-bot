@@ -40,7 +40,10 @@ class Feedback:
             await save_profile(self.db, int(p["cluster_id"]), prof, self.e.cfg)
         elif kind == "paper":
             cmd = p.get("cmd", "")
-            from .paper import PERIOD_KEYBOARD, SCHEMES
+            from .paper import GONE_TEXT, PAPER_TRADING, PERIOD_KEYBOARD, SCHEMES
+            if not PAPER_TRADING:
+                await self.db.enqueue("text", {"topic": "real", "text": GONE_TEXT}, priority=4)
+                return
             if cmd == "trades":
                 parts = await self.e.paper.trades_text(float(p.get("hours") or 24))
                 for i, part in enumerate(parts):

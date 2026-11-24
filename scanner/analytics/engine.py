@@ -27,8 +27,10 @@ from .filters import check as check_filters
 from .newcoins import evaluate_new
 from .majors import Majors
 from .trends import Trends, Tracked
+from . import paper as paper_mod
 from .paper import PaperTrader
 from ..external import ExternalHub
+from ..real import settings as RS
 from .loader import attach_cluster, cluster_profile, load_state, save_profile, state_from_token
 from .price import SolPrice, measured_fee_bps
 from .profiles import Profile, similar_to_reference
@@ -231,15 +233,22 @@ class Engine:
         await self._load_traders()
         await self._load_references()
         await self.paper.start()
-        try:    # сделки по монетам в паре не к SOL (до исправления 17.11) — ⚠, не в итоге
-            n = await asyncio.wait_for(self.paper.mark_non_sol(), timeout=90)
-            if n:
-                await self.db.enqueue("text", {"topic": "paper", "text": (
-                    f"📒 Бумага: {n} сделок по монетам в паре не к SOL (USDC, акции, другие монеты) помечены ⚠ — "
-                    "их цена считалась не в SOL, в итог и баланс они не входят.")}, priority=6)
-        except Exception:  # noqa: BLE001
-            log.exception("бумага: проверка валюты пары")
-        await self.paper.reconcile()          # баланс бумаги без сделок ⚠ (иначе фальшивая прибыль раздувает ставки)
+        if paper_mod.PAPER_TRADING:
+            try:    # сделки по монетам в паре не к SOL (до исправления 17.11) — ⚠, не в итоге
+                n = await asyncio.wait_for(self.paper.mark_non_sol(), timeout=90)
+                if n:
+                    await self.db.enqueue("text", {"topic": "paper", "text": (
+                        f"📒 Бумага: {n} сделок по монетам в паре не к SOL (USDC, акции, другие монеты) помечены ⚠ — "
+                        "их цена считалась не в SOL, в итог и баланс они не входят.")}, priority=6)
+            except Exception:  # noqa: BLE001
+                log.exception("бумага: проверка валюты пары")
+            await self.paper.reconcile()      # баланс бумаги без сделок ⚠ (иначе фальшивая прибыль раздувает ставки)
+        if "autofollow" in RS.RETIRED:
+            try:                              # 25.11: авто-тень убрана — снять ту, что включил бот, до запуска лент
+                from .wallet_rules import autofollow
+                await autofollow(self.db, {}, set())
+            except Exception:  # noqa: BLE001
+                log.exception("снятие авто-тени")
         if self.real is not None:
             try:
                 await self.real.start()
@@ -276,7 +285,11 @@ class Engine:
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
                  self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.majors.run(), self.paper.tick_loop(),
-                 self.pricecheck.loop(), self.scout.loop(), self.ratings.loop(), self.filter.loop()]
+                 self.scout.loop()]
+        if paper_mod.PAPER_TRADING:
+            # 25.11: проверка цен бумаги по свечам, рейтинг кошельков по копиям бумаги и автофильтр (учится на
+            # бумаге M) без бумаги не нужны: рейтинг по устаревшим копиям ещё и снимал бы кошельки из своего списка
+            tasks += [self.pricecheck.loop(), self.ratings.loop(), self.filter.loop()]
         if self.real is not None:
             tasks.append(self.real.loop())
         await asyncio.gather(*(asyncio.create_task(t) for t in tasks))
@@ -321,8 +334,8 @@ class Engine:
         mine = self.my_devs.get(st.deployer) or (self.my_devs.get(st.creator) if st.creator else None)
         if mine is not None:
             asyncio.create_task(self._my_dev_launch(st, mine, rec))
-        elif getattr(self, "real", None) is not None:
-            asyncio.create_task(self._newdev_launch(st, rec))
+        elif getattr(self, "real", None) is not None and "newdev" not in RS.RETIRED:
+            asyncio.create_task(self._newdev_launch(st, rec))     # 25.11: «новый дев» убран — запуски не разбираем
         try:
             if not cfg.get("modes", {}).get("dev", True):
                 return
@@ -739,6 +752,8 @@ class Engine:
     async def _fast_create(self, payload: str) -> None:
         """23.11: быстрый вход «новый дев» — запуск приходит из приёмника сразу (NOTIFY), решение без запросов
         к базе, сигнал реальному боту в тот же миг. Обычный путь (_newdev_launch) остаётся запасным."""
+        if "newdev" in RS.RETIRED:
+            return                                   # 25.11: метод убран (в минусе) — без запросов и памяти на девов
         try:
             ev = json.loads(payload)
             mint, dev = ev["mint"], ev.get("deployer") or ""
@@ -1631,7 +1646,7 @@ class Engine:
                     await send_daily(self.db, self.settings, now.date())
                 except Exception:  # noqa: BLE001
                     log.exception("daily")
-                if cfg.get("daily_export", True):
+                if cfg.get("daily_export", True) and paper_mod.PAPER_TRADING:   # архив — сделки бумаги
                     try:                             # архив для разбора: сделки за день и за 30 дней, кошельки, копитрейд
                         from ..reports.export import enqueue_export
                         await enqueue_export(self.db, self.paper, "📦 Ежедневная выгрузка")

@@ -58,7 +58,7 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
     # итог метода — только сделки по его нынешнему правилу продажи: сменили подход (например «мой дев» → D) —
     # старый минус новый подход не останавливает
     main = {}
-    for kind in S.METHODS:
+    for kind in S.active_methods():               # 25.11: убранные методы не настраиваем
         r = await db.fetchrow(
             """SELECT count(*) n, COALESCE(avg(pnl_pct), 0) a, COALESCE(sum(pnl_sol), 0) s FROM real_positions
                WHERE mode = 'shadow' AND closed_at IS NOT NULL AND closed_at > $1 AND kind = $2
@@ -70,7 +70,7 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
             """SELECT kind, rule, count(*) n, COALESCE(avg(pnl_pct), 0) a FROM real_rule_trials
                WHERE closed_at IS NOT NULL AND closed_at > $1 GROUP BY kind, rule""", since):
         trials.setdefault(r["kind"], {})[r["rule"]] = r
-    for kind in S.METHODS:
+    for kind in S.active_methods():
         m = main.get(kind)
         tr = {k: v for k, v in (trials.get(kind) or {}).items() if v["n"] >= MIN_RULE_N}
         name = S.KIND_NAMES.get(kind, kind)

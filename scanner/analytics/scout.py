@@ -299,6 +299,12 @@ class Scout:
     async def run_once(self) -> list[str]:
         self.stats["runs"] += 1
         events: list[str] = []
+        from ..real import settings as RS
+        if {"smart", "copy"} <= RS.RETIRED:
+            # 25.11: smart и копии убраны (в минусе), бумаги нет — искать и испытывать кандидатов не для чего (испытание
+            # шло на бумаге S). Остаётся пересчёт кошельков доски и отчёт «Реальный бот за кошельками» раз в 6 ч
+            self._schedule_rules()
+            return events
         await self.discover_own()
         await self.discover_cobuyers()
         await self.discover_gmgn()
@@ -324,10 +330,7 @@ class Scout:
                 and time.time() - self._ct_at >= float(cfg_get(self.cfg, "scout_copytest_every_h")) * 3600:
             self._ct_at = time.time()
             self._ct_task = asyncio.create_task(self._copytest_bg())   # расчёт копий — минуты, в фоне
-        if (self._rules_task is None or self._rules_task.done()) and time.time() - self._rules_at >= 6 * 3600 \
-                and callable(getattr(self.e, "costs", None)):
-            self._rules_at = time.time()
-            self._rules_task = asyncio.create_task(self._rules_bg())   # кошельки через все выходы — в фоне
+        self._schedule_rules()
         if self.dune.key and (self._dune_task is None or self._dune_task.done()):
             self._dune_task = asyncio.create_task(self._dune_bg())   # весь PumpSwap через Dune — раз в сутки, в фоне
         await self.load()
@@ -338,6 +341,12 @@ class Scout:
         if events:
             await self.db.system("🔍 <b>Разведка</b>\n" + "\n".join(events[:25]))
         return events
+
+    def _schedule_rules(self) -> None:
+        if (self._rules_task is None or self._rules_task.done()) and time.time() - self._rules_at >= 6 * 3600 \
+                and callable(getattr(self.e, "costs", None)):
+            self._rules_at = time.time()
+            self._rules_task = asyncio.create_task(self._rules_bg())   # кошельки через все выходы — в фоне
 
     async def _rules_bg(self) -> None:
         """Кошельки своего списка, smart и испытания — через все выходы (analytics/wallet_rules.py); авто-тень."""

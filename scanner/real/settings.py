@@ -310,6 +310,27 @@ METHODS: dict[str, tuple[str, str, str]] = {
     # 24.11: крупные монеты из трендов Jupiter (analytics/majors.py) — только тень, на деньги не идут
     "majorj": ("Крупные монеты (тренды Jupiter) — только тень", "real_majorj", "MJ"),
 }
+# 25.11 (владелец: «убирай вообще с бота все минусовые»): методы в минусе на реальных ценах (тень и бой 17–24.11,
+# 2092 сделки, при $10 на сделку: smart −$43, мой дев −$265, копии −$244, крупные копии −$8, тренды pump.fun −$34,
+# новый дев −$948; разбор признаков входа — ни один фильтр не выводит их в плюс). Они не торгуют ни в тени, ни в бою
+# и не показываются на экранах. Код остаётся: «за ним» (кошельки, выбранные владельцем вручную) торгуется теми же
+# видами сделок (smart / копия), а «тренд» несёт сигнал «трендов на других биржах». Вернуть метод — убрать его
+# отсюда (тесты механики подменяют это множество пустым, см. tests/conftest.py)
+RETIRED = frozenset({"smart", "mydev", "copy", "bigcopy", "trend", "newdev",
+                     "autofollow"})          # autofollow — бот сам включал «тень за ним» за кошельками (те же копии)
+# выключатели убранного — не показываются в настройках
+RETIRED_TOGGLES = frozenset({"real_mydev_strong_only", "real_autofollow"})
+
+
+def active(kind: str | None) -> bool:
+    """Метод есть и не убран."""
+    return kind in METHODS and kind not in RETIRED
+
+
+def active_methods() -> list[str]:
+    return [k for k in METHODS if k not in RETIRED]
+
+
 KIND_NAMES = {"smart": "smart", "mydev": "мой дев", "copy": "копия", "bigcopy": "крупная копия",
               "swing": "смарт-ракета", "trend": "тренд", "newdev": "новый дев", "trendj": "тренд (др. биржи)",
               "majorj": "крупная монета"}
@@ -322,6 +343,8 @@ def live_methods(cfg: dict[str, Any]) -> list[str]:
         return []
     out = []
     for k, (_name, on_key, _port) in METHODS.items():
+        if k in RETIRED:
+            continue
         if not get(cfg, on_key) or (k == "mydev" and not get(cfg, "real_live_mydev")) \
                 or (k == "trendj" and not get(cfg, "real_live_trendj")) or k == "majorj":
             continue
@@ -333,7 +356,7 @@ def methods_summary(cfg: dict[str, Any]) -> str:
     """Коротко, какими методами торгует кошелёк: «Smart A · Мой дев G (только тень) · Копии»; своя ставка — в скобках."""
     out = []
     for kind in ("smart", "mydev", "bigcopy", "copy", "swing", "trend", "newdev", "trendj", "majorj"):
-        if get(cfg, METHODS[kind][1]):
+        if kind not in RETIRED and get(cfg, METHODS[kind][1]):
             stake = method_stake(cfg, kind)
             out.append(method_name(cfg, kind) + (f" ${stake:g}" if stake else ""))
     return " · ".join(out) if out else "все выключены"

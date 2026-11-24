@@ -174,8 +174,9 @@ async def build_daily(db: Database, settings: Settings, day: date,
     lines += ["", *await shadow_summary(db, start, end)] if await db.fetchval(
         "SELECT 1 FROM trend_shadow WHERE created_at >= $1 AND created_at < $2 LIMIT 1", start, end) else []
 
-    # 6) бумажная торговля
-    ports = await db.fetch("SELECT * FROM paper_portfolios ORDER BY name")
+    # 6) бумажная торговля (25.11: убрана — раздела нет)
+    from ..analytics.paper import PAPER_TRADING
+    ports = await db.fetch("SELECT * FROM paper_portfolios ORDER BY name") if PAPER_TRADING else []
     if ports:
         lines.append("\n<b>Бумажная торговля</b> (за день)")
         for p in ports:
@@ -199,7 +200,7 @@ async def build_daily(db: Database, settings: Settings, day: date,
         lines = lines[:rough_from] + real + lines[rough_from:]
     else:
         lines = (lines[:rough_from] + real + lines[rough_to:tail_from]
-                 + ["", "<i>Бумага, грубая оценка сигналов и окна входа — в полном разборе: /today full</i>"])
+                 + ["", "<i>Грубая оценка сигналов и окна входа — в полном разборе: /today full</i>"])
     # CSV: расширенные колонки (сделки, продажи кластера, причина склейки, окно входа, лучшие трейдеры)
     from .verify import extended_csv
     csv_bytes = await extended_csv(db, start, end)

@@ -34,6 +34,7 @@ from .copytrade import MIN_COPY_T, compute_trader, t_stat
 from .curve import trade_net_profit
 from ..alerts.format import esc
 from .paper import SCHEMES, Position, buy_fill, decide_exit, sell_fill
+from ..real import settings as RS
 
 log = logging.getLogger(__name__)
 
@@ -336,14 +337,24 @@ async def autofollow(db: Any, results: dict[str, dict[str, Any]], own: set[str],
     """«👻 тень за ним» (сам): свои кошельки с лучшим выходом в устойчивом плюсе и кошельки «Сейчас» (плюс за 30
     дней и за сутки, лучшие до hot_limit); перестали — снять ту тень, что включил сам. Бой и включённое вручную
     не трогаются. Выключено в настройках (real_autofollow, «🧹 Сбросить всё») — ничего не включает."""
+    follow = dict(await db.kv_get(FOLLOW_KEY) or {})
+    auto = set(await db.kv_get(AUTO_KEY) or [])
+    if "autofollow" in RS.RETIRED:
+        # 25.11 (владелец: «убирай все минусовые»): авто-тень убрана — снимаем тень, которую включил сам бот; бой и
+        # включённое вручную остаются
+        if auto:
+            for a in auto:
+                if follow.get(a) == "shadow":
+                    follow.pop(a, None)
+            await db.kv_set(FOLLOW_KEY, follow)
+            await db.kv_set(AUTO_KEY, [])
+        return []
     try:
         overrides = await db.get_overrides()
     except Exception:  # noqa: BLE001
         overrides = {}
     if overrides.get("real_autofollow") is False:
         return []
-    follow = dict(await db.kv_get(FOLLOW_KEY) or {})
-    auto = set(await db.kv_get(AUTO_KEY) or [])
     now = set(hot(results, hot_limit))
     events: list[str] = []
     for addr, res in results.items():

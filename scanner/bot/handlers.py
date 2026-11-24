@@ -26,6 +26,7 @@ NEW_DEFAULTS = {**_NEW_DEFAULTS, **_COPY_DEFAULTS, "paper_priority_sol": 0.0005,
                 "rating_top_mult": 1.5, "smart_accounts": 2,
                 "own_smart_min_hold_s": 180, "wallet_autoclean_min_copies": 10, "swing_min_hold_s": 1800,
                 "swing_min_buy_sol": 0.3}
+from ..analytics import paper as pp
 from ..analytics.copytrade import compute_trader, linked_to_dev, qualifies, save_trader
 from ..config import EDITABLE, PRESET_NAMES, PRESETS, Env, Settings
 from ..db.pool import Database
@@ -178,19 +179,31 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await m.answer(fmt.plain(text)[:4096], reply_markup=markup, link_preview_options=NO_PREVIEW)
 
     def main_menu() -> list[list[dict[str, Any]]]:
+        if pp.PAPER_TRADING:
+            return [
+                [{"text": "📊 Реальные цифры", "callback": "menu:pnl"}],
+                [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "⚖️ Бой против бумаги", "callback": "menu:cmp"}],
+                [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "📊 Excel: весь отчёт", "callback": "menu:excel"}],
+                [{"text": "💳 Кошельки бота", "callback": "rl:wl"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
+                [{"text": "🏆 Доска кошельков", "callback": "menu:board"}],
+                [{"text": "🔍 Разведка", "callback": "menu:scout"}, {"text": "⭐ Рейтинг кошельков", "callback": "menu:rating"}],
+                [{"text": "📋 Журнал копий", "callback": "menu:copylog"}, {"text": "📄 Файл по кошелькам", "callback": "menu:wallets"}],
+                [{"text": "➕ Добавить кошелёк", "callback": "menu:add"}, {"text": "📥 Импорт кошельков", "callback": "menu:import"}],
+                [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "👁 Отслеживаемое", "callback": "menu:watchlist"}],
+                [{"text": "📅 Разбор дня", "callback": "menu:today"}, {"text": "📈 Итог серии", "callback": "menu:stats"}],
+                [{"text": "⚙️ Настройки", "callback": "menu:settings"}, {"text": "🎛 Режимы", "callback": "menu:mode"}],
+                [{"text": "📦 Выгрузка (архив)", "callback": "menu:export"}, {"text": "🩺 Состояние", "callback": "menu:health"}],
+            ]
+        # 25.11: без бумаги и того, что по ней считалось (сравнение, Smart-отчёт, рейтинг, разведка, архив, файл)
         return [
             [{"text": "📊 Реальные цифры", "callback": "menu:pnl"}],
-            [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "⚖️ Бой против бумаги", "callback": "menu:cmp"}],
-            [{"text": "📒 Бумага", "callback": "menu:paper"}, {"text": "📊 Excel: весь отчёт", "callback": "menu:excel"}],
-            [{"text": "💳 Кошельки бота", "callback": "rl:wl"}, {"text": "🧠 Smart-отчёт", "callback": "menu:smart"}],
-            [{"text": "🏆 Доска кошельков", "callback": "menu:board"}],
-            [{"text": "🔍 Разведка", "callback": "menu:scout"}, {"text": "⭐ Рейтинг кошельков", "callback": "menu:rating"}],
-            [{"text": "📋 Журнал копий", "callback": "menu:copylog"}, {"text": "📄 Файл по кошелькам", "callback": "menu:wallets"}],
-            [{"text": "➕ Добавить кошелёк", "callback": "menu:add"}, {"text": "📥 Импорт кошельков", "callback": "menu:import"}],
-            [{"text": "🏷 Источники кошельков", "callback": "menu:origin"}, {"text": "👁 Отслеживаемое", "callback": "menu:watchlist"}],
-            [{"text": "📅 Разбор дня", "callback": "menu:today"}, {"text": "📈 Итог серии", "callback": "menu:stats"}],
-            [{"text": "⚙️ Настройки", "callback": "menu:settings"}, {"text": "🎛 Режимы", "callback": "menu:mode"}],
-            [{"text": "📦 Выгрузка (архив)", "callback": "menu:export"}, {"text": "🩺 Состояние", "callback": "menu:health"}],
+            [{"text": "💵 Реальный бот", "callback": "menu:real"}, {"text": "📊 Excel: весь отчёт", "callback": "menu:excel"}],
+            [{"text": "💳 Кошельки бота", "callback": "rl:wl"}, {"text": "🏆 Доска кошельков", "callback": "menu:board"}],
+            [{"text": "📋 Журнал копий", "callback": "menu:copylog"}, {"text": "➕ Добавить кошелёк", "callback": "menu:add"}],
+            [{"text": "📥 Импорт кошельков", "callback": "menu:import"}, {"text": "🏷 Источники кошельков", "callback": "menu:origin"}],
+            [{"text": "👁 Отслеживаемое", "callback": "menu:watchlist"}, {"text": "📅 Разбор дня", "callback": "menu:today"}],
+            [{"text": "📈 Итог серии", "callback": "menu:stats"}, {"text": "⚙️ Настройки", "callback": "menu:settings"}],
+            [{"text": "🎛 Режимы", "callback": "menu:mode"}, {"text": "🩺 Состояние", "callback": "menu:health"}],
         ]
 
     screens: dict[tuple[int, int | None], int] = {}   # (чат, тема) → сообщение-экран под панелью «Главной»
@@ -260,7 +273,11 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     def settings_view(cfg: dict[str, Any]) -> tuple[str, list[list[dict[str, Any]]]]:
         lines = ["<b>Настройки</b>"]
         kb = []
+        paper_on = pp.PAPER_TRADING
         for key, (label, _step, _lo, _hi, kind) in EDITABLE.items():
+            if not paper_on and (key.startswith(("paper_", "rating_", "scout_"))
+                                 or key in ("smart_accounts", "wallet_autoclean_min_copies")):
+                continue                     # 25.11: бумага, рейтинг и разведка по ней убраны — их настроек нет
             v = cfg.get(key, NEW_DEFAULTS.get(key))
             shown = pct(v, False) if kind == "pct" else f"{v:g}" if isinstance(v, (int, float)) else str(v)
             lines.append(f"{label}: <b>{shown}</b>")
@@ -273,6 +290,12 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                      f"Неполные данные: <b>{'ждать' if cfg.get('wait_full_data') else 'слать с пометкой'}</b>")
         kb.append([{"text": "Компактный/подробный", "callback": "tog:compact"},
                    {"text": "Ждать полные данные", "callback": "tog:wait_full_data"}])
+        if not paper_on:
+            lines.append(f"Тихие часы: <b>{cfg.get('quiet_hours') or 'нет'}</b> · Часовой пояс: <b>{cfg.get('timezone')}</b>"
+                         f" · Разбор дня в <b>{cfg.get('daily_report_time')}</b>")
+            if cfg.get("trading_wallet"):
+                lines.append(f"Торговый кошелёк (только чтение): <code>{cfg['trading_wallet']}</code>")
+            return "\n".join(lines), kb
         pl = set(cfg.get("paper_levels") or ["strong", "normal"])
         lines.append("Бумажная торговля входит по уровням: <b>" + (", ".join(
             {"strong": "Сильный", "normal": "Обычный", "watch": "Наблюдение"}[x] for x in ("strong", "normal", "watch")
@@ -786,6 +809,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     async def paper_answer(target: Message, cmd: str, hours: float | None = None) -> None:
         from ..analytics.paper import PERIOD_KEYBOARD
+        if not pp.PAPER_TRADING:
+            return await reply(target, pp.GONE_TEXT)
         tr = await paper_view()
         if cmd == "csv":
             data = await tr.trades_csv(None)
@@ -806,6 +831,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         arg = (command.args or "").strip().lower()
         cmd = {"reset": "reset", "history": "history", "day": "trades", "24": "trades", "csv": "csv",
                "file": "csv"}.get(arg, "state")
+        if not pp.PAPER_TRADING:
+            return await reply(m, pp.GONE_TEXT)
         if cmd == "reset":
             await db.job("paper", {"cmd": "reset"})
             return await reply(m, "Сбрасываю портфели до $30… Подтверждение придёт в «Бумажная торговля».")
@@ -891,6 +918,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     async def send_smart(m: Message, days: int) -> None:
         from ..reports.smart import chunks, smart_report
+        if not pp.PAPER_TRADING:
+            return await reply(m, pp.GONE_TEXT)          # Smart-отчёт считался по бумажному портфелю G
         cfg = await reload()
         parts = chunks(await smart_report(db, days, str(cfg.get("timezone") or "Asia/Tbilisi"),
                                           int(cfg.get("smart_accounts") or 2)))
@@ -908,12 +937,16 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def cmd_filter(m: Message) -> None:
         """Автофильтр сигналов: чему научился на сделках трейдеров, включён ли, что отсеивает."""
         from ..analytics.autofilter import filter_report
+        if not pp.PAPER_TRADING:
+            return await reply(m, pp.GONE_TEXT)          # учился на бумаге M
         await reply(m, await filter_report(db))
 
     @router.message(Command("rating"))
     async def cmd_rating(m: Message, command: CommandObject) -> None:
         """Рейтинг кошельков по итогу их копий; /rating адрес топ|норм|слабый|пауза|авто — ручная правка."""
         from ..analytics.rating import MANUAL, TIERS, rating_report
+        if not pp.PAPER_TRADING:
+            return await reply(m, pp.GONE_TEXT)          # рейтинг — по копиям в бумаге H
         cfg = await reload()
         parts = (command.args or "").split()
         if parts and is_valid_address(parts[0]):
@@ -941,12 +974,16 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def cmd_scout(m: Message) -> None:
         """Разведка кошельков: кто на испытании, кого добавили и отсеяли."""
         from ..analytics.scout import scout_report
+        if not pp.PAPER_TRADING:
+            return await reply(m, pp.GONE_TEXT)          # испытание кандидатов шло на бумаге S
         await reply(m, await scout_report(db))
 
     @router.message(Command("wallets"))
     async def cmd_wallets(m: Message) -> None:
         """Файл по всем кошелькам: свои, разведка, кандидаты, smart-money — с итогом копий и вердиктом."""
         from ..reports.wallets import wallets_csv
+        if not pp.PAPER_TRADING:
+            return await reply(m, pp.GONE_TEXT)          # вердикт кошелька — по копиям в бумаге
         cfg = await reload()
         sol = float((await db.kv_get("sol_usd", {}) or {}).get("price", 150))
         data, n = await wallets_csv(db, sol, str(cfg.get("paper_reset_tz") or "Asia/Tbilisi"))
@@ -969,6 +1006,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
     async def send_export(m: Message) -> None:
         """Всё для разбора одним архивом: сделки за сутки и 30 дней, кошельки, журнал копитрейда."""
         from ..reports.export import build_export
+        if not pp.PAPER_TRADING:
+            return await reply(m, pp.GONE_TEXT)          # в архиве — сделки бумаги
         tr = await paper_view()
         data, caption = await build_export(db, tr)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1005,6 +1044,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         await c.answer("Считаю…")
         if c.message is None:
             return
+        if not pp.PAPER_TRADING:
+            return await reply(c.message, pp.GONE_TEXT)
         if arg == "reset":
             await reply(c.message, "Сбросить все бумажные портфели к стартовому балансу?",
                         [[{"text": "Да, сбросить", "callback": "pp:reset!"}, {"text": "Нет", "callback": "pp:no"}]])
@@ -1117,6 +1158,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             text, kb = await real_stats.view(db, await reload())
             return await show(m, text, kb)
         if what == "cmp":
+            if not pp.PAPER_TRADING:
+                return await show(m, pp.GONE_TEXT)
             return await show(m, await real_report.compare_text(db, await reload()),
                               [[{"text": "📊 Excel: весь отчёт", "callback": "rl:xlsx"}]])
         if what == "excel":
@@ -1125,6 +1168,8 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             return await cmd_wallets(m)
         if what == "scout":
             from ..analytics.scout import scout_report
+            if not pp.PAPER_TRADING:
+                return await show(m, pp.GONE_TEXT)
             return await show(m, await scout_report(db))
         if what == "rating":
             return await cmd_rating(m, CommandObject(prefix="/", command="rating", args=None))
