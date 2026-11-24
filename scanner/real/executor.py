@@ -1357,7 +1357,7 @@ class RealTrader:
             have = jupswap._amount((await self.chain.accounts([ata], "confirmed"))[0])
         except Exception:  # noqa: BLE001
             have = 0
-        got = max(got, have)
+        bought, got = got, max(got, have)
         r2 = await self._jup_send("sell", jupswap.USDC_MINT, SOL_MINT, got, slip, 0, ata, base, payload={"test": True})
         await self.refresh_balance(force=True)
         if not r2["ok"]:
@@ -1367,10 +1367,14 @@ class RealTrader:
         rent = int(((fill1 or {}).get("rents") or {}).get(str(ata), 0))
         diff = (self.balance or 0) - bal0 + rent
         return (f"🧪 ✅ <b>Пробная сделка через Jupiter прошла</b>\n"
-                f"SOL → USDC: {amount / 1e9:.4f} SOL → {got / 1e6:.2f} USDC · "
+                f"SOL → USDC: {amount / 1e9:.4f} SOL → {bought / 1e6:.2f} USDC · "
                 f"<a href=\"https://solscan.io/tx/{r1['sig']}\">покупка</a>\n"
-                f"USDC → SOL: обратно · <a href=\"https://solscan.io/tx/{r2['sig']}\">продажа</a>\n"
-                f"Итог: {diff / 1e9:+.5f} SOL ({diff / 1e9 * sol_usd:+.2f}$) — комиссии сети и маршрута"
+                f"USDC → SOL: {got / 1e6:.2f} USDC"
+                + (" (вместе с остатком прошлой пробы)" if got > bought else "")
+                + f" · <a href=\"https://solscan.io/tx/{r2['sig']}\">продажа</a>\n"
+                f"Итог: {diff / 1e9:+.5f} SOL ({diff / 1e9 * sol_usd:+.2f}$)"
+                + (" — плюс здесь от продажи остатка прошлой пробы, это не прибыль" if got > bought else
+                   " — комиссии сети и маршрута")
                 + (f"; залог счёта USDC {rent / 1e9:.4f} SOL вернётся при закрытии счёта" if rent else "")
                 + ".\nВесь путь боя работает: котировка, белый список, подпись, проверка симуляцией, отправка, учёт.")
 
