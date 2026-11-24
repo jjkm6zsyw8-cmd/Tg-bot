@@ -183,6 +183,12 @@ async def test_methods_screen_for_wallet_and_common(db, monkeypatch):
     assert "Копии своего списка и разведки</b> — ⬜ выкл" in text
     cbs = [b["callback"] for row in kb for b in row]
     assert f"rl:wmk:{t}:smart" in cbs and f"rl:wmx:{t}:copy:on" in cbs and all(len(c.encode()) <= 64 for c in cbs)
+    # 25.11: у кошелька видно, что пойдёт на деньги, и замер остального в тени — своя кнопка
+    assert "💵 На деньги (когда кошелёк в бою): smart" in text and "👻 Мерить всё в тени: ✅" in text
+    r = await UI.on_wallet_callback(db, {}, "wmm", f"{t}:off")
+    assert (await db.fetchval("SELECT settings FROM real_wallets WHERE id=$1", wid))["real_shadow_all"] is False
+    assert "👻 Мерить всё в тени: ⬜ выкл" in r.text and "real_autofollow" not in str(await db.get_overrides())
+    await UI.on_wallet_callback(db, {}, "wmm", f"{t}:on")
 
     async def press(action, rest):
         r = await UI.on_wallet_callback(db, {}, action, rest)

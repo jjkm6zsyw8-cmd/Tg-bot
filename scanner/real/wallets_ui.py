@@ -406,13 +406,16 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
               "общий стоп $50 — как бумажный портфель A, давший +$710 за 14–17.11."]
     kb.append([{"text": "✅ Включить все методы", "callback": f"rl:wmall:{tag}:on"},
                {"text": "⬜ Выключить все", "callback": f"rl:wmall:{tag}:off"}])
-    if tag == "g":
-        # 24.11 (владелец: «пока всё пускай работает»): выключенные методы — в тень, без денег
-        meas = bool(S.get(wcfg, "real_shadow_all"))
-        lines.append("👻 Мерить всё в тени: " + ("✅ выключенные методы и горячие кошельки доски тоже идут в тень "
-                                                 "(без денег)" if meas else "⬜ выкл"))
-        kb.append([{"text": f"{'✅' if meas else '⬜'} 👻 Мерить всё в тени (без денег)",
-                    "callback": f"rl:wmm:{tag}:{'off' if meas else 'on'}"}])
+    # 24.11 (владелец: «пока всё пускай работает»): выключенные методы — в тень, без денег; 25.11 — и у кошелька
+    # в бою: на деньги — только то, что видно в строке «💵 На деньги»
+    meas = bool(S.get(wcfg, "real_shadow_all"))
+    money_kinds = S.live_methods(wcfg)
+    lines.append("💵 На деньги (когда кошелёк в бою): " + (", ".join(money_kinds) if money_kinds else "ничего"))
+    lines.append("👻 Мерить всё в тени: " + ("✅ остальные методы" + (" и горячие кошельки доски" if tag == "g" else "")
+                                             + " тоже идут в тень (без денег; копии своего списка — только бумага H)"
+                                             if meas else "⬜ выкл"))
+    kb.append([{"text": f"{'✅' if meas else '⬜'} 👻 Мерить всё в тени (без денег)",
+                "callback": f"rl:wmm:{tag}:{'off' if meas else 'on'}"}])
     kb.append([{"text": "🧹 Сбросить всё — выбрать заново", "callback": f"rl:wmz:{tag}"}])
     kb.append([{"text": "📋 Как бумага A ($10)", "callback": f"rl:wmp:{tag}"}])
     kb.append([{"text": "🔄 Считать с нуля", "callback": f"rl:zero:m{tag}"}])
@@ -633,9 +636,11 @@ async def methods_callback(db: Any, cfg: dict[str, Any], action: str, parts: lis
             cur = S.method_stake(wcfg, kind) or S.get(wcfg, "real_stake_usd")
             v = cur + 5 if parts[2] == "+" else cur - 5
             patch = {key: min(S.max_stake_usd(), max(1.0, round(v)))}
-    elif action == "wmm" and tag == "g" and len(parts) == 2 and parts[1] in ("on", "off"):
+    elif action == "wmm" and len(parts) == 2 and parts[1] in ("on", "off"):
         on = parts[1] == "on"
-        patch = {"real_shadow_all": on, "real_autofollow": on}   # и тень за горячими кошельками доски — тоже без денег
+        patch = {"real_shadow_all": on}
+        if tag == "g":
+            patch["real_autofollow"] = on           # и тень за горячими кошельками доски — тоже без денег (общее)
     elif action == "wmp":
         patch = dict(PAPER_A_PRESET)
         drop = [S.stake_key(k) for k in S.METHODS]
