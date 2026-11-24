@@ -300,6 +300,7 @@ async def test_wallet_screens_flow(db, monkeypatch):
         await desk.lanes[wid].publish_status()
         r = await UI.on_wallet_callback(db, {}, "wm", f"{wid}:live")
         assert "✅ бой разрешён на сервере" in r.text and f"rl:wm:{wid}:live!" in cbs(r.kb)
+        assert "<b>На деньги пойдут:</b> smart (ставка $" in r.text                 # 25.11: что именно пойдёт на деньги
         r = await UI.on_wallet_callback(db, {}, "wm", f"{wid}:live!")
         await asyncio.sleep(0.2)
         assert r.toast == "Бой включён" and desk.lanes[wid].mode() == "live"

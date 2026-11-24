@@ -265,6 +265,11 @@ async def live_confirm(db: Any, cfg: dict[str, Any], wid: int, rpc: Any = None) 
              f"{S.get(wcfg, 'real_max_open')} позиций, дневной стоп "
              f"{S.fmt('real_day_stop_usd', S.get(wcfg, 'real_day_stop_usd'))}, общий стоп "
              f"{S.fmt('real_total_stop_usd', S.get(wcfg, 'real_total_stop_usd'))} (после него бой сам выключится)."]
+    money_kinds = S.live_methods(wcfg)
+    lines.append("<b>На деньги пойдут:</b> " + (", ".join(
+        f"{k} (ставка ${S.method_stake(wcfg, kk) or S.get(wcfg, 'real_stake_usd'):g})"
+        for kk, k in ((kk, S.KIND_NAMES.get(kk, kk)) for kk in S.METHODS) if k in money_kinds)
+        if money_kinds else "ни один метод (только кошельки «💵 Бой за ним»)") + ". Остальное — только тень.")
     can = allowed and can_sign and bal is not None and bal >= need
     if not can:
         lines += ["", "Сейчас включить нельзя: не выполнены условия выше."]
