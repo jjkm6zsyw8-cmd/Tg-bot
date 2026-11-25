@@ -63,3 +63,21 @@ async def test_wallet_limit(db):
         await fire(tr, chain, mint=m, alert_id=10 + i)
     spent = sum(p.cost_sol for p in tr.positions.values())
     assert spent <= 0.2 + 0.01 and skipped(tr, "на этот кошелёк уже открыто")
+
+
+def test_coin_once_shadow_does_not_block_money_and_other_bot_wallet(db):
+    """27.11: несколько кошельков купили одну монету — входим один раз. Тень по монете не мешает бою; бой по монете
+    занимает её и для тени; бой в другом кошельке бота занимает её для боя."""
+    tr, other = shadow(db, FakeChain()), shadow(db, FakeChain())
+    tr._busy, other._busy = {}, {}
+    tr.positions = {1: SimpleNamespace(mint="X", extra={"mode": "shadow"}, trader="A")}
+    other.positions = {2: SimpleNamespace(mint="Z", extra={"mode": "live"}, trader="B")}
+    tr.peers = other.peers = {1: tr, 2: other}
+    assert tr.coin_taken("X", "shadow") == "уже есть позиция по монете"
+    assert tr.coin_taken("X", "live") is None
+    tr.positions[3] = SimpleNamespace(mint="X", extra={"mode": "live"}, trader="C")
+    assert tr.coin_taken("X", "live") == "уже есть позиция по монете"
+    assert tr.coin_taken("Z", "live") == "монету уже купил другой кошелёк бота"
+    assert tr.coin_taken("Z", "shadow") is None                 # тень меряется в своём кошельке
+    other._busy["Q"] = "live"
+    assert tr.coin_taken("Q", "live") == "монету уже купил другой кошелёк бота"

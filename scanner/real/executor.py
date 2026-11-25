@@ -464,8 +464,8 @@ class RealTrader:
                                    error="отклонена сетью" if info else "не легла в блок",
                                    fee_sol=self.failed_fee_sol() if info else None)
             return
-        if any(p.mint == base["mint"] for p in self.positions.values()):
-            return
+        if any(p.mint == base["mint"] and p.extra.get("mode") == "live" for p in self.positions.values()):
+            return                                    # тень по той же монете живой покупке не мешает
         await self._adopt_buy(base, o["signature"], info, o["id"], None, late=True)
 
     async def _recover_buy_later(self, o: Any, delay_s: float) -> None:
@@ -608,8 +608,24 @@ class RealTrader:
             log.exception("реальный бот: вход %s", mint)
             self._skip(mode, kind, f"сбой: {type(exc).__name__}")
         finally:
-            self._busy.pop(mint, None)
+            if self._busy.get(mint) == mode:              # живой вход мог занять монету поверх тени — его метку не снимаем
+                self._busy.pop(mint, None)
             getattr(self, "_feat_ctx", {}).pop(mint, None)
+
+    def coin_taken(self, mint: str, mode: str) -> str | None:
+        """27.11 (владелец): несколько кошельков купили одну монету — входим один раз. Деньги: одна живая позиция на
+        монету во всех кошельках бота (peers — полосы стола), тень её не занимает. Тень: одна позиция на монету в этом
+        кошельке (живая тоже считается)."""
+        mine = [p for p in self.positions.values() if p.mint == mint]
+        if mode != "live":
+            return "уже есть позиция по монете" if mint in self._busy or mine else None
+        if self._busy.get(mint) == "live" or any(p.extra.get("mode") == "live" for p in mine):
+            return "уже есть позиция по монете"
+        for lane in list((getattr(self, "peers", None) or {}).values()):
+            if lane is not self and (lane._busy.get(mint) == "live" or any(
+                    p.mint == mint and p.extra.get("mode") == "live" for p in lane.positions.values())):
+                return "монету уже купил другой кошелёк бота"
+        return None
 
     def entry_block(self, mint: str, kind: str, mode: str, data: dict[str, Any]) -> str | None:
         """Причина не входить (до запросов к сети) или None."""
@@ -624,8 +640,9 @@ class RealTrader:
             return "нет покупки трейдера в блоке"
         elif time.time() - float(data["trigger_at"]) > float(self.get("real_max_signal_age_s")):
             return "сигнал опоздал"
-        if mint in self._busy or any(p.mint == mint for p in self.positions.values()):
-            return "уже есть позиция по монете"
+        taken = self.coin_taken(mint, mode)
+        if taken:
+            return taken
         free = mode == "shadow" and bool(self.get("real_shadow_free"))   # тень — замер: все сигналы, без стопа
         if kind in OWN_LIMIT and mode == "shadow":
             # свой лимит: лотерея «нового дева» и «крупные монеты» — много позиций сразу, места остальных не занимают

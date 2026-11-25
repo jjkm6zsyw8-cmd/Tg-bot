@@ -613,14 +613,15 @@ class Hunter:
 async def save_copies(db: Any, addr: str, rule: str, copies: list[tuple[CM.Entry, CM.Copy]]) -> None:
     """B4: копии после находки — бессрочно (hunter_copies)."""
     rows = [(addr, e.mint, datetime.fromtimestamp(e.ts, timezone.utc), rule, c.res, c.why or c.reason, c.entry_mc,
-             c.exit_mc, c.burst, c.stake) for e, c in copies]
+             c.exit_mc, c.burst, c.stake, c.hold_s) for e, c in copies]
     if rows:
         await db.p.executemany(
-            """INSERT INTO hunter_copies(address, mint, entry_at, rule, res, reason, entry_mc, exit_mc, burst, stake)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            """INSERT INTO hunter_copies(address, mint, entry_at, rule, res, reason, entry_mc, exit_mc, burst, stake,
+                                         hold_s)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                ON CONFLICT (address, mint, entry_at) DO UPDATE SET rule = EXCLUDED.rule, res = EXCLUDED.res,
                    reason = EXCLUDED.reason, entry_mc = EXCLUDED.entry_mc, exit_mc = EXCLUDED.exit_mc,
-                   burst = EXCLUDED.burst, stake = EXCLUDED.stake""", rows)
+                   burst = EXCLUDED.burst, stake = EXCLUDED.stake, hold_s = EXCLUDED.hold_s""", rows)
 
 
 async def weekly_text(db: Any, now: float) -> str:
@@ -653,6 +654,71 @@ async def weekly_text(db: Any, now: float) -> str:
     return "\n".join(lines)
 
 
+def once_per_coin(items: list[tuple[float, float, str, bool, Any]]) -> tuple[list[tuple[float, float, str, bool, Any]],
+                                                                             int]:
+    """27.11 (владелец): несколько кошельков купили одну монету — входим один раз. Как в боте (executor.coin_taken):
+    пока копия по монете открыта, такая же покупка другого кошелька — мимо; живую (бой) занимает только живая, тень
+    занимает любая. items: (вход, выход, монета, бой ли, данные). Возвращает оставшиеся по времени и сколько убрано."""
+    live_until: dict[str, float] = {}
+    any_until: dict[str, float] = {}
+    out, dup = [], 0
+    for it in sorted(items, key=lambda i: i[0]):
+        t0, t1, mint, live = it[0], it[1], it[2], it[3]
+        if (live_until if live else any_until).get(mint, float("-inf")) > t0:
+            dup += 1
+            continue
+        if live:
+            live_until[mint] = max(live_until.get(mint, t1), t1)
+        any_until[mint] = max(any_until.get(mint, t1), t1)
+        out.append(it)
+    return out, dup
+
+
+async def shadow_total(db: Any, now: float | None = None) -> list[str]:
+    """27.11 (/hunt): итог по всем кошелькам, за которыми повторяем (тень и бой): модель — копии после находки (монета
+    у нескольких — один раз), $ в день — сумма по кошелькам; и настоящие сделки бота за ними."""
+    now = now or time.time()
+    ws = await db.fetch("SELECT address, status, found_at, followed_at FROM hunter_wallets "
+                        "WHERE status IN ('shadow', 'live') AND followed_at IS NOT NULL")
+    if not ws:
+        return []
+    prm = await params_of(db)
+    ok = set(await db.kv_get(BATTLE_KEY) or {})
+    found = {r["address"]: r["found_at"].timestamp() for r in ws}
+    live = {r["address"] for r in ws if r["status"] == "live" and r["address"] in ok}
+    rows = await db.fetch(
+        """SELECT address, mint, extract(epoch FROM entry_at) AS ts, res, hold_s FROM hunter_copies
+           WHERE address = ANY($1::text[]) AND reason IS DISTINCT FROM $2""", list(found), CM.SMALL_POOL)
+    items = [(float(r["ts"]), float(r["ts"]) + float(r["hold_s"] if r["hold_s"] is not None else EXIT_LAG_S),
+              r["mint"], r["address"] in live, r) for r in rows if float(r["ts"]) >= found[r["address"]]]
+    kept, dup = once_per_coin(items)
+    res = [float(it[4]["res"]) for it in kept if it[4]["res"] is not None]
+    usd_day = 0.0
+    for addr, t0 in found.items():
+        mine = [float(it[4]["res"]) for it in kept if it[4]["address"] == addr and it[4]["res"] is not None]
+        usd_day += sum(mine) * STAKE_SOL * prm.sol_usd / max((now - t0) / 86400, 1 / 24)
+    noprice = sum(1 for it in kept if it[4]["res"] is None)
+    lines = [f"Σ <b>Итого за {len(ws)} кошельками</b> (тень{' и бой' if live else ''}), модель после находки: "
+             + (f"{len(res)} копий, в среднем {statistics.fmean(res):+.1%}, {sum(res) * STAKE_SOL:+.3f} SOL при "
+                f"{STAKE_SOL:g} SOL, ≈${usd_day:,.0f}/день" if res else "копий с ценой ещё нет")
+             + (f" · без цены {noprice}" if noprice else "")
+             + (f" · монета у нескольких — один раз (убрано {dup})" if dup else "")]
+    n = sol = 0.0
+    pct: list[float] = []
+    usd_ours = 0.0
+    for r in ws:
+        d = await our_results(db, r["address"], r["followed_at"])
+        if d["n"]:
+            n += d["n"]
+            sol += d["sol"]
+            pct.append(d["avg"] * d["n"])
+            usd_ours += d["sol"] * prm.sol_usd / max((now - r["followed_at"].timestamp()) / 86400, 1 / 24)
+    lines.append("   Бот за ними (настоящие сделки тени и боя): "
+                 + (f"{int(n)} сд, в среднем {sum(pct) / n:+.1%}, {sol:+.3f} SOL, ≈${usd_ours:,.0f}/день" if n
+                    else "сделок ещё нет"))
+    return lines
+
+
 async def hunt_text(db: Any, hours: float = 24.0) -> str:
     """A8: кого нашёл за hours часов и все из списков «в бой» и «наблюдение»."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -664,7 +730,7 @@ async def hunt_text(db: Any, hours: float = 24.0) -> str:
     if not rows:
         return f"🎯 Охотник: за {hours:g} ч никого не нашёл, в списках пусто."
     status = {"new": "без решения", "shadow": "👻 тень", "live": "💵 бой", "ignored": "игнор", "cooled": "🧊 остыл"}
-    lines = [f"🎯 <b>Охотник</b>: найдены за {hours:g} ч и списки"]
+    lines = [f"🎯 <b>Охотник</b>: найдены за {hours:g} ч и списки"] + await shadow_total(db)
     for r in rows:
         after = (f"после находки {int(r['n_after'] or 0)} коп., {float(r['avg_after'] or 0):+.1%}, "
                  f"${float(r['usd_day_after'] or 0):,.0f}/день" if r["n_after"] else "после находки копий ещё нет")
@@ -739,15 +805,18 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
              f"{len(by_list.get('watch', []))}, архив {len(by_list.get('archive', []))}"]
     with_fwd = [f for f in found if f["n"]]
     if with_fwd:
-        allres = [r for f in with_fwd for r in f["res"]]
-        lines.append(f"После находки (модель, пока не остыл и не в архиве): копий {len(allres)}, в среднем "
-                     f"{statistics.fmean(allres):+.1%}, в плюсе {sum(1 for x in allres if x > 0) / len(allres):.0%}; "
-                     f"кошельков в плюсе {sum(1 for f in with_fwd if f['sum'] > 0)} из {len(with_fwd)}; итог "
-                     f"{sum(f['sum'] for f in with_fwd) * STAKE_SOL:+.3f} SOL при {STAKE_SOL:g} SOL на копию; "
-                     f"без цены {sum(f['noprice'] for f in with_fwd)} копий")
+        # 27.11: монета у нескольких кошельков — один раз (как бот: пока копия открыта, вторая — мимо)
+        kept, dup = once_per_coin([it for f in found for it in f["items"]])
+        allres = [it[4][0] for it in kept if it[4][0] is not None]
+        lines.append(f"После находки (модель, пока не остыл и не в архиве; монета у нескольких — один раз, убрано "
+                     f"{dup}): копий {len(allres)}, в среднем {statistics.fmean(allres):+.1%}, в плюсе "
+                     f"{sum(1 for x in allres if x > 0) / len(allres):.0%}; кошельков в плюсе "
+                     f"{sum(1 for f in with_fwd if f['sum'] > 0)} из {len(with_fwd)}; итог "
+                     f"{sum(allres) * STAKE_SOL:+.3f} SOL при {STAKE_SOL:g} SOL на копию; без цены "
+                     f"{sum(1 for it in kept if it[4][0] is None)} копий")
         moved = [f for f in found if f["battle_at"] is not None]
-        pre = [r for f in found for r in f["pre"]]
-        bat = [r for f in found for r in f["bat"]]
+        pre = [it[4][0] for it in kept if it[4][1] == "pre" and it[4][0] is not None]
+        bat = [it[4][0] for it in kept if it[4][1] == "bat" and it[4][0] is not None]
         lines.append(f"Переведены в «в бой» (от ${BATTLE_USD:g}/день на {BATTLE_N}+ копиях после находки, 24 ч тени): "
                      f"{len(moved)} из {len(found)}")
         lines.append("  до перевода — тень, денег нет: " + phase_text(pre, prm.sol_usd))
@@ -867,7 +936,9 @@ def journey(copies: list[tuple[CM.Entry, CM.Copy]], trades: list[dict[str, Any]]
             else None, "end": stop, "usd": usd, "list": lst, "reason": reason or why, "why_not": why_not,
             "battle_at": battle_at, "pre": [c.res for _e, c in pre if c.res is not None],
             "pre_np": sum(1 for _e, c in pre if c.res is None), "bat": [c.res for _e, c in bat if c.res is not None],
-            "bat_np": sum(1 for _e, c in bat if c.res is None), "out": len(gap)}
+            "bat_np": sum(1 for _e, c in bat if c.res is None), "out": len(gap),
+            "items": [(e.ts, e.ts + (c.hold_s or 0.0), e.mint, ph == "bat", (c.res, ph))
+                      for ph, cs in (("pre", pre), ("bat", bat), ("gap", gap)) for e, c in cs]}
 
 
 def forward(copies: list[tuple[CM.Entry, CM.Copy]], trades: list[dict[str, Any]], t0: float,

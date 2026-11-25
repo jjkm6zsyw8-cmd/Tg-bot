@@ -200,6 +200,7 @@ async def test_track_lists_copies_and_battle_gate(db):
     r = await db.fetchrow("SELECT list, n_after, avg_after, usd_day_after FROM hunter_wallets WHERE address = $1", ME)
     assert r["n_after"] and r["avg_after"] > 0 and r["usd_day_after"] > 0
     assert await db.fetchval("SELECT count(*) FROM hunter_copies WHERE address = $1", ME) == r["n_after"]
+    assert not await db.fetchval("SELECT count(*) FROM hunter_copies WHERE address = $1 AND hold_s IS NULL", ME)
     monkey = H.BATTLE_N, H.BATTLE_USD
     H.BATTLE_N, H.BATTLE_USD = 3, 1.0
     try:
@@ -258,6 +259,39 @@ def test_journey_moves_to_battle_after_24h_and_splits_copies():
     k = H.journey(weak, [{"ts": e.ts, "is_buy": True} for e, _c in weak], t0, t0 + 21 * 3600, 150.0)
     assert k["list"] == "archive" and k["battle_at"] is None and k["n"] < 60 and "< $15" in k["why_not"]
     assert "до перевода" not in H.phase_text([], 150.0) and "$+25" in H.phase_text([0.6, 0.6], 150.0)
+
+
+def test_once_per_coin_like_the_bot():
+    """27.11: монета у нескольких — один раз, пока копия открыта; бой занимает только бой, тень — любая."""
+    items = [(0, 60, "X", False, "a"), (10, 70, "X", False, "b"),        # второй кошелёк, копия по X ещё открыта
+             (100, 130, "X", False, "c"),                                 # первая закрылась — новый вход
+             (110, 200, "X", True, "d"),                                  # бой: тень его не занимает
+             (150, 160, "X", False, "e"), (120, 125, "X", True, "f"),     # бой по X открыт — мимо и тени, и бою
+             (0, 10, "Y", True, "g")]
+    kept, dup = H.once_per_coin(items)
+    assert [it[4] for it in kept] == ["a", "g", "c", "d"] and dup == 3
+
+
+async def test_hunt_total_counts_coin_once(db):
+    """/hunt: итог по всем кошелькам в тени — копии после находки (монета у двух — один раз), SOL и $ в день."""
+    w1, w2 = "TOTA" + "1" * 40, "TOTB" + "2" * 40
+    now = datetime.now(timezone.utc)
+    for w in (w1, w2):
+        await db.execute(
+            """INSERT INTO hunter_wallets(address, found_at, status, list, followed_at)
+               VALUES ($1, now() - interval '24 hours', 'shadow', 'watch', now() - interval '24 hours')""", w)
+    for w, mint, ago, res in ((w1, "MA", 3600, 0.20), (w2, "MA", 3590, 0.10),    # MA у второго — копия открыта
+                              (w1, "MB", 7200, -0.05), (w2, "MC", 9000, 0.15)):
+        await db.execute(
+            """INSERT INTO hunter_copies(address, mint, entry_at, rule, res, reason, hold_s)
+               VALUES ($1, $2, $3, 'A', $4, 'take_profit', 120)""", w, mint, now - timedelta(seconds=ago), res)
+    await db.execute(
+        """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
+               pnl_sol, pnl_pct) VALUES ('shadow', 'copy', 'MA', $1, now() - interval '1 hour', now(), 0.14, 1, 40,
+               0.02, 0.15)""", w1)
+    text = await H.hunt_text(db, 48)
+    assert "Итого за 2 кошельками" in text and "3 копий, в среднем +10.0%" in text and "убрано 1" in text
+    assert "+0.042 SOL" in text and "/день" in text and "Бот за ними" in text and "1 сд, в среднем +15.0%" in text
 
 
 async def test_follow_uses_wallet_rule_and_cools_on_steady_minus(db):

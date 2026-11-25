@@ -314,6 +314,7 @@ class RealDesk:
                    "source": row["source"], "pubkey": row["pubkey"]}
         wallet, note = self._wallet_of(row)
         lane = RealTrader(self.e, self.chain, wallet, profile, wallet_note=note)
+        lane.peers = self.lanes                       # 27.11: по монете — одна живая позиция во всех кошельках
         self.lanes[profile["id"]] = lane
         await lane.start()
         return lane
@@ -327,6 +328,7 @@ class RealDesk:
         lane = self.lanes.get(None)
         if lane is None and (not has_wallets or orphan):
             lane = RealTrader(self.e, self.chain, self.env_wallet, None, wallet_note=self.env_note)
+            lane.peers = self.lanes
             self.lanes[None] = lane
             await lane.start()
         if lane is not None:

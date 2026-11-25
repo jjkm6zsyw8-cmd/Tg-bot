@@ -720,6 +720,8 @@ CREATE TABLE IF NOT EXISTS hunter_copies (
     stake    double precision,
     PRIMARY KEY (address, mint, entry_at)
 );
+-- 27.11: удержание копии — для «по монете один раз» (пока копия открыта, такая же покупка другого кошелька — мимо)
+ALTER TABLE hunter_copies ADD COLUMN IF NOT EXISTS hold_s double precision;
 -- 25.11: продажа без подписи не могла «лечь в блок» (списание «покупателей нет», токенов нет на счёте) — no_tx
 UPDATE real_orders SET status = 'no_tx' WHERE status = 'landed' AND signature IS NULL;
 CREATE INDEX IF NOT EXISTS real_positions_wallet_idx ON real_positions (wallet_id, opened_at);
