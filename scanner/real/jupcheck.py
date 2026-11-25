@@ -1,7 +1,7 @@
 """25.11 (владелец, после рагов 1847 и 1863): пересчёт сделок других бирж (тренды trendj, крупные монеты majorj) с
 фильтрами входа — LP заблокирован или сожжён и пул старше N часов. Сколько сделок осталось бы и какой итог.
 
-Запуск на сервере: python -m scanner jupcheck [--days N] [--lp 0.9]
+Запуск на сервере: python -m scanner jupcheck [--all] [--days N] [--lp 0.9]   (--all — и до «считать с нуля»)
 Данные — то, что бот записал на входе в extra позиции: lp_locked (RugCheck, доля LP главного пула, заблокированная
 или сожжённая; есть с 24.11) и age_s (возраст пула, по которому пришёл сигнал). Чёрный список создателей задним числом
 не применяется: у старых позиций создатель не записан.
@@ -69,8 +69,9 @@ def report_text(rows: list[dict[str, Any]], min_lp: float, sol_usd: float, since
     return "\n".join(out)
 
 
-async def run(db: Any, min_lp: float = 0.9, days: float | None = None) -> str:
-    since = await stats_since(db)
+async def run(db: Any, min_lp: float = 0.9, days: float | None = None, all_time: bool = False) -> str:
+    """all_time — без даты «считать с нуля» (все сделки, что есть в базе)."""
+    since = None if all_time else await stats_since(db)
     rows = await db.fetch(
         """SELECT id, kind, mode, symbol, pnl_pct, pnl_sol, exit_reason, opened_at, extra->>'lp_locked' AS lp,
                   extra->>'age_s' AS age FROM real_positions

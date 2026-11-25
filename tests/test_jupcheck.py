@@ -45,5 +45,10 @@ async def test_run_reads_positions():
                 pct, lp, age)
         text = await JC.run(db)
         assert "все          3" in text and "LP закр.     1" in text and "N = 6 ч      1" in text
+        from datetime import datetime, timedelta, timezone
+        from scanner.real.report import STATS_SINCE_KEY
+        await db.kv_set(STATS_SINCE_KEY, (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+        assert "Сделок других бирж за период нет" in await JC.run(db)       # после «считать с нуля» — пусто
+        assert "все          3" in await JC.run(db, all_time=True)            # --all — все сделки базы
     finally:
         await db.close()

@@ -249,7 +249,7 @@ async def run_tool(cmd: str, db: Database) -> None:
         from .real.jupcheck import run as jup_run
         days = float(args[args.index("--days") + 1]) if "--days" in args else None
         lp = float(args[args.index("--lp") + 1]) if "--lp" in args else 0.9
-        print(await jup_run(db, lp, days))
+        print(await jup_run(db, lp, days, all_time="--all" in args))
     elif cmd == "trendfeat":
         # 25.11: признаки входа трендов: python -m scanner trendfeat [--compare] [--days N] [--kind trend|trendj]
         # [--mode shadow|live] (CSV — в stdout: … > /opt/tg-bot/trend_feat.csv)
