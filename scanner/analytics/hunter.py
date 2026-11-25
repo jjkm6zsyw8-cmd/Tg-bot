@@ -238,8 +238,12 @@ async def candidates(db: Any, since: float, until: float, min_coins: int | None 
     считаем тут же."""
     min_coins = BAR.min_coins if min_coins is None else min_coins
     rows = await db.fetch(
-        """WITH b AS (SELECT trader, mint, min(slot) AS slot, min(ts) AS ts FROM trades
-                      WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2) GROUP BY 1, 2)
+        """WITH s AS (SELECT trader, mint, slot, ts FROM trades
+                      WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2)
+                      UNION ALL                       -- 27.11: весь рынок из pumpdata.fun
+                      SELECT trader, mint, slot, ts FROM market_trades
+                      WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2)),
+                b AS (SELECT trader, mint, min(slot) AS slot, min(ts) AS ts FROM s GROUP BY 1, 2)
            SELECT b.trader, count(*) AS coins, count(*) FILTER (WHERE k.deployer = b.trader) AS own,
                   count(*) FILTER (WHERE k.created_slot IS NOT NULL AND b.slot IS NOT NULL
                                    AND b.slot <= k.created_slot) AS bundled,
@@ -801,8 +805,9 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
         since = found.timestamp()
         trades = await CM.wallet_trades(db, addr, since - 120, now)
         buys = [d for d in trades if d["is_buy"] and d["ts"] >= since]
-        before = await db.fetchval("SELECT extract(epoch FROM max(ts)) FROM trades WHERE trader = $1 AND is_buy "
-                                   "AND ts < $2", addr, found)
+        before = await db.fetchval(
+            """SELECT extract(epoch FROM max(ts)) FROM (SELECT ts FROM trades WHERE trader = $1 AND is_buy AND ts < $2
+                   UNION ALL SELECT ts FROM market_trades WHERE trader = $1 AND is_buy AND ts < $2) x""", addr, found)
         rule = r["rule"] if r["rule"] in SCHEMES else "A"
         p = await CM.prepare(db, addr, trades, since, now, limit=100_000)
         cs = CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)

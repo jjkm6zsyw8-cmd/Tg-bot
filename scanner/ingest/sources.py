@@ -123,7 +123,9 @@ class PumpPortalSource(Source):
     """wss://pumpportal.fun/api/data — одно соединение на все подписки.
 
     subscribeNewToken / Migration — бесплатно; subscribeTokenTrade / AccountTrade — только с ключом,
-    на кошельке которого ≥0.02 SOL (сделки на bonding curve бесплатны, PumpSwap — 0.01 SOL за 10 тыс.).
+    на кошельке которого ≥0.02 SOL; 27.11 (документация и проверка без ключа): платны все сделки — и кривая, и
+    PumpSwap, 0.01 SOL за 10 тыс. сообщений. Каждое пришедшее сообщение считается по виду (on_raw: монеты / кошельки /
+    создания / миграции / служебные) — приёмник пишет это по часам в source_stats (pp_raw_*), отчёт — ppcost.
     Сделки каждой новой монеты слушаем window_min минут; дольше — если keep(mint) == True
     (алерт, бумажная позиция, наблюдение, растущий MC).
     """
@@ -144,6 +146,7 @@ class PumpPortalSource(Source):
         self._lock = asyncio.Lock()
         self.messages_by_pool: dict[str, int] = {"pump": 0, "pump-amm": 0}
         self.refused = ""          # ответ PumpPortal, если он отказал в подписке на сделки
+        self.on_raw: Callable[[str], None] | None = None    # 27.11: каждое сообщение — по виду подписки
 
     async def subscribe_tokens(self, mints: list[str]) -> None:
         if not self.has_key:
@@ -226,6 +229,8 @@ class PumpPortalSource(Source):
                         msg = json.loads(raw)
                     except ValueError:
                         continue
+                    if self.on_raw is not None:
+                        self.on_raw(self.raw_kind(msg))
                     ev = self.normalize(msg)
                     if ev is None:
                         if isinstance(msg, dict) and msg.get("message") and "only available" in str(msg["message"]):
@@ -250,6 +255,20 @@ class PumpPortalSource(Source):
                     await sink(ev)
             finally:
                 subs.cancel()
+
+    def raw_kind(self, msg: Any) -> str:
+        """27.11: вид сообщения для счёта денег — coin (сделка монеты из подписки), wallet (сделка кошелька из
+        подписки на кошельки), create / migrate (бесплатные), service (ответы на подписки, отказы)."""
+        if not isinstance(msg, dict):
+            return "service"
+        tx = msg.get("txType")
+        if tx in ("create", "migrate"):
+            return str(tx)
+        if tx in ("buy", "sell"):
+            if msg.get("mint") in self.token_subs:
+                return "coin"
+            return "wallet" if msg.get("traderPublicKey") in self.account_subs else "coin"
+        return "service"
 
     @staticmethod
     def normalize(msg: dict[str, Any]) -> Event | None:

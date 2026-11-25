@@ -28,6 +28,13 @@ async def reserves_part(db: Any, hours: float) -> list[str]:
            WHERE ts > now() - make_interval(secs => $1) GROUP BY 1 ORDER BY 1 DESC LIMIT 6""", hours * 3600)
     out = ["1) Резервы по часам (UTC): " + (", ".join(f"{r['h']:%H}ч — {r['coins']} мон. / {r['ticks']} изм."
                                                        for r in rows) or "изменений нет")]
+    pdh = ((await db.kv_get("health:ingest")) or {}).get("pumpdata")
+    if pdh:
+        n = await db.fetchval("SELECT count(*) FROM market_trades WHERE ts > now() - interval '1 hour'")
+        out.append(f"   pumpdata (весь рынок, сделки от {pdh.get('min_sol')} SOL): соединение "
+                   f"{'есть' if pdh.get('connected') else 'НЕТ'}, за час записано {n:,}, очередь {pdh.get('queue', 0)}, "
+                   f"потеряно {pdh.get('dropped', 0)}, переподключений {pdh.get('reconnects', 0)}"
+                   + (f"; ошибка: {pdh.get('last_error')}" if pdh.get("last_error") else ""))
     h = ((await db.kv_get("health:ingest")) or {}).get("reserves") or {}
     if h:
         out.append(f"   соединение {'есть' if h.get('connected') else 'НЕТ'}, отказов узла (429) {h.get('refused', 0)}, "
@@ -155,6 +162,24 @@ async def pp_cost_text(db: Any, days: int = 30) -> str:
         sol = int(r["trades"]) * PP_SOL_PER_MSG
         lines.append(f"  {r['day']:%d.%m}: {int(r['trades']):>10,} · {int(r['hours']):>2} ч · {sol:.3f} SOL"
                      + (f" (${sol * price:,.0f})" if price else ""))
+    # 27.11: сырые сообщения по видам подписки (приёмник считает каждое пришедшее, source_stats pp_raw_*)
+    raw = await db.fetch(
+        """SELECT (hour AT TIME ZONE 'UTC')::date AS day, substr(source, 8) AS kind, sum(trades) AS n
+           FROM source_stats WHERE source LIKE 'pp\\_raw\\_%' AND hour > now() - make_interval(days => $1)
+           GROUP BY 1, 2 ORDER BY 1""", days)
+    if raw:
+        by: dict[Any, dict[str, int]] = {}
+        for r in raw:
+            by.setdefault(r["day"], {})[r["kind"]] = int(r["n"])
+        lines.append("Все сообщения PumpPortal (с 27.11): сделки монет · сделки кошельков · служебные · создания+миграции "
+                     "→ платные (сделки)")
+        for d, k in sorted(by.items()):
+            paid = k.get("coin", 0) + k.get("wallet", 0)
+            lines.append(f"  {d:%d.%m}: {k.get('coin', 0):,} · {k.get('wallet', 0):,} · {k.get('service', 0):,} · "
+                         f"{k.get('create', 0) + k.get('migrate', 0):,} → {paid * PP_SOL_PER_MSG:.3f} SOL"
+                         + (f" (${paid * PP_SOL_PER_MSG * price:,.0f})" if price else "")
+                         + (f"; со служебными {(paid + k.get('service', 0)) * PP_SOL_PER_MSG:.3f}" if k.get("service")
+                            else ""))
     full = [r for r in rows if int(r["hours"]) >= 20]
     if full:
         avg = sum(int(r["trades"]) for r in full) / len(full)

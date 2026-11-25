@@ -27,6 +27,7 @@ from ..solana import PUMP_PROGRAM
 from .pump_parser import ParseStats, parse_transaction
 from .rpc import RpcError, SolanaRpc
 from .reserves import ReserveSource, Target, curve_mc, pool_mc, token_amount
+from .pumpdata import PumpDataStream
 from .sources import HeliusSource, LogsSource, PumpPortalSource, Source, WatchSource
 
 log = logging.getLogger(__name__)
@@ -71,6 +72,16 @@ class Receiver:
         self.max_extend_s = 3600 * float(rel.get("trade_extend_max_h", 6))
         self.pp = PumpPortalSource(env.pumpportal_ws, env.pumpportal_api_key, self.window_s / 60,
                                    keep=self.keep_mint)
+        self.pp.on_raw = lambda kind: self._count("pp_raw_" + kind, trades=1)   # 27.11: за что платим (ppcost)
+        # 27.11 (владелец): кошельки — только через слежку Helius; подписка PumpPortal на кошельки (боты вроде ASqDbh —
+        # десятки тысяч платных сообщений) по умолчанию выключена
+        self.pp_accounts = bool(rel.get("pumpportal_accounts", False))
+        # 27.11: весь рынок из pumpdata.fun — своя таблица market_trades (охотник и модели), не в сигналы бота
+        self.pumpdata: PumpDataStream | None = None
+        if env.pumpdata_api_key:
+            self.pumpdata = PumpDataStream(db, env.pumpdata_ws, env.pumpdata_api_key,
+                                           float(rel.get("pumpdata_min_sol", 0.2)),
+                                           on_rows=lambda n: self._count("pumpdata", trades=n))
         self.sources: list[Source] = [self.pp]
         self.helius: HeliusSource | None = None
         if env.helius_ws_url:
@@ -845,6 +856,7 @@ class Receiver:
                     "SELECT address FROM scout WHERE status = 'probation'")} - {r["address"] for r in await self.db.fetch(
                     "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist")}
                 self.tracked_wallets = wallets
+                pp_wallets = wallets if self.pp_accounts else set()
                 self.tracked_mints = {r["mint"] for r in await self.db.fetch(
                     """SELECT mint FROM alerts WHERE created_at > now() - interval '1 day'
                        UNION SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())
@@ -853,7 +865,7 @@ class Receiver:
                 await self.watch_targets()
                 for s in self.sources:
                     if isinstance(s, PumpPortalSource):
-                        await s.set_accounts(wallets)
+                        await s.set_accounts(pp_wallets)
                         tokens = await self.db.fetch(
                             "SELECT address FROM watchlist WHERE kind='token' AND (until IS NULL OR until > now())")
                         if tokens:
@@ -912,6 +924,7 @@ class Receiver:
                     "devs": len(self.watch_devs), "reconnects": self.watch.reconnects,
                     "fallback": self.watch.on_fallback, "last_error": self.watch.last_error},
                 "rpc_fallback": self.rpc.on_fallback,
+                "pumpdata": None if self.pumpdata is None else self.pumpdata.health(),
                 "reserves": None if self.reserves is None else {
                     "connected": self.reserves.connected, **self.reserves.counts(),
                     "mb_today": round(usage.get("bytes_reserves", 0) / 1e6, 1), "capped": self.reserve_capped,
@@ -967,6 +980,8 @@ class Receiver:
         await self.db.execute("DELETE FROM outbox WHERE sent_at < now() - interval '7 days'")
         await self.db.execute("DELETE FROM reserve_ticks WHERE ts < now() - make_interval(days => $1)", days)
         await self.db.execute("DELETE FROM reserve_cover WHERE ended_at < now() - make_interval(days => $1)", days)
+        await self.db.execute("DELETE FROM market_trades WHERE ts < now() - make_interval(days => $1)",
+                              int(self.settings.reliability().get("market_trades_days", 7)))
 
     async def run(self) -> None:
         await self.load_known_mints()
@@ -981,6 +996,9 @@ class Receiver:
             tasks.append(asyncio.create_task(self.watch.run(self.enqueue), name="watch"))
         if self.reserves is not None:
             tasks.append(asyncio.create_task(self.reserves.run(self.enqueue), name="reserves"))
+        if self.pumpdata is not None:
+            tasks += [asyncio.create_task(self.pumpdata.run(), name="pumpdata"),
+                      asyncio.create_task(self.pumpdata.flush_loop(), name="pumpdata-flush")]
         tasks += [asyncio.create_task(c()) for c in (
             self.worker, self.flush_loop, self.slot_loop, self.slot_research_loop, self.watchdog_loop, self.coverage_loop,
             self.accounts_loop, self.health_loop, self.retention_loop, self.extend_loop, self.backfill_worker)]

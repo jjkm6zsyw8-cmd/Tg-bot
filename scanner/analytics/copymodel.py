@@ -352,7 +352,13 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]]) -> dict[s
                   t.source
            FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
            JOIN trades t ON t.mint = p.mint AND t.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi) AND t.mc_sol > 0
-           ORDER BY p.mint, t.ts""", mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints])
+           UNION ALL
+           SELECT p.mint, extract(epoch FROM m.ts), m.mc_sol, m.slot, m.trader, m.is_buy, m.sol_amount, m.pool,
+                  'pumpdata'
+           FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
+           JOIN market_trades m ON m.mint = p.mint AND m.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi)
+                AND m.mc_sol > 0
+           ORDER BY 1, 2""", mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints])
     out: dict[str, list[Tick]] = {}
     for r in rows:
         pool = r["pool"] or "pump"
@@ -445,9 +451,15 @@ async def wallet_trades(db: Any, address: str, since: float, until: float | None
     from datetime import datetime, timezone
     lo = datetime.fromtimestamp(since, timezone.utc)
     hi = datetime.fromtimestamp(until, timezone.utc) if until else datetime.now(timezone.utc)
+    # 27.11: плюс весь рынок из pumpdata.fun (market_trades); та же сделка из обоих источников — один раз (по блоку)
     rows = await db.fetch(
         """SELECT mint, extract(epoch FROM ts) AS ts, is_buy, sol_amount, token_amount, slot FROM trades
-           WHERE trader = $1 AND ts >= $2 AND ts <= $3 ORDER BY ts""", address, lo, hi)
+           WHERE trader = $1 AND ts >= $2 AND ts <= $3
+           UNION ALL
+           SELECT m.mint, extract(epoch FROM m.ts), m.is_buy, m.sol_amount, m.token_amount, m.slot FROM market_trades m
+           WHERE m.trader = $1 AND m.ts >= $2 AND m.ts <= $3 AND NOT EXISTS (
+               SELECT 1 FROM trades t WHERE t.trader = $1 AND t.mint = m.mint AND t.slot = m.slot AND t.is_buy = m.is_buy)
+           ORDER BY 2""", address, lo, hi)
     return [{"mint": r["mint"], "ts": float(r["ts"]), "is_buy": r["is_buy"], "sol": r["sol_amount"],
              "tokens": r["token_amount"], "slot": r["slot"]} for r in rows]
 

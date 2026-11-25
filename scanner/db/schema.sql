@@ -720,6 +720,23 @@ CREATE TABLE IF NOT EXISTS hunter_copies (
     stake    double precision,
     PRIMARY KEY (address, mint, entry_at)
 );
+-- 27.11: весь рынок из pumpdata.fun (ingest/pumpdata.py) — только охотник и модели, в сигналы бота не идёт
+CREATE TABLE IF NOT EXISTS market_trades (
+    slot         bigint NOT NULL,
+    idx          integer NOT NULL,
+    ts           timestamptz NOT NULL,
+    mint         text NOT NULL,
+    trader       text NOT NULL,
+    is_buy       boolean NOT NULL,
+    sol_amount   double precision,
+    token_amount double precision,
+    mc_sol       double precision,
+    pool         text,
+    PRIMARY KEY (slot, idx)
+);
+CREATE INDEX IF NOT EXISTS market_trades_trader_idx ON market_trades (trader, ts);
+CREATE INDEX IF NOT EXISTS market_trades_mint_idx ON market_trades (mint, ts);
+CREATE INDEX IF NOT EXISTS market_trades_ts_idx ON market_trades (ts);
 -- 27.11: отсев ферм (analytics/farm.py): причина и когда проверен
 ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS farm text;
 ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS farm_at timestamptz;

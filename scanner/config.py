@@ -30,6 +30,9 @@ class Env(BaseSettings):
 
     pumpportal_ws: str = "wss://pumpportal.fun/api/data"
     pumpportal_api_key: str = ""
+    # 27.11: живой поток всего рынка pumpdata.fun — только для охотника и моделей (ключ: регистрация на pumpdata.fun)
+    pumpdata_api_key: str = ""
+    pumpdata_ws: str = "wss://pumpdata.fun/stream"
     helius_api_key: str = ""
     helius_ws: str = ""  # Enhanced WebSockets (платный Helius), напр. wss://atlas-mainnet.helius-rpc.com/?api-key=...
     logs_ws: str = ""    # websocket для logsSubscribe; по умолчанию выводится из RPC_URL (https → wss)

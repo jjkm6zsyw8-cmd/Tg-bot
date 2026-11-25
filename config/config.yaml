@@ -139,7 +139,10 @@ reliability:
   tracked_trades_days: 30          # 26.11: сделки отслеживаемых кошельков (свой список, охотник) — 30 дней
   reserve_daily_mb: 150            # резервы монет: трафик за сутки
   reserve_coin_daily_mb: 3         # 26.11: и на одну монету за сутки
-  pumpportal_trade_window_min: 60   # сколько минут держать подписку на сделки новой монеты
+  trade_window_min: 30              # сколько минут держать подписку PumpPortal на сделки новой монеты (ТЗ: 30)
+  pumpportal_accounts: false        # 27.11: подписка PumpPortal на сделки кошельков (платно) — выкл., кошельки ведёт Helius
+  pumpdata_min_sol: 0.2             # 27.11: поток pumpdata.fun (PUMPDATA_API_KEY) — сделки от стольких SOL
+  market_trades_days: 7             # и сколько дней их хранить (охотник смотрит 72 ч)
   withdrawal_poll_s: 15
   withdrawal_hops: 3
   exchange_tx_heuristic: 1000       # столько подписей за <1 ч — считаем биржей/сервисом
