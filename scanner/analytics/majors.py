@@ -131,6 +131,7 @@ class Majors:
             data = {"modes": ["major"], "symbol": str(x.get("symbol") or "")[:20], "trend_at": now, "trigger_at": now,
                     "age_s": a * 3600,
                     "trend": {"liq": _f(x.get("liquidity")), "holders": int(_f(x.get("holderCount"))),
+                              "pair": (x.get("firstPool") or {}).get("id"),
                               "organic": x.get("organicScoreLabel"), "mcap": _f(x.get("mcap")),
                               "pc_m5": _f((x.get("stats5m") or {}).get("priceChange")),
                               "pc_h1": _f((x.get("stats1h") or {}).get("priceChange"))}}

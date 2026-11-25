@@ -239,6 +239,13 @@ async def run_tool(cmd: str, db: Database) -> None:
         lo = dates[0] if dates else datetime(2026, 11, 10, tzinfo=timezone.utc)
         hi = dates[1] if len(dates) > 1 else datetime(2026, 11, 18, tzinfo=timezone.utc)
         print(await control_text(db, wallet, lo.timestamp(), hi.timestamp()))
+    elif cmd == "jupcheck":
+        # 25.11: сделки других бирж с фильтрами входа (LP закрыт / сожжён, пул старше N ч): python -m scanner jupcheck
+        # [--days N] [--lp 0.9]
+        from .real.jupcheck import run as jup_run
+        days = float(args[args.index("--days") + 1]) if "--days" in args else None
+        lp = float(args[args.index("--lp") + 1]) if "--lp" in args else 0.9
+        print(await jup_run(db, lp, days))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

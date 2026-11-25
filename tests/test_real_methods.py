@@ -13,6 +13,8 @@ from scanner.real.executor import kinds_of
 from tests.real_helpers import FakeChain, pk
 from tests.test_real import MINT, _fast, db, engine, fire, live, only, shadow, skipped, trade  # noqa: F401 — фикстуры
 from tests.test_real_wallets import make_desk
+# 25.11: фильтры входа других бирж (LP, возраст пула) проверяются в test_real_jupiter — здесь механика котировок
+NO_JUP_FILTERS = {"real_jup_min_lp_locked": 0.0, "real_jup_min_pool_age_h": 0}
 
 
 def test_kinds_of_signal_by_paper_route():
@@ -717,7 +719,8 @@ async def test_trend_on_other_dex_goes_to_jupiter_shadow(db, monkeypatch):
     other = pk("raydium-coin")                                 # нет ни кривой, ни пула PumpSwap
     from scanner.real import pump as _pump
     chain.programs[str(other)] = _pump.TOKEN                   # монета есть в сети, но торгуется на другой бирже
-    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=True, real_scheme_trendj="G")
+    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=True, real_scheme_trendj="G",
+                **NO_JUP_FILTERS)
 
     class Ext:
         price = 0.0002                                         # $ за токен → MC = 0.0002 × 1e9 / 150 ≈ 1333 SOL
@@ -763,7 +766,7 @@ async def test_trendj_real_jupiter_quotes_and_rule_u(db):
     other = pk("meteora-coin")
     from scanner.real import pump as _pump
     chain.programs[str(other)] = _pump.TOKEN
-    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=False)
+    tr = shadow(db, chain, real_max_open=10, real_shadow_all=True, real_rule_trials=False, **NO_JUP_FILTERS)
     calls = []
 
     class Ext:
@@ -862,7 +865,7 @@ async def test_only_trendj_enabled_still_gets_trend_signals(db):
     chain.programs[str(other)] = _pump.TOKEN
     chain.add_curve(pumpc, 40.0)
     flags = {S.METHODS[k][1]: False for k in S.METHODS}
-    tr = shadow(db, chain, real_max_open=10, real_shadow_all=False, **{**flags, "real_trendj": True})
+    tr = shadow(db, chain, real_max_open=10, real_shadow_all=False, **{**flags, "real_trendj": True, **NO_JUP_FILTERS})
 
     class Ext:
         async def jup_price(self, mint, ttl=None):

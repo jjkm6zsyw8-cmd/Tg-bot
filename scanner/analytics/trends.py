@@ -573,7 +573,7 @@ class Trends:
             "exit_rule": "Выход при развороте (продажи > покупок)",
             "trend": {"pc_m5": pi.pc_m5, "buys": pi.buys_m5, "sells": pi.sells_m5, "vol_m5": pi.vol_m5,
                       "liq": pi.liq_usd, "boosts": boosts, "pc_h1": pi.pc_h1, "mc_usd": pi.mc_usd,
-                      "age_h": pi.age_h, "buyers": buyers, "sellers": sellers,
+                      "age_h": pi.age_h, "buyers": buyers, "sellers": sellers, "pair": pi.pair, "dex": pi.dex,
                       "pullback": extra.get("pullback"), "holders": {k: v for k, v in hs.items() if k != "funder"}},
         }
         if extra.get("x"):

@@ -132,6 +132,13 @@ NO_ROUTE_KEEP_S = 1800.0              # монета без маршрута: с
 NO_ROUTE_RETRY_S = 30.0               # бой: покупателей нет — повтор продажи через столько
 NO_ROUTE_ALERT_S = 1800.0             # …и напоминание владельцу не чаще раза в столько
 STALE_ALERT_REPEAT_S = 1800.0         # бой: цена позиции не обновляется — повтор алерта не чаще раза в столько
+# 25.11 (владелец): после рага — создатели монеты и пула в чёрный список; их монеты не берём ни в тень, ни в бой.
+# Раг = Jupiter не находит маршрут продажи и через RUG_CONFIRM_S — снова не находит
+RUG_CREATORS_KEY = "real:rug_creators"   # {адрес: {"mint", "symbol", "role", "ts"}}
+RUG_CONFIRM_S = 45.0
+POOL_SIG_PAGES = 5                    # создатель пула — подписант первой транзакции пула (до 5 × 1000 подписей назад)
+_RUG_SEEN: set[str] = set()           # монеты, по которым раг уже разобран (общий для всех кошельков бота)
+_BACKFILL = {"started": False}        # разбор прошлых рагов — один раз на запуск
 # 24.11: плюс «заблокированных» пулов в бумаге дали клоны (JENSEN, Green cat, MARS…): пул PumpSwap с заблокированной
 # ликвидностью, но 9–31 держатель — создатель продаёт свои монеты в пул и выкачивает весь SOL. На деньги — только монеты
 # с живой аудиторией: держателей от TRENDJ_MIN_HOLDERS и топ-10 (без пулов и локеров) не больше TRENDJ_MAX_TOP10
@@ -367,6 +374,9 @@ class RealTrader:
             await self.load_autotune()
         except Exception:  # noqa: BLE001
             self.follow = {}
+        if not _BACKFILL["started"] and getattr(self.e, "ext", None) is not None:
+            _BACKFILL["started"] = True
+            asyncio.create_task(self._rug_backfill_safe())
         for r in await self.db.fetch("SELECT * FROM real_positions WHERE closed_at IS NULL AND wallet_id IS NOT DISTINCT FROM $1", self.wid):
             ex = dict(r["extra"] or {})
             ex.update(mode=r["mode"], kind=r["kind"], venue=r["venue"], token_program=r["token_program"],
@@ -508,6 +518,7 @@ class RealTrader:
             paper.rug_devs.add(dev)
 
     async def load_follow(self) -> None:
+        self.rug_creators = dict(await self.db.kv_get(RUG_CREATORS_KEY) or {})
         self.follow = dict(await self.db.kv_get("real:follow") or {})
         self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
         self.follow_rule = dict(await self.db.kv_get("real:follow_rule") or {})
@@ -1055,17 +1066,25 @@ class RealTrader:
             mode = "shadow"                            # «на деньги — только выбранные мной кошельки»
         ext = getattr(self.e, "ext", None)
         # 24.11: заблокирована ли ликвидность пула (RugCheck). 0% — создатель может вынуть деньги в любую секунду:
-        # так ушли обе боевые покупки ($b, Slingoor). Меряем у каждого входа (тень делит итог по этому признаку),
-        # на деньги — только от real_trendj_live_min_lp_locked
+        # так ушли обе боевые покупки ($b, Slingoor = позиции 1847 и 1863). 25.11 (владелец): не заблокирован и не
+        # сожжён, пул моложе real_jup_min_pool_age_h, создатель уже рагал — НЕ входим ни в тень, ни в бой
         rc = await ext.rug_report(mint_s) if ext is not None and hasattr(ext, "rug_report") else None
+        creator = (rc or {}).get("creator")
+        bad = self.rug_creator(creator)
+        if bad:
+            return self._skip(mode, kind, f"создатель монеты уже рагал ({bad}) — не вхожу")
         lp_locked = (rc or {}).get("lp_locked_pct")
         lp_locked = float(lp_locked) / 100 if lp_locked is not None else None
-        min_lp = float(self.get("real_trendj_live_min_lp_locked"))
-        if mode == "live" and min_lp > 0 and (lp_locked is None or lp_locked < min_lp):
-            self._skip("live", kind, "ликвидность пула не заблокирована" + (f" ({lp_locked:.0%})" if lp_locked is not None
-                                                                           else " (RugCheck не ответил)")
-                       + " — создатель может вынуть деньги: на деньги не беру, меряю в тени")
-            mode = "shadow"
+        min_lp = float(self.get("real_jup_min_lp_locked"))
+        if min_lp > 0 and (lp_locked is None or lp_locked < min_lp):
+            return self._skip(mode, kind, "LP пула не заблокирован и не сожжён"
+                              + (f" ({lp_locked:.0%})" if lp_locked is not None else " (RugCheck не ответил)")
+                              + " — создатель может вынуть SOL: не вхожу")
+        age_s = data.get("age_s")
+        min_age_h = float(self.get("real_jup_min_pool_age_h"))
+        if min_age_h > 0 and (age_s is None or float(age_s) < min_age_h * 3600):
+            return self._skip(mode, kind, f"пул моложе {min_age_h:g} ч ("
+                              + (fmt.ago(float(age_s)) if age_s is not None else "возраст неизвестен") + ") — не вхожу")
         # 24.11: и права у создателя: заморозка (запретит продать) и допечатка (обвалит цену) — тоже скам
         danger = [n for n, k in (("может заморозить токены", "freeze_authority"),
                                  ("может допечатать токены", "mint_authority")) if (rc or {}).get(k)]
@@ -1078,13 +1097,6 @@ class RealTrader:
             danger.append(f"топ-10 держат {float(top10):.0%}")
         if mode == "live" and danger:
             self._skip("live", kind, "создатель " + ", ".join(danger) + " — на деньги не беру, меряю в тени")
-            mode = "shadow"
-        age_s = data.get("age_s")
-        min_age = float(self.get("real_trendj_live_min_age_min"))
-        if mode == "live" and age_s is not None and float(age_s) < min_age * 60:
-            # 24.11: свежий пул (минуты от создания) — частый скам: ликвидность забирают через минуты ($b)
-            self._skip("live", kind, f"монета моложе {min_age:g} мин ({float(age_s) / 60:.0f} мин) — на деньги не "
-                                     "беру, меряю в тени")
             mode = "shadow"
         if mode == "live":
             # проверки боя (лимиты, дневной стоп, замок прибыли, покупок в час) — уже как у метода trendj
@@ -1113,7 +1125,8 @@ class RealTrader:
                 "best_exit": None, "followed": False, "fast": False, "detect_ms": None,
                 "age_s": round(float(age_s)) if age_s is not None else None,
                 "liq": (data.get("trend") or {}).get("liq"), "lp_locked": lp_locked,
-                "holders": holders, "top10": top10,
+                "holders": holders, "top10": top10, "creator": creator,
+                "pool": (rc or {}).get("market") or (data.get("trend") or {}).get("pair"),
                 "market": (rc or {}).get("market_type"), "target_mc": None, "dec": dec}
         if mode == "live":
             if dec is None:
@@ -1152,7 +1165,7 @@ class RealTrader:
             return None, "нет доступа к Jupiter"
         q = await ext.jup_quote_full(in_mint, out_mint, int(amount), int(round(slip * 10_000)))
         if q and q.get("no_route"):
-            self._mark_no_route(in_mint if out_mint == SOL_MINT else out_mint)
+            self._mark_no_route(in_mint, int(amount)) if out_mint == SOL_MINT else self._mark_no_route(out_mint)
             return None, NO_ROUTE
         if not q or int(q.get("outAmount") or 0) <= 0:
             return None, "Jupiter не дал котировку"
@@ -1578,17 +1591,153 @@ class RealTrader:
                               if time.time() - v[0] < 2.0}
             self._jq_cache[key] = (time.time(), q)
         if q and q.get("no_route"):
-            self._mark_no_route(p.mint)
+            self._mark_no_route(p.mint, amount)
             return 0.0, 0.0                            # продать некому — выручка ноль (честно, а не «по последней цене»)
         if not q or q["out"] <= 0:
             return None
         sol = q["out"] / 1e9
         return max(0.0, sol - self.fees_sol()), sol / (raw6 / 1e6) * 1e9
 
-    def _mark_no_route(self, mint: str) -> None:
+    def _mark_no_route(self, mint: str, amount: int | None = None) -> None:
         if not hasattr(self, "_no_route"):
             self._no_route: dict[str, float] = {}
+        new = mint not in self._no_route
         self._no_route.setdefault(mint, time.time())
+        if new and amount and mint not in _RUG_SEEN:
+            # проверка через RUG_CONFIRM_S: маршрута всё ещё нет — раг, создатели — в чёрный список
+            asyncio.create_task(self._rug_confirm_safe(mint, int(amount)))
+
+    def rug_creator(self, addr: str | None) -> str | None:
+        """Адрес в чёрном списке рагов: «создатель пула $SYM» — или None."""
+        x = (getattr(self, "rug_creators", None) or {}).get(addr or "")
+        return f"создатель {x.get('role') or 'монеты'} ${x.get('symbol') or '?'}" if x else None
+
+    async def _rug_confirm_safe(self, mint: str, amount: int, delay: float | None = None) -> None:
+        try:
+            await self._rug_confirm(mint, amount, RUG_CONFIRM_S if delay is None else delay)
+        except Exception:  # noqa: BLE001 — чёрный список не должен мешать торговле
+            log.exception("реальный бот: проверка рага %s", mint)
+
+    async def _rug_confirm(self, mint: str, amount: int, delay: float, quiet: bool = False) -> bool:
+        ext = getattr(self.e, "ext", None)
+        if ext is None or not hasattr(ext, "jup_quote"):
+            return False
+        for _ in range(3):
+            await asyncio.sleep(delay)
+            q = await ext.jup_quote(mint, SOL_MINT, amount)
+            if q is not None:
+                break
+            delay = max(delay, 10.0)                  # котировки нет (лимит, сеть) — ещё раз
+        if not (q and q.get("no_route")):
+            getattr(self, "_no_route", {}).pop(mint, None)   # маршрут вернулся — не раг
+            return False
+        await self._blacklist_rug(mint, quiet)
+        return True
+
+    async def _rug_meta(self, mint: str) -> dict[str, Any]:
+        """Создатель монеты, адрес пула и символ: из открытых позиций и проб, иначе из базы."""
+        for p in [*self.positions.values(), *self.trials.values()]:
+            if p.mint == mint and (p.extra.get("creator") or p.extra.get("pool")):
+                return {"creator": p.extra.get("creator"), "pool": p.extra.get("pool"), "symbol": p.symbol}
+        r = await self.db.fetchrow(
+            """SELECT symbol, extra->>'creator' AS creator, extra->>'pool' AS pool FROM real_positions WHERE mint = $1
+               ORDER BY (extra ? 'creator') DESC, id DESC LIMIT 1""", mint)
+        meta = {"creator": r["creator"], "pool": r["pool"], "symbol": r["symbol"]} if r else {}
+        if not meta.get("creator") or not meta.get("pool"):
+            ext = getattr(self.e, "ext", None)
+            rc = await ext.rug_report(mint) if ext is not None and hasattr(ext, "rug_report") else None
+            meta["creator"] = meta.get("creator") or (rc or {}).get("creator")
+            meta["pool"] = meta.get("pool") or (rc or {}).get("market")
+        return meta
+
+    async def _pool_creator(self, pool: str | None) -> str | None:
+        """Кто создал пул: подписант (плательщик) самой первой транзакции пула. Пул с историей длиннее
+        POOL_SIG_PAGES × 1000 транзакций — не ищем (None)."""
+        if not pool or self.chain is None or not hasattr(self.chain, "_call"):
+            return None
+        try:
+            Pubkey.from_string(pool)
+        except Exception:  # noqa: BLE001
+            return None
+        before, oldest = None, None
+        for _ in range(POOL_SIG_PAGES):
+            opts: dict[str, Any] = {"limit": 1000, "commitment": "confirmed"}
+            if before:
+                opts["before"] = before
+            rows = await self.chain._call("getSignaturesForAddress", [pool, opts])
+            if not rows:
+                break
+            oldest = rows[-1]["signature"]
+            if len(rows) < 1000:
+                break
+            before = oldest
+        else:
+            return None
+        if not oldest:
+            return None
+        info = await self.chain.transaction(oldest, tries=2)
+        keys = ((info or {}).get("transaction") or {}).get("message", {}).get("accountKeys") or []
+        first = keys[0] if keys else None
+        return (first.get("pubkey") if isinstance(first, dict) else first) or None
+
+    async def _blacklist_rug(self, mint: str, quiet: bool = False) -> list[str]:
+        """Раг подтверждён: создатель монеты (RugCheck) и создатель пула (первая транзакция пула) — в чёрный список."""
+        if mint in _RUG_SEEN:
+            return []
+        _RUG_SEEN.add(mint)
+        meta = await self._rug_meta(mint)
+        try:
+            pool_creator = await self._pool_creator(meta.get("pool"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("реальный бот: создатель пула %s: %s", meta.get("pool"), str(exc)[:120])
+            pool_creator = None
+        found: dict[str, str] = {}
+        if meta.get("creator"):
+            found[meta["creator"]] = "монеты"
+        if pool_creator:
+            found[pool_creator] = "монеты и пула" if pool_creator in found else "пула"
+        sym = meta.get("symbol") or "?"
+        bl = dict(await self.db.kv_get(RUG_CREATORS_KEY) or {})
+        for addr, role in found.items():
+            bl[addr] = {"mint": mint, "symbol": sym, "role": role, "ts": time.time()}
+        if found:
+            await self.db.kv_set(RUG_CREATORS_KEY, bl)
+        self.rug_creators = bl
+        if not quiet:
+            who = ", ".join(f"создатель {role} <code>{a}</code>" for a, role in found.items()) or \
+                "создателя не нашёл (RugCheck не ответил, у пула длинная история)"
+            await self._say(f"⛔ Раг ${fmt.esc(sym)}: Jupiter не находит покупателей и через {RUG_CONFIRM_S:.0f} с — SOL "
+                            f"из пула вынули. В чёрный список: {who}. Их монеты больше не беру ни в тень, ни в бой. "
+                            f"Монета: <code>{mint}</code>")
+        return list(found)
+
+    async def rug_backfill(self) -> str:
+        """Разовый разбор прошлых рагов (позиции других бирж, закрытые как rug за DEAD_DAYS): если Jupiter и сейчас не
+        находит покупателей — создатели в чёрный список."""
+        rows = await self.db.fetch(
+            """SELECT DISTINCT ON (mint) mint, symbol, cost_sol, entry_mc, (extra->>'dec')::int AS dec
+               FROM real_positions WHERE venue = $1 AND exit_reason IN ('rug', 'rug_back')
+                 AND closed_at > now() - make_interval(days => $2) ORDER BY mint, id DESC""", JUP_VENUE, DEAD_DAYS)
+        listed = {v.get("mint") for v in (await self.db.kv_get(RUG_CREATORS_KEY) or {}).values()}
+        added, checked = [], 0
+        for r in rows:
+            if r["mint"] in listed or r["mint"] in _RUG_SEEN or not r["entry_mc"] or r["dec"] is None:
+                continue
+            checked += 1
+            amount = int(float(r["cost_sol"]) / float(r["entry_mc"]) * 1e9 * 10 ** int(r["dec"]))
+            if amount > 0 and await self._rug_confirm(r["mint"], amount, 0.0, quiet=True):
+                added.append(f"${r['symbol'] or '?'}")
+        text = f"прошлых рагов проверено {checked}, подтверждено (покупателей нет и сейчас): {len(added)} {' '.join(added)}"
+        if added:
+            n = len(await self.db.kv_get(RUG_CREATORS_KEY) or {})
+            await self._say(f"⛔ Чёрный список создателей после рагов: {text.strip()}. Всего адресов в списке: {n}.")
+        return text
+
+    async def _rug_backfill_safe(self) -> None:
+        try:
+            log.info("реальный бот: %s", await self.rug_backfill())
+        except Exception:  # noqa: BLE001
+            log.exception("реальный бот: разбор прошлых рагов")
 
     def no_route(self, mint: str) -> bool:
         """Jupiter недавно не нашёл покупателей этой монеты (ликвидность убрали)."""
@@ -1615,7 +1764,8 @@ class RealTrader:
              "followed": base.get("followed", False), "fast": base.get("fast", False),
              "detect_ms": base.get("detect_ms"), "age_s": base.get("age_s"), "target_mc": base.get("target_mc"),
              "dec": base.get("dec"), "liq": base.get("liq"), "lp_locked": base.get("lp_locked"),
-             "market": base.get("market"), "holders": base.get("holders"), "top10": base.get("top10")},
+             "market": base.get("market"), "holders": base.get("holders"), "top10": base.get("top10"),
+             "creator": base.get("creator"), "pool": base.get("pool")},
             self.wid)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee_sol,
@@ -1632,7 +1782,7 @@ class RealTrader:
             extra={"mode": base["mode"], "kind": base["kind"], "venue": base["venue"],
                    "token_program": base["token_program"], "tokens_raw": tokens_raw, "rent": rent_sol,
                    "last_mc": entry_mc, "entry_slot": slot, "best_exit": base.get("best_exit"),
-                   "dec": base.get("dec")})
+                   "dec": base.get("dec"), "creator": base.get("creator"), "pool": base.get("pool")})
         if self.get("real_rule_trials"):
             try:
                 await self._open_trials(base, pid, entry_mc, cost_sol - rent_sol, tokens_raw, slot)

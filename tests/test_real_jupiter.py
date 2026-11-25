@@ -46,6 +46,7 @@ class Ext:
         self.rugged = False                     # ликвидность забрали: продать некому (Jupiter «маршрута нет»)
         self.lp_locked: float | None = 100.0    # RugCheck: заблокировано ликвидности главного пула, %
         self.holders = 1500                     # RugCheck: держателей
+        self.creator = str(pk("dev-honest"))    # RugCheck: создатель монеты
         self.quotes: list[tuple[str, str, int]] = []
 
     def usd(self, mint: str) -> float:
@@ -59,7 +60,7 @@ class Ext:
 
     async def rug_report(self, mint):
         return {"lp_locked_pct": self.lp_locked, "market_type": "meteora_damm_v2", "total_holders": self.holders,
-                "top10_pct": 0.2}
+                "top10_pct": 0.2, "creator": self.creator, "market": str(pk("pool-" + str(mint)[:6]))}
 
     async def jup_prices(self, mints, ttl=3.0):
         return {m: self.usd(m) for m in mints}
@@ -111,10 +112,11 @@ def other_coin(chain: FakeChain, seed: str = "ray-live") -> Pubkey:
     return m
 
 
-async def signal(tr, mint: Pubkey, aid: int = 9, age_s: float | None = None) -> None:
+async def signal(tr, mint: Pubkey, aid: int = 9, age_s: float | None = 30 * 3600.0) -> None:
+    """Сигнал тренда другой биржи; по умолчанию пул живёт 30 ч (25.11: моложе real_jup_min_pool_age_h — не входим)."""
     data = {"modes": ["trend"], "symbol": "RAY", "trend_at": time.time(), "trigger_at": time.time()}
     if age_s is not None:
-        data.update(age_s=age_s, trend={"liq": 12_000.0})
+        data.update(age_s=age_s, trend={"liq": 12_000.0, "pair": str(pk("pool-" + str(mint)[:6]))})
     await tr.on_signal(str(mint), "normal", aid, data, None, {"T"})
 
 
@@ -542,39 +544,46 @@ async def test_price_from_quote_when_price_api_is_silent(db, monkeypatch):
         assert p.extra["price_at"] == p2_at and tr.no_route(p.mint)
 
 
-async def test_live_only_for_coins_older_than_limit(db, monkeypatch):
-    """Свежий пул (минуты от создания) — на деньги не берём, меряем в тени; старше лимита — бой."""
+async def test_young_pool_is_never_entered(db, monkeypatch):
+    """25.11 (владелец): 1847 и 1863 — пулы Meteora за 2–5 мин до покупки. Пул моложе real_jup_min_pool_age_h —
+    не входим ни в бой, ни в тень; возраст неизвестен — тоже не входим."""
     chain = FakeChain()
-    tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_jup_dry_run=False)
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_jup_dry_run=False, real_jup_min_pool_age_h=6)
     tr.e.ext = Ext(chain)
     await tr.start()
-    young, old = other_coin(chain, "young"), other_coin(chain, "old")
+    young, mid, old, unknown = (other_coin(chain, s) for s in ("young", "mid", "old", "unknown"))
     await signal(tr, young, aid=1, age_s=180)
-    await signal(tr, old, aid=2, age_s=3 * 3600)
+    await signal(tr, mid, aid=2, age_s=3 * 3600)
+    await signal(tr, old, aid=3, age_s=7 * 3600)
+    await signal(tr, unknown, aid=4, age_s=None)
     modes = {p.mint: p.extra["mode"] for p in tr.positions.values()}
-    assert modes == {str(young): "shadow", str(old): "live"}, dict(tr.skips)
-    assert skipped(tr, "монета моложе 60 мин (3 мин) — на деньги не беру, меряю в тени")
-    row = await db.fetchrow("SELECT extra FROM real_positions WHERE mint = $1", str(young))
-    assert row["extra"]["age_s"] == 180 and row["extra"]["liq"] == 12_000.0
+    assert modes == {str(old): "live"}, dict(tr.skips)
+    assert skipped(tr, "пул моложе 6 ч (3м) — не вхожу") and skipped(tr, "пул моложе 6 ч (3ч00м) — не вхожу")
+    assert skipped(tr, "пул моложе 6 ч (возраст неизвестен) — не вхожу")
+    row = await db.fetchrow("SELECT extra FROM real_positions WHERE mint = $1", str(old))
+    assert row["extra"]["age_s"] == 7 * 3600 and row["extra"]["liq"] == 12_000.0
 
 
-
-async def test_live_only_when_pool_liquidity_is_locked(db, monkeypatch):
-    """24.11: обе боевые покупки ($b, Slingoor) — пулы Meteora DAMM v2 с ликвидностью, заблокированной на 0%: создатель
-    вынул деньги через секунды. На деньги — только если заблокировано от 90%; иначе — тень (меряем)."""
+async def test_only_locked_or_burned_lp_is_entered(db, monkeypatch):
+    """24.11: обе боевые покупки ($b, Slingoor = 1847, 1863) — пулы Meteora DAMM v2 с LP, заблокированным на 0%:
+    создатель вынул SOL через минуты. 25.11: LP не заблокирован и не сожжён (или RugCheck не ответил) — не входим ни
+    в бой, ни в тень."""
     chain = FakeChain()
     tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_jup_dry_run=False)
     tr.e.ext = ext = Ext(chain)
     await tr.start()
     ext.lp_locked = 0.0
     await signal(tr, other_coin(chain, "unlocked"), aid=1)
+    ext.lp_locked = None
+    await signal(tr, other_coin(chain, "unknown-lp"), aid=5)
     ext.lp_locked = 100.0
     await signal(tr, other_coin(chain, "locked"), aid=2)
     modes = sorted(p.extra["mode"] for p in tr.positions.values())
-    assert modes == ["live", "shadow"], dict(tr.skips)
-    assert skipped(tr, "ликвидность пула не заблокирована (0%) — создатель может вынуть деньги")
+    assert modes == ["live"], dict(tr.skips)
+    assert skipped(tr, "LP пула не заблокирован и не сожжён (0%) — создатель может вынуть SOL: не вхожу")
+    assert skipped(tr, "LP пула не заблокирован и не сожжён (RugCheck не ответил)")
     rows = {r["mint"]: dict(r["extra"]) for r in await db.fetch("SELECT mint, extra FROM real_positions")}
-    assert rows[str(pk("unlocked"))]["lp_locked"] == 0.0 and rows[str(pk("locked"))]["lp_locked"] == 1.0
+    assert list(rows) == [str(pk("locked"))] and rows[str(pk("locked"))]["lp_locked"] == 1.0
     assert rows[str(pk("locked"))]["market"] == "meteora_damm_v2"
     # ликвидность заблокирована, но у создателя право заморозки — тоже не на деньги
     async def frozen(mint):
@@ -634,3 +643,107 @@ async def test_live_skips_clone_with_few_holders(db, monkeypatch):
     assert skipped(tr, "мало держателей (25)")
     row = await db.fetchrow("SELECT extra FROM real_positions WHERE mint = $1", str(pk("clone")))
     assert row["extra"]["holders"] == 25 and row["extra"]["top10"] == 0.2
+
+
+# ====================================================================== 25.11: чёрный список создателей после рага
+def _pool_history(chain, creator: str):
+    """Поддельная история пула: 1500 подписей, самая первая (создание пула) подписана creator."""
+    sigs = [f"S{i:05d}" for i in range(1500)]                 # от новых к старым
+
+    async def call(method, params):
+        assert method == "getSignaturesForAddress"
+        before = params[1].get("before")
+        i = sigs.index(before) + 1 if before else 0
+        return [{"signature": s} for s in sigs[i:i + params[1]["limit"]]]
+    old_tx = chain.transaction
+
+    async def transaction(sig, tries=4):
+        if sig == sigs[-1]:
+            return {"transaction": {"message": {"accountKeys": [{"pubkey": creator, "signer": True}]}}}
+        return await old_tx(sig, tries)
+    chain._call, chain.transaction = call, transaction
+
+
+async def test_rug_blacklists_coin_and_pool_creators(db, monkeypatch):
+    """Раг (маршрута нет и через RUG_CONFIRM_S): создатель монеты (RugCheck) и создатель пула (подписант первой
+    транзакции пула) — в чёрный список; их следующая монета — ни в тень, ни в бой."""
+    monkeypatch.setattr(ex, "RUG_CONFIRM_S", 0.0)
+    monkeypatch.setattr(ex, "_RUG_SEEN", set())
+    chain = FakeChain()
+    coin, nxt, other = other_coin(chain, "rug-bl"), other_coin(chain, "rug-next"), other_coin(chain, "honest-next")
+    pool_dev = str(pk("pool-dev"))
+    _pool_history(chain, pool_dev)
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
+    tr.e.ext = ext = Ext(chain)
+    ext.creator = str(pk("dev-rugger"))
+    said = []
+
+    async def say(text):
+        said.append(text)
+    tr._say = say
+    await tr.start()
+    await signal(tr, coin)
+    p = only(tr)
+    assert p.extra["creator"] == ext.creator and p.extra["pool"]
+    ext.rugged = True
+    await tr._sell_jup_live(p, "max_hold", 1.0)
+    for _ in range(50):
+        await asyncio.sleep(0.02)
+        if await db.kv_get(ex.RUG_CREATORS_KEY):
+            break
+    bl = await db.kv_get(ex.RUG_CREATORS_KEY)
+    assert set(bl) == {ext.creator, pool_dev}
+    assert bl[ext.creator]["role"] == "монеты" and bl[pool_dev]["role"] == "пула" and bl[pool_dev]["mint"] == str(coin)
+    assert any("⛔ Раг" in t and pool_dev in t and "ни в тень, ни в бой" in t for t in said)
+    assert tr.positions                                         # позиция при этом остаётся открытой
+    ext.rugged = False
+    n = len(tr.positions)
+    await signal(tr, nxt, aid=2)                                # та же рука — не берём
+    assert len(tr.positions) == n and skipped(tr, "создатель монеты уже рагал (создатель монеты $RAY) — не вхожу")
+    ext.creator = pool_dev                                      # монета от создателя рагнувшего пула — тоже нет
+    await signal(tr, other_coin(chain, "pool-dev-coin"), aid=3)
+    assert len(tr.positions) == n and skipped(tr, "создатель монеты уже рагал (создатель пула $RAY)")
+    ext.creator = str(pk("dev-other"))
+    await signal(tr, other, aid=4)
+    assert len(tr.positions) == n + 1                           # другой создатель — как обычно
+
+
+async def test_route_back_is_not_a_rug(db, monkeypatch):
+    monkeypatch.setattr(ex, "RUG_CONFIRM_S", 0.0)
+    monkeypatch.setattr(ex, "_RUG_SEEN", set())
+    chain = FakeChain()
+    coin = other_coin(chain, "blip")
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
+    tr.e.ext = ext = Ext(chain)
+    await tr.start()
+    await signal(tr, coin)
+    assert await tr._rug_confirm(str(coin), 10**9, 0.0) is False       # маршрут есть — не раг
+    assert not await db.kv_get(ex.RUG_CREATORS_KEY)
+
+
+async def test_rug_backfill_for_old_write_offs(db, monkeypatch):
+    """1847 и 1863 списаны до 25.11: разовый разбор прошлых рагов — покупателей нет и сейчас — создатель в список."""
+    monkeypatch.setattr(ex, "_RUG_SEEN", set())
+    chain = FakeChain()
+    dead, alive = other_coin(chain, "old-rug"), other_coin(chain, "old-alive")
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
+    tr.e.ext = ext = Ext(chain)
+    ext.creator = str(pk("dev-old"))
+    await tr.start()
+    for m in (dead, alive):
+        await db.execute(
+            """INSERT INTO real_positions(mode, kind, mint, symbol, venue, token_program, opened_at, closed_at, entry_mc,
+                   cost_sol, tokens, tokens_raw, exit_reason, pnl_sol, pnl_pct, extra)
+               VALUES ('live', 'trendj', $1, 'OLD', 'jupiter', '', now(), now(), 200000, 0.07, 0, 0, 'rug', -0.07, -1,
+                       '{"dec": 9}'::jsonb)""", str(m))
+    real_quote = ext.jup_quote_full
+
+    async def quote(inp, out, amount, slippage_bps):
+        if inp == str(dead):
+            return {"no_route": True}
+        return await real_quote(inp, out, amount, slippage_bps)
+    ext.jup_quote_full = quote
+    text = await tr.rug_backfill()
+    assert "проверено 2" in text and "подтверждено (покупателей нет и сейчас): 1" in text
+    bl = await db.kv_get(ex.RUG_CREATORS_KEY)
+    assert set(bl) == {ext.creator} and bl[ext.creator]["mint"] == str(dead)
