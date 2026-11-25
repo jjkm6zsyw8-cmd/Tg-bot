@@ -180,6 +180,8 @@ class Engine:
         self.my_devs: dict[str, dict[str, Any]] = {}
         from .copyguard import CopyGuard
         self.copyguard = CopyGuard(self)
+        from .hunter import Hunter
+        self.hunter = Hunter(self)
 
     # ------------------------------------------------------------------ утилиты
     @property
@@ -294,7 +296,7 @@ class Engine:
         tasks = [self._listen(), self._consume_loop(), self._timer_loop(), self._slots_loop(),
                  self._housekeeping_loop(), self._summary_loop(), self.price.loop(), self._jobs_loop(),
                  self._daily_loop(), self._withdrawal_loop(), self._traders_loop(), self.trends.run(), self.trends.fast_follow_loop(), self.majors.run(), self.paper.tick_loop(),
-                 self.scout.loop()]
+                 self.scout.loop(), self.hunter.loop()]
         if paper_mod.PAPER_TRADING:
             # 25.11: проверка цен бумаги по свечам, рейтинг кошельков по копиям бумаги и автофильтр (учится на
             # бумаге M) без бумаги не нужны: рейтинг по устаревшим копиям ещё и снимал бы кошельки из своего списка

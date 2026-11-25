@@ -524,6 +524,7 @@ class RealTrader:
         self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
         self.follow_rule = dict(await self.db.kv_get("real:follow_rule") or {})
         self.follow_until = {a: float(t) for a, t in (await self.db.kv_get("real:follow_until") or {}).items()}
+        self.follow_stake = dict(await self.db.kv_get("real:follow_stake") or {})
 
     def follow_exit(self, wallet: str | None) -> str | None:
         """Правило выхода «за ним»: выбранное владельцем (A/B/G/R) или лучший выход кошелька по его истории."""
@@ -679,11 +680,15 @@ class RealTrader:
         except Exception as exc:  # noqa: BLE001 — журнал пропусков не должен мешать торговле
             log.warning("журнал пропусков: %s", str(exc)[:160])
 
-    def stake_lamports(self, v_quote: int, kind: str | None = None) -> tuple[int, str | None]:
+    def stake_lamports(self, v_quote: int, kind: str | None = None, wallet: str | None = None
+                       ) -> tuple[int, str | None]:
         """Ставка: своя у метода или общая у кошелька, урезанная так, чтобы своя покупка двигала цену не сильнее
-        лимита."""
+        лимита. 25.11: «за ним» из охотника — своя ставка в SOL (real:follow_stake), не выше потолка сервера."""
         sol_usd = self.sol_usd()
         usd = S.method_stake(self.cfg, kind) or float(self.get("real_stake_usd"))
+        own = (getattr(self, "follow_stake", None) or {}).get(wallet or "")
+        if own:
+            usd = min(float(own) * sol_usd, S.max_stake_usd())
         stake = int(usd / sol_usd * 1e9)
         cap = int(v_quote * ((1 + float(self.get("real_max_impact"))) ** 0.5 - 1))
         stake = min(stake, cap)
@@ -849,7 +854,7 @@ class RealTrader:
         trig_slot = 0 if trend else int(data.get("trigger_slot") or 0)
         if trig_slot and st["slot"] and st["slot"] - trig_slot > int(self.get("real_max_blocks")):
             return self._skip(mode, kind, "после сигнала прошло слишком много блоков")
-        stake, why = self.stake_lamports(st["v_quote"], kind)
+        stake, why = self.stake_lamports(st["v_quote"], kind, data.get("_followed"))
         if why:
             return self._skip(mode, kind, why)
         trig_mc = 0.0 if trend else float(data.get("trigger_mc") or 0)

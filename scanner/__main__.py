@@ -38,7 +38,7 @@ def setup_logging(level: str, name: str) -> None:
 
 # разовые команды (run_tool): новая команда — и сюда, иначе «неизвестная команда» (tests/test_cli.py)
 TOOLS = ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-         "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat")
+         "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat", "hunt")
 
 
 async def main(cmd: str) -> None:
@@ -259,6 +259,26 @@ async def run_tool(cmd: str, db: Database) -> None:
         mode = args[args.index("--mode") + 1] if "--mode" in args else None
         rows = await load(db, days, kind, mode)
         print(compare(rows) if "--compare" in args else to_csv(rows).rstrip("\n"))
+    elif cmd == "hunt":
+        # 25.11: охотник — python -m scanner hunt --history [--days 7] [--step 6] [--max 500] (исторический прогон)
+        # или python -m scanner hunt (один проход сейчас: кто горячий за 72 ч, без алертов)
+        import time as _t
+        from .analytics import hunter as H
+        days = float(args[args.index("--days") + 1]) if "--days" in args else 7.0
+        step = float(args[args.index("--step") + 1]) if "--step" in args else 6.0
+        mx = int(args[args.index("--max") + 1]) if "--max" in args else 500
+        if "--history" in args:
+            print(await H.history(db, days, step, mx))
+        else:
+            now = _t.time()
+            cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, H.HOT_MIN_COINS, mx)
+            print(f"Кошельков с {H.HOT_MIN_COINS}+ монетами за {H.WINDOW_H} ч: {len(cands)}")
+            for c in cands:
+                s = await H.evaluate(db, c["trader"], now - H.WINDOW_H * 3600, now, cand=c)
+                why = s.hot()
+                if why is None or "--all" in args:
+                    print(f"{'🔥' if why is None else '  '} {c['trader']} монет {s.coins} копий {s.n} ср. {s.avg:+.1%} "
+                          f"в плюсе {s.win:.0%} без цены {s.noprice:.0%}" + (f" — {why}" if why else ""))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

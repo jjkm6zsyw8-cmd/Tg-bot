@@ -1454,6 +1454,56 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             if "not modified" not in str(exc):
                 await reply(c.message, text, kb)
 
+    @router.callback_query(F.data.startswith("hn:"))
+    async def cb_hunter(c: CallbackQuery) -> None:
+        """25.11: охотник — «Тень» / «Бой 0.14» (с подтверждением) / «Игнор» (analytics/hunter.py)."""
+        from ..analytics import hunter
+        from ..real import settings as RS
+        parts = c.data.split(":")
+        act, addr = (parts[1] if len(parts) > 1 else ""), (parts[2] if len(parts) > 2 else "")
+        if not is_valid_address(addr):
+            return await c.answer()
+        cfg = await reload()
+        if act == "l":
+            text, kb = hunter.live_confirm(addr, RS.max_stake_usd())
+            await c.answer()
+            if c.message is not None:
+                await reply(c.message, text, kb)
+            return
+        if act == "x":
+            await c.answer("Бой не включён")
+            return
+        if act == "i":
+            await db.execute("UPDATE hunter_wallets SET status = 'ignored' WHERE address = $1", addr)
+            toast = "Игнор: больше не предложу"
+        else:
+            mode = {"s": "shadow", "L": "live"}.get(act)
+            if mode is None:
+                return await c.answer()
+            await hunter.follow(db, cfg, views.costs_of(settings), addr, mode)
+            toast = "Тень за ним включена" if mode == "shadow" else f"Бой за ним: {hunter.STAKE_SOL:g} SOL на покупку"
+        await c.answer(toast)
+        if c.message is not None:
+            try:
+                await c.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+            await reply(c.message, f"🎯 <code>{addr}</code>: {toast}.")
+
+    @router.message(Command("hunter"))
+    async def cmd_hunter(m: Message, command: CommandObject) -> None:
+        """25.11: /hunter on|off — режим «охотник»; без слова — состояние."""
+        arg = (command.args or "").strip().lower()
+        if arg in ("on", "off"):
+            await db.set_override("hunter_on", arg == "on")
+        cfg = await reload()
+        rows = await db.fetch("SELECT status, count(*) n FROM hunter_wallets GROUP BY status")
+        by = {r["status"]: r["n"] for r in rows}
+        await reply(m, f"🎯 Охотник: <b>{'включён' if cfg.get('hunter_on') else 'выключен'}</b> "
+                       "(/hunter on · /hunter off). Раз в час ищет горячие кошельки за 72 ч по копии «как бот».\n"
+                       f"Найдено: без решения {by.get('new', 0)}, тень {by.get('shadow', 0)}, бой {by.get('live', 0)}, "
+                       f"игнор {by.get('ignored', 0)}, остыли {by.get('cooled', 0)}.")
+
     @router.callback_query(F.data.startswith("wl:"))
     async def cb_unwatch(c: CallbackQuery) -> None:
         _, kind, addr = c.data.split(":", 2)

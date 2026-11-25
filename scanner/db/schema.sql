@@ -675,6 +675,22 @@ CREATE TABLE IF NOT EXISTS reserve_cover (
     ended_at   timestamptz NOT NULL,
     PRIMARY KEY (mint, started_at)
 );
+-- 25.11 (владелец): режим «охотник» (analytics/hunter.py) — горячие кошельки и что с ними сделали
+CREATE TABLE IF NOT EXISTS hunter_wallets (
+    address       text PRIMARY KEY,
+    found_at      timestamptz NOT NULL,
+    status        text NOT NULL,                 -- new | shadow | live | ignored | cooled
+    coins         int,
+    avg_pct       double precision,
+    win           double precision,
+    hold_s        double precision,
+    n_copies      int,
+    noprice       double precision,
+    last_alert_at timestamptz,
+    followed_at   timestamptz,
+    cooled_at     timestamptz,
+    cool_reason   text
+);
 -- 25.11: продажа без подписи не могла «лечь в блок» (списание «покупателей нет», токенов нет на счёте) — no_tx
 UPDATE real_orders SET status = 'no_tx' WHERE status = 'landed' AND signature IS NULL;
 CREATE INDEX IF NOT EXISTS real_positions_wallet_idx ON real_positions (wallet_id, opened_at);
