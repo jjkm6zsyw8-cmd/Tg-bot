@@ -136,6 +136,35 @@ async def model_vs_shadow(db: Any, days: float, delay: float) -> tuple[list[str]
             f"{mean * 100:+.1f} п.п. {ok} (цель ≤ 5), медиана |разницы| {_med([abs(x) for x in diffs]) * 100:.1f} п.п."], mean
 
 
+PP_SOL_PER_MSG = 0.01 / 10_000          # PumpPortal: 0.01 SOL за 10 тыс. сообщений сделок (документация 27.11)
+
+
+async def pp_cost_text(db: Any, days: int = 30) -> str:
+    """27.11 (владелец: «сколько PumpPortal тратил в SOL в день, когда работал»): сделки, пришедшие от PumpPortal, по
+    дням (source_stats — приёмник пишет каждый час) × 0.01 SOL за 10 тыс. Создания и миграции бесплатны."""
+    rows = await db.fetch(
+        """SELECT (hour AT TIME ZONE 'UTC')::date AS day, sum(trades) AS trades,
+                  count(*) FILTER (WHERE trades > 0) AS hours
+           FROM source_stats WHERE source = 'pumpportal' AND hour > now() - make_interval(days => $1)
+           GROUP BY 1 ORDER BY 1""", days)
+    if not rows:
+        return "PumpPortal: в source_stats нет записей."
+    price = float(((await db.kv_get("sol_usd", {})) or {}).get("price") or 0) if hasattr(db, "kv_get") else 0.0
+    lines = ["PumpPortal по дням (UTC): сделок пришло · часов со сделками · стоимость (0.01 SOL за 10 тыс.)"]
+    for r in rows:
+        sol = int(r["trades"]) * PP_SOL_PER_MSG
+        lines.append(f"  {r['day']:%d.%m}: {int(r['trades']):>10,} · {int(r['hours']):>2} ч · {sol:.3f} SOL"
+                     + (f" (${sol * price:,.0f})" if price else ""))
+    full = [r for r in rows if int(r["hours"]) >= 20]
+    if full:
+        avg = sum(int(r["trades"]) for r in full) / len(full)
+        lines.append(f"В полные дни (сделки шли 20+ ч, {len(full)} дн): в среднем {avg:,.0f} сделок ≈ "
+                     f"{avg * PP_SOL_PER_MSG:.3f} SOL в день" + (f" (${avg * PP_SOL_PER_MSG * price:,.0f})" if price else ""))
+    else:
+        lines.append("Полных дней (сделки шли 20+ ч) нет — PumpPortal отказывал большую часть времени.")
+    return "\n".join(lines)
+
+
 async def run(db: Any, hours: float = 24.0, days: float = 3.0, delay: float = 1.36) -> str:
     lines = [f"Проверка данных · {datetime.now(timezone.utc):%d.%m %H:%M} UTC"]
     lines += await reserves_part(db, hours)

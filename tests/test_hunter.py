@@ -373,6 +373,12 @@ async def test_history_run(db):
     assert "Горячих нашлось бы: 1" in text and "кошельков с 15+ монетами (не дев, не бандл): 2" in text
     assert "Найден" in text and "Для сравнения вход «блок +2»" in text
     assert "Переведены в «в бой»" in text and "До перевода в «в бой» (тень, денег нет)" in text
+    assert "из них ферм 0" in text
+    sigs = [{"signature": f"h{i}", "err": None} for i in range(30)]
+    rpc = FakeRpc({ME: sigs}, {f"h{i}": transfer_tx(ME, f"D{i}") for i in range(30)})
+    text = await H.history(db, days=5, step_h=6, prm=NOPOOL, trace=ME, rpc=rpc)
+    assert "Горячих по планке: 1, из них ферм 1" in text and "Горячих нашлось бы: 0" in text
+    assert "профинансировал 21+ кошельков" in text
 
 
 async def test_follow_stake_in_executor(db):

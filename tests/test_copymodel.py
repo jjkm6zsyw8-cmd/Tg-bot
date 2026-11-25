@@ -307,3 +307,20 @@ async def test_datacheck_model_vs_shadow_and_noprice(db):
     assert share == 0.0 and "0 из 1" in lines[0]
     text = await DC.run(db, 24, 3, 1.36)
     assert "Модель против тени" in text
+
+
+async def test_pp_cost_per_day(db):
+    """27.11: сколько PumpPortal стоил по дням — сделки от него × 0.01 SOL за 10 тыс."""
+    from scanner.analytics.datacheck import pp_cost_text
+    await db.execute(
+        """INSERT INTO source_stats(source, hour, trades)
+           SELECT 'pumpportal', (current_date - 3)::timestamp AT TIME ZONE 'UTC' + make_interval(hours => h), 50000
+           FROM generate_series(0, 23) h""")
+    await db.execute(
+        """INSERT INTO source_stats(source, hour, trades)
+           SELECT 'pumpportal', (current_date - 2)::timestamp AT TIME ZONE 'UTC' + make_interval(hours => h), 1000
+           FROM generate_series(0, 4) h""")
+    await db.execute("INSERT INTO source_stats(source, hour, trades) VALUES ('watch', date_trunc('hour', now()), 999)")
+    text = await pp_cost_text(db)
+    assert "1,200,000 · 24 ч · 1.200 SOL" in text and "5,000 ·  5 ч · 0.005 SOL" in text
+    assert "в среднем 1,200,000 сделок ≈ 1.200 SOL в день" in text and "999" not in text

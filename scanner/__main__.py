@@ -38,7 +38,7 @@ def setup_logging(level: str, name: str) -> None:
 
 # разовые команды (run_tool): новая команда — и сюда, иначе «неизвестная команда» (tests/test_cli.py)
 TOOLS = ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-         "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat", "hunt",
+         "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat", "hunt", "ppcost",
          "datacheck", "pdcheck")
 
 
@@ -284,9 +284,18 @@ async def run_tool(cmd: str, db: Database) -> None:
             prm.min_pool = float(arg("--min-pool"))
         rules = tuple(arg("--rules").upper().split(",")) if arg("--rules") else H.RULES
         if "--history" in args:
-            # --from / --to — даты ГГГГ-ММ-ДД (UTC); --wallet адрес — разбор одного кошелька по точкам проверки
-            print(await H.history(db, days, step, mx, until=day(arg("--to")), bar=bar, trace=arg("--wallet"),
-                                  start=day(arg("--from")), prm=prm, rules=rules))
+            # --from / --to — даты ГГГГ-ММ-ДД (UTC); --wallet адрес — разбор одного кошелька по точкам проверки;
+            # 27.11: отсев ферм через RPC (--no-farm-rpc — только по базе)
+            from .ingest.rpc import SolanaRpc
+            henv = h_env()
+            hrpc = None if "--no-farm-rpc" in args else SolanaRpc(henv.rpc_endpoint, rps=henv.rpc_rps,
+                                                                    fallback=henv.rpc_fallback_url or None)
+            try:
+                print(await H.history(db, days, step, mx, until=day(arg("--to")), bar=bar, trace=arg("--wallet"),
+                                      start=day(arg("--from")), prm=prm, rules=rules, rpc=hrpc))
+            finally:
+                if hrpc is not None:
+                    await hrpc.close()
         elif "--list" in args:
             print(await H.hunt_text(db, float(arg("--hours") or 24)))
         elif "--why" in args:
@@ -303,6 +312,10 @@ async def run_tool(cmd: str, db: Database) -> None:
                     print(f"{'🔥' if why is None else '  '} {c['trader']} монет {s.coins_all} копий {s.n} правило "
                           f"{s.rule} ср. {s.avg:+.1%} в плюсе {s.win:.0%} t={s.t:.1f} без цены {s.noprice:.0%} "
                           f"${s.usd_day:,.0f}/день всплеск {s.burst:.0%}" + (f" — {why}" if why else ""))
+    elif cmd == "ppcost":
+        # 27.11: сколько PumpPortal стоил в SOL по дням: python -m scanner ppcost [--days 30]
+        from .analytics.datacheck import pp_cost_text
+        print(await pp_cost_text(db, int(args[args.index("--days") + 1]) if "--days" in args else 30))
     elif cmd == "datacheck":
         # 26.11: проверки данных и модели: python -m scanner datacheck [--hours 24] [--days 3] [--delay 1.36]
         from .analytics.datacheck import run as dc_run

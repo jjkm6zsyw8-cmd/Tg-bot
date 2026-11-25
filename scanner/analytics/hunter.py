@@ -876,7 +876,8 @@ async def hunt_text(db: Any, hours: float = 24.0) -> str:
 # ---------------------------------------------------------------------- исторический прогон
 async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: int = 500,
                   until: float | None = None, bar: Bar | None = None, trace: str | None = None,
-                  start: float | None = None, prm: Params | None = None, rules: tuple[str, ...] = RULES) -> str:
+                  start: float | None = None, prm: Params | None = None, rules: tuple[str, ...] = RULES,
+                  rpc: Any = None) -> str:
     """Как охотник сработал бы на прошлых данных: в каждой точке (шаг step_h) — горячие за 72 ч до неё (правило — на
     первой половине окна, проверка — на второй); первый раз найденный ведём вперёд по модели до «остыл» (t ≤ −2 на
     10+ копиях после находки или 12 ч без покупок) или до конца данных; список — по $ в день после находки."""
@@ -891,6 +892,8 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
     if trace and not any(c["trader"] == trace for c in cands):
         cands.append({"trader": trace, "coins": 0, "own": 0, "bundled": 0})
     found: list[dict[str, Any]] = []
+    farms: list[tuple[str, str]] = []
+    unchecked = 0
     tr_lines: list[str] = []
     for c in cands:
         trades = await CM.wallet_trades(db, c["trader"], lo, until)
@@ -917,6 +920,14 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
                                 f"в плюсе {s.win:.0%}, t={s.t:.1f}, без цены {s.noprice:.0%} → "
                                 f"{'🔥 ГОРЯЧИЙ' if why is None else why}")
             if why is None:
+                # 27.11: отсев ферм, как при находке (база и RPC — нынешняя история кошелька: ферма остаётся фермой)
+                farm, checked = await FARM.check(db, rpc, c["trader"])
+                if farm:
+                    farms.append((c["trader"], farm))
+                    if c["trader"] == trace:
+                        tr_lines.append(f"  → {farm}: в архив, за ним не повторяем")
+                    break
+                unchecked += not checked
                 j = journey(by_rule[rule], [d for d in trades if d["ts"] >= t], t, until, prm.sol_usd)
                 b2 = [x.res for e, x in CM.run(p, SCHEMES[rule], min_pool_sol=prm.min_pool)
                       if t <= e.ts <= j["end"] and x.res is not None]
@@ -931,8 +942,13 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
              f"{prm.delay:g} с, правила {'/'.join(rules)} (выбор на 1-й половине окна), пул от {prm.min_pool:g} SOL; "
              f"планка: {bar.min_coins}+ монет, ≥ {bar.min_avg:+.0%}, в плюсе ≥ {bar.min_win:.0%}, t ≥ {bar.min_t:g}; "
              f"кошельков с {bar.min_coins}+ монетами (не дев, не бандл): {n_cands}",
+             f"Горячих по планке: {len(found) + len(farms)}, из них ферм {len(farms)}"
+             + (f" (не проверены через RPC: {unchecked})" if unchecked else ""),
              f"Горячих нашлось бы: {len(found)} · в бой {len(by_list.get('battle', []))}, наблюдение "
              f"{len(by_list.get('watch', []))}, архив {len(by_list.get('archive', []))}"]
+    if farms:
+        lines.append("Фермы (в архив, после находки не считаются): " + "; ".join(
+            f"{a[:4]}…{a[-4:]} — {w.removeprefix('ферма: ')}" for a, w in farms[:20]))
     with_fwd = [f for f in found if f["n"]]
     if with_fwd:
         # 27.11: монета у нескольких кошельков — один раз (как бот: пока копия открыта, вторая — мимо)
