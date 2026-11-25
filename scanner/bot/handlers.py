@@ -667,16 +667,40 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
 
     @router.message(Command("removewallet"))
     async def cmd_removewallet(m: Message, command: CommandObject) -> None:
-        a = arg_addr(command)
-        if not a:
-            return await reply(m, "Формат: /removewallet &lt;адрес&gt;")
-        await remove(a)
-        await reply(m, f"Убран из отслеживания: <code>{a}</code>")
+        """/removewallet <адрес или начало адреса> […] — убрать из слежки (27.11: можно несколько, по 4+ буквам начала:
+        /removewallet 7HcK Arkd 6d7y). Неоднозначное начало — список совпадений, ничего не убирается."""
+        refs = (command.args or "").split()
+        if not refs:
+            return await reply(m, "Формат: /removewallet &lt;адрес или начало адреса&gt; […]")
+        follow = dict(await db.kv_get("real:follow") or {})
+        known = {r["address"] for r in await db.fetch(
+            "SELECT address FROM traders WHERE active OR manual UNION SELECT address FROM watchlist "
+            "WHERE kind = 'trader'")} | set(follow)
+        lines = []
+        for ref in refs:
+            hits = [ref] if is_valid_address(ref) else sorted(a for a in known if len(ref) >= 4 and a.startswith(ref))
+            if not hits:
+                lines.append(f"❔ {esc(ref)}: в слежке нет такого (нужно 4+ первых буквы адреса)")
+            elif len(hits) > 1:
+                lines.append(f"❔ {esc(ref)}: подходит несколько — укажи полный адрес: "
+                             + ", ".join(f"<code>{a}</code>" for a in hits[:5]))
+            else:
+                await remove(hits[0])
+                lines.append(f"🗑 Убран из слежки{' и тени «за ним»' if hits[0] in follow else ''}: <code>{hits[0]}</code>")
+        await reply(m, "\n".join(lines))
 
     async def remove(addr: str, code: str | None = None) -> None:
-        """code: t — трейдер, d — дев, k — монета, None — везде."""
+        """code: t — трейдер, d — дев, k — монета, None — везде. Трейдер: и «за ним» реального бота (тень/бой)
+        снимается (27.11), и охотник его больше не предложит."""
         if code in (None, "t"):
             await db.execute("UPDATE traders SET active=false, manual=false WHERE address=$1", addr)
+            from . import board as _board
+            await _board.set_follow(db, addr, None)
+            stakes = dict(await db.kv_get("real:follow_stake") or {})
+            if stakes.pop(addr, None) is not None:
+                await db.kv_set("real:follow_stake", stakes or None)
+            await db.execute("UPDATE hunter_wallets SET status = 'ignored', list = 'archive', list_reason = 'убран вручную', "
+                             "list_at = now() WHERE address = $1", addr)
         if code is None:
             await db.execute("DELETE FROM watchlist WHERE address=$1", addr)
         else:
@@ -1523,8 +1547,14 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         """26.11 (A8): /hunt [часы] — кого охотник нашёл, в каком списке, $ в день, что дали копии после находки."""
         from ..analytics import hunter
         arg = (command.args or "").strip()
-        hours = float(arg) if arg.replace(".", "", 1).isdigit() else 24.0
-        for part in fmt.split_html(await hunter.hunt_text(db, min(hours, 24 * 30))):
+        if arg.lower().startswith(("why", "почему")):
+            # 27.11: /hunt why [адрес] — что стало с покупками кошельков охотника после находки
+            addr = next((w for w in arg.split()[1:] if is_valid_address(w)), None)
+            text = await hunter.why_text(db, await hunter.params_of(db, await reload()), addr)
+        else:
+            hours = float(arg) if arg.replace(".", "", 1).isdigit() else 24.0
+            text = await hunter.hunt_text(db, min(hours, 24 * 30))
+        for part in fmt.split_html(text):
             await reply(m, part)
 
     @router.message(Command("hunter"))

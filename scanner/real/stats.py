@@ -76,6 +76,24 @@ async def mode_lines(db: Any, cfg: dict[str, Any], mode: str, sol_usd: float,
             + f" · за 7 дн {n}" + (f", в плюсе {w / n:.0%}" if n else "")]
 
 
+async def kind_lines(db: Any, mode: str, sol_usd: float, kinds: list[str] | None = None,
+                     days: float = 7.0) -> list[str]:
+    """27.11: по методам за 7 дней — сколько сделок, средний % на сделку, доля в плюсе, итог."""
+    rows = await db.fetch(
+        """SELECT kind, count(*) n, avg(pnl_pct) a, count(*) FILTER (WHERE pnl_pct > 0) w, COALESCE(sum(pnl_sol), 0) s
+           FROM real_positions WHERE mode = $1 AND closed_at IS NOT NULL AND pnl_pct IS NOT NULL
+             AND closed_at > now() - make_interval(days => $2)
+             AND ($3::text[] IS NULL OR (kind = ANY($3::text[]) AND NOT COALESCE((extra->>'followed')::boolean, false)))
+           GROUP BY kind ORDER BY count(*) DESC""", mode, days, kinds)
+    if not rows:
+        return []
+    out = [f"по методам за {days:g} дн: сделок · средний % на сделку · в плюсе · итог"]
+    for r in rows:
+        out.append(f"{SHORT.get(r['kind'], r['kind'])}: {r['n']} · {float(r['a']):+.1%} · {r['w'] / r['n']:.0%} · "
+                   f"{_usd(float(r['s']) * sol_usd)}")
+    return out
+
+
 async def follow_lines(db: Any, sol_usd: float, limit: int = 12) -> list[str]:
     """Кошельки «за ним»: итог реального бота за 7 дней по каждому (тень и бой вместе)."""
     follow = dict(await db.kv_get("real:follow") or {})
@@ -150,8 +168,10 @@ async def view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
     shadow = await mode_lines(db, cfg, "shadow", sol_usd, shadow_kinds())
     live = await mode_lines(db, cfg, "live", sol_usd)
     lines += shadow or ["👻 Тень: сделок за 7 дней нет"]
+    if shadow:
+        lines += await kind_lines(db, "shadow", sol_usd, shadow_kinds())
     if live:
-        lines += ["", *live]
+        lines += ["", *live, *await kind_lines(db, "live", sol_usd)]
     fol = await follow_lines(db, sol_usd)
     if fol:
         lines += ["", *fol]

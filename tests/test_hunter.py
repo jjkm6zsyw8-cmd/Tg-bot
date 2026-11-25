@@ -356,3 +356,64 @@ async def test_follow_stake_in_executor(db):
     sol_usd = tr.sol_usd()
     stake, why = tr.stake_lamports(10**15, "smart", "W")
     assert why is None and stake == int(min(0.14 * sol_usd, S.max_stake_usd()) / sol_usd * 1e9)
+
+
+# ====================================================================== 27.11: разбор, методы, удаление
+async def test_why_text_explains_each_buy_after_find(db):
+    """/hunt why: покупки после находки и что с ними стало — модель, журнал копий, бот."""
+    await hot_wallet(db, ME, hours_ago=60)
+    e = Engine(db, hunter_on=True)
+    await H.Hunter(e).scan(time.time())
+    await db.execute("UPDATE hunter_wallets SET found_at = now() - interval '50 hours' WHERE address = $1", ME)
+    mint = await db.fetchval("SELECT mint FROM trades WHERE trader = $1 AND is_buy AND ts > now() - interval '49 hours' "
+                             "ORDER BY ts LIMIT 1", ME)
+    ts = await db.fetchval("SELECT ts FROM trades WHERE trader = $1 AND mint = $2 AND is_buy", ME, mint)
+    await db.execute("INSERT INTO real_skips(at, mint, mode, kind, why) VALUES ($1, $2, 'shadow', 'copy', "
+                     "'мелкий пул, не входим')", ts + timedelta(seconds=2), mint)
+    text = await H.why_text(db, NOPOOL)
+    assert ME in text and "покупок после находки:" in text and "модель: с ценой" in text
+    assert "бот: мелкий пул, не входим — 1" in text and "ни сигнала, ни пропуска бота" in text
+    assert "без фильтра пула с ценой было бы" in text
+    assert await H.why_text(db, NOPOOL, wallet="NOPE") == "Такого кошелька у охотника нет."
+
+
+async def test_pnl_has_trades_and_average_per_method(db):
+    from scanner.real import stats as RS
+    for pct in (0.10, -0.02, 0.06):
+        await db.execute(
+            """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
+                   pnl_sol, pnl_pct) VALUES ('shadow', 'swing', 'R', 'W', now() - interval '2 hours', now(), 0.1, 1, 40,
+                   $1, $2)""", pct * 0.1, pct)
+    lines = await RS.kind_lines(db, "shadow", 150.0)
+    assert lines and "ракеты: 3 · +4.7% · 67%" in lines[1]
+
+
+async def test_removewallet_by_prefix_also_stops_shadow(db):
+    """/removewallet 7HcK Arkd — по началу адреса, несколько сразу; снимает и «за ним» реального бота."""
+    from types import SimpleNamespace
+
+    from aiogram import Router
+    from aiogram.filters import CommandObject
+
+    from scanner.bot import handlers
+    from scanner.config import Env, Settings, YamlConfig
+    a, b, c, d = "7HcK" + "a" * 40, "Arkd" + "b" * 40, "Abcd" + "c" * 40, "Abcd" + "d" * 40
+    for x in (a, b, c, d):
+        await db.execute("INSERT INTO traders(address, manual, active) VALUES ($1, true, true)", x)
+    await db.kv_set("real:follow", {a: "shadow", c: "shadow"})
+    router = Router()
+    handlers.setup(router, Env(alert_chat_id="-100", allowed_user_ids="1"), Settings(YamlConfig("config/config.yaml")),
+                   db, SimpleNamespace(chat_id=-100, thread=lambda t: None))
+    cmd = next(h.callback for h in router.message.handlers if h.callback.__name__ == "cmd_removewallet")
+    said = []
+
+    async def answer(text, **kw):
+        said.append(text)
+    await cmd(SimpleNamespace(answer=answer), CommandObject(prefix="/", command="removewallet",
+                                                            args="7HcK Arkd Abcd zzzz Ab"))
+    text = "\n".join(said)
+    assert f"Убран из слежки и тени «за ним»: <code>{a}</code>" in text and f"Убран из слежки: <code>{b}</code>" in text
+    assert "Abcd: подходит несколько" in text and "zzzz: в слежке нет" in text and "Ab: в слежке нет" in text
+    act = {r["address"]: r["active"] for r in await db.fetch("SELECT address, active FROM traders")}
+    assert act == {a: False, b: False, c: True, d: True}
+    assert await db.kv_get("real:follow") == {c: "shadow"}

@@ -289,6 +289,9 @@ async def run_tool(cmd: str, db: Database) -> None:
                                   start=day(arg("--from")), prm=prm, rules=rules))
         elif "--list" in args:
             print(await H.hunt_text(db, float(arg("--hours") or 24)))
+        elif "--why" in args:
+            # 27.11: что стало с покупками кошельков охотника после находки (модель, журнал копий, бот)
+            print(H.fmt.plain(await H.why_text(db, prm, arg("--wallet"))))
         else:
             now = _t.time()
             cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, bar.min_coins, mx)

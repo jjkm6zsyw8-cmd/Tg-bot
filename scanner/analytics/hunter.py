@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import statistics
 import time
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -717,6 +719,72 @@ async def shadow_total(db: Any, now: float | None = None) -> list[str]:
                  + (f"{int(n)} сд, в среднем {sum(pct) / n:+.1%}, {sol:+.3f} SOL, ≈${usd_ours:,.0f}/день" if n
                     else "сделок ещё нет"))
     return lines
+
+
+def _reason(text: str | None) -> str:
+    """Причина без чисел конкретной сделки — чтобы одинаковые складывались."""
+    t = re.sub(r"[-+]?\d[\d.,]*\s*%?", "…", (text or "без причины").split(";")[0]).strip()
+    return t[:70]
+
+
+async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None, now: float | None = None) -> str:
+    """27.11 (владелец: «найдены в 17:52, к 23:42 ни одной копии»): по каждому кошельку охотника в тени — его покупки
+    после находки и что с каждой стало: модель (с ценой / мелкий пул < real_min_pool_sol / нет цены), журнал копий
+    (сигнал взят или причина отказа), бот (позиция тени или причина пропуска из real_skips по той же монете ±3 мин), и
+    сколько не дошли ни до журнала, ни до бота (кошелёк не в слежке / сделка не записана)."""
+    now = now or time.time()
+    prm = prm or await params_of(db)
+    rows = await db.fetch("SELECT * FROM hunter_wallets WHERE address = $1", wallet) if wallet else await db.fetch(
+        "SELECT * FROM hunter_wallets WHERE status IN ('shadow', 'live') ORDER BY found_at")
+    if not rows:
+        return "Кошельков охотника в тени нет." if not wallet else "Такого кошелька у охотника нет."
+    out = [f"🔎 <b>Охотник: что стало с покупками после находки</b> (вход через {prm.delay:g} с, пул от "
+           f"{prm.min_pool:g} SOL; время UTC)"]
+    for r in rows:
+        addr, found = r["address"], r["found_at"]
+        since = found.timestamp()
+        trades = await CM.wallet_trades(db, addr, since - 120, now)
+        buys = [d for d in trades if d["is_buy"] and d["ts"] >= since]
+        rule = r["rule"] if r["rule"] in SCHEMES else "A"
+        p = await CM.prepare(db, addr, trades, since, now, limit=100_000)
+        cs = CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
+        model = Counter("с ценой" if c.res is not None else (c.why or "?") for _e, c in cs)
+        nopool = sum(1 for _e, c in CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay) if c.res is not None)
+        small = [CM.pool_sol(c.entry_mc, c.venue) for _e, c in cs if c.why == CM.SMALL_POOL and c.entry_mc]
+        head = (f"<code>{addr}</code> · найден {found:%d.%m %H:%M}, {r['status']}, правило {rule}\n"
+                f"  покупок после находки: {len(buys)} (монет {len({d['mint'] for d in buys})})"
+                + (f", последняя {datetime.fromtimestamp(buys[-1]['ts'], timezone.utc):%d.%m %H:%M}" if buys else "")
+                + (f"; все сделки в базе до {datetime.fromtimestamp(trades[-1]['ts'], timezone.utc):%d.%m %H:%M}"
+                   if trades else "; его сделок в базе нет"))
+        out.append(head)
+        if not cs:
+            continue
+        out.append("  модель: " + ", ".join(f"{k} {v}" for k, v in model.most_common())
+                   + (f" (пул у мелких: медиана {statistics.median(small):.0f} SOL)" if small else "")
+                   + f"; без фильтра пула с ценой было бы {nopool}")
+        lo = datetime.fromtimestamp(since - 5, timezone.utc)
+        logs = await db.fetch("""SELECT mint, extract(epoch FROM ts) AS ts, action, reason FROM copy_log
+                                 WHERE wallet = $1 AND side = 'buy' AND ts >= $2""", addr, lo)
+        pos = await db.fetch("""SELECT mint, extract(epoch FROM opened_at) AS ts FROM real_positions
+                                WHERE trader = $1 AND opened_at >= $2""", addr, lo)
+        skips = await db.fetch("""SELECT mint, extract(epoch FROM at) AS ts, mode, why FROM real_skips
+                                  WHERE mint = ANY($1::text[]) AND at >= $2""", list({e.mint for e, _c in cs}), lo)
+        fate: Counter[str] = Counter()
+        for e, _c in cs:
+            near = lambda xs: [x for x in xs if x["mint"] == e.mint and e.ts - 5 <= float(x["ts"]) <= e.ts + 180]  # noqa: E731
+            sk, lg = near(skips), near(logs)
+            if near(pos):
+                fate["позиция тени"] += 1
+            elif sk:
+                fate["бот: " + _reason(sk[-1]["why"])] += 1
+            elif lg and lg[-1]["action"] == "skipped":
+                fate["сигнал: " + _reason(lg[-1]["reason"])] += 1
+            elif lg:
+                fate["сигнал есть, у бота ни позиции, ни причины"] += 1
+            else:
+                fate["ни сигнала, ни пропуска бота"] += 1
+        out.append("  бот: " + "; ".join(f"{k} — {v}" for k, v in fate.most_common(6)))
+    return "\n".join(out)
 
 
 async def hunt_text(db: Any, hours: float = 24.0) -> str:
