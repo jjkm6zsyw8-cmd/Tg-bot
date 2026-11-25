@@ -39,7 +39,8 @@ def shadow_kinds() -> list[str] | None:
     return S.active_methods() if S.RETIRED else None
 
 
-RETIRED_NOTE = "Убраны 25.11 (в минусе): smart, мой дев, копии, крупные копии, тренды pump.fun, новый дев."
+RETIRED_NOTE = ("Убран 25.11: новый дев. Остальные методы с 26.11 — только тень; на деньги — только «за ним» по "
+                "кошелькам охотника из списка «в бой» после 24 ч тени, по кнопке.")
 
 
 async def mode_lines(db: Any, cfg: dict[str, Any], mode: str, sol_usd: float,

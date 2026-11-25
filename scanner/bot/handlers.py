@@ -1464,8 +1464,18 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         if not is_valid_address(addr):
             return await c.answer()
         cfg = await reload()
+        if act in ("l", "L"):
+            # 26.11 (D5): в бой — только список «в бой» после 24 ч тени на новых сделках
+            why_not = await hunter.battle_ready(db, addr)
+            if why_not:
+                await c.answer("Бой пока нельзя")
+                if c.message is not None:
+                    await reply(c.message, f"💵 Бой за <code>{addr}</code> пока нельзя: {fmt.esc(why_not)}.\n"
+                                           "Сначала «👻 Тень»: через 24 ч и при списке «в бой» кнопка заработает.")
+                return
         if act == "l":
-            text, kb = hunter.live_confirm(addr, RS.max_stake_usd())
+            rule = await db.fetchval("SELECT rule FROM hunter_wallets WHERE address = $1", addr) or "A"
+            text, kb = hunter.live_confirm(addr, RS.max_stake_usd(), rule)
             await c.answer()
             if c.message is not None:
                 await reply(c.message, text, kb)
@@ -1474,7 +1484,9 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             await c.answer("Бой не включён")
             return
         if act == "i":
-            await db.execute("UPDATE hunter_wallets SET status = 'ignored' WHERE address = $1", addr)
+            await db.execute("UPDATE hunter_wallets SET status = 'ignored', list = 'archive', list_reason = 'игнор', "
+                             "list_at = now() WHERE address = $1", addr)
+            await hunter.follow(db, cfg, views.costs_of(settings), addr, None)
             toast = "Игнор: больше не предложу"
         else:
             mode = {"s": "shadow", "L": "live"}.get(act)
@@ -1489,6 +1501,31 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             except TelegramBadRequest:
                 pass
             await reply(c.message, f"🎯 <code>{addr}</code>: {toast}.")
+
+    @router.message(Command("kill"))
+    async def cmd_kill(m: Message, command: CommandObject) -> None:
+        """26.11: /kill [причина] — kill switch: новых боевых входов нет ни у одного кошелька (открытые позиции бот
+        продолжает сопровождать и продавать). /kill off — снять."""
+        arg = (command.args or "").strip()
+        if arg.lower() == "off":
+            await db.kv_set("real:kill", None)
+            await db.job("real", {"cmd": "reload"})
+            return await reply(m, "🟢 Kill switch снят: бой снова возможен (если кошелёк в режиме «бой» и есть REAL_LIVE).")
+        why = arg or "остановлено владельцем"
+        await db.kv_set("real:kill", {"why": why[:200], "at": datetime.now(timezone.utc).isoformat()})
+        await db.job("real", {"cmd": "reload"})
+        await reply(m, f"🛑 <b>Kill switch</b>: новых боевых входов нет ни у одного кошелька ({fmt.esc(why)}). Открытые "
+                       "позиции бот продолжает вести и продавать. Продать всё сразу — «Продать всё» в /real. "
+                       "Снять: /kill off")
+
+    @router.message(Command("hunt"))
+    async def cmd_hunt(m: Message, command: CommandObject) -> None:
+        """26.11 (A8): /hunt [часы] — кого охотник нашёл, в каком списке, $ в день, что дали копии после находки."""
+        from ..analytics import hunter
+        arg = (command.args or "").strip()
+        hours = float(arg) if arg.replace(".", "", 1).isdigit() else 24.0
+        for part in fmt.split_html(await hunter.hunt_text(db, min(hours, 24 * 30))):
+            await reply(m, part)
 
     @router.message(Command("hunter"))
     async def cmd_hunter(m: Message, command: CommandObject) -> None:

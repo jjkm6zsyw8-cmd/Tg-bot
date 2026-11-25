@@ -72,6 +72,9 @@ class ReserveSource(Source):
     name = "reserves"
     MAX_SUBS = 400
     SUB_GAP_S = 0.2                # не больше 5 запросов подписки в секунду
+    COIN_DAILY_BYTES = 3_000_000   # 26.11 (B1): на одну монету за сутки не больше (монета-шторм не съест лимит)
+    JUMP_X = 0.5                   # 26.11 (B1): цена пула прыгнула больше чем на 50% за одно изменение — перечитать пул
+    REREAD_S = 300.0
     START_DELAY_S = 5.0            # перед каждым подключением (+10 с перед первым) — не в одну секунду с другими
     min_backoff = 30.0
 
@@ -92,6 +95,12 @@ class ReserveSource(Source):
         self._changed = asyncio.Event()
         self.ticks = 0
         self.on_complete: Callable[[str], Awaitable[None]] | None = None   # кривая закрылась → переезд на пул
+        self.on_jump: Callable[[str], Awaitable[None]] | None = None       # резкий скачок цены пула → перечитать пул
+        self.coin_bytes: dict[str, int] = {}
+        self.coin_day = ""
+        self.capped: set[str] = set()                # монеты, у которых кончился суточный лимит
+        self.last_mc: dict[str, float] = {}
+        self.reread_at: dict[str, float] = {}
         self._sink: Sink | None = None
 
     # ------------------------------------------------------------------ цели
@@ -125,7 +134,7 @@ class ReserveSource(Source):
     def counts(self) -> dict[str, Any]:
         return {"coins": len(self.targets), "accounts": len(self.acc_mint), "active": len(self.subs),
                 "ticks": self.ticks, "refused": self.refused, "sub_errors": self.sub_errors,
-                "last_sub_error": self.last_sub_error}
+                "last_sub_error": self.last_sub_error, "capped_coins": len(self.capped)}
 
     # ------------------------------------------------------------------ окно слежения
     def _cover(self, mint: str, t: Target, final: bool = False) -> None:
@@ -173,7 +182,27 @@ class ReserveSource(Source):
         if t.base is None or t.quote is None or t.base[1] != t.quote[1]:
             return None
         mc = pool_mc(t.base[0], t.quote[0], t.virtual_quote)
+        prev = self.last_mc.get(mint)
+        if mc > 0:
+            self.last_mc[mint] = mc
+        if (prev and mc > 0 and abs(mc / prev - 1) > self.JUMP_X and self.on_jump is not None
+                and time.time() - self.reread_at.get(mint, 0.0) > self.REREAD_S):
+            self.reread_at[mint] = time.time()
+            asyncio.create_task(self.on_jump(mint))     # виртуальный резерв или пул могли смениться — перечитать
         return ReserveTick(mint, mc, "pump-amm", slot, t.quote[0] / LAMPORTS) if mc > 0 else None
+
+    def count_bytes(self, mint: str, n: int) -> bool:
+        """Трафик монеты за сутки (UTC); False — лимит кончился, монету снимаем до конца суток."""
+        day = datetime.now(timezone.utc).date().isoformat()
+        if day != self.coin_day:
+            self.coin_day, self.coin_bytes, self.capped = day, {}, set()
+        self.coin_bytes[mint] = self.coin_bytes.get(mint, 0) + n
+        if self.coin_bytes[mint] > self.COIN_DAILY_BYTES:
+            self.capped.add(mint)
+            self.drop(mint)
+            log.info("reserves: %s — суточный лимит %d Б на монету, снята до конца суток", mint, self.COIN_DAILY_BYTES)
+            return False
+        return True
 
     # ------------------------------------------------------------------ соединение
     async def _sync(self, ws: Any) -> None:
@@ -252,6 +281,9 @@ class ReserveSource(Source):
                     acc = self.sid_acc.get((msg.get("params") or {}).get("subscription"))
                     data = ((res.get("value") or {}).get("data") or [None])[0]
                     if acc is None or not data:
+                        continue
+                    mint = self.acc_mint.get(acc)
+                    if mint is not None and not self.count_bytes(mint, len(raw)):
                         continue
                     try:
                         raw_data = base64.b64decode(data)

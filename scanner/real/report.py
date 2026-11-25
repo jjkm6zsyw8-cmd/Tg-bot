@@ -735,6 +735,9 @@ async def on_callback(db: Any, reload: Callable[[], Awaitable[dict[str, Any]]], 
     if action == "sell" and rest.isdigit():
         await db.job("real", {"cmd": "sell", "id": int(rest)})
         return await main("Продаю позицию")
+    if action == "dsell" and rest.isdigit():          # 26.11 (D3): сторож — продажа остатка только по кнопке
+        await db.job("real", {"cmd": "dead_sell", "id": int(rest)})
+        return await main("Продаю остаток — итог придёт в тему «Реальный бот»")
     if action == "trades":
         return Reply(await trades_text(db, cfg), [[{"text": "← Назад", "callback": "rl:view"}]])
     if action == "mine":

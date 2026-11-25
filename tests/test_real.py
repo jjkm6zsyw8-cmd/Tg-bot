@@ -344,8 +344,10 @@ def engine(db, **cfg):
                             reset_tz=lambda: timezone.utc)
     # замер тенью (все методы, без стопа и лимита) — в своих тестах; здесь — правила как у боя
     # старые тесты — «мой дев» по правилу G и за любым девом (новое по умолчанию: D и только девы с почерком)
+    # 26.11: защита копирования (пул от 30 SOL, доли ставки, лимит на кошелёк) — в своих тестах (test_copy_guard.py)
     cfg = {"real_shadow_all": False, "real_shadow_free": False, "real_scheme_mydev": "G",
-           "real_mydev_strong_only": False, **cfg}
+           "real_mydev_strong_only": False, "real_min_pool_sol": 0.0, "real_copy_max_share": 1.0,
+           "real_max_depth_share": 1.0, "real_follow_max_sol": 100.0, "real_copy_largest": False, **cfg}
     return SimpleNamespace(db=db, cfg={"real_land_s": 0.0, **cfg}, price=SimpleNamespace(value=150.0), states={},
                            my_devs={}, paper=paper)
 

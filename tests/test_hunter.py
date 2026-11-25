@@ -1,18 +1,20 @@
-"""25.11: режим «охотник» — горячие кошельки по копии «как бот», алерт с кнопками, «остыл», отчёты, прогон по истории."""
+"""Режим «охотник» (25.11, v2 по сводному ТЗ 26.11): задержка входа, правило на первой половине, $ в день, всплеск,
+слив на копировщиков, списки «в бой» / «наблюдение» / архив, «остыл» по t, допуск к бою после 24 ч тени, /hunt,
+исторический прогон."""
 from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 import pytest
 
 from scanner.analytics import copymodel as M, hunter as H
 from scanner.analytics.curve import Costs
-from tests.test_copymodel import DEV, ME, OTHER, db, put_coin, put_trade  # noqa: F401 — фикстура db
+from tests.test_copymodel import DEV, ME, OTHER, T0, db, put_coin, put_trade, tk  # noqa: F401 — фикстура db
 
 NOW = 1_795_000_000.0
-OLD = H.Bar(min_coins=15, min_t=0.0)          # планка до 25.11 — на маленьких синтетических данных
+OLD = H.Bar(min_coins=15, min_t=0.0)          # маленькая планка — на маленьких синтетических данных
+NOPOOL = H.Params(delay=1.36, min_pool=0.0, sol_usd=150.0)
 
 
 @pytest.fixture(autouse=True)
@@ -20,64 +22,118 @@ def _small_bar(monkeypatch):
     monkeypatch.setattr(H, "BAR", OLD)
 
 
-def copy(mint: str, res: float | None, ts: float = NOW) -> tuple[M.Entry, M.Copy]:
-    return M.Entry(mint, ts, 1, 1.0), M.Copy(res, None if res is not None else "нет цены выхода", "take_profit")
+def copy(mint: str, res: float | None, ts: float = NOW, burst: bool = False, why: str | None = None):
+    return M.Entry(mint, ts, 1, 1.0), M.Copy(res, why if why else (None if res is not None else "нет цены выхода"),
+                                             "take_profit", burst=burst)
 
 
-def test_hot_criteria():
-    good = [copy(f"M{i}", 0.2 if i % 4 else -0.1) for i in range(20)]          # 20 монет, 75% в плюсе
+# ====================================================================== критерии, правило, метрики
+def test_hot_criteria_and_new_bar():
+    good = [copy(f"M{i}", 0.2 if i % 4 else -0.1) for i in range(20)]
     s = H.stats_of("W", good, [])
-    assert s.coins == 20 and s.win == 0.75 and s.avg == pytest.approx(0.125) and s.hot() is None
+    assert s.coins_all == 20 and s.win == 0.75 and s.avg == pytest.approx(0.125) and s.hot() is None
     assert H.stats_of("W", good[:14], []).hot().startswith("монет 14")
-    lose = [copy(f"M{i}", 0.4 if i % 2 else -0.05) for i in range(20)]           # +17.5% в среднем, но 50% в плюсе
-    assert H.stats_of("W", lose, []).hot().startswith("в плюсе 50%")
-    flat = [copy(f"M{i}", 0.05) for i in range(20)]
-    assert H.stats_of("W", flat, []).hot().startswith("в среднем +5.0%")
-    noprice = good + [copy(f"N{i}", None) for i in range(25)]
-    assert H.stats_of("W", noprice, []).hot().startswith("без цены")
-    s.own = 1
-    assert s.hot() == "покупает свои монеты (дев)"
-    s.own, s.bundled = 0, 0.4
-    assert s.hot().startswith("бандл")
+    s.rule_test = -0.02
+    assert s.hot().startswith("правило A на второй половине")            # A2: на второй половине — минус
+    s.rule_test, s.dump = 0.05, 0.4
+    assert s.hot().startswith("сливает на копировщиков")                  # C2
+    new = H.Bar()
+    assert new.min_coins == 50 and new.min_t == 3.0
+    many = [copy(f"M{i}", 0.3 if i % 3 else -0.1) for i in range(60)]
+    assert H.stats_of("W", many, []).hot(new) is None
+    shaky = [copy(f"M{i}", 0.9 if i % 5 < 3 else -0.95) for i in range(55)]
+    assert H.stats_of("W", shaky, []).hot(new).startswith("t ")
 
 
-def test_trader_hold_and_activity():
-    trades = [{"mint": "A", "ts": NOW - 600, "is_buy": True}, {"mint": "A", "ts": NOW - 420, "is_buy": False},
-              {"mint": "B", "ts": NOW - 300, "is_buy": True}, {"mint": "B", "ts": NOW - 60, "is_buy": False},
-              {"mint": "C", "ts": NOW - 30, "is_buy": True}]
-    s = H.stats_of("W", [copy("A", 0.3)], trades, {"A": "AAA"})
-    assert s.hold_s == pytest.approx(210) and s.last_buy == NOW - 30 and s.top == [("AAA", 0.3)]
-    text, kb = H.alert_text(s, NOW)
-    assert "<code>W</code>" in text and "🟢 активен" in text and "$AAA +30%" in text
-    calls = [b["callback"] for row in kb for b in row]
-    assert calls == ["hn:s:W", "hn:l:W", "hn:i:W"]
-    addr = "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5"
-    assert all(len(f"hn:{a}:{addr}".encode()) <= 64 for a in "slLix")            # лимит Telegram на callback
+def test_small_pool_copies_are_not_counted():
+    cs = [copy(f"M{i}", 0.2) for i in range(16)] + [copy(f"S{i}", None, why=M.SMALL_POOL) for i in range(10)]
+    s = H.stats_of("W", cs, [])
+    assert s.small_pool == 10 and s.total == 16 and s.coins_all == 16 and s.noprice == 0.0
 
 
-def test_cool_reason():
-    assert H.cool_reason(10, -0.01, NOW, NOW - 3600, NOW).startswith("за 24 ч 10 сделок")
-    assert H.cool_reason(9, -0.5, NOW, NOW - 3600, NOW) is None                   # мало сделок — рано судить
-    assert H.cool_reason(3, 0.2, NOW - 13 * 3600, NOW - 20 * 3600, NOW) == "нет покупок 12 ч"
-    assert H.cool_reason(0, 0.0, None, NOW - 3600, NOW) is None                   # взяли час назад — ждём
+def test_pick_rule_on_first_half_checks_second():
+    ents = [NOW + 60 * i for i in range(20)]
+    by = {"A": [copy(f"M{i}", 0.05, ts) for i, ts in enumerate(ents)],
+          "B": [copy(f"M{i}", 0.30 if i < 10 else -0.10, ts) for i, ts in enumerate(ents)],
+          "G": [copy(f"M{i}", 0.10, ts) for i, ts in enumerate(ents)]}
+    rule, train, test = H.pick_rule(by)
+    # B лучше на первой половине (+30%), но на второй −10% — хуже A (+5%): проверка не прошла, остаётся A
+    assert rule == "A" and train == pytest.approx(0.05) and test == pytest.approx(0.05)
+    by["B"] = [copy(f"M{i}", 0.30 if i < 10 else 0.20, ts) for i, ts in enumerate(ents)]
+    assert H.pick_rule(by)[0] == "B"                                       # и на второй лучше — берём B
+    assert H.pick_rule({"A": by["A"][:3]}) == ("A", None, None)
 
 
-def test_forward_stops_when_cooled():
+def test_entry_by_our_delay_and_burst():
+    ticks = [tk(0, 50, 100, ME), tk(0.5, 54, 101), tk(1.2, 58, 102), tk(2.0, 70, 103), tk(20, 75, 140)]
+    e = M.Entry("MINT", T0, 100, 1.0)
+    assert M.entry_by_delay(e, ticks, 1.36).mc == 58                       # худшая цена за 1.36 с
+    assert M.entry_tick(e, ticks).mc == 58                                 # блок +2 — те же сделки здесь
+    c = M.copy_trade(e, ticks, ME, DEV, T0 - 60, entry_delay_s=1.36)
+    assert c.burst                                                         # +25% от 58 за 30 с: 75 ≥ 72.5
+    flat = [tk(0, 50, 100, ME), tk(10, 52), tk(29, 55)]
+    assert not M.copy_trade(e, flat, ME, DEV, T0 - 60, entry_delay_s=1.36).burst
+
+
+def test_min_pool_and_depth_stake():
+    e = M.Entry("MINT", T0, 100, 1.0)
+    low = [tk(0, 50, 100, ME), tk(1, 50, 101), tk(40, 80, 160)]
+    assert M.copy_trade(e, low, ME, DEV, T0 - 60, min_pool_sol=30).why == M.SMALL_POOL   # MC 50 → ~10 SOL в кривой
+    assert M.pool_sol(112.0, "pump") == pytest.approx(30, abs=0.3)
+    deep = [tk(0, 200, 100, ME), tk(1, 200, 101), tk(40, 300, 160)]
+    c = M.copy_trade(e, deep, ME, DEV, T0 - 60, min_pool_sol=30, stake_share=0.03)
+    assert c.res is not None and c.stake == pytest.approx(0.03 * M.reserves(200, "pump")[0])
+
+
+def test_dump_detector():
+    e = M.Entry("C1", T0, 100, 1.0)
+    p = M.Prepared(ME, [e], {"C1": [tk(0, 50, 100, ME), tk(2, 55, who="b1"), tk(4, 60, who="b2"), tk(6, 66, who="b3")]},
+                   {}, {}, 1800)
+    sells = [{"mint": "C1", "ts": T0 + 20, "is_buy": False}]
+    assert H.dump_share(p, sells) == 1.0                                   # продал через 14 с после 3-го покупателя
+    assert H.dump_share(p, [{"mint": "C1", "ts": T0 + 300, "is_buy": False}]) == 0.0
+
+
+def test_lists_and_cooling():
+    assert H.list_for(60, 55.0) == ("battle", None)
+    assert H.list_for(30, 55.0) == ("watch", None)                         # $ есть, но копий < 50
+    assert H.list_for(30, 16.0) == ("watch", None)
+    assert H.list_for(25, 5.0)[0] == "archive" and "< $15" in H.list_for(25, 5.0)[1]
+    assert H.list_for(5, 5.0) == ("new", None)                             # мало данных — ждём
+    assert H.cool_reason(12, -2.5, NOW, NOW - 3600, NOW).startswith("12 сделок")
+    assert H.cool_reason(12, -1.0, NOW, NOW - 3600, NOW) is None           # минус, но неустойчивый — не снимаем
+    assert H.cool_reason(3, 1.0, NOW - 13 * 3600, NOW - 20 * 3600, NOW) == "нет покупок 12 ч"
+
+
+def test_forward_stops_on_steady_minus():
     t0 = NOW
     good = [copy(f"G{i}", 0.1, t0 + 600 * i) for i in range(5)]
-    bad = [copy(f"B{i}", -0.2, t0 + 3600 + 300 * i) for i in range(12)]
+    bad = [copy(f"B{i}", -0.2 - 0.01 * (i % 3), t0 + 3600 + 300 * i) for i in range(20)]
     f = H.forward(good + bad, [{"ts": t0 + 3600 * 5, "is_buy": True}], t0, t0 + 6 * 3600)
-    assert f["cooled"].startswith("минус на") and f["n"] < 17
+    assert f["cooled"].startswith("устойчивый минус") and f["n"] < 25
     idle = H.forward([copy("A", 0.1, t0 + 60), copy("B", 0.1, t0 + 14 * 3600)], [], t0, t0 + 20 * 3600)
     assert idle["n"] == 1 and idle["cooled"] == "нет покупок 12 ч"
 
 
-async def hot_wallet(db, addr=ME, n=16, own=False, bundled=False):
-    """n монет за последние часы: покупка → через 20 с чужая покупка на +40% (тейк A) → его продажа."""
+def test_alert_text_has_money_burst_and_buttons():
+    s = H.stats_of("W", [copy("A", 0.3, burst=True), copy("B", 0.1)], [{"mint": "A", "ts": NOW - 30, "is_buy": True}],
+                   {"A": "AAA"})
+    s.usd_day, s.usd_day_max, s.per_day, s.rule, s.rule_test, s.block2_avg = 52.0, 140.0, 40.0, "B", 0.12, 0.18
+    text, kb = H.alert_text(s, NOW, NOPOOL)
+    assert "$52 в день" in text and "$140 при 3% пула" in text and "Всплеск (+25% за 30 с): 50%" in text
+    assert "правило <b>B</b>" in text and "🟢 активен" in text and "через 1.36 с" in text
+    assert [b["callback"] for b in kb[0]] == ["hn:s:W", "hn:l:W", "hn:i:W"]
+    addr = "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5"
+    assert all(len(f"hn:{a}:{addr}".encode()) <= 64 for a in "slLix")
+
+
+# ====================================================================== база
+async def hot_wallet(db, addr=ME, n=16, own=False, bundled=False, hours_ago=40.0):
+    """n монет: покупка → через 20 с чужая покупка на +40% (тейк A) → его продажа через 40 с."""
     now = datetime.now(timezone.utc)
     for i in range(n):
         m = f"H{i:03d}{addr[:3]}" + "h" * 34
-        t = now - timedelta(hours=40 - i)
+        t = now - timedelta(hours=hours_ago - i)
         await put_coin(db, m, t - timedelta(minutes=2), dev=addr if own and i == 0 else DEV)
         await db.execute("UPDATE tokens SET created_slot = $2 WHERE mint = $1", m, 1000 + i * 100 if bundled else 1)
         await put_trade(db, m, addr, t, True, 50, 1000 + i * 100)
@@ -87,7 +143,7 @@ async def hot_wallet(db, addr=ME, n=16, own=False, bundled=False):
 
 class Engine:
     def __init__(self, db, **cfg):
-        self.db, self._cfg, self.sent = db, {"trader_min_trades_30d": 5, **cfg}, []
+        self.db, self._cfg, self.sent = db, {"trader_min_trades_30d": 5, "real_min_pool_sol": 0, **cfg}, []
         orig = db.enqueue
 
         async def enqueue(kind, payload, priority=5):
@@ -112,70 +168,102 @@ async def test_scan_finds_hot_wallet_once_and_skips_dev_and_bundles(db):
     cands = {c["trader"]: c for c in await H.candidates(db, now - 72 * 3600, now)}
     assert cands[ME]["coins"] == 16 and cands[devw]["own"] == 1 and cands[bund]["bundled"] == 16
     e = Engine(db, hunter_on=True)
-    h = H.Hunter(e)
-    hot = await h.scan(now)
+    hot = await H.Hunter(e).scan(now)
     assert [s.address for s in hot] == [ME]
     s = hot[0]
-    assert s.coins == 16 and s.win == 1.0 and 0.25 < s.avg < 0.4
+    assert s.coins_all == 16 and s.win == 1.0 and 0.2 < s.avg < 0.4 and s.usd_day > 0 and s.rule in H.RULES
     alerts = [p for p in e.sent if "горячий кошелёк" in p["text"]]
-    assert len(alerts) == 1 and alerts[0]["keyboard"][0][0]["callback"] == f"hn:s:{ME}"
-    assert await db.fetchval("SELECT status FROM hunter_wallets WHERE address = $1", ME) == "new"
-    assert await h.scan(now) == []                                               # второй раз не предлагает
+    assert len(alerts) == 1 and "в день" in alerts[0]["text"]
+    r = await db.fetchrow("SELECT status, list, rule, usd_day FROM hunter_wallets WHERE address = $1", ME)
+    assert r["status"] == "new" and r["list"] == "new" and r["rule"] == s.rule and r["usd_day"] > 0
+    assert await H.Hunter(e).scan(now) == []
 
 
-async def test_follow_buttons_and_cooling(db):
+async def test_track_lists_copies_and_battle_gate(db):
+    """После находки — новые сделки: копии бессрочно (hunter_copies), список по $ в день; в бой — только после 24 ч
+    тени (hunter:battle_ok)."""
+    await hot_wallet(db, ME, hours_ago=60)
+    e = Engine(db, hunter_on=True)
+    h = H.Hunter(e)
+    await h.scan(time.time())
+    await db.execute("UPDATE hunter_wallets SET found_at = now() - interval '50 hours' WHERE address = $1", ME)
+    await h.track(time.time())
+    r = await db.fetchrow("SELECT list, n_after, avg_after, usd_day_after FROM hunter_wallets WHERE address = $1", ME)
+    assert r["n_after"] and r["avg_after"] > 0 and r["usd_day_after"] > 0
+    assert await db.fetchval("SELECT count(*) FROM hunter_copies WHERE address = $1", ME) == r["n_after"]
+    monkey = H.BATTLE_N, H.BATTLE_USD
+    H.BATTLE_N, H.BATTLE_USD = 3, 1.0
+    try:
+        await h.track(time.time())
+        assert await db.fetchval("SELECT list FROM hunter_wallets WHERE address = $1", ME) == "battle"
+        assert "не в списке" not in (await H.battle_ready(db, ME) or "") and await H.battle_ready(db, ME) == \
+            "сначала 24 ч тени"
+        await H.follow(db, e.cfg, Costs(), ME, "shadow")
+        assert "меньше 24 ч" in await H.battle_ready(db, ME)
+        await db.execute("UPDATE hunter_wallets SET followed_at = now() - interval '25 hours' WHERE address = $1", ME)
+        assert "сделок" in await H.battle_ready(db, ME)                    # в тени ещё нет сделок
+        for _ in range(5):
+            await db.execute(
+                """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens,
+                       entry_mc, pnl_sol, pnl_pct) VALUES ('shadow', 'copy', 'M', $1, now() - interval '2 hours',
+                       now(), 0.14, 1, 40, 0.01, 0.07)""", ME)
+        assert await H.battle_ready(db, ME) is None
+        ok = await h.battle_list(time.time())
+        assert ME in ok and ME in (await db.kv_get(H.BATTLE_KEY))
+    finally:
+        H.BATTLE_N, H.BATTLE_USD = monkey
+
+
+async def test_follow_uses_wallet_rule_and_cools_on_steady_minus(db):
     await hot_wallet(db, ME)
     e = Engine(db, hunter_on=True)
     h = H.Hunter(e)
     await h.scan(time.time())
+    await db.execute("UPDATE hunter_wallets SET rule = 'G' WHERE address = $1", ME)
     await H.follow(db, e.cfg, Costs(), ME, "live")
-    assert (await db.kv_get("real:follow"))[ME] == "live" and (await db.kv_get("real:follow_rule"))[ME] == "A"
+    assert (await db.kv_get("real:follow"))[ME] == "live" and (await db.kv_get("real:follow_rule"))[ME] == "G"
     assert (await db.kv_get("real:follow_stake"))[ME] == H.STAKE_SOL
-    assert await db.fetchval("SELECT active AND manual FROM traders WHERE address = $1", ME)
-    assert await db.fetchval("SELECT status FROM hunter_wallets WHERE address = $1", ME) == "live"
-    # 10 наших сделок за ним за сутки в минусе — остыл: копирование стоп
-    for _ in range(10):
+    for i in range(12):
         await db.execute(
             """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
-                   pnl_sol, pnl_pct) VALUES ('live', 'smart', 'M', $1, now(), now(), 0.14, 1, 40, -0.01, -0.07)""", ME)
-    cooled = await h.watch(time.time())
-    assert cooled == [ME] and ME not in (await db.kv_get("real:follow") or {})
-    assert not await db.kv_get("real:follow_stake")
+                   pnl_sol, pnl_pct) VALUES ('live', 'copy', 'M', $1, now(), now(), 0.14, 1, 40, -0.01, $2)""",
+            ME, -0.07 - 0.01 * (i % 3))
+    assert await h.watch(time.time()) == [ME]
+    assert ME not in (await db.kv_get("real:follow") or {}) and not await db.kv_get("real:follow_stake")
     r = await db.fetchrow("SELECT status, cool_reason FROM hunter_wallets WHERE address = $1", ME)
-    assert r["status"] == "cooled" and r["cool_reason"].startswith("за 24 ч 10 сделок")
-    assert any("🧊 <b>Остыл</b>" in p["text"] and "бой" in p["text"] for p in e.sent)
-    assert await h.scan(time.time()) == []                                       # остывший — неделю не предлагаем
+    assert r["status"] == "cooled" and "устойчивый минус" in r["cool_reason"]
+    assert any("🧊 <b>Остыл</b>" in p["text"] for p in e.sent)
 
 
-async def test_daily_and_weekly_reports(db):
+async def test_hunt_text_daily_weekly(db):
     await hot_wallet(db, ME)
     e = Engine(db, hunter_on=True)
     h = H.Hunter(e)
     await h.scan(time.time())
+    text = await H.hunt_text(db, 24)
+    assert "найден" in text and ME in text and "/день" in text
     await H.follow(db, e.cfg, Costs(), ME, "shadow")
     await db.execute(
         """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
-               pnl_sol, pnl_pct) VALUES ('shadow', 'smart', 'M', $1, now(), now(), 0.14, 1, 40, 0.02, 0.15)""", ME)
+               pnl_sol, pnl_pct) VALUES ('shadow', 'copy', 'M', $1, now(), now(), 0.14, 1, 40, 0.02, 0.15)""", ME)
     await h.daily(time.time())
     assert any("итог за 24 ч" in p["text"] and "1 сд" in p["text"] for p in e.sent)
     text = await h.weekly(time.time())
     assert "найдено горячих 1" in text and "в плюсе 1 из 1 кошельков" in text
-    assert await h.weekly(time.time()) is None                                    # раз в неделю
+    assert await h.weekly(time.time()) is None
 
 
 async def test_hunter_off_does_not_scan(db):
     await hot_wallet(db, ME)
-    e = Engine(db, hunter_on=False)
-    await H.Hunter(e).tick(time.time())
+    await H.Hunter(Engine(db, hunter_on=False)).tick(time.time())
     assert not await db.fetchval("SELECT count(*) FROM hunter_wallets")
 
 
 async def test_history_run(db):
     await hot_wallet(db, ME, n=20)
-    # монеты 40…21 ч назад: в точке −24 ч за 72 ч до неё 17 монет — горячий; дальше 3 копии и 12 ч без покупок
-    text = await H.history(db, days=5, step_h=6)
-    assert "Горячих нашлось бы: 1" in text and "кошельков с 15+ монетами (не дев, не бандл): 2" in text     # второй — OTHER, не горячий
-    assert "После находки (модель, пока не остыл): копий 3" in text and "остыл: нет покупок 12 ч" in text
+    text = await H.history(db, days=5, step_h=6, prm=NOPOOL, trace=ME)
+    assert "Горячих нашлось бы: 1" in text and "кошельков с 15+ монетами (не дев, не бандл): 2" in text
+    assert "Найден" in text and "Для сравнения вход «блок +2»" in text
 
 
 async def test_follow_stake_in_executor(db):
@@ -187,20 +275,3 @@ async def test_follow_stake_in_executor(db):
     sol_usd = tr.sol_usd()
     stake, why = tr.stake_lamports(10**15, "smart", "W")
     assert why is None and stake == int(min(0.14 * sol_usd, S.max_stake_usd()) / sol_usd * 1e9)
-    other, _ = tr.stake_lamports(10**15, "smart", "X")
-    assert other == int(float(tr.get("real_stake_usd")) / sol_usd * 1e9)          # у остальных — как было
-
-
-def test_new_bar_50_coins_and_t3():
-    """25.11 (владелец): горячий — от 50 монет и t ≥ 3."""
-    new = H.Bar()
-    assert new.min_coins == 50 and new.min_t == 3.0
-    many = [copy(f"M{i}", 0.3 if i % 3 else -0.1) for i in range(60)]          # 60 монет, 67% в плюсе
-    s = H.stats_of("W", many, [])
-    assert s.t > 3 and s.hot(new) is None
-    noisy = [copy(f"M{i}", 1.5 if i % 3 == 0 else -0.45) for i in range(60)]   # +20% в среднем, но 33% в плюсе
-    assert H.stats_of("W", noisy, []).hot(new).startswith("в плюсе")
-    shaky = [copy(f"M{i}", 0.9 if i % 5 < 3 else -0.95) for i in range(55)]    # 60% в плюсе, +16%, разброс большой
-    st = H.stats_of("W", shaky, [])
-    assert st.t < 3 and st.hot(new).startswith("t ")
-    assert H.stats_of("W", many[:40], []).hot(new) == "монет 40 < 50"

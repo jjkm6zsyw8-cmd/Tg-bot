@@ -23,7 +23,10 @@ def _no_day_cap(monkeypatch):
 @pytest.fixture(autouse=True)
 def _mechanics(request, monkeypatch):
     if request.node.get_closest_marker("policy") is None:
+        from scanner.real import executor as ex
         monkeypatch.setattr(S, "RETIRED", frozenset())
+        monkeypatch.setattr(S, "SHADOW_ONLY", frozenset())       # 26.11: методы только в тени — у тестов механики боя
+        monkeypatch.setattr(ex, "BATTLE_GATE", False)            # «за ним» на деньги без списка «в бой»
         monkeypatch.setattr(pp, "PAPER_TRADING", True)
 
 

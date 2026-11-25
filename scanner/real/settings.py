@@ -119,7 +119,7 @@ SETTINGS: dict[str, tuple[str, Any, float, float, float, str, str]] = {
     "real_max_signal_age_s": ("Макс. возраст сигнала, с", 4.0, 1.0, 1.0, 30.0, "sec",
                               "Сигнал дошёл до исполнителя позже — пропуск."),
     "real_max_blocks": ("Не входить, если после сигнала прошло блоков больше", 10, 2, 2, 100, "num",
-                        "Блок ≈ 0.4 с. Бумага считает вход через 2 блока; опоздали сильнее — это уже другая сделка."),
+                        "Блок ≈ 0.4 с."),
     "real_priority_sol": ("Приоритет на транзакцию, SOL", 0.0003, 0.0001, 0.00001, 0.01, "sol",
                           "Доплата сети за скорость включения в блок (за каждую транзакцию)."),
     "real_tip_sol": ("Чаевые за быструю доставку, SOL", 0.00001, 0.00001, 0.000005, 0.01, "sol",
@@ -131,6 +131,11 @@ SETTINGS: dict[str, tuple[str, Any, float, float, float, str, str]] = {
     "real_poll_s": ("Проверка цены открытых позиций, с", 4.0, 1.0, 1.0, 30.0, "sec",
                     "Цена открытых позиций (бой и тень) прямо из блокчейна — как бумага берёт её каждые 4 с."),
     "real_price_stale_min": ("Бой: алерт, если цена не обновлялась, мин", 5, 1, 1, 120, "num", ""),
+    # 26.11 (сводное ТЗ, защита копирования)
+    "real_min_pool_sol": ("Копии: пул от, SOL", 30.0, 5.0, 0.0, 500.0, "sol", ""),
+    "real_copy_max_share": ("Копии: ставка не больше доли его покупки", 0.10, 0.05, 0.01, 1.0, "pct", ""),
+    "real_max_depth_share": ("Копии: ставка не больше доли SOL пула", 0.03, 0.01, 0.005, 0.2, "pct", ""),
+    "real_follow_max_sol": ("Копии: открыто на один кошелёк до, SOL", 0.5, 0.1, 0.05, 20.0, "sol", ""),
     "real_reserve_sol": ("Неприкосновенный остаток, SOL", 0.02, 0.01, 0.005, 1.0, "sol",
                          "На комиссии и залоги счетов; ниже остатка покупки не делаются."),
     "real_jup_slippage": ("Jupiter: лимит проскальзывания", 0.05, 0.01, 0.01, 0.30, "pct", ""),
@@ -145,8 +150,7 @@ SETTINGS: dict[str, tuple[str, Any, float, float, float, str, str]] = {
 TOGGLES: dict[str, tuple[str, bool, str]] = {
     # 22.11: «торговать только за теми, кого я выбрал»; 24.11: методы при этом меряются в тени (без денег)
     "real_only_follow": ("🎯 На деньги — только выбранные мной кошельки", False,
-                         "В бой идут только покупки кошельков, за которыми ты сам нажал «💵 Бой за ним». Методы "
-                         "(smart, мой дев, тренды…) и тень, которую бот включил сам, — только в тени, без денег."),
+                         "Методы и так только в тени (26.11)."),
     "real_smart": ("Сигналы smart", True, ""),
     "real_mydev": ("Сигналы «мой дев»", True, ""),
     "real_autofollow": ("Авто-тень за кошельками с плюсом", True, ""),
@@ -182,10 +186,9 @@ TOGGLES: dict[str, tuple[str, bool, str]] = {
     # 19.11: бумага до исправлений завышала PumpSwap и «мой дев» — честные цифры по методам даёт тень (симуляция
     # настоящей сделки). Чтобы она считала все сигналы, а не первые 3 до дневного стопа, — замер без ограничений
     "real_shadow_all": ("Тень считает все методы (замер)", True,
-                        "Выключенные методы тоже идут в тень — для честной таблицы по каждому методу. На деньги "
-                        "по-прежнему только включённые."),
+                        "Выключенные методы тоже идут в тень."),
     "real_shadow_free": ("Тень без дневного стопа и лимита позиций", True,
-                         "Тень — только симуляция: считает все сигналы (до 30 позиций), а не первые до стопа."),
+                         "Считает все сигналы (до 30 позиций)."),
     # 20.11: у метода одно правило выхода, а сравнить хочется все — пробы считают A / B / G / R на том же входе
     "real_rule_trials": ("Пробовать все правила выхода (A…Q)", True,
                          "Тот же вход — все правила выхода; только расчёт, без денег."),
@@ -242,17 +245,16 @@ def method_name(cfg: dict[str, Any], kind: str) -> str:
     """«Smart M», «Smart A», «Smart (как M) → G», «Мой дев G (только тень)», «Копии → A»…"""
     rule = get(cfg, SCHEME_KEYS[kind])
     if kind == "smart":
-        if get(cfg, "real_smart_filter") == "m":
-            return "Smart M" if rule == "A" else f"Smart (отбор M) → {rule}"
-        return f"Smart {rule}"
+        name = (("Smart M" if rule == "A" else f"Smart (отбор M) → {rule}") if get(cfg, "real_smart_filter") == "m"
+                else f"Smart {rule}")
+        return name + (" (только тень)" if kind in SHADOW_ONLY else "")
     base = {"mydev": "Мой дев", "bigcopy": "Крупные копии", "copy": "Копии", "swing": "Смарт-ракеты",
             "trend": "Тренды", "newdev": "Новый дев", "trendj": "Тренды (др. биржи)",
             "majorj": "Крупные монеты"}[kind]
     default = DEFAULT_SCHEMES[SCHEME_KEYS[kind]]
     out = f"{base} {rule}" if kind == "mydev" else (base if rule == default else f"{base} → {rule}")
-    if kind == "mydev" and not get(cfg, "real_live_mydev"):
-        out += " (только тень)"
-    if (kind == "trendj" and not get(cfg, "real_live_trendj")) or kind == "majorj":
+    if (kind in SHADOW_ONLY or (kind == "mydev" and not get(cfg, "real_live_mydev"))
+            or (kind == "trendj" and not get(cfg, "real_live_trendj")) or kind == "majorj"):
         out += " (только тень)"
     return out
 
@@ -320,8 +322,11 @@ METHODS: dict[str, tuple[str, str, str]] = {
 # и не показываются на экранах. Код остаётся: «за ним» (кошельки, выбранные владельцем вручную) торгуется теми же
 # видами сделок (smart / копия), а «тренд» несёт сигнал «трендов на других биржах». Вернуть метод — убрать его
 # отсюда (тесты механики подменяют это множество пустым, см. tests/conftest.py)
-RETIRED = frozenset({"smart", "mydev", "copy", "bigcopy", "trend", "newdev",
+# 26.11 (сводное ТЗ владельца): убран только «новый дев»; остальные методы возвращены, но ТОЛЬКО в тень (SHADOW_ONLY):
+# на деньги идёт лишь «за ним» по кошелькам из списка охотника «в бой» после 24 ч тени и по кнопке владельца
+RETIRED = frozenset({"newdev",
                      "autofollow"})          # autofollow — бот сам включал «тень за ним» за кошельками (те же копии)
+SHADOW_ONLY = frozenset({"smart", "mydev", "copy", "bigcopy", "swing", "trend", "trendj", "majorj"})
 # выключатели убранного — не показываются в настройках
 RETIRED_TOGGLES = frozenset({"real_mydev_strong_only", "real_autofollow"})
 
@@ -347,6 +352,8 @@ def live_methods(cfg: dict[str, Any]) -> list[str]:
         return []
     out = []
     for k, (_name, on_key, _port) in METHODS.items():
+        if k in SHADOW_ONLY:
+            continue                     # 26.11: методы — только тень
         if k in RETIRED:
             continue
         if not get(cfg, on_key) or (k == "mydev" and not get(cfg, "real_live_mydev")) \

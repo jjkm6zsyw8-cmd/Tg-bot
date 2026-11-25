@@ -82,7 +82,12 @@ async def test_autotune_decisions():
         assert "Автонастройка" in await AT.last_text(db)
         out12 = await AT.run(db, cfg, {"trend"}, now=time.time() + 12 * 3600)      # полсуток — ещё рано
         assert not out12 and "real_scheme" not in await db.get_overrides()        # изменений нет — отчёта нет
-        out25 = await AT.run(db, cfg, {"trend"}, now=time.time() + 25 * 3600)      # сутки удержалось — переключаю
+        out25 = await AT.run(db, cfg, {"trend"}, now=time.time() + 25 * 3600)      # сутки, но новых пар нет — ждём
+        assert not out25 and "real_scheme" not in await db.get_overrides()
+        # 26.11 (F): подтверждение — только на новых парах (от 30)
+        await pairs(db, "smart", "A", "G", [0.04] * 30)
+        await pairs(db, "trend", "A", "B", [0.05] * 30)
+        out25 = await AT.run(db, cfg, {"trend"}, now=time.time() + 25 * 3600)      # подтвердилось — переключаю
         assert "🔁 <b>smart</b>: продаю по правилу G вместо A" in out25[0] and "держится сутки" in out25[0]
         assert (await db.get_overrides())["real_scheme"] == "G"
         assert "💡 <b>тренд</b>: B лучше A" in out25[0] and "Метод в бою — сам не меняю" in out25[0]
@@ -147,6 +152,30 @@ async def test_rule_switch_needs_pairs_and_stability():
         await db.execute("UPDATE real_rule_trials SET pnl_pct = -0.01 WHERE kind = 'smart'")   # разница пропала
         out = await AT.run(db, cfg, set(), now=now + 25 * 3600)
         assert "↩️ <b>smart</b>: кандидат G больше не лучше A" in out[0]
+        assert "real_scheme" not in await db.get_overrides() and not await db.kv_get(AT.PENDING_KEY)
+    finally:
+        await db.close()
+
+
+
+async def test_rule_switch_not_confirmed_on_new_pairs():
+    """26.11 (F): кандидат нашёлся на 7-дневном окне, но на 30 новых парах разницы нет — не меняем, кандидат сброшен."""
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=3)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        await pairs(db, "smart", "A", "G", [0.05] * 100)
+        cfg = {"real_scheme": "A"}
+        out = await AT.run(db, cfg, set())
+        assert "🔎 <b>smart</b>" in out[0]
+        await pairs(db, "smart", "A", "G", [0.0] * 20)
+        assert not await AT.run(db, cfg, set(), now=time.time() + 25 * 3600)       # 20 новых — мало, ждём
+        await pairs(db, "smart", "A", "G", [0.0] * 10)
+        out = await AT.run(db, cfg, set(), now=time.time() + 25 * 3600)
+        assert "↩️ <b>smart</b>: на 30 новых парах G не подтвердился" in out[0]
         assert "real_scheme" not in await db.get_overrides() and not await db.kv_get(AT.PENDING_KEY)
     finally:
         await db.close()

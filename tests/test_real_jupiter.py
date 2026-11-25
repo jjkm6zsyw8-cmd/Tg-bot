@@ -620,11 +620,23 @@ async def test_dead_watch_sells_written_off_tokens_when_buyers_return(db, monkey
     await tr._dead_watch()                                     # покупателей всё ещё нет — ничего не делает
     assert len(chain.sent) == 1
     ext.rugged = False                                         # ликвидность вернули
-    await tr._dead_watch()
+    keyboards = []
+
+    async def say_kb(text, keyboard=None):
+        said.append(text)
+        keyboards.append(keyboard)
+    tr._say = say_kb
+    await tr._dead_watch()                                     # 26.11 (D3): сам не продаёт — котировка и кнопка
+    assert len(chain.sent) == 1 and (await db.fetchval("SELECT exit_reason FROM real_positions")) == "rug"
+    assert any("Сторож" in t and "Продать?" in t for t in said)
+    assert keyboards[-1][0][0]["callback"] == f"rl:dsell:{p.id}"
+    await tr._dead_watch()                                     # повтор не раньше чем через 6 ч
+    assert sum("Продать?" in t for t in said) == 1
+    await tr.dead_sell(p.id)                                   # кнопка владельца
     r = await db.fetchrow("SELECT exit_reason, proceeds_sol, pnl_pct FROM real_positions")
     assert r["exit_reason"] == "rug_back" and r["proceeds_sol"] > 0 and r["pnl_pct"] > -0.1
     assert chain.tokens_of(tr.wallet.pubkey, coin) == 0 and len(chain.sent) == 2
-    assert any("Сторож" in t for t in said)
+    assert any("Сторож" in t and "продал" in t for t in said)
 
 
 
@@ -747,3 +759,48 @@ async def test_rug_backfill_for_old_write_offs(db, monkeypatch):
     assert "проверено 2" in text and "подтверждено (покупателей нет и сейчас): 1" in text
     bl = await db.kv_get(ex.RUG_CREATORS_KEY)
     assert set(bl) == {ext.creator} and bl[ext.creator]["mint"] == str(dead)
+
+
+
+async def test_no_price_no_entry_and_quote_fallback(db, monkeypatch):
+    """26.11 (D1): нет цены Price API — цена по котировке; нет и котировки — не входим."""
+    chain = FakeChain()
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_jup_dry_run=False)
+    tr.e.ext = ext = Ext(chain)
+
+    async def no_price(mint, ttl=None):
+        return None
+    ext.jup_price = no_price
+    await tr.start()
+    await signal(tr, other_coin(chain, "np-quote"), aid=1)
+    assert len(tr.positions) == 1                               # котировка есть — цена есть
+    ext.rugged = True                                           # и котировки нет (маршрута нет)
+    real_full = ext.jup_quote_full
+
+    async def no_buy_route(inp, out, amount, slippage_bps):
+        if inp == ex.SOL_MINT:
+            return {"no_route": True}
+        return await real_full(inp, out, amount, slippage_bps)
+    ext.jup_quote_full = no_buy_route
+    await signal(tr, other_coin(chain, "np-none"), aid=2)
+    assert len(tr.positions) == 1 and skipped(tr, "нет цены: ни Price API Jupiter, ни котировки")
+
+
+async def test_jupiter_429_alert():
+    from types import SimpleNamespace
+    from scanner.real.desk import RealDesk
+    desk = RealDesk.__new__(RealDesk)
+    said = []
+
+    async def say(text, keyboard=None):
+        said.append(text)
+    desk.say = say
+    stats = SimpleNamespace(rate_limited=0)
+    desk.e = SimpleNamespace(ext=SimpleNamespace(jupiter=SimpleNamespace(stats=stats)))
+    await desk.jup_limit_watch()
+    stats.rate_limited = 3
+    await desk.jup_limit_watch()
+    assert len(said) == 1 and "429" in said[0] and "3 раз" in said[0]
+    stats.rate_limited = 5
+    await desk.jup_limit_watch()
+    assert len(said) == 1                                       # не чаще раза в 30 мин

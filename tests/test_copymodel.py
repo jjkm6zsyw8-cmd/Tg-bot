@@ -285,3 +285,25 @@ async def test_load_ticks_and_cover_include_reserves(db):
     assert [(t.mc, t.trader, t.price_ok) for t in ticks] == [(50, ME, True), (55, "", True)]
     cover = (await M.load_cover(db, win))[m]
     assert len(cover) == 1 and cover[0][1] - cover[0][0] == pytest.approx(2399, abs=1)
+
+
+async def test_datacheck_model_vs_shadow_and_noprice(db):
+    """26.11 (проверки 3–4): модель против тени на одной сделке и доля копий без цены."""
+    from scanner.analytics import datacheck as DC
+    now = datetime.now(timezone.utc)
+    m = "DCHK" + "d" * 40
+    t = now - timedelta(hours=2)
+    await put_coin(db, m, t - timedelta(minutes=2))
+    await put_trade(db, m, ME, t, True, 50, 100)
+    await put_trade(db, m, OTHER, t + timedelta(seconds=20), True, 70, 140)       # тейк A по модели
+    await db.execute("INSERT INTO traders(address, active, manual) VALUES ($1, true, true)", ME)
+    await db.execute(
+        """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
+               pnl_sol, pnl_pct, extra) VALUES ('shadow', 'copy', $1, $2, $3, now(), 0.14, 1, 50, 0.04, 0.30,
+               '{"rule": "A"}'::jsonb)""", m, ME, t + timedelta(seconds=1))
+    lines, mean = await DC.model_vs_shadow(db, 3, 1.36)
+    assert mean is not None and abs(mean) < 0.15 and "1 из 1" in lines[0]
+    lines, share = await DC.noprice_part(db, 24, 1.36)
+    assert share == 0.0 and "0 из 1" in lines[0]
+    text = await DC.run(db, 24, 3, 1.36)
+    assert "Модель против тени" in text

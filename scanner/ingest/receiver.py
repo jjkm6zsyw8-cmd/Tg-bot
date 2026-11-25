@@ -101,6 +101,9 @@ class Receiver:
         self.reserve_last_error = ""
         if self.reserves is not None:
             self.reserves.on_complete = self.reserve_migrated
+            self.reserves.on_jump = self.reserve_migrated            # 26.11 (B1): скачок — перечитать пул
+            self.reserves.COIN_DAILY_BYTES = int(float(rel.get("reserve_coin_daily_mb", 3)) * 1e6)
+        self.dev_watch_until: dict[str, float] = {}   # 26.11 (B2): дев монеты, купленной отслеживаемым, — 35 мин
         self.reserve_until: dict[str, float] = {}     # монета → до какого времени слушать резервы
         self.reserve_capped = False
         self._reserve_busy: set[str] = set()
@@ -258,6 +261,7 @@ class Receiver:
                 if self.watch is not None:
                     self.watch_coin(ev.mint, self.coin_track_s)
                 self.reserve_watch(ev.mint, self.coin_track_s)
+                asyncio.create_task(self._watch_dev(ev.mint, self.coin_track_s))
             if not self.should_store(ev):
                 return
             self._track_mc(ev)
@@ -313,9 +317,21 @@ class Receiver:
         if self.reserves is None:
             return
         self.reserve_until[mint] = max(self.reserve_until.get(mint, 0), time.time() + seconds)
+        if mint in self.reserves.capped:
+            return                                    # суточный лимит монеты кончился
         if mint not in self.reserves.targets and mint not in self._reserve_busy and not self.reserve_capped:
             self._reserve_busy.add(mint)
             asyncio.create_task(self._reserve_add(mint))
+
+    async def _watch_dev(self, mint: str, seconds: float) -> None:
+        """26.11 (B2): «продал дев» без логов по монете — 35 мин слушаем кошелёк дева этой монеты (его сделки редки:
+        одна подписка, мало трафика)."""
+        try:
+            dev = await self.db.fetchval("SELECT deployer FROM tokens WHERE mint = $1", mint)
+        except Exception:  # noqa: BLE001
+            return
+        if dev and self.watch is not None:
+            self.dev_watch_until[dev] = max(self.dev_watch_until.get(dev, 0), time.time() + seconds)
 
     async def reserve_migrated(self, mint: str) -> None:
         """Кривая закрылась — монета на PumpSwap: слушаем хранилища пула."""
@@ -424,6 +440,10 @@ class Receiver:
                UNION SELECT address FROM scout WHERE status = 'probation'""")
         wallets = [r["address"] for r in rows]
         seen = set(wallets)
+        now0 = time.time()
+        self.dev_watch_until = {a: t for a, t in self.dev_watch_until.items() if t > now0}
+        wallets += [a for a in self.dev_watch_until if a not in seen]       # 26.11 (B2): девы монет — после списка
+        seen |= set(self.dev_watch_until)
         wallets += [a for a in await self.candidates() if a not in seen]      # кандидаты — последними
         self.watch_devs = {r["wallet"] for r in await self.db.fetch(
             """SELECT l.wallet FROM cluster_links l JOIN clusters c ON c.id = l.cluster_id
@@ -928,14 +948,25 @@ class Receiver:
                 [(c.mint, c.started_at, c.ended_at) for c in covers])
 
     async def retention_loop(self) -> None:
-        days = int(self.settings.reliability().get("raw_trades_days", 30))
         while True:
             await asyncio.sleep(6 * 3600)
-            await self.db.execute("DELETE FROM trades WHERE ts < now() - make_interval(days => $1)", days)
-            await self.db.execute("DELETE FROM sol_transfers WHERE ts < now() - make_interval(days => $1)", days * 2)
-            await self.db.execute("DELETE FROM outbox WHERE sent_at < now() - interval '7 days'")
-            await self.db.execute("DELETE FROM reserve_ticks WHERE ts < now() - make_interval(days => $1)", days)
-            await self.db.execute("DELETE FROM reserve_cover WHERE ended_at < now() - make_interval(days => $1)", days)
+            await self.retention_once()
+
+    async def retention_once(self) -> None:
+        days = int(self.settings.reliability().get("raw_trades_days", 30))
+        keep = int(self.settings.reliability().get("tracked_trades_days", 30))
+        # 26.11 (B4): сделки отслеживаемых кошельков (свой список, «за ним», охотник) — tracked_trades_days (30),
+        # остальные — raw_trades_days; результаты охотника и копии после находки (hunter_*) не удаляются
+        await self.db.execute(
+            """DELETE FROM trades WHERE ts < now() - make_interval(days => $1) AND trader NOT IN (
+                   SELECT address FROM traders WHERE active OR manual
+                   UNION SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')
+                   UNION SELECT address FROM hunter_wallets WHERE list <> 'archive')""", days)
+        await self.db.execute("DELETE FROM trades WHERE ts < now() - make_interval(days => $1)", max(days, keep))
+        await self.db.execute("DELETE FROM sol_transfers WHERE ts < now() - make_interval(days => $1)", days * 2)
+        await self.db.execute("DELETE FROM outbox WHERE sent_at < now() - interval '7 days'")
+        await self.db.execute("DELETE FROM reserve_ticks WHERE ts < now() - make_interval(days => $1)", days)
+        await self.db.execute("DELETE FROM reserve_cover WHERE ended_at < now() - make_interval(days => $1)", days)
 
     async def run(self) -> None:
         await self.load_known_mints()

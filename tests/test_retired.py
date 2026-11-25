@@ -1,6 +1,6 @@
-"""25.11 (владелец: «убирай вообще с бота все минусовые хуйни и бумажную торговлю»): как бот работает у владельца —
-без подмены из conftest (метка policy). Убранные методы не торгуют ни в тени, ни в бою и не видны на экранах; бумага не
-открывает позиций, но сигнал реальному боту по-прежнему уходит; «за ним» (выбранные вручную кошельки) работает."""
+"""Как бот работает у владельца — без подмены из conftest (метка policy). 25.11: бумага выключена (сигнал реальному
+боту уходит). 26.11 (сводное ТЗ): убран только «новый дев», остальные методы — только тень; на деньги — только «за ним»
+из списка охотника «в бой» (hunter:battle_ok); kill switch."""
 from __future__ import annotations
 
 import asyncio
@@ -21,29 +21,49 @@ ALL_ON = {"real_smart": True, "real_mydev": True, "real_copy": True, "real_bigco
 
 
 def test_policy_retired_set_and_paper_off():
-    assert {"smart", "mydev", "copy", "bigcopy", "trend", "newdev"} <= S.RETIRED and not pp.PAPER_TRADING
-    assert S.active_methods() == ["swing", "trendj", "majorj"]
-    assert S.methods_summary(ALL_ON) == "Смарт-ракеты · Тренды (др. биржи) (только тень) · Крупные монеты (только тень)"
-    assert S.live_methods(ALL_ON) == ["смарт-ракета"]           # «тренды др. бирж» в бой — только своей кнопкой
+    """26.11 (сводное ТЗ): убран только «новый дев»; все остальные методы — только тень."""
+    assert S.RETIRED == {"newdev", "autofollow"} and not pp.PAPER_TRADING
+    assert "newdev" not in S.active_methods() and set(S.active_methods()) == S.SHADOW_ONLY
+    assert S.live_methods(ALL_ON) == []                          # ни один метод на деньги не идёт
+    assert all("(только тень)" in part for part in S.methods_summary(ALL_ON).split(" · "))
 
 
-async def test_retired_methods_do_not_trade_even_when_switched_on(db, monkeypatch):
+async def test_methods_only_shadow_even_when_wallet_live(db, monkeypatch):
+    """26.11: кошелёк бота в бою, все методы включены — методы всё равно только в тени, ни одной транзакции."""
     chain = FakeChain()
-    m_smart, m_dev, m_swing = pk("ret-smart"), pk("ret-dev"), pk("ret-swing")
-    for m in (m_smart, m_dev, m_swing):
+    m_smart, m_swing = pk("ret-smart"), pk("ret-swing")
+    for m in (m_smart, m_swing):
         chain.add_curve(m, 40.0)
     tr = live(db, chain, monkeypatch, real_max_open=10, real_shadow_all=True, **ALL_ON)
     await tr.start()
-    for k in ("smart", "mydev", "copy", "bigcopy", "trend", "newdev"):
-        assert tr.mode_for(k) == "off", k                        # ни тени, ни боя — даже включённые и «мерить всё»
-    assert tr.mode_for("swing") == "live" and tr.mode_for("majorj") == "shadow"
+    assert tr.mode() == "live" and tr.mode_for("newdev") == "off"
+    for k in S.SHADOW_ONLY:
+        assert tr.mode_for(k) == "shadow", k
     await fire(tr, chain, mint=m_smart, kind="smart")
-    await fire(tr, chain, mint=m_dev, kind="mydev", alert_id=2)
-    assert not tr.positions and not chain.sent
     data = {"modes": ["swing"], "symbol": "SW", "trigger_at": time.time(), "trigger_ts": time.time() - 0.8,
             "trigger_slot": chain.slot - 2, "trigger_mc": chain.mc(m_swing), "trigger_sig": "sig"}
     await tr.on_signal(str(m_swing), "normal", 3, data, "HOLDER", {"R"})
-    assert only(tr).extra["kind"] == "swing"                     # оставшийся метод торгует как раньше
+    assert {p.extra["mode"] for p in tr.positions.values()} == {"shadow"} and len(tr.positions) == 2
+    assert not chain.sent
+
+
+async def test_follow_live_needs_battle_list_and_no_kill_switch(db, monkeypatch):
+    """26.11 (D5): «за ним» на деньги — только кошелёк из списка охотника «в бой» (hunter:battle_ok); kill switch
+    отключает бой всем."""
+    chain = FakeChain()
+    tr = live(db, chain, monkeypatch, real_max_open=10)
+    await db.kv_set("real:follow", {"STAR": "live"})
+    await tr.start()
+    assert tr.follow_mode("STAR") == "shadow"                    # нажата кнопка «бой», но не в списке «в бой»
+    await db.kv_set("hunter:battle_ok", {"STAR": time.time()})
+    await tr.load_follow()
+    assert tr.follow_mode("STAR") == "live"
+    await db.kv_set("real:kill", {"why": "тест"})
+    await tr.load_follow()
+    assert tr.mode() == "shadow" and tr.follow_mode("STAR") == "shadow" and "kill switch" in tr.why_not_live()
+    await db.kv_set("real:kill", None)
+    await tr.load_follow()
+    assert tr.follow_mode("STAR") == "live"
 
 
 async def test_manual_follow_still_trades_retired_kinds(db):
@@ -114,21 +134,21 @@ async def test_rug_filter_now_from_real_trades(db):
     assert str(m) in tr.e.paper.rugged and "OTHER" not in tr.e.paper.rugged
 
 
-async def test_screens_show_only_remaining_methods_and_no_paper(db):
+async def test_screens_show_methods_as_shadow_only_and_no_paper(db):
     text, kb = await UI.methods_view(db, {}, None)
     calls = [b["callback"] for row in kb for b in row]
     assert "Смарт-ракеты" in text and "Тренды на других биржах" in text and "Крупные монеты" in text
-    rest = "\n".join(x for x in text.split("\n") if "убраны 25.11" not in x)   # кроме строки «что убрано»
-    for gone in ("Smart", "Мой дев", "Копии своего списка", "Новый дев", "бумага", "Бумага", "Как бумага"):
+    rest = "\n".join(x for x in text.split("\n") if "Убран" not in x and "убран" not in x)
+    for gone in ("Новый дев", "бумага", "Бумага", "Как бумага"):
         assert gone not in rest, gone
-    assert not any(c.startswith("rl:wmp") or ":smart:" in c or ":mydev:" in c for c in calls)
-    t2, kb2 = await UI.method_view(db, {}, "g", "smart")
+    assert not any(c.startswith("rl:wmp") or ":newdev:" in c for c in calls)
+    t2, kb2 = await UI.method_view(db, {}, "g", "newdev")
     assert "метод убран" in t2 and kb2 == [[{"text": "← Методы", "callback": "rl:wme:g"}]]
-    r = await UI.on_wallet_callback(db, {}, "wmx", "g:smart:on")
-    assert r.toast == "Метод убран (в минусе)" and "real_smart" not in await db.get_overrides()
+    r = await UI.on_wallet_callback(db, {}, "wmx", "g:newdev:on")
+    assert r.toast == "Метод убран (в минусе)" and "real_newdev" not in await db.get_overrides()
     r = await UI.on_wallet_callback(db, {}, "wmall", "g:on")
     ov = await db.get_overrides()
-    assert ov.get("real_swing") is True and ov.get("real_trendj") is True and "real_smart" not in ov
+    assert ov.get("real_swing") is True and ov.get("real_smart") is True and "real_newdev" not in ov
     t3, _ = await UI.method_view(db, {}, "g", "swing")
     assert "<b>Бумага</b>" not in t3
     st_text, st_kb = await R.status_view(db, {})
@@ -154,9 +174,9 @@ async def test_pnl_hides_retired_shadow_but_never_hides_money(db):
     await db.kv_set("real:follow", {"STAR": "shadow"})
     text, _ = await ST.view(db, {})
     shadow_part, _, live_part = text.partition("💵 <b>Бой</b>")
-    assert "ракеты" in shadow_part and "новый дев" not in shadow_part and "копии" not in shadow_part
+    assert "ракеты" in shadow_part and "новый дев" not in shadow_part
     assert "smart" in live_part                                  # бой — всегда целиком: это деньги
-    assert "За кошельками" in text and "Убраны 25.11" in text
+    assert "За кошельками" in text and "Убран 25.11" in text
 
 
 async def test_excel_has_no_paper_sheets(db):
@@ -179,8 +199,8 @@ async def test_scout_trials_are_off():
     assert await sc.run_once() == [] and calls == ["rules"]
 
 
-async def test_trends_on_other_dexes_still_work_without_pumpfun_trends(db):
-    """Сигнал «тренд» общий: монета pump.fun — молча мимо (метод убран), другая биржа — «тренды на других биржах»."""
+async def test_pumpfun_trends_back_in_shadow_and_other_dexes_too(db):
+    """26.11: тренды pump.fun снова в тени (замер признаков входа), другая биржа — «тренды на других биржах»."""
     from tests.test_real_jupiter import Ext, other_coin, signal
     chain = FakeChain()
     pumpcoin, ray = pk("ret-trend-pump"), other_coin(chain, "ret-trend-ray")
@@ -190,10 +210,10 @@ async def test_trends_on_other_dexes_still_work_without_pumpfun_trends(db):
     tr.e.ext = Ext(chain)
     await tr.start()
     await signal(tr, pumpcoin)
-    assert not tr.positions and not tr.skips                      # без позиции и без записи в «Пропуски»
+    assert [p.extra["kind"] for p in tr.positions.values()] == ["trend"], dict(tr.skips)
     await signal(tr, ray, aid=10)
-    p = only(tr)
-    assert p.extra["kind"] == "trendj" and p.extra["venue"] == "jupiter" and p.extra["mode"] == "shadow"
+    kinds = sorted((p.extra["kind"], p.extra["mode"]) for p in tr.positions.values())
+    assert kinds == [("trend", "shadow"), ("trendj", "shadow")]
 
 
 async def test_engine_starts_without_paper():

@@ -129,25 +129,47 @@ class Env(BaseSettings):
         return ""
 
 
+def deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    """over поверх base: вложенные словари — по ключам, остальное — заменой."""
+    out = dict(base)
+    for k, v in (over or {}).items():
+        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
 class YamlConfig:
-    """YAML-конфиг с перечитыванием по изменению файла."""
+    """YAML-конфиг с перечитыванием по изменению файла. 26.11 (владелец): свои настройки — в config.local.yaml рядом
+    (не в git, обновление их не стирает), он ложится поверх config.yaml."""
 
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
+        self.local = self.path.with_name(self.path.stem + ".local" + self.path.suffix)
         self._data: dict[str, Any] = {}
         self._mtime = 0.0
         self._checked = 0.0
         self.reload(force=True)
 
+    def _mtimes(self) -> float:
+        total = 0.0
+        for p in (self.path, self.local):
+            try:
+                total += p.stat().st_mtime
+            except FileNotFoundError:
+                pass
+        return total
+
     def reload(self, force: bool = False) -> bool:
-        try:
-            mtime = self.path.stat().st_mtime
-        except FileNotFoundError:
+        if not self.path.exists():
             return False
+        mtime = self._mtimes()
         if not force and mtime == self._mtime:
             return False
         with self.path.open(encoding="utf-8") as fh:
-            self._data = yaml.safe_load(fh) or {}
+            data = yaml.safe_load(fh) or {}
+        if self.local.exists():
+            with self.local.open(encoding="utf-8") as fh:
+                data = deep_merge(data, yaml.safe_load(fh) or {})
+        self._data = data
         self._mtime = mtime
         return True
 

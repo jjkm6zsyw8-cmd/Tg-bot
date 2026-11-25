@@ -113,6 +113,22 @@ def _price_at(ticks: list[Tick], ts: float) -> Tick | None:
     return last
 
 
+def entry_by_delay(e: Entry, ticks: list[Tick], delay_s: float) -> Tick | None:
+    """26.11: вход с нашей настоящей задержкой (медиана из боя 1.36 с от его покупки до нашей): худшая для покупки
+    цена сделок за (его покупка; + delay]; сделок нет — цена после его покупки."""
+    ok = [t for t in ticks if t.price_ok]
+    win = [t for t in ok if e.ts < t.ts <= e.ts + delay_s]
+    if win:
+        return max(win, key=lambda t: t.mc)
+    return _price_at(ok, e.ts + delay_s)
+
+
+def pool_sol(mc: float, venue: str) -> float:
+    """Настоящих SOL в кривой / пуле при этом MC (кривая: виртуальный резерв минус стартовые 30 SOL)."""
+    s = reserves(mc, venue)[0]
+    return s if venue == AMM else max(0.0, s - INITIAL_V_SOL)
+
+
 def entry_tick(e: Entry, ticks: list[Tick]) -> Tick | None:
     """Цена входа бота: худшая для покупки цена блоков (его блок; его блок + 2]; сделок там нет — цена после последней
     сделки до блока + 2 (это его же покупка). Блок неизвестен — цена через ENTRY_DELAY_S."""
@@ -136,23 +152,38 @@ class Copy:
     exit_mc: float = 0.0
     venue: str = "pump"
     hold_s: float = 0.0
+    stake: float = STAKE_SOL             # 26.11: ставка копии, SOL (для $ в день)
+    burst: bool = False                  # 26.11: цена от нашего входа дала +BURST_UP за BURST_S
+
+
+SMALL_POOL = "мелкий пул"             # копия не в оценке: бот в такой пул не входит (C1, real_min_pool_sol)
+BURST_UP, BURST_S = 0.25, 30.0
 
 
 def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, created_ts: float | None,
                scheme: dict[str, Any] | None = None, stake: float = STAKE_SOL,
-               covered: list[tuple[float, float]] | None = None) -> Copy:
+               covered: list[tuple[float, float]] | None = None, entry_delay_s: float | None = None,
+               stake_share: float | None = None, min_pool_sol: float = 0.0) -> Copy:
     """Копия одной покупки трейдера: вход как у бота, выход по decide_exit (правило A и общие выходы).
-    covered — окна слежения за резервами монеты (reserve_cover): внутри окна тишина значит «цена не менялась»."""
+    covered — окна слежения за резервами монеты (reserve_cover): внутри окна тишина значит «цена не менялась».
+    26.11: entry_delay_s — вход через нашу задержку (иначе блок +2); stake_share — ставка как доля SOL пула (3%
+    глубины) вместо stake; min_pool_sol — в пул мельче бот не входит (копия не в оценке)."""
     sc = scheme or SCHEMES[RULE]
     ticks = sorted(ticks, key=lambda t: t.ts)
-    et = entry_tick(e, ticks)
+    et = entry_by_delay(e, ticks, entry_delay_s) if entry_delay_s is not None else entry_tick(e, ticks)
     if et is None or et.mc <= 0:
         return Copy(None, "нет цены входа")
     venue = AMM if et.pool == AMM else "pump"
+    depth = pool_sol(et.mc, venue)
+    if min_pool_sol and depth < min_pool_sol:
+        return Copy(None, SMALL_POOL, entry_mc=et.mc, venue=venue)
+    if stake_share:
+        stake = max(0.001, stake_share * reserves(et.mc, venue)[0])
     opened = e.ts + ENTRY_DELAY_S
     tokens = buy_tokens(et.mc, venue, stake)
     pos = CopyPos(id=0, portfolio="copy", mint=e.mint, opened_ts=opened, entry_mc=et.mc, cost_sol=stake + FIXED_SOL,
                   tokens=tokens, tokens_initial=tokens, target_mc=None, max_mc=et.mc, extra={"venue": venue})
+    burst = any(t.price_ok and opened < t.ts <= opened + BURST_S and t.mc >= et.mc * (1 + BURST_UP) for t in ticks)
     deadline = opened + float(sc.get("max_hold_s") or 1800)
     entry_slot = et.slot
 
@@ -174,7 +205,7 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
         mc = px.mc if px is not None else et.mc
         v = AMM if (px is not None and px.pool == AMM) else venue
         pos.proceeds_sol += sell_sol(mc, v, pos.tokens) - FIXED_SOL
-        return Copy(pos.proceeds_sol / pos.cost_sol - 1, None, why, et.mc, mc, venue, at - opened)
+        return Copy(pos.proceeds_sol / pos.cost_sol - 1, None, why, et.mc, mc, venue, at - opened, stake, burst)
 
     for t in ticks:
         if t.ts <= opened:
@@ -341,11 +372,21 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]]) -> dict[s
     return out
 
 
-async def evaluate_trades(db: Any, address: str, trades: list[dict[str, Any]], since: float,
-                          until: float | None = None, limit: int = 120, recent_from: float | None = None,
-                          recent_limit: int = 60, scheme: dict[str, Any] | None = None) -> list[tuple[Entry, Copy]]:
-    """Копии входов кошелька из его сделок trades (dict: mint, ts, is_buy, sol, tokens, slot): за [since, until] до
-    limit входов равномерно по времени и ещё до recent_limit последних с recent_from (неделя — для оценки за 7 дней)."""
+@dataclass
+class Prepared:
+    """26.11: входы кошелька и данные их монет (сделки, резервы, окна слежения, создание и дев) — загружаются один раз,
+    дальше копии считаются по разным правилам / задержкам / ставкам без новых запросов к базе."""
+    address: str
+    ents: list[Entry]
+    ticks: dict[str, list[Tick]]
+    cover: dict[str, list[tuple[float, float]]]
+    meta: dict[str, tuple[Any, Any]]
+    hold: float
+
+
+async def prepare(db: Any, address: str, trades: list[dict[str, Any]], since: float, until: float | None = None,
+                  limit: int = 120, recent_from: float | None = None, recent_limit: int = 60,
+                  hold_s: float = 1800.0) -> Prepared:
     all_e = [e for e in entries_of(trades) if e.ts >= since and (until is None or e.ts <= until)]
     pick = {id(e): e for e in spread(all_e, limit)}
     if recent_from is not None:
@@ -353,12 +394,10 @@ async def evaluate_trades(db: Any, address: str, trades: list[dict[str, Any]], s
             pick[id(e)] = e
     ents = sorted(pick.values(), key=lambda e: e.ts)
     if not ents:
-        return []
-    sc = scheme or SCHEMES[RULE]
-    hold = float(sc.get("max_hold_s") or 1800)
+        return Prepared(address, [], {}, {}, {}, hold_s)
     win: dict[str, tuple[float, float]] = {}
     for e in ents:
-        a, b = e.ts - 5, e.ts + ENTRY_DELAY_S + hold + 60
+        a, b = e.ts - 5, e.ts + ENTRY_DELAY_S + hold_s + 60
         w = win.get(e.mint)
         win[e.mint] = (min(a, w[0]), max(b, w[1])) if w else (a, b)
     ticks = await load_ticks(db, win)
@@ -366,14 +405,32 @@ async def evaluate_trades(db: Any, address: str, trades: list[dict[str, Any]], s
     meta = {r["mint"]: (r["created"], r["deployer"]) for r in await db.fetch(
         "SELECT mint, extract(epoch FROM created_at) AS created, deployer FROM tokens WHERE mint = ANY($1::text[])",
         list(win))}
+    return Prepared(address, ents, ticks, cover, meta, hold_s)
+
+
+def run(p: Prepared, scheme: dict[str, Any] | None = None, **kw: Any) -> list[tuple[Entry, Copy]]:
+    """Копии всех входов p по правилу scheme (kw — как у copy_trade: entry_delay_s, stake_share, min_pool_sol…)."""
+    sc = scheme or SCHEMES[RULE]
+    hold = min(float(sc.get("max_hold_s") or 1800), p.hold)
     out = []
-    for e in ents:
-        created, dev = meta.get(e.mint, (None, None))
+    for e in p.ents:
+        created, dev = p.meta.get(e.mint, (None, None))
         hi = e.ts + ENTRY_DELAY_S + hold + 60
-        c = copy_trade(e, [t for t in ticks.get(e.mint, []) if e.ts - 5 <= t.ts <= hi], address, dev or None,
-                       float(created) if created is not None else None, sc, covered=cover.get(e.mint))
+        c = copy_trade(e, [t for t in p.ticks.get(e.mint, []) if e.ts - 5 <= t.ts <= hi], p.address, dev or None,
+                       float(created) if created is not None else None, sc, covered=p.cover.get(e.mint), **kw)
         out.append((e, c))
     return out
+
+
+async def evaluate_trades(db: Any, address: str, trades: list[dict[str, Any]], since: float,
+                          until: float | None = None, limit: int = 120, recent_from: float | None = None,
+                          recent_limit: int = 60, scheme: dict[str, Any] | None = None) -> list[tuple[Entry, Copy]]:
+    """Копии входов кошелька из его сделок trades (dict: mint, ts, is_buy, sol, tokens, slot): за [since, until] до
+    limit входов равномерно по времени и ещё до recent_limit последних с recent_from (неделя — для оценки за 7 дней)."""
+    sc = scheme or SCHEMES[RULE]
+    p = await prepare(db, address, trades, since, until, limit, recent_from, recent_limit,
+                      float(sc.get("max_hold_s") or 1800))
+    return run(p, sc)
 
 
 def summarize(copies: list[tuple[Entry, Copy]], since: float | None = None) -> Summary:

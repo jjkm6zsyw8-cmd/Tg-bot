@@ -38,7 +38,8 @@ def setup_logging(level: str, name: str) -> None:
 
 # разовые команды (run_tool): новая команда — и сюда, иначе «неизвестная команда» (tests/test_cli.py)
 TOOLS = ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-         "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat", "hunt")
+         "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat", "hunt",
+         "datacheck", "pdcheck")
 
 
 async def main(cmd: str) -> None:
@@ -272,20 +273,44 @@ async def run_tool(cmd: str, db: Database) -> None:
         day = lambda v: _dt.strptime(v, "%Y-%m-%d").replace(tzinfo=_tz.utc).timestamp() if v else None   # noqa: E731
         bar = H.Bar(min_coins=int(arg("--min-coins") or H.BAR.min_coins),
                     min_t=float(arg("--min-t") or H.BAR.min_t))
+        from .config import Settings as HSettings, YamlConfig as HYaml, load_env as h_env
+        hs = HSettings(HYaml(h_env().config_path))
+        hs.overrides = await db.get_overrides()
+        prm = await H.params_of(db, hs.effective())
+        if arg("--delay"):
+            prm.delay = float(arg("--delay"))            # вход через N с (по умолчанию — hunter_entry_delay_s, 1.36)
+        if arg("--min-pool") is not None:
+            prm.min_pool = float(arg("--min-pool"))
+        rules = tuple(arg("--rules").upper().split(",")) if arg("--rules") else H.RULES
         if "--history" in args:
             # --from / --to — даты ГГГГ-ММ-ДД (UTC); --wallet адрес — разбор одного кошелька по точкам проверки
             print(await H.history(db, days, step, mx, until=day(arg("--to")), bar=bar, trace=arg("--wallet"),
-                                  start=day(arg("--from"))))
+                                  start=day(arg("--from")), prm=prm, rules=rules))
+        elif "--list" in args:
+            print(await H.hunt_text(db, float(arg("--hours") or 24)))
         else:
             now = _t.time()
             cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, bar.min_coins, mx)
             print(f"Кошельков с {bar.min_coins}+ монетами за {H.WINDOW_H} ч: {len(cands)}")
             for c in cands:
-                s = await H.evaluate(db, c["trader"], now - H.WINDOW_H * 3600, now, cand=c)
+                s = await H.evaluate(db, c["trader"], now - H.WINDOW_H * 3600, now, prm, cand=c)
                 why = s.hot(bar)
                 if why is None or "--all" in args:
-                    print(f"{'🔥' if why is None else '  '} {c['trader']} монет {s.coins} копий {s.n} ср. {s.avg:+.1%} "
-                          f"в плюсе {s.win:.0%} без цены {s.noprice:.0%}" + (f" — {why}" if why else ""))
+                    print(f"{'🔥' if why is None else '  '} {c['trader']} монет {s.coins_all} копий {s.n} правило "
+                          f"{s.rule} ср. {s.avg:+.1%} в плюсе {s.win:.0%} t={s.t:.1f} без цены {s.noprice:.0%} "
+                          f"${s.usd_day:,.0f}/день всплеск {s.burst:.0%}" + (f" — {why}" if why else ""))
+    elif cmd == "datacheck":
+        # 26.11: проверки данных и модели: python -m scanner datacheck [--hours 24] [--days 3] [--delay 1.36]
+        from .analytics.datacheck import run as dc_run
+        hours = float(args[args.index("--hours") + 1]) if "--hours" in args else 24.0
+        dd = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
+        delay = float(args[args.index("--delay") + 1]) if "--delay" in args else 1.36
+        print(await dc_run(db, hours, dd, delay))
+    elif cmd == "pdcheck":
+        # 26.11 (B5): сверка образца pumpdata.fun с нашей базой: python -m scanner pdcheck файл.parquet
+        from .analytics.pdcheck import run as pd_run
+        path = next((a for a in args if a.endswith(".parquet")), None)
+        print(await pd_run(db, path) if path else "Укажите файл образца: python -m scanner pdcheck /app/data/x.parquet")
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

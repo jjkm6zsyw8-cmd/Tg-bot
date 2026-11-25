@@ -488,9 +488,11 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
         rules.append("D")
     stake_txt = (f"${stake:g}" if stake else f"как у кошелька ({S.fmt('real_stake_usd', S.get(wcfg, 'real_stake_usd'))})")
     state = f"{'✅ включён' if on else '⬜ выключен'} · ставка {stake_txt} · потолок ${S.max_stake_usd():g}"
-    if kind == "mydev":
+    if kind in S.SHADOW_ONLY:
+        state += " · только тень (26.11: на деньги — только «за ним» из списка охотника «в бой»)"
+    elif kind == "mydev":
         state += " · в бою: " + ("да" if S.get(wcfg, "real_live_mydev") else "нет, только тень")
-    if kind == "trendj":
+    elif kind == "trendj":
         state += " · в бою: " + ("да" if S.get(wcfg, "real_live_trendj") else "нет, только тень")
     lines = [f"🎯 <b>{name}</b> — {title}", state, "",
              "<b>Покупает</b>", ABOUT[kind] + (f" — {S.SMART_FILTERS[filt]}" if kind == "smart" else ""), "",
@@ -529,15 +531,16 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
         kb.append([{"text": ("● " if filt == "all" else "") + "Все сигналы", "callback": f"rl:wmf:{tag}:all"},
                    {"text": ("● " if filt == "m" else "") + "Только отобранные (M)", "callback": f"rl:wmf:{tag}:m"}])
         kb.append([{"text": "⚡ Сделать как M (отбор M + выход A)", "callback": f"rl:wmf:{tag}:M"}])
-    if kind == "mydev":
+    if kind == "mydev" and kind not in S.SHADOW_ONLY:
         dlive = S.get(wcfg, "real_live_mydev")
         kb.append([{"text": f"{'✅' if dlive else '⬜'} Торговать и в бою",
                     "callback": f"rl:wmo:{tag}:devlive:{0 if dlive else 1}"}])
     if kind == "trendj":
         lines += await trendj_live_lines(db, wcfg, None if tag == "g" else int(tag))
         jlive = S.get(wcfg, "real_live_trendj")
-        kb.append([{"text": "✅ 💵 Бой включён — выключить" if jlive else "⬜ 💵 Торговать и в бою (Jupiter)",
-                    "callback": f"rl:wmo:{tag}:jlive:{0 if jlive else 1}"}])
+        if kind not in S.SHADOW_ONLY:
+            kb.append([{"text": "✅ 💵 Бой включён — выключить" if jlive else "⬜ 💵 Торговать и в бою (Jupiter)",
+                        "callback": f"rl:wmo:{tag}:jlive:{0 if jlive else 1}"}])
         kb.append([{"text": f"🧪 Пробная сделка ${JUP_TEST_USD:g} (SOL→USDC→SOL)", "callback": f"rl:wjt:{tag}"}])
     kb.append([{"text": "− $5", "callback": f"rl:wms:{tag}:{kind}:-"},
                {"text": f"Ставка: {'$%g' % stake if stake else 'как у кошелька'}", "callback": f"rl:wmk:{tag}:{kind}"},

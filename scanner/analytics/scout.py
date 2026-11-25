@@ -300,7 +300,8 @@ class Scout:
         self.stats["runs"] += 1
         events: list[str] = []
         from ..real import settings as RS
-        if {"smart", "copy"} <= RS.RETIRED:
+        from . import paper as _pp
+        if {"smart", "copy"} <= RS.RETIRED or not _pp.PAPER_TRADING:
             # 25.11: smart и копии убраны (в минусе), бумаги нет — искать и испытывать кандидатов не для чего (испытание
             # шло на бумаге S). Остаётся пересчёт кошельков доски и отчёт «Реальный бот за кошельками» раз в 6 ч
             self._schedule_rules()

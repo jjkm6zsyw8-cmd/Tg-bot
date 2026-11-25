@@ -31,6 +31,7 @@ from .executor import TOPIC, RealTrader, make_chain
 from .keys import Wallet, load_wallet
 from .vault import Vault, load_vault
 
+JUP_429_ALERT_S = 1800.0     # 26.11 (D2): сообщение о лимите Jupiter не чаще раза в 30 мин
 JUP_QUOTE_PRICE_S = 10.0     # 25.11: цены Jupiter нет — котировка продажи позиции вместо неё не чаще раза в столько
 
 if TYPE_CHECKING:
@@ -187,6 +188,21 @@ class RealDesk:
                     ln.on_state(x, {"venue": "jupiter", "mc": jq[1]})
         self._jq_price_at = {m: t for m, t in self._jq_price_at.items() if now - t < 600}
 
+    async def jup_limit_watch(self) -> None:
+        """26.11 (D2): Jupiter отвечает 429 (лимит запросов) — сообщение, не чаще раза в JUP_429_ALERT_S."""
+        jup = getattr(getattr(self.e, "ext", None), "jupiter", None)
+        n = int(getattr(getattr(jup, "stats", None), "rate_limited", 0) or 0)
+        seen = getattr(self, "_jup_429_seen", None)
+        self._jup_429_seen = n
+        if seen is None or n <= seen:
+            return
+        now = time.time()
+        if now - getattr(self, "_jup_429_at", 0.0) < JUP_429_ALERT_S:
+            return
+        self._jup_429_at = now
+        await self.say(f"⚠️ Jupiter: лимит запросов (429) — {n - seen} раз с прошлой проверки. Цены и котировки "
+                       "позиций других бирж задерживаются; если повторяется — нужен тариф Jupiter выше.")
+
     async def poll_prices(self) -> None:
         """Цена открытых позиций всех кошельков — из сети, одним запросом на 16 монет (а не запрос на кошелёк)."""
         lanes = [lane for lane in self.lanes.values() if lane.watched()]
@@ -200,6 +216,10 @@ class RealDesk:
         jup = [(lane, p) for lane in lanes for p in lane.watched() if p.extra.get("venue") == "jupiter"]
         if jup:
             await self._poll_jupiter(lanes, jup)
+            try:
+                await self.jup_limit_watch()
+            except Exception:  # noqa: BLE001
+                log.exception("реальный бот: лимит Jupiter")
         mints = list(dict.fromkeys(p.mint for lane in lanes for p in lane.watched()
                                    if p.extra.get("venue") != "jupiter"))
         for i in range(0, len(mints), 16):
@@ -233,6 +253,12 @@ class RealDesk:
             elif cmd == "sell":
                 for lane in self.lanes.values():
                     if int(p.get("id") or 0) in lane.positions:
+                        await lane.command(p)
+            elif cmd == "dead_sell":
+                # 26.11 (D3): остаток списанной позиции — по кнопке владельца; позиция закрыта — ищем кошелёк по базе
+                wid = await self.db.fetchval("SELECT wallet_id FROM real_positions WHERE id = $1", int(p.get("id") or 0))
+                for lane in self.lanes.values():
+                    if lane.wid == wid:
                         await lane.command(p)
             elif cmd == "jup_test":
                 signers = [x for x in self.lanes.values() if x.wallet is not None and x.wallet.can_sign]
@@ -328,6 +354,10 @@ class RealDesk:
             await self._sync_common_lane()
         for lane in list(self.lanes.values()):          # режим могли включить после пополнения — баланс свежий
             await lane.refresh_balance(force=True)
+            try:
+                await lane.load_follow()                # 26.11: kill switch, список «в бой», «за ним» — сразу
+            except Exception:  # noqa: BLE001
+                log.exception("реальный бот: перечитать «за ним»")
 
     async def create_wallet(self, name: str) -> int | None:
         if not self.vault.can_store:

@@ -1,0 +1,9 @@
+# Свои настройки: скопируйте в config/config.local.yaml и меняйте там (этот файл не в git — обновление его не сотрёт).
+# Ложится поверх config/config.yaml: указывайте только то, что меняете, с теми же разделами.
+#
+# defaults:
+#   trader_min_trades_30d: 30
+# links:
+#   use_direct_pump_link: true
+# reliability:
+#   raw_trades_days: 7

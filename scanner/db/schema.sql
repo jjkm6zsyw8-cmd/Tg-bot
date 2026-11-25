@@ -691,6 +691,35 @@ CREATE TABLE IF NOT EXISTS hunter_wallets (
     cooled_at     timestamptz,
     cool_reason   text
 );
+-- 26.11 (сводное ТЗ): охотник v2 — правило, $ в день, всплеск, слив, списки «в бой» / «наблюдение» / архив;
+-- копии после находки — бессрочно
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS list text NOT NULL DEFAULT 'new';   -- new | battle | watch | archive
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS list_reason text;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS list_at timestamptz;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS rule text;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS rule_train double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS rule_test double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS usd_day double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS usd_day_max double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS burst double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS block2_avg double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS dump_share double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS n_after int;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS avg_after double precision;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS usd_day_after double precision;
+CREATE TABLE IF NOT EXISTS hunter_copies (
+    address  text NOT NULL,
+    mint     text NOT NULL,
+    entry_at timestamptz NOT NULL,
+    rule     text,
+    res      double precision,                  -- итог копии после издержек; NULL — нет цены / мелкий пул
+    reason   text,                              -- причина выхода или почему не посчитана
+    entry_mc double precision,
+    exit_mc  double precision,
+    burst    boolean,
+    stake    double precision,
+    PRIMARY KEY (address, mint, entry_at)
+);
 -- 25.11: продажа без подписи не могла «лечь в блок» (списание «покупателей нет», токенов нет на счёте) — no_tx
 UPDATE real_orders SET status = 'no_tx' WHERE status = 'landed' AND signature IS NULL;
 CREATE INDEX IF NOT EXISTS real_positions_wallet_idx ON real_positions (wallet_id, opened_at);

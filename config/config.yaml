@@ -3,6 +3,9 @@
 # Пользовательские значения из /settings хранятся в БД и перекрывают раздел defaults.
 
 defaults:
+  # --- 26.11: охотник (analytics/hunter.py) ---
+  hunter_on: false                # поиск раз в час — включается /hunter on
+  hunter_entry_delay_s: 1.36      # вход модели: наша задержка из боя (медиана от его покупки до нашей)
   # --- разд. 2: ключевые определения ---
   funding_window_min: 30          # окно финансирования кошельков кластера до запуска
   big_sell_single_tx_pct: 30      # крупная продажа: >=30% токенов кластера одной tx
@@ -131,6 +134,9 @@ reliability:
   coverage_target: 0.995
   parse_error_alert_per_min: 20
   raw_trades_days: 7
+  tracked_trades_days: 30          # 26.11: сделки отслеживаемых кошельков (свой список, охотник) — 30 дней
+  reserve_daily_mb: 150            # резервы монет: трафик за сутки
+  reserve_coin_daily_mb: 3         # 26.11: и на одну монету за сутки
   pumpportal_trade_window_min: 60   # сколько минут держать подписку на сделки новой монеты
   withdrawal_poll_s: 15
   withdrawal_hops: 3

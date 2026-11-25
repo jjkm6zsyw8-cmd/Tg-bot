@@ -129,6 +129,8 @@ NO_ROUTE_KEEP_S = 1800.0              # монета без маршрута: с
 # 25.11 (владелец, позиции 1847 и 1863): «покупателей нет» больше НЕ закрывает боевую позицию как rug −100% —
 # позиция остаётся открытой, бот повторяет продажу и пишет владельцу. Раньше через 10 мин бот списывал её в ноль
 # и записывал продажу «landed» без подписи (транзакции не было)
+COPY_KINDS = {"smart", "copy", "bigcopy", "swing"}
+BATTLE_GATE = True                    # 26.11: «за ним» на деньги — только из списка охотника «в бой» (тесты механики: False)
 NO_ROUTE_RETRY_S = 30.0               # бой: покупателей нет — повтор продажи через столько
 NO_ROUTE_ALERT_S = 1800.0             # …и напоминание владельцу не чаще раза в столько
 STALE_ALERT_REPEAT_S = 1800.0         # бой: цена позиции не обновляется — повтор алерта не чаще раза в столько
@@ -147,6 +149,7 @@ JUP_RETRY_S = 10.0                    # тень: котировки Jupiter н�
 # «сторож» (24.11, просьба владельца): списанные в ноль боевые позиции (скам) — раз в DEAD_CHECK_S бот спрашивает
 # Jupiter, не появились ли покупатели; дают от DEAD_MIN_USD — продаёт остаток сам (это только продажа своих токенов)
 DEAD_CHECK_S, DEAD_MIN_USD, DEAD_DAYS = 1800.0, 1.0, 14
+DEAD_ALERT_S, DEAD_ALERT_KEY = 6 * 3600.0, "real:dead_alerted"   # 26.11: сторож пишет не чаще раза в 6 ч на позицию
 
 
 def paid_mc(lamports: int, tokens_raw: int) -> float:
@@ -240,13 +243,15 @@ class RealTrader:
         return float(self.e.price.value or 150)
 
     def mode(self) -> str:
-        """Действующий режим: «бой» только при REAL_LIVE=1 на сервере и заданном ключе."""
+        """Действующий режим: «бой» только при REAL_LIVE=1 на сервере, заданном ключе и без kill switch."""
         m = self.get("real_mode")
         if m == "live" and self.why_not_live():
             return "shadow"
         return m
 
     def why_not_live(self) -> str | None:
+        if getattr(self, "killed", None):
+            return f"kill switch: {self.killed}"      # 26.11: /kill — новых боевых входов нет, позиции сопровождаются
         if not S.live_allowed():
             return "на сервере не задан REAL_LIVE=1"
         if self.wallet is None or not self.wallet.can_sign:
@@ -260,6 +265,8 @@ class RealTrader:
         measure = bool(self.get("real_shadow_all")) and kind not in SHADOW_SKIP   # выключенный метод — в тень, не на деньги
         if not self.get(S.METHODS[kind][1]):
             return "shadow" if measure else "off"
+        if m == "live" and kind in S.SHADOW_ONLY:
+            return "shadow"                          # 26.11: все методы — только тень (деньги — только «за ним»)
         if m == "live" and kind == "mydev" and not self.get("real_live_mydev"):
             return "shadow"                          # запуски девов в бою — только по отдельному разрешению
         if m == "live" and kind == "trendj" and not self.get("real_live_trendj"):
@@ -520,6 +527,9 @@ class RealTrader:
 
     async def load_follow(self) -> None:
         self.rug_creators = dict(await self.db.kv_get(RUG_CREATORS_KEY) or {})
+        self.battle_ok = dict(await self.db.kv_get("hunter:battle_ok") or {})
+        kill = await self.db.kv_get("real:kill")
+        self.killed = (kill or {}).get("why") if isinstance(kill, dict) else (str(kill) if kill else None)
         self.follow = dict(await self.db.kv_get("real:follow") or {})
         self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
         self.follow_rule = dict(await self.db.kv_get("real:follow_rule") or {})
@@ -541,7 +551,10 @@ class RealTrader:
             return None                  # срок проверки вышел
         if self.get("real_only_follow") and wallet in (getattr(self, "follow_auto", None) or set()):
             return None                  # «только выбранные мной»: тень, которую бот включил сам, — не в счёт
-        return "live" if f == "live" and self.mode() == "live" else "shadow"
+        # 26.11 (владелец): на деньги — только кошельки из списка охотника «в бой» после 24 ч тени (hunter:battle_ok);
+        # остальные «за ним» — тень, даже если кнопка «бой» нажата
+        ok = not BATTLE_GATE or wallet in (getattr(self, "battle_ok", None) or {})
+        return "live" if f == "live" and self.mode() == "live" and ok else "shadow"
 
     async def on_signal(self, mint: str, level: str, alert_id: int | None, data: dict[str, Any],
                         trader: str | None, targets: set[str]) -> None:
@@ -679,6 +692,42 @@ class RealTrader:
                 await self.db.execute("DELETE FROM real_skips WHERE at < now() - interval '14 days'")
         except Exception as exc:  # noqa: BLE001 — журнал пропусков не должен мешать торговле
             log.warning("журнал пропусков: %s", str(exc)[:160])
+
+    def copy_guard(self, st: dict[str, Any], mint_s: str, data: dict[str, Any], trader: str | None, stake: int,
+                   mode: str) -> tuple[str | None, int]:
+        """26.11 (сводное ТЗ, C): защита копирования — (почему не входить | None, ставка в лампортах).
+        C1: в пуле меньше real_min_pool_sol настоящих SOL — не входим (мелкий пул: копировщики сами двигают цену).
+        C5: ставка ≤ real_copy_max_share его покупки и ≤ real_max_depth_share SOL пула (виртуальных — от них цена).
+        C3: мы самые крупные покупатели после него — ставка не больше крупнейшей чужой покупки после него (нет чужих —
+        половина): иначе мы и есть выход для него. C4: на один кошелёк открыто не больше real_follow_max_sol."""
+        sol_usd = self.sol_usd()
+        liq = getattr(st.get("curve") or st.get("pool"), "liquidity_sol", None)
+        min_pool = float(self.get("real_min_pool_sol"))
+        if liq is not None and min_pool > 0 and liq < min_pool:
+            return f"в пуле {liq:.1f} SOL < {min_pool:g} — мелкий пул, не входим", 0
+        his = float(data.get("copy_sol") or data.get("trigger_sol") or 0)
+        if his > 0:
+            stake = min(stake, int(float(self.get("real_copy_max_share")) * his * 1e9))
+        if st.get("v_quote"):
+            stake = min(stake, int(float(self.get("real_max_depth_share")) * int(st["v_quote"])))
+        es = self.e.states.get(mint_s) if getattr(self.e, "states", None) else None
+        t0 = float(data.get("trigger_ts") or data.get("trigger_at") or 0)
+        if es is not None and t0 and trader and self.cfg.get("real_copy_largest", True):
+            me = str(self.wallet.pubkey) if self.wallet is not None else ""
+            others = [float(t.sol) for t in getattr(es, "trades", []) or []
+                      if t.is_buy and t.ts >= t0 - 0.5 and t.trader not in (trader, me)]
+            cap = int((max(others) if others else stake / 1e9 * 0.5) * 1e9)
+            stake = min(stake, max(cap, 1))
+        wallet = data.get("_followed") or data.get("copy_wallet") or trader
+        if wallet:
+            used = sum(p.cost_sol for p in self.positions.values() if p.trader == wallet and p.extra.get("mode") == mode)
+            room = float(self.get("real_follow_max_sol")) - used
+            if room <= 0:
+                return f"на этот кошелёк уже открыто {used:.2f} SOL (лимит {self.get('real_follow_max_sol'):g})", 0
+            stake = min(stake, int(room * 1e9))
+        if stake < float(self.get("real_min_stake_usd")) / sol_usd * 1e9:
+            return "ставка после защиты копирования меньше минимума", 0
+        return None, stake
 
     def stake_lamports(self, v_quote: int, kind: str | None = None, wallet: str | None = None
                        ) -> tuple[int, str | None]:
@@ -857,6 +906,10 @@ class RealTrader:
         stake, why = self.stake_lamports(st["v_quote"], kind, data.get("_followed"))
         if why:
             return self._skip(mode, kind, why)
+        if data.get("copy_wallet") or data.get("_followed") or kind in COPY_KINDS:
+            why, stake = self.copy_guard(st, mint_s, data, trader, stake, mode)
+            if why:
+                return self._skip(mode, kind, why)
         trig_mc = 0.0 if trend else float(data.get("trigger_mc") or 0)
         # тренд: цена сигнала — DexScreener (отстаёт на секунды) — «цена уже убежала» по ней не считаем; от переплаты
         # защищает проскальзывание покупки
@@ -1119,8 +1172,14 @@ class RealTrader:
         if tb:
             return self._skip(mode, kind, tb)
         jp = await ext.jup_price(mint_s) if ext is not None else None
+        if not jp and ext is not None and hasattr(ext, "jup_quote") and hasattr(ext, "jup_decimals"):
+            # 26.11 (D1): Price API молчит — цена по котировке на 0.01 SOL; нет и её — не входим
+            d0 = ext.jup_decimals(mint_s)
+            q0 = await ext.jup_quote(SOL_MINT, mint_s, 10_000_000) if d0 is not None else None
+            if q0 and not q0.get("no_route") and q0.get("out", 0) > 0:
+                jp = 0.01 * self.sol_usd() / (q0["out"] / 10 ** int(d0))
         if not jp:
-            return self._skip(mode, kind, "другая биржа: нет цены Jupiter")
+            return self._skip(mode, kind, "нет цены: ни Price API Jupiter, ни котировки — не входим")
         sol_usd = self.sol_usd()
         mc = float(jp) * 1e9 / sol_usd                 # условная капитализация: цена × 1 млрд (как у бумаги T)
         usd = (S.method_stake(self.cfg, kind) or (S.method_stake(self.cfg, "trend") if kind == "trendj" else None)
@@ -1464,25 +1523,55 @@ class RealTrader:
             q = await ext.jup_quote(r["mint"], SOL_MINT, have)
             if not q or q.get("no_route") or q["out"] / 1e9 * self.sol_usd() < DEAD_MIN_USD:
                 continue
-            res = await self._jup_send("sell", r["mint"], SOL_MINT, have,
-                                       min(0.5, float(self.get("real_jup_slippage")) * 4), 0, ata,
-                                       {"mode": "live", "mint": r["mint"]}, position_id=r["id"],
-                                       payload={"reason": "dead_watch"})
-            if not res["ok"]:
+            # 26.11 (D3): не продаём сами — присылаем котировку и кнопку «Продать» (раз в DEAD_ALERT_S на позицию)
+            seen = dict(await self.db.kv_get(DEAD_ALERT_KEY) or {})
+            if time.time() - float(seen.get(str(r["id"]), 0)) < DEAD_ALERT_S:
                 continue
-            fill = rtx.fill_from_tx(res["info"], str(self.wallet.pubkey), []) if res["info"] else None
-            got = fill["sol_delta"] / 1e9 if fill else int(res["quote"].get("outAmount") or 0) / 1e9 - self.fees_sol()
-            await self.db.execute(
-                """UPDATE real_positions SET proceeds_sol = proceeds_sol + $2, pnl_sol = pnl_sol + $2,
-                       pnl_pct = (pnl_sol + $2) / NULLIF(cost_sol, 0), exit_reason = 'rug_back', sell_sig = $3
-                   WHERE id = $1""", r["id"], got, res["sig"])
-            self._roll_day()
-            self.day_pnl["live"] = self.day_pnl.get("live", 0.0) + got
-            self.live_total += got
-            self.to_close[r["mint"]] = (str(r["token_program"]), time.time() + 20, 1)
-            await self._say(f"💵 ✅ Сторож: у ${fmt.esc(r['symbol'] or '?')} снова появились покупатели — продал "
-                            f"остаток за {got:.4f} SOL (${got * self.sol_usd():.2f}).")
-            await self.refresh_balance(force=True)
+            seen[str(r["id"])] = time.time()
+            await self.db.kv_set(DEAD_ALERT_KEY, seen)
+            usd = q["out"] / 1e9 * self.sol_usd()
+            await self._say(f"💵 🔔 Сторож: у ${fmt.esc(r['symbol'] or '?')} (списана как раг) снова есть покупатели — "
+                            f"за остаток дают {q['out'] / 1e9:.4f} SOL (${usd:.2f}). Продать? Монета: "
+                            f"<code>{r['mint']}</code>",
+                            keyboard=[[{"text": f"💸 Продать за ~${usd:.2f}", "callback": f"rl:dsell:{r['id']}",
+                                        "style": "danger"}]])
+
+    async def dead_sell(self, pid: int) -> None:
+        """Продажа остатка списанной позиции — только по кнопке владельца (D3)."""
+        if self.wallet is None or not self.wallet.can_sign or self.chain is None or not S.live_allowed():
+            return await self._say("💵 Продать остаток нельзя: нет ключа кошелька или REAL_LIVE на сервере.")
+        ext = getattr(self.e, "ext", None)
+        r = await self.db.fetchrow(
+            """SELECT id, mint, symbol, token_program FROM real_positions WHERE id = $1 AND mode = 'live'
+               AND exit_reason = 'rug' AND wallet_id IS NOT DISTINCT FROM $2""", pid, self.wid)
+        if r is None or ext is None:
+            return
+        tp = pump.TOKEN_PROGRAMS.get(str(r["token_program"]))
+        if tp is None:
+            return
+        ata = pump.ata(self.wallet.pubkey, Pubkey.from_string(r["mint"]), tp)
+        have = jupswap._amount((await self.chain.accounts([ata], "confirmed"))[0])
+        if have <= 0:
+            return await self._say(f"💵 ${fmt.esc(r['symbol'] or '?')}: токенов на кошельке уже нет.")
+        res = await self._jup_send("sell", r["mint"], SOL_MINT, have,
+                                   min(0.5, float(self.get("real_jup_slippage")) * 4), 0, ata,
+                                   {"mode": "live", "mint": r["mint"]}, position_id=r["id"],
+                                   payload={"reason": "dead_watch"})
+        if not res["ok"]:
+            return await self._say(f"💵 ${fmt.esc(r['symbol'] or '?')}: продать не вышло — {fmt.esc(str(res['why'])[:150])}")
+        fill = rtx.fill_from_tx(res["info"], str(self.wallet.pubkey), []) if res["info"] else None
+        got = fill["sol_delta"] / 1e9 if fill else int(res["quote"].get("outAmount") or 0) / 1e9 - self.fees_sol()
+        await self.db.execute(
+            """UPDATE real_positions SET proceeds_sol = proceeds_sol + $2, pnl_sol = pnl_sol + $2,
+                   pnl_pct = (pnl_sol + $2) / NULLIF(cost_sol, 0), exit_reason = 'rug_back', sell_sig = $3
+               WHERE id = $1""", r["id"], got, res["sig"])
+        self._roll_day()
+        self.day_pnl["live"] = self.day_pnl.get("live", 0.0) + got
+        self.live_total += got
+        self.to_close[r["mint"]] = (str(r["token_program"]), time.time() + 20, 1)
+        await self._say(f"💵 ✅ Сторож: у ${fmt.esc(r['symbol'] or '?')} снова появились покупатели — продал "
+                        f"остаток за {got:.4f} SOL (${got * self.sol_usd():.2f}).")
+        await self.refresh_balance(force=True)
 
     async def _jup_dry_run_safe(self, mint_s: str, stake: int, pid: int | None) -> None:
         try:
@@ -2315,6 +2404,8 @@ class RealTrader:
                     n += 1
                     self._start_exit(pos, "sell_all", 1.0)
             await self._say(f"Продаю всё: позиций {n}.")
+        elif cmd == "dead_sell":
+            await self.dead_sell(int(p.get("id") or 0))
         elif cmd == "sell":
             pos = self.positions.get(int(p.get("id") or 0))
             if pos is not None and not pos.closing:
@@ -2525,12 +2616,12 @@ class RealTrader:
     async def say_raw(self, text: str) -> None:
         await self._say(text)
 
-    async def _say(self, text: str) -> None:
+    async def _say(self, text: str, keyboard: list[list[dict[str, Any]]] | None = None) -> None:
         topic = MONEY_TOPIC if "💵" in text else TOPIC
         if self.name:
             text = f"👛 <b>{fmt.esc(self.name)}</b> · {text}"
         try:
-            await self.db.enqueue("text", {"topic": topic, "text": text}, priority=8)
+            await self.db.enqueue("text", {"topic": topic, "text": text, "keyboard": keyboard}, priority=8)
         except Exception:  # noqa: BLE001
             log.exception("реальный бот: сообщение")
 

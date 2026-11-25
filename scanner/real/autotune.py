@@ -40,7 +40,8 @@ RULE_EDGE = 0.02
 MIN_PAIRS = 100                       # пар проб «текущее / другое правило» на одних позициях
 PAIR_T = 2.0                          # t разницы на парах
 RULE_WINDOW_D = 7                     # окно сравнения правил
-CONFIRM_S = 24 * 3600                 # кандидат должен держаться столько, прежде чем правило сменится
+CONFIRM_S = 24 * 3600
+CONFIRM_PAIRS = 30                    # 26.11 (F): подтверждение — от стольких НОВЫХ пар                 # кандидат должен держаться столько, прежде чем правило сменится
 PENDING_KEY = "real:autotune_pending"  # {kind: {"rule", "since", "d", "n", "t"}}
 BANDS = ((0, 35), (35, 45), (45, 57), (57, 80), (80, 100))
 MIN_BAND_N = 10
@@ -50,10 +51,15 @@ def _pct(v: float) -> str:
     return f"{v * 100:+.1f}%"
 
 
-async def better_rule(db: Any, kind: str, cur: str, now: float) -> dict[str, Any] | None:
+async def better_rule(db: Any, kind: str, cur: str, now: float, since_ts: float | None = None,
+                      min_pairs: int | None = None, only: str | None = None) -> dict[str, Any] | None:
     """Правило лучше текущего на одних и тех же позициях (пары проб за RULE_WINDOW_D дней): {rule, n, d, t, a} или None.
-    d — средняя разница результата «другое − текущее» на паре, t — её устойчивость, a — средний результат другого."""
-    since = datetime.fromtimestamp(now, timezone.utc) - timedelta(days=RULE_WINDOW_D)
+    d — средняя разница результата «другое − текущее» на паре, t — её устойчивость, a — средний результат другого.
+    26.11 (F): since_ts — только пары, открытые после него (подтверждение — на новых позициях), min_pairs — свой
+    порог, only — проверить одно правило."""
+    since = (datetime.fromtimestamp(since_ts, timezone.utc) if since_ts is not None
+             else datetime.fromtimestamp(now, timezone.utc) - timedelta(days=RULE_WINDOW_D))
+    need = MIN_PAIRS if min_pairs is None else min_pairs
     rows = await db.fetch(
         """SELECT c.rule, count(*) n, avg(c.pnl_pct - b.pnl_pct) d, stddev_samp(c.pnl_pct - b.pnl_pct) sd,
                   avg(c.pnl_pct) a
@@ -65,9 +71,20 @@ async def better_rule(db: Any, kind: str, cur: str, now: float) -> dict[str, Any
     for r in rows:
         n, d, sd = int(r["n"]), float(r["d"] or 0), float(r["sd"] or 0)
         t = d / (sd / n ** 0.5) if sd > 0 and n > 1 else (99.0 if d > 0 else 0.0)
-        if n >= MIN_PAIRS and d >= RULE_EDGE and t >= PAIR_T and float(r["a"] or 0) > 0:
+        if only is not None and r["rule"] != only:
+            continue
+        if n >= need and d >= RULE_EDGE and t >= PAIR_T and float(r["a"] or 0) > 0:
             ok.append({"rule": r["rule"], "n": n, "d": d, "t": t, "a": float(r["a"])})
     return max(ok, key=lambda x: x["d"]) if ok else None
+
+
+async def new_pairs(db: Any, kind: str, cur: str, rule: str, since_ts: float) -> int:
+    """Сколько новых пар «текущее / кандидат» закрыто после since_ts."""
+    return int(await db.fetchval(
+        """SELECT count(*) FROM real_rule_trials b JOIN real_rule_trials c ON c.position_id = b.position_id
+           WHERE b.kind = $1 AND b.rule = $2 AND c.rule = $3 AND b.position_id IS NOT NULL AND b.closed_at IS NOT NULL
+             AND c.closed_at IS NOT NULL AND b.pnl_pct IS NOT NULL AND c.pnl_pct IS NOT NULL
+             AND b.opened_at > to_timestamp($4)""", kind, cur, rule, since_ts) or 0)
 
 
 async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | None = None) -> list[str]:
@@ -129,6 +146,19 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
             continue
         if now - float(had.get("since", now)) < CONFIRM_S:
             continue                          # ждём, пока кандидат продержится сутки
+        # 26.11 (F): подтверждение — только на НОВЫХ парах (позиции после появления кандидата), от CONFIRM_PAIRS;
+        # то же 7-дневное окно, в котором кандидат и нашёлся, ничего не подтверждает
+        n_new = await new_pairs(db, kind, cur, had["rule"], float(had["since"]))
+        if n_new < CONFIRM_PAIRS:
+            continue                          # новых пар мало — ждём дальше
+        fresh = await better_rule(db, kind, cur, now, since_ts=float(had["since"]), min_pairs=CONFIRM_PAIRS,
+                                  only=had["rule"])
+        if fresh is None:
+            pending.pop(kind, None)
+            lines.append(f"↩️ <b>{name}</b>: на {n_new} новых парах {had['rule']} не подтвердился — правило не меняю.")
+            continue
+        why = (f"{fresh['rule']} лучше {cur} на {_pct(fresh['d'])} на {fresh['n']} новых парах (t={fresh['t']:.1f}); "
+               f"нашёлся на {had.get('n')} парах за {RULE_WINDOW_D} дн")
         pending.pop(kind, None)
         if kind in live_kinds:
             lines.append(f"💡 <b>{name}</b>: {why}, держится сутки. Метод в бою — сам не меняю, переключи в 🎯 Методы.")

@@ -249,3 +249,69 @@ async def test_receiver_counts_reserve_failures():
     rec.rpc = Boom()
     await REAL_ADD(rec, MINT)
     assert rec.reserve_stats["rpc_error"] == 1 and "429" in rec.reserve_last_error
+
+
+def test_coin_daily_cap_and_jump_reread():
+    """26.11 (B1): лимит трафика на монету в сутки; резкий скачок цены пула — перечитать пул."""
+    src = R.ReserveSource("wss://x")
+    src.COIN_DAILY_BYTES = 1000
+    src.set_target("M", R.Target("pump-amm", ["BASE", "QUOTE"]))
+    assert src.count_bytes("M", 600) and not src.count_bytes("M", 600)
+    assert "M" in src.capped and "M" not in src.targets
+    called = []
+
+    async def on_jump(mint):
+        called.append(mint)
+    src.on_jump = on_jump
+    src.set_target("P", R.Target("pump-amm", ["B2", "Q2"]))
+    src.on_account("B2", vault(100 * 10**6), 1)
+    src.on_account("Q2", vault(2 * 10**9), 1)
+    import asyncio as _a
+    loop = _a.new_event_loop()
+    try:
+        async def go():
+            src.on_account("B2", vault(100 * 10**6), 2)
+            src.on_account("Q2", vault(4 * 10**9), 2)          # цена ×2 за одно изменение
+            await _a.sleep(0)
+        loop.run_until_complete(go())
+    finally:
+        loop.close()
+    assert called == ["P"]
+
+
+async def test_tracked_buy_watches_dev_wallet():
+    """26.11 (B2): «продал дев» без логов по монете — 35 мин слушаем кошелёк дева монеты."""
+    rec = receiver(Rpc({}))
+
+    class Db:
+        async def fetchval(self, *a):
+            return "DEVWALLET"
+    rec.db = Db()
+    await rec._watch_dev(MINT, 2100)
+    assert rec.dev_watch_until["DEVWALLET"] > time.time() + 2000
+
+
+async def test_retention_keeps_tracked_wallets_30_days():
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=2)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        for who, age in (("TRACKED", 10), ("OTHER", 10), ("TRACKED", 40), ("HUNTED", 10)):
+            await db.execute(
+                """INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol, ts, pool)
+                   VALUES ($1, 'M', $2, true, 1, 1, 50, now() - make_interval(days => $3), 'pump')""",
+                f"{who}{age}", who, age)
+        await db.execute("INSERT INTO traders(address, active, manual) VALUES ('TRACKED', true, true)")
+        await db.execute("INSERT INTO hunter_wallets(address, found_at, status, list) VALUES "
+                         "('HUNTED', now(), 'new', 'watch')")
+        rec = receiver(Rpc({}))
+        rec.db = db
+        await rec.retention_once()
+        left = sorted(r["signature"] for r in await db.fetch("SELECT signature FROM trades"))
+        assert left == ["HUNTED10", "TRACKED10"]       # чужие 10 дней — удалены, свои 40 дней — удалены (> 30)
+    finally:
+        await db.close()
