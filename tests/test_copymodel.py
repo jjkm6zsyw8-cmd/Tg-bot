@@ -304,7 +304,7 @@ async def test_datacheck_model_vs_shadow_and_noprice(db):
     lines, mean = await DC.model_vs_shadow(db, 3, 1.36)
     assert mean is not None and abs(mean) < 0.15 and "1 из 1" in lines[0]
     lines, share = await DC.noprice_part(db, 24, 1.36)
-    assert share == 0.0 and "0 из 1" in lines[0]
+    assert share == 0.0 and "0 из 1" in lines[0] and "без резервов было бы 0" in lines[0]
     text = await DC.run(db, 24, 3, 1.36)
     assert "Модель против тени" in text
 
@@ -353,3 +353,17 @@ async def test_model_gap_parts_and_effective_rule(db):
     assert "задержка тени от его покупки: медиана 3.0 с" in text
     short, mean = await DC.model_vs_shadow(db, 3, 1.36)
     assert "1 из 2" in short[0] and mean is not None and mean > 0.15
+    assert "тейк → тейк (1)" in text and "пробел в ценах" in text
+
+
+def test_exit_delay_and_without_reserves():
+    """27.11: задержка продажи — параметр модели; без резервов — те же входы без тиков резервов и окон слежения."""
+    e = M.Entry("MINT", T0, 100, 1.0)
+    ticks = [tk(0, 50, 100, ME), tk(20, 70, 140), tk(21.5, 90, 145), tk(40, 95, 160)]
+    fast = M.copy_trade(e, ticks, ME, DEV, T0 - 60, entry_delay_s=1.36)
+    slow = M.copy_trade(e, ticks, ME, DEV, T0 - 60, entry_delay_s=1.36, exit_delay_s=2.0)
+    assert fast.reason == "take_profit" and fast.exit_mc == 70 and slow.exit_mc == 90
+    p = M.Prepared(ME, [e], {"MINT": ticks + [M.Tick(T0 + 5, 60, None, "", True, 0.0, "pump", True)]},
+                   {"MINT": [(T0, T0 + 600)]}, {}, 1800)
+    q = M.without_reserves(p)
+    assert len(q.ticks["MINT"]) == 4 and q.cover == {} and len(p.ticks["MINT"]) == 5

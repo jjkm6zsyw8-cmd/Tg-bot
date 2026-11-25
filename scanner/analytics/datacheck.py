@@ -75,7 +75,7 @@ async def noprice_part(db: Any, hours: float, delay: float) -> tuple[list[str], 
     wallets = [r["address"] for r in await db.fetch(
         """SELECT address FROM traders WHERE active OR manual
            UNION SELECT address FROM hunter_wallets WHERE list <> 'archive' AND status <> 'ignored'""")]
-    total = nop = small = 0
+    total = nop = small = nop_nr = 0
     for w in wallets:
         trades = await CM.wallet_trades(db, w, since - 120, now)
         if not any(d["is_buy"] for d in trades):
@@ -85,10 +85,14 @@ async def noprice_part(db: Any, hours: float, delay: float) -> tuple[list[str], 
             total += 1
             nop += c.res is None and c.why != CM.SMALL_POOL
             small += c.why == CM.SMALL_POOL
+        # 27.11 (владелец: нужны ли резервы при pumpdata?): те же копии без цены из резервов
+        for _e, c in CM.run(CM.without_reserves(p), SCHEMES["A"], entry_delay_s=delay):
+            nop_nr += c.res is None and c.why != CM.SMALL_POOL
     share = nop / max(1, total - small) if total else None
     ok = "✅" if share is not None and share <= 0.30 else "❌"
     return [f"4) Копии без цены за {hours:g} ч (свой список и охотник, {len(wallets)} кошельков): "
-            + (f"{nop} из {total - small} — {share:.0%} {ok} (цель ≤ 30%)" if share is not None else "покупок нет")], share
+            + (f"{nop} из {total - small} — {share:.0%} {ok} (цель ≤ 30%); без резервов было бы {nop_nr} — "
+               f"{nop_nr / max(1, total - small):.0%}" if share is not None else "покупок нет")], share
 
 
 GAP_RULES = ("A", "B", "G")             # правила до 30 мин — модель их считает; R / F / W / тренды — дольше
@@ -106,7 +110,8 @@ def effective_rule(extra: dict[str, Any]) -> str:
     return str(extra.get("rule") or "A")
 
 
-async def shadow_pairs(db: Any, days: float, delay: float, limit: int = 600) -> dict[str, Any]:
+async def shadow_pairs(db: Any, days: float, delay: float, limit: int = 600,
+                       exit_delay: float | None = None) -> dict[str, Any]:
     """Сделки тени за кошельками и копия модели на той же покупке — по тому же правилу. Две копии: с задержкой
     delay (как оценивает охотник) и с настоящей задержкой тени (от его покупки до нашего входа)."""
     import json as _json
@@ -159,14 +164,15 @@ async def shadow_pairs(db: Any, days: float, delay: float, limit: int = 600) -> 
         tk = [t for t in ticks.get(r["mint"], []) if e.ts - 5 <= t.ts <= e.ts + 1900]
         lag = max(0.0, float(r["ts"]) - e.ts)
 
-        def model(d: float) -> CM.Copy:
+        def model(d: float, xd: float | None = None, e=e, tk=tk, dev=dev, created=created, r=r) -> CM.Copy:
             return CM.copy_trade(e, tk, r["trader"], dev, float(created) if created is not None else None,
-                                 SCHEMES[r["rule"]], covered=cover.get(r["mint"]), entry_delay_s=d)
-        m, ml = model(delay), model(lag)
+                                 SCHEMES[r["rule"]], covered=cover.get(r["mint"]), entry_delay_s=d, exit_delay_s=xd)
+        m, ml = model(delay, exit_delay), model(lag, exit_delay)
         if m.res is None:
             out["no_model"] += 1
             continue
-        out["pairs"].append({"rule": r["rule"], "venue": r["venue"] or "pump", "kind": r["kind"], "lag": lag, "m": m,
+        out["pairs"].append({"redo": model, "e_ts": e.ts, "s_close": float(r["cts"]),
+                             "rule": r["rule"], "venue": r["venue"] or "pump", "kind": r["kind"], "lag": lag, "m": m,
                              "ml": ml if ml.res is not None else None, "s_res": float(r["pnl_pct"]),
                              "s_entry": float(r["entry_mc"] or 0), "s_exit": float(r["exit_mc"] or 0),
                              "s_reason": r["exit_reason"] or "?", "s_hold": float(r["cts"]) - float(r["ts"])})
@@ -207,6 +213,27 @@ async def model_gap(db: Any, days: float = 3.0, delay: float = 1.36) -> list[str
         + (f"разница {mean(lagged) * 100:+.1f} п.п. на {len(lagged)}" if lagged else "—"),
         f"   удержание: модель медиана {_med([p['m'].hold_s for p in ps]) / 60:.1f} мин, тень "
         f"{_med([p['s_hold'] for p in ps]) / 60:.1f} мин"]
+    # 27.11 (владелец: тейк → тейк +7.1 п.п. — тень продаёт позже?): на выходах по тейку у обеих — через сколько после
+    # решения модели тень закрыла сделку; та же модель с этой задержкой продажи — на тейках и на всех копиях
+    takes = [p for p in ps if p["m"].reason == "take_profit" and p["s_reason"] == "take_profit"]
+    if takes:
+        lags_x = [p["s_close"] - (p["e_ts"] + CM.ENTRY_DELAY_S + p["m"].hold_s) for p in takes]
+        xd = max(0.0, round(_med(lags_x), 1))
+        before = mean([p["m"].res - p["s_res"] for p in takes])
+        after_t = [p["redo"](delay, xd) for p in takes]
+        after = mean([c.res - p["s_res"] for c, p in zip(after_t, takes) if c.res is not None])
+        after_all = [(p["redo"](delay, xd), p) for p in ps]
+        after_all_d = mean([c.res - p["s_res"] for c, p in after_all if c.res is not None])
+        lines.append(f"   тейк → тейк ({len(takes)}): тень закрывает через {xd:g} с после решения модели (медиана; модель "
+                     f"продаёт через {CM.EXIT_DELAY_S:g} с); модель с продажей через {xd:g} с: на тейках "
+                     f"{before * 100:+.1f} → {after * 100:+.1f} п.п., на всех копиях {mean(diff) * 100:+.1f} → "
+                     f"{after_all_d * 100:+.1f} — в настройку hunter_exit_delay_s: {xd:g}")
+        # пробел в ценах у модели: она не видела, когда цена прошла тейк, и «продала» по первой следующей сделке выше
+        late = [p for p in takes if p["m"].hold_s - p["s_hold"] > 20]   # тень смотрит цену раз в 4 с
+        rest = [p["m"].res - p["s_res"] for p in takes if p not in late]
+        lines.append(f"   из них модель держала дольше тени на 20+ с (пробел в ценах — продала позже и выше): {len(late)}"
+                     + (f", на них {mean([p['m'].res - p['s_res'] for p in late]) * 100:+.1f} п.п." if late else "")
+                     + (f"; остальные тейки {mean(rest) * 100:+.1f} п.п." if rest else ""))
     pairs: dict[tuple[str, str], list[float]] = {}
     for p, x in zip(ps, diff):
         pairs.setdefault((p["m"].reason or "?", p["s_reason"]), []).append(x)

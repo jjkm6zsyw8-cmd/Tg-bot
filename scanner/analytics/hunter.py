@@ -262,19 +262,21 @@ class Params:
     delay: float = ENTRY_DELAY_S
     min_pool: float = MIN_POOL_SOL
     sol_usd: float = 150.0
+    exit_delay: float = CM.EXIT_DELAY_S   # 27.11: продажа «садится» через столько секунд (hunter_exit_delay_s)
 
 
 async def params_of(db: Any, cfg: dict[str, Any] | None = None) -> Params:
     cfg = cfg or {}
     price = (await db.kv_get("sol_usd", {}) or {}).get("price") if hasattr(db, "kv_get") else None
     return Params(float(cfg.get("hunter_entry_delay_s", ENTRY_DELAY_S)),
-                  float(cfg.get("real_min_pool_sol", MIN_POOL_SOL)), float(price or 150.0))
+                  float(cfg.get("real_min_pool_sol", MIN_POOL_SOL)), float(price or 150.0),
+                  float(cfg.get("hunter_exit_delay_s", CM.EXIT_DELAY_S)))
 
 
 def assess(p: CM.Prepared, trades: list[dict[str, Any]], prm: Params, days: float,
            symbols: dict[str, str] | None = None, rules: tuple[str, ...] = RULES) -> tuple[Stats, dict[str, Any]]:
     """Оценка кошелька на входах p: правило (A2), итог, $ в день (A3), всплеск (A4), блок +2 (A1), слив (C2)."""
-    by_rule = {r: CM.run(p, SCHEMES[r], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool) for r in rules}
+    by_rule = {r: CM.run(p, SCHEMES[r], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool) for r in rules}
     rule, train, test = pick_rule(by_rule)
     copies = by_rule[rule]
     s = stats_of(p.address, copies, trades, symbols)
@@ -282,12 +284,12 @@ def assess(p: CM.Prepared, trades: list[dict[str, Any]], prm: Params, days: floa
     s.per_day = s.total / max(days, 1 / 24)
     s.trades_day = len(trades) / max(days, 1 / 24)
     s.usd_day = s.per_day * STAKE_SOL * s.avg * prm.sol_usd
-    mx = [c for _e, c in CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool,
+    mx = [c for _e, c in CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool,
                                 stake_share=MAX_STAKE_SHARE) if c.res is not None]
     if mx:
         s.usd_day_max = s.per_day * statistics.fmean(c.stake for c in mx) * statistics.fmean(c.res for c in mx) \
             * prm.sol_usd
-    b2 = [c.res for _e, c in CM.run(p, SCHEMES[rule], min_pool_sol=prm.min_pool) if c.res is not None]
+    b2 = [c.res for _e, c in CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, min_pool_sol=prm.min_pool) if c.res is not None]
     s.block2_avg = statistics.fmean(b2) if b2 else None
     s.dump = dump_share(p, trades)
     return s, {"by_rule": by_rule}
@@ -597,7 +599,7 @@ class Hunter:
             trades = await CM.wallet_trades(db, addr, start - 120, now)
             p = await CM.prepare(db, addr, trades, start, now, limit=100_000)
             rule = r["rule"] if r["rule"] in SCHEMES else "A"
-            copies = CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
+            copies = CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
             await save_copies(db, addr, rule, copies)
             done = [(e, c) for e, c in copies if c.why != CM.SMALL_POOL]
             res = [c.res for _e, c in done if c.res is not None]
@@ -846,9 +848,9 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
                    UNION ALL SELECT ts FROM market_trades WHERE trader = $1 AND is_buy AND ts < $2) x""", addr, found)
         rule = r["rule"] if r["rule"] in SCHEMES else "A"
         p = await CM.prepare(db, addr, trades, since, now, limit=100_000)
-        cs = CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
+        cs = CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
         model = Counter("с ценой" if c.res is not None else (c.why or "?") for _e, c in cs)
-        nopool = sum(1 for _e, c in CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay) if c.res is not None)
+        nopool = sum(1 for _e, c in CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay) if c.res is not None)
         small = [CM.pool_sol(c.entry_mc, c.venue) for _e, c in cs if c.why == CM.SMALL_POOL and c.entry_mc]
         head = (f"<code>{addr}</code> · найден {found:%d.%m %H:%M}, {r['status']}, правило {rule}\n"
                 f"  покупок после находки: {len(buys)} (монет {len({d['mint'] for d in buys})})"
@@ -944,7 +946,7 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
             if c["trader"] == trace:
                 tr_lines.append("  копий нет: в базе нет его покупок за период")
             continue
-        by_rule = {r: CM.run(p, SCHEMES[r], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool) for r in rules}
+        by_rule = {r: CM.run(p, SCHEMES[r], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool) for r in rules}
         t = start
         while t <= until:
             win = {r: [(e, x) for e, x in cs if t - WINDOW_H * 3600 <= e.ts < t] for r, cs in by_rule.items()}
@@ -971,7 +973,7 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
                     break
                 unchecked += not checked
                 j = journey(by_rule[rule], [d for d in trades if d["ts"] >= t], t, until, prm.sol_usd)
-                b2 = [x.res for e, x in CM.run(p, SCHEMES[rule], min_pool_sol=prm.min_pool)
+                b2 = [x.res for e, x in CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, min_pool_sol=prm.min_pool)
                       if t <= e.ts <= j["end"] and x.res is not None]
                 found.append({"address": c["trader"], "at": t, "stats": s, **j, "b2": b2})
                 break

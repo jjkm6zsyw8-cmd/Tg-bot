@@ -163,11 +163,14 @@ BURST_UP, BURST_S = 0.25, 30.0
 def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, created_ts: float | None,
                scheme: dict[str, Any] | None = None, stake: float = STAKE_SOL,
                covered: list[tuple[float, float]] | None = None, entry_delay_s: float | None = None,
-               stake_share: float | None = None, min_pool_sol: float = 0.0) -> Copy:
+               stake_share: float | None = None, min_pool_sol: float = 0.0, exit_delay_s: float | None = None) -> Copy:
     """Копия одной покупки трейдера: вход как у бота, выход по decide_exit (правило A и общие выходы).
     covered — окна слежения за резервами монеты (reserve_cover): внутри окна тишина значит «цена не менялась».
     26.11: entry_delay_s — вход через нашу задержку (иначе блок +2); stake_share — ставка как доля SOL пула (3%
-    глубины) вместо stake; min_pool_sol — в пул мельче бот не входит (копия не в оценке)."""
+    глубины) вместо stake; min_pool_sol — в пул мельче бот не входит (копия не в оценке). 27.11: exit_delay_s —
+    продажа «садится» через столько секунд после решения (по умолчанию EXIT_DELAY_S; настоящую задержку тени меряет
+    datacheck --gap)."""
+    xd = EXIT_DELAY_S if exit_delay_s is None else float(exit_delay_s)
     sc = scheme or SCHEMES[RULE]
     ticks = sorted(ticks, key=lambda t: t.ts)
     et = entry_by_delay(e, ticks, entry_delay_s) if entry_delay_s is not None else entry_tick(e, ticks)
@@ -201,7 +204,7 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
         return venue == AMM or upto > trusted_until
 
     def close(at: float, why: str) -> Copy:
-        px = _price_at(ticks, at + EXIT_DELAY_S)
+        px = _price_at(ticks, at + xd)
         mc = px.mc if px is not None else et.mc
         v = AMM if (px is not None and px.pool == AMM) else venue
         pos.proceeds_sol += sell_sol(mc, v, pos.tokens) - FIXED_SOL
@@ -237,7 +240,7 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
         share = float(d[1])
         if share < 1 and pos.tokens > 0:
             part = pos.tokens * share
-            px = _price_at(ticks, t.ts + EXIT_DELAY_S)
+            px = _price_at(ticks, t.ts + xd)
             pos.proceeds_sol += sell_sol(px.mc if px else t.mc, venue, part) - FIXED_SOL
             pos.tokens -= part
             pos.tp_done = True
@@ -343,7 +346,7 @@ async def load_cover(db: Any, windows: dict[str, tuple[float, float]]) -> dict[s
     return out
 
 
-async def load_ticks(db: Any, windows: dict[str, tuple[float, float]]) -> dict[str, list[Tick]]:
+async def load_ticks(db: Any, windows: dict[str, tuple[float, float]], reserves: bool = True) -> dict[str, list[Tick]]:
     if not windows:
         return {}
     mints = list(windows)
@@ -366,7 +369,7 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]]) -> dict[s
                                                   bool(r["is_buy"]), float(r["sol_amount"] or 0), pool,
                                                   not (r["source"] == "pumpportal" and pool == AMM)))
     # 25.11: цена из резервов (подписка на кривую / хранилища пула) — без сделки, только цена
-    for r in await db.fetch(
+    for r in [] if not reserves else await db.fetch(
             """SELECT p.mint, extract(epoch FROM r.ts) AS ts, r.mc_sol, r.slot, r.venue
                FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
                JOIN reserve_ticks r ON r.mint = p.mint AND r.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi)
@@ -412,6 +415,13 @@ async def prepare(db: Any, address: str, trades: list[dict[str, Any]], since: fl
         "SELECT mint, extract(epoch FROM created_at) AS created, deployer FROM tokens WHERE mint = ANY($1::text[])",
         list(win))}
     return Prepared(address, ents, ticks, cover, meta, hold_s)
+
+
+def without_reserves(p: Prepared) -> Prepared:
+    """27.11: те же входы без цены из резервов (у тиков резервов нет кошелька) и без окон их слежения — сколько копий
+    останется без цены, если подписку на резервы выключить."""
+    return Prepared(p.address, p.ents, {m: [t for t in ts if t.trader] for m, ts in p.ticks.items()}, {}, p.meta,
+                    p.hold)
 
 
 def run(p: Prepared, scheme: dict[str, Any] | None = None, **kw: Any) -> list[tuple[Entry, Copy]]:
