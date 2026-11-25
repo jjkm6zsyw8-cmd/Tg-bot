@@ -79,9 +79,12 @@ class Receiver:
         # 27.11: весь рынок из pumpdata.fun — своя таблица market_trades (охотник и модели), не в сигналы бота
         self.pumpdata: PumpDataStream | None = None
         if env.pumpdata_api_key:
+            feed = bool(rel.get("pumpdata_coin_feed", True))
             self.pumpdata = PumpDataStream(db, env.pumpdata_ws, env.pumpdata_api_key,
                                            float(rel.get("pumpdata_min_sol", 0.2)),
-                                           on_rows=lambda n: self._count("pumpdata", trades=n))
+                                           on_rows=lambda n: self._count("pumpdata_market", trades=n),
+                                           route=self.pd_route if feed else None,
+                                           feed=self._pd_feed if feed else None)
         self.sources: list[Source] = [self.pp]
         self.helius: HeliusSource | None = None
         if env.helius_ws_url:
@@ -188,6 +191,28 @@ class Receiver:
                 await self.sink(ev)
             except Exception:  # noqa: BLE001
                 log.exception("обработка события")
+
+    def pp_silent(self) -> bool:
+        """27.11: от PumpPortal 10 минут нет сделок (нет ключа, отказ по балансу, обрыв) — сделки монет из pumpdata."""
+        t = self.pp.last_trade_at
+        return t is None or time.monotonic() - t > 600       # сделок ещё не было — тоже тишина
+
+    def pd_route(self, row: Any) -> bool:
+        """Сделка pumpdata → основной поток: пока PumpPortal молчит; монета моложе окна или её нужно держать; не то,
+        что ведёт слежка Helius (кошельки и монеты — там быстрее и с подписью)."""
+        if not self.pp_silent():
+            return False
+        mint, wallet = row[3], row[4]
+        if self.watch is not None and (wallet in self.watch.want or mint in self.watch.want):
+            return False
+        born = self.known_mints.get(mint)
+        return (born is not None and time.time() - born <= self.window_s) or self.keep_mint(mint)
+
+    def _pd_feed(self, ev: Trade) -> None:
+        try:
+            self.queue.put_nowait(ev)
+        except asyncio.QueueFull:
+            self.dropped += 1
 
     def keep_mint(self, mint: str) -> bool:
         return mint in self.tracked_mints or self.extended.get(mint, 0) > time.time()

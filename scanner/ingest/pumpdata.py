@@ -10,6 +10,13 @@
 token_amount, slot, idx, ts / block_time; пул в другой валюте — quote_mint / quote_amount вместо sol (такие пропускаем).
 Подписи, резервов и цены в потоке нет: MC = sol / token_amount × 1 млрд (средняя цена сделки). Ключ — PUMPDATA_API_KEY
 в .env; отстающего клиента поток отключает, поэтому чтение только кладёт строки в очередь, запись — отдельно.
+
+27.11 (владелец не пополняет PumpPortal: полный поток ~$100–250/день): пока от PumpPortal нет сделок (10 мин тишины,
+нет ключа или отказ по балансу), сделки новых монет (первые trade_window_min минут) и отслеживаемых / растущих монет
+идут и в основной поток бота (route → feed, как раньше от PumpPortal): метрики новых монет, продажи дева и кластера,
+алерты, разведка — для тени задержка 1.5 с не важна. Сделки кошельков и монет, которые ведёт слежка Helius, отсюда не
+берутся (там они быстрее и с подписью — иначе дубль). Резервы кривой восстанавливаются по сделке (постоянное
+произведение 30 SOL × 1.073 млрд); PumpSwap — пропорция из MC, как у PumpPortal.
 """
 from __future__ import annotations
 
@@ -21,6 +28,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import websockets
+
+from ..models import Trade
+from ..solana import INITIAL_V_SOL, INITIAL_V_TOKENS
 
 log = logging.getLogger(__name__)
 
@@ -67,19 +77,53 @@ def parse(msg: Any) -> Row | None:
             side in ("buy", "b"), sol, tok, sol / tok * TOTAL_SUPPLY, pool)
 
 
+def curve_reserves(sol: float, tokens: float, is_buy: bool,
+                   k: float = INITIAL_V_SOL * INITIAL_V_TOKENS) -> tuple[float, float]:
+    """Виртуальные резервы кривой ПОСЛЕ сделки по её сумме и токенам (v_sol · v_tok = k до и после; комиссия вне
+    резервов — погрешность ~1%). Покупка: (v + s)(k/v − t) = k → t·v² + s·t·v − s·k = 0; продажа: t·v² − s·t·v − s·k = 0."""
+    st = sol * tokens
+    if is_buy:
+        v = (-st + (st * st + 4 * tokens * sol * k) ** 0.5) / (2 * tokens)
+        v_after = v + sol
+    else:
+        v = (st + (st * st + 4 * tokens * sol * k) ** 0.5) / (2 * tokens)
+        v_after = v - sol
+    v_after = max(v_after, 1e-9)
+    return v_after, k / v_after
+
+
+def to_trade(row: Row) -> Trade:
+    """Строка потока → событие сделки основного потока (подпись условная: pd:блок:номер)."""
+    slot, idx, ts, mint, wallet, is_buy, sol, tok, mc, pool = row
+    if pool == "pump":
+        v_sol, v_tok = curve_reserves(sol, tok, is_buy)
+        real = max(0.0, v_tok - 279_900_000.0)
+    else:
+        v_sol, v_tok, real = mc, TOTAL_SUPPLY, None
+    return Trade(signature=f"pd:{slot}:{idx}", mint=mint, trader=wallet, is_buy=is_buy, sol_amount=sol,
+                 token_amount=tok, v_sol=v_sol, v_tokens=v_tok, real_tokens=real, pool=pool, slot=slot, ts=ts,
+                 source="pumpdata", received_at=datetime.now(timezone.utc))
+
+
 class PumpDataStream:
     name = "pumpdata"
 
     def __init__(self, db: Any, url: str, key: str, min_sol: float = 0.2,
-                 on_rows: Callable[[int], None] | None = None):
+                 on_rows: Callable[[int], None] | None = None, route: Callable[[Row], bool] | None = None,
+                 feed: Callable[[Trade], None] | None = None):
         self.db, self.url, self.key, self.min_sol = db, url, key, float(min_sol)
         self.on_rows = on_rows
+        self.route, self.feed = route, feed          # 27.11: сделки новых монет — в основной поток, пока нет PumpPortal
+        self.fed = 0
         self.queue: deque[Row] = deque()
         self.connected = False
         self.events = self.rows = self.dropped = self.reconnects = 0
         self.last_error = ""
 
     def stream_url(self) -> str:
+        # для основного потока нужны все сделки новых монет — тогда без фильтра сервера, отбор здесь
+        if self.feed is not None:
+            return f"{self.url}?key={self.key}&types=trade"
         return f"{self.url}?key={self.key}&types=trade&min_sol={self.min_sol:g}"
 
     def take(self, raw: str | bytes) -> None:
@@ -94,6 +138,11 @@ class PumpDataStream:
             if row is None:
                 if isinstance(m, dict) and (m.get("error") or m.get("type") == "error"):
                     self.last_error = str(m.get("error") or m.get("message") or m)[:200]
+                continue
+            if self.feed is not None and self.route is not None and self.route(row):
+                self.feed(to_trade(row))
+                self.fed += 1
+            if row[6] < self.min_sol:
                 continue
             if len(self.queue) >= MAX_QUEUE:
                 self.dropped += 1
@@ -144,5 +193,6 @@ class PumpDataStream:
 
     def health(self) -> dict[str, Any]:
         return {"connected": self.connected, "events": self.events, "rows": self.rows, "queue": len(self.queue),
+                "fed": self.fed,
                 "dropped": self.dropped, "reconnects": self.reconnects, "min_sol": self.min_sol,
                 "last_error": self.last_error}

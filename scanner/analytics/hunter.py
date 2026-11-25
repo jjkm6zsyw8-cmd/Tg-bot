@@ -84,6 +84,7 @@ BATTLE_USD, BATTLE_N, WATCH_USD, ARCHIVE_MIN_N = 40.0, 50, 15.0, 20
 COOL_MIN_N, COOL_T, COOL_IDLE_H = 10, -2.0, 12
 SHADOW_BEFORE_LIVE_H, SHADOW_MIN_N = 24, 5
 DUMP_BUYERS, DUMP_WIN_S, DUMP_SELL_S, DUMP_ALERT, DUMP_RISE = 3, 10.0, 30.0, 0.3, 0.1
+BOT_TRADES_DAY, BOT_LOW_BALANCE = 100, 0.05   # 27.11: метка «бот» (не отсев — решает модель копирования)
 STAKE_SOL = 0.14
 MAX_WALLETS = 600                    # мягкая планка — кандидатов больше
 EVAL_LIMIT = 200
@@ -127,6 +128,8 @@ class Stats:
     block2_avg: float | None = None  # A1: то же правило со входом «блок +2»
     dump: float = 0.0                # C2
     small_pool: int = 0              # копий мимо (пул < 30 SOL)
+    trades_day: float = 0.0          # 27.11: его сделок (покупки и продажи) в день за окно — метка «бот»
+    balance: float | None = None     # 27.11: баланс SOL при находке (RPC)
 
     def hot(self, bar: Bar | None = None) -> str | None:
         """None — горячий, иначе — почему нет (планка — BAR, если не задана)."""
@@ -277,6 +280,7 @@ def assess(p: CM.Prepared, trades: list[dict[str, Any]], prm: Params, days: floa
     s = stats_of(p.address, copies, trades, symbols)
     s.rule, s.rule_train, s.rule_test = rule, train, test
     s.per_day = s.total / max(days, 1 / 24)
+    s.trades_day = len(trades) / max(days, 1 / 24)
     s.usd_day = s.per_day * STAKE_SOL * s.avg * prm.sol_usd
     mx = [c for _e, c in CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool,
                                 stake_share=MAX_STAKE_SHARE) if c.res is not None]
@@ -306,6 +310,14 @@ def ago(sec: float | None) -> str:
     return fmt.ago(sec) if sec is not None else "?"
 
 
+def bot_line(s: Stats) -> str:
+    """27.11 (владелец): ботов жёстко не отсеивать — в алерте метка «бот: N сделок/день, баланс ~0»."""
+    bal = "?" if s.balance is None else ("~0" if s.balance < BOT_LOW_BALANCE else f"{s.balance:,.2f} SOL")
+    if s.trades_day >= BOT_TRADES_DAY:
+        return f"🤖 <b>бот: {s.trades_day:,.0f} сделок/день, баланс {bal}</b>"
+    return f"Сделок в день: {s.trades_day:,.0f} · баланс {bal}"
+
+
 def alert_text(s: Stats, now: float, prm: Params | None = None) -> tuple[str, list[list[dict[str, Any]]]]:
     prm = prm or Params()
     active = s.last_buy is not None and now - s.last_buy <= ACTIVE_S
@@ -323,6 +335,7 @@ def alert_text(s: Stats, now: float, prm: Params | None = None) -> tuple[str, li
             f"Удержание у него: медиана {ago(s.hold_s)} · последняя покупка "
             f"{ago(now - s.last_buy) if s.last_buy else '?'} назад — {'🟢 активен' if active else '⚪ сейчас не торгует'}\n"
             f"Монеты: {coins}\n"
+            f"{bot_line(s)}\n"
             f"Тень за ним включена (без денег). В «в бой» — по итогу после находки: от ${BATTLE_USD:g}/день на "
             f"{BATTLE_N}+ новых копиях; после 24 ч тени пришлю кнопку «Бой {STAKE_SOL:g}». Архив и снятие тени — "
             f"{ARCHIVE_MIN_N}+ копий и меньше ${WATCH_USD:g}/день.")
@@ -517,6 +530,7 @@ class Hunter:
                 if not checked:
                     unchecked += 1
                     continue
+                s.balance = await self.balance(c["trader"])
                 hot.append(s)
                 await upsert(db, s)
                 await db.execute("UPDATE hunter_wallets SET farm_at = now() WHERE address = $1", c["trader"])
@@ -529,6 +543,17 @@ class Hunter:
         self.stats = {"at": now, "candidates": len(cands), "hot": len(hot), "farms": len(farms),
                       "farm_unchecked": unchecked}
         return hot
+
+    async def balance(self, addr: str) -> float | None:
+        rpc = getattr(self.e, "rpc", None)
+        if rpc is None or not hasattr(rpc, "call"):
+            return None
+        try:
+            res = await rpc.call("getBalance", [addr, {"commitment": "confirmed"}], retries=1)
+            value = res.get("value") if isinstance(res, dict) else res
+            return int(value) / 1e9 if value is not None else None
+        except Exception:  # noqa: BLE001 — баланс в алерте не обязателен
+            return None
 
     async def farm_check(self, addr: str) -> tuple[str | None, bool]:
         rpc = getattr(self.e, "rpc", None)

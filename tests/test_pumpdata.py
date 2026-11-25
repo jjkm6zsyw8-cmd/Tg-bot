@@ -98,3 +98,44 @@ async def test_ppcost_shows_raw_kinds(db):
         await db.execute(f"INSERT INTO source_stats(source, hour, trades) VALUES ($1, {h}, $2)", src, n)
     text = await pp_cost_text(db)
     assert "600,000 · 54,000 · 2,000 · 30,000 → 0.654 SOL" in text and "со служебными 0.656" in text
+
+
+
+def test_curve_reserves_and_trade_event():
+    from scanner.solana import INITIAL_V_SOL, INITIAL_V_TOKENS
+    k = INITIAL_V_SOL * INITIAL_V_TOKENS
+    out = INITIAL_V_TOKENS - k / 31.0                                   # 1 SOL с самого начала кривой
+    v_sol, v_tok = PD.curve_reserves(1.0, out, True)
+    assert abs(v_sol - 31.0) < 1e-6 and abs(v_tok - k / 31.0) < 1e-3
+    v_sol, v_tok = PD.curve_reserves(1.0, out, False, k)                # продать их обратно → снова 30
+    assert abs(v_sol - 30.0) < 1e-6
+    ev = PD.to_trade(PD.parse(trade(sol=1.0, token_amount=out)))
+    assert ev.signature == "pd:100:3" and ev.source == "pumpdata" and ev.slot == 100 and ev.pool == "pump"
+    assert abs(ev.v_sol - 31.0) < 1e-6 and ev.real_tokens == max(0.0, ev.v_tokens - 279_900_000.0)
+    amm = PD.to_trade(PD.parse(trade(venue="pumpswap", sol=2.0, token_amount=1_000_000.0)))
+    assert amm.pool == "pump-amm" and abs(amm.v_sol / amm.v_tokens * 1e9 - 2000.0) < 1e-6
+
+
+def test_feed_routes_new_coins_and_market_keeps_big_trades():
+    fed = []
+    st = PD.PumpDataStream(None, "wss://x/stream", "k", 0.5, route=lambda r: r[3] == "NEW", feed=fed.append)
+    assert st.stream_url() == "wss://x/stream?key=k&types=trade"          # для основного потока — без фильтра сервера
+    st.take(json.dumps(trade(mint="NEW", sol=0.01, token_amount=300_000.0)))     # мелкая сделка новой монеты
+    st.take(json.dumps(trade(mint="OLD", sol=2.0, idx=9)))                         # крупная старой — только в таблицу
+    assert [e.mint for e in fed] == ["NEW"] and [r[3] for r in st.queue] == ["OLD"] and st.fed == 1
+
+
+async def test_receiver_routes_only_while_pumpportal_silent(db):
+    from scanner.config import Env, Settings, YamlConfig
+    from scanner.ingest.receiver import Receiver
+    rec = Receiver(Env(pumpportal_api_key="k", pumpdata_api_key="pdk"), Settings(YamlConfig("config/config.yaml")), db)
+    rec.known_mints = {"NEW": time.time() - 60, "OLD": time.time() - 3 * 3600}
+    row = lambda mint, wallet="W": PD.parse(trade(mint=mint, wallet=wallet))   # noqa: E731
+    assert rec.pp_silent() and rec.pd_route(row("NEW")) and not rec.pd_route(row("OLD"))
+    if rec.watch is not None:
+        rec.watch.want["WATCHED"] = "wallet"
+        assert not rec.pd_route(row("NEW", "WATCHED"))                  # кошелёк из слежки Helius — оттуда
+    rec.pp.last_trade_at = time.monotonic()                             # PumpPortal снова шлёт сделки — не дублируем
+    assert not rec.pd_route(row("NEW"))
+    rec._pd_feed(PD.to_trade(row("NEW")))
+    assert rec.queue.qsize() == 1

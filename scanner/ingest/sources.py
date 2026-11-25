@@ -147,6 +147,7 @@ class PumpPortalSource(Source):
         self.messages_by_pool: dict[str, int] = {"pump": 0, "pump-amm": 0}
         self.refused = ""          # ответ PumpPortal, если он отказал в подписке на сделки
         self.on_raw: Callable[[str], None] | None = None    # 27.11: каждое сообщение — по виду подписки
+        self.last_trade_at: float | None = None            # monotonic последней сделки (тишина → сделки из pumpdata)
 
     async def subscribe_tokens(self, mints: list[str]) -> None:
         if not self.has_key:
@@ -240,6 +241,7 @@ class PumpPortalSource(Source):
                     self.mark_event()
                     if isinstance(ev, Trade):
                         self.messages_by_pool[ev.pool] = self.messages_by_pool.get(ev.pool, 0) + 1
+                        self.last_trade_at = time.monotonic()
                     if isinstance(ev, TokenCreated):
                         await self.subscribe_tokens([ev.mint])
                         await sink(ev)

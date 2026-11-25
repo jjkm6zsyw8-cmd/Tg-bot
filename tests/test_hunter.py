@@ -127,6 +127,11 @@ def test_alert_text_has_money_burst_and_buttons():
     assert "правило <b>B</b>" in text and "🟢 активен" in text and "через 1.36 с" in text
     assert "→ 👻 тень и «наблюдение»" in text and "пришлю кнопку «Бой 0.14»" in text
     assert [b["callback"] for b in kb[0]] == ["hn:i:W"]                    # найденный — сразу в тени, денег нет
+    assert "Сделок в день: 0 · баланс ?" in text
+    s.trades_day, s.balance = 340.0, 0.01
+    assert "🤖 <b>бот: 340 сделок/день, баланс ~0</b>" in H.alert_text(s, NOW, NOPOOL)[0]
+    s.trades_day, s.balance = 12.0, 109.3
+    assert "Сделок в день: 12 · баланс 109.30 SOL" in H.alert_text(s, NOW, NOPOOL)[0]
     text, kb = H.ready_text("W", {"n": 7, "avg": 0.05, "sol": 0.03}, 44.0)
     assert "Можно в бой" in text and [b["callback"] for b in kb[0]] == ["hn:l:W", "hn:i:W"]
     addr = "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5"
@@ -159,6 +164,9 @@ class FakeRpc:
     async def transaction(self, sig):
         self.calls += 1
         return self.txs.get(sig)
+
+    async def call(self, method, params, retries=2):
+        return {"context": {}, "value": 2_500_000_000} if method == "getBalance" else None
 
 
 def transfer_tx(src, dst, extra_program=None):
@@ -205,6 +213,7 @@ async def test_scan_finds_hot_wallet_once_and_skips_dev_and_bundles(db):
     assert s.coins_all == 16 and s.win == 1.0 and 0.2 < s.avg < 0.4 and s.usd_day > 0 and s.rule in H.RULES
     alerts = [p for p in e.sent if "горячий кошелёк" in p["text"]]
     assert len(alerts) == 1 and "в день" in alerts[0]["text"]
+    assert s.balance == 2.5 and "баланс 2.50 SOL" in alerts[0]["text"] and s.trades_day > 0
     r = await db.fetchrow("SELECT status, list, rule, usd_day, followed_at FROM hunter_wallets WHERE address = $1", ME)
     # 27.11: найденный — сразу в тень и «наблюдение»; денег нет
     assert r["status"] == "shadow" and r["list"] == "watch" and r["rule"] == s.rule and r["usd_day"] > 0
