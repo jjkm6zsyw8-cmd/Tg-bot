@@ -102,6 +102,11 @@ class ReserveSource(Source):
         self.last_mc: dict[str, float] = {}
         self.reread_at: dict[str, float] = {}
         self._sink: Sink | None = None
+        # 27.11 (владелец: «резервы лежат, 429 ×8 — переведи на соединение слежки»): общий режим — своего соединения
+        # нет, подписки идут через WatchSource (attach / handle / detach), там же приходят уведомления
+        self._send: Callable[[dict[str, Any]], Awaitable[bool]] | None = None
+        self._task: asyncio.Task[None] | None = None
+        self.shared = False
 
     # ------------------------------------------------------------------ цели
     def set_target(self, mint: str, target: Target) -> bool:
@@ -204,6 +209,77 @@ class ReserveSource(Source):
             return False
         return True
 
+    # ------------------------------------------------------------------ общий режим (соединение слежки)
+    async def attach(self, send: Callable[[dict[str, Any]], Awaitable[bool]], sink: Sink) -> None:
+        """Слежка подключилась: подписки — через её соединение."""
+        self.shared = True
+        self._sink, self._send = sink, send
+        self.subs.clear()
+        self.sid_acc.clear()
+        self.pending.clear()
+        self._set_connected(True)
+        self._changed.set()
+        if self._task is not None:
+            self._task.cancel()
+        self._task = asyncio.create_task(self._sync(None))
+        log.info("reserves: в соединении слежки, монет %d, счетов %d", len(self.targets), len(self.acc_mint))
+
+    def detach(self) -> None:
+        """Соединение слежки оборвалось: окна слежения закрыты, подписки — заново при следующем подключении."""
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        for mint, t in list(self.targets.items()):
+            self._cover(mint, t, final=True)
+        self._set_connected(False)
+
+    async def _out(self, ws: Any, obj: dict[str, Any]) -> None:
+        if ws is not None:
+            await ws.send(json.dumps(obj))
+        elif self._send is not None:
+            await self._send(obj)
+
+    async def handle(self, msg: dict[str, Any], n: int) -> bool:
+        """Сообщение из соединения: ответ на нашу подписку или уведомление о счёте — разобрать (True), иначе — не наше."""
+        rid = msg.get("id")
+        if rid is not None:
+            if rid not in self.pending and not (isinstance(rid, int) and rid >= (1 << 40)):
+                return False
+            acc = self.pending.pop(rid, None)
+            if acc is not None and isinstance(msg.get("result"), int) and acc in self.acc_mint:
+                self.subs[acc] = msg["result"]
+                self.sid_acc[msg["result"]] = acc
+                mint = self.acc_mint[acc]
+                t = self.targets.get(mint)
+                if t is not None and t.started is None and self._all_subscribed(mint):
+                    t.started = time.time()
+            elif acc is not None and "error" in msg:
+                self.sub_errors += 1
+                self.last_sub_error = str(msg["error"])[:160]
+                if self.sub_errors <= 5 or self.sub_errors % 100 == 0:
+                    log.warning("reserves: подписка на %s отклонена: %s", acc, msg["error"])
+            return True
+        if msg.get("method") != "accountNotification":
+            return False
+        res = (msg.get("params") or {}).get("result") or {}
+        acc = self.sid_acc.get((msg.get("params") or {}).get("subscription"))
+        data = ((res.get("value") or {}).get("data") or [None])[0]
+        if acc is None or not data:
+            return True
+        mint = self.acc_mint.get(acc)
+        if mint is not None and not self.count_bytes(mint, n):
+            return True
+        try:
+            raw_data = base64.b64decode(data)
+        except ValueError:
+            return True
+        tick = self.on_account(acc, raw_data, (res.get("context") or {}).get("slot"))
+        if tick is not None and self._sink is not None:
+            self.ticks += 1
+            self.mark_event()
+            await self._sink(tick)
+        return True
+
     # ------------------------------------------------------------------ соединение
     async def _sync(self, ws: Any) -> None:
         while True:
@@ -218,14 +294,14 @@ class ReserveSource(Source):
             for acc in [a for a in self.acc_mint if a not in self.subs and a not in asked]:
                 rid = next(self._ids)
                 self.pending[rid] = acc
-                await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "accountSubscribe",
-                                          "params": [acc, {"encoding": "base64", "commitment": "confirmed"}]}))
+                await self._out(ws, {"jsonrpc": "2.0", "id": rid, "method": "accountSubscribe",
+                                     "params": [acc, {"encoding": "base64", "commitment": "confirmed"}]})
                 await asyncio.sleep(self.SUB_GAP_S)
             for acc in [a for a in self.subs if a not in self.acc_mint]:
                 sid = self.subs.pop(acc)
                 self.sid_acc.pop(sid, None)
-                await ws.send(json.dumps({"jsonrpc": "2.0", "id": next(self._ids), "method": "accountUnsubscribe",
-                                          "params": [sid]}))
+                await self._out(ws, {"jsonrpc": "2.0", "id": next(self._ids), "method": "accountUnsubscribe",
+                                     "params": [sid]})
                 await asyncio.sleep(self.SUB_GAP_S)
 
     def on_failure(self, exc: Exception) -> None:
@@ -259,41 +335,7 @@ class ReserveSource(Source):
                         continue
                     if not isinstance(msg, dict):
                         continue
-                    rid = msg.get("id")
-                    if rid is not None:
-                        acc = self.pending.pop(rid, None)
-                        if acc is not None and isinstance(msg.get("result"), int) and acc in self.acc_mint:
-                            self.subs[acc] = msg["result"]
-                            self.sid_acc[msg["result"]] = acc
-                            mint = self.acc_mint[acc]
-                            t = self.targets.get(mint)
-                            if t is not None and t.started is None and self._all_subscribed(mint):
-                                t.started = time.time()
-                        elif acc is not None and "error" in msg:
-                            self.sub_errors += 1
-                            self.last_sub_error = str(msg["error"])[:160]
-                            if self.sub_errors <= 5 or self.sub_errors % 100 == 0:
-                                log.warning("reserves: подписка на %s отклонена: %s", acc, msg["error"])
-                        continue
-                    if msg.get("method") != "accountNotification":
-                        continue
-                    res = (msg.get("params") or {}).get("result") or {}
-                    acc = self.sid_acc.get((msg.get("params") or {}).get("subscription"))
-                    data = ((res.get("value") or {}).get("data") or [None])[0]
-                    if acc is None or not data:
-                        continue
-                    mint = self.acc_mint.get(acc)
-                    if mint is not None and not self.count_bytes(mint, len(raw)):
-                        continue
-                    try:
-                        raw_data = base64.b64decode(data)
-                    except ValueError:
-                        continue
-                    tick = self.on_account(acc, raw_data, (res.get("context") or {}).get("slot"))
-                    if tick is not None:
-                        self.ticks += 1
-                        self.mark_event()
-                        await sink(tick)
+                    await self.handle(msg, len(raw))
             finally:
                 sync.cancel()
                 for mint, t in list(self.targets.items()):    # обрыв — окно слежения закрыто

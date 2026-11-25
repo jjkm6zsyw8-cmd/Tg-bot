@@ -117,6 +117,12 @@ class Receiver:
             self.reserves.on_complete = self.reserve_migrated
             self.reserves.on_jump = self.reserve_migrated            # 26.11 (B1): скачок — перечитать пул
             self.reserves.COIN_DAILY_BYTES = int(float(rel.get("reserve_coin_daily_mb", 3)) * 1e6)
+            # 27.11 (владелец): одно соединение с Helius — резервы в соединении слежки; на соединение ~1000 подписок:
+            # слежке 700, резервам 250 счетов (кривая — 1 счёт, пул — 2)
+            if self.watch is not None and rel.get("reserves_shared", True):
+                self.watch.passenger = self.reserves
+                self.watch.MAX_SUBS = int(rel.get("watch_max_subs_shared", 700))
+                self.reserves.MAX_SUBS = int(rel.get("reserve_max_subs_shared", 250))
         self.dev_watch_until: dict[str, float] = {}   # 26.11 (B2): дев монеты, купленной отслеживаемым, — 35 мин
         self.reserve_until: dict[str, float] = {}     # монета → до какого времени слушать резервы
         self.reserve_capped = False
@@ -1020,7 +1026,7 @@ class Receiver:
         tasks = [asyncio.create_task(s.run(self.enqueue), name=s.name) for s in self.sources]
         if self.watch is not None:
             tasks.append(asyncio.create_task(self.watch.run(self.enqueue), name="watch"))
-        if self.reserves is not None:
+        if self.reserves is not None and not (self.watch is not None and self.watch.passenger is self.reserves):
             tasks.append(asyncio.create_task(self.reserves.run(self.enqueue), name="reserves"))
         if self.pumpdata is not None:
             tasks += [asyncio.create_task(self.pumpdata.run(), name="pumpdata"),

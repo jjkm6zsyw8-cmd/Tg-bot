@@ -214,6 +214,8 @@ async def test_scan_finds_hot_wallet_once_and_skips_dev_and_bundles(db):
     alerts = [p for p in e.sent if "горячий кошелёк" in p["text"]]
     assert len(alerts) == 1 and "в день" in alerts[0]["text"]
     assert s.balance == 2.5 and "баланс 2.50 SOL" in alerts[0]["text"] and s.trades_day > 0
+    assert "⚠️ оценка не сверена с тенью" in alerts[0]["text"]                 # пока модель не сверена с тенью
+    assert H.unchecked({"hunter_model_checked": True}) == "" and "не сверена" in await H.hunt_text(db, 24)
     r = await db.fetchrow("SELECT status, list, rule, usd_day, followed_at FROM hunter_wallets WHERE address = $1", ME)
     # 27.11: найденный — сразу в тень и «наблюдение»; денег нет
     assert r["status"] == "shadow" and r["list"] == "watch" and r["rule"] == s.rule and r["usd_day"] > 0

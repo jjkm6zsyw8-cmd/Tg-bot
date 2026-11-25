@@ -322,7 +322,12 @@ async def run_tool(cmd: str, db: Database) -> None:
         hours = float(args[args.index("--hours") + 1]) if "--hours" in args else 24.0
         dd = float(args[args.index("--days") + 1]) if "--days" in args else 3.0
         delay = float(args[args.index("--delay") + 1]) if "--delay" in args else 1.36
-        print(await dc_run(db, hours, dd, delay))
+        if "--gap" in args:
+            # 27.11: модель против тени по частям: вход, выход, издержки, причина выхода, правило, биржа
+            from .analytics.datacheck import model_gap
+            print("\n".join(await model_gap(db, dd, delay)))
+        else:
+            print(await dc_run(db, hours, dd, delay))
     elif cmd == "pdcheck":
         # 26.11 (B5): сверка образца pumpdata.fun с нашей базой: python -m scanner pdcheck файл.parquet
         from .analytics.pdcheck import run as pd_run

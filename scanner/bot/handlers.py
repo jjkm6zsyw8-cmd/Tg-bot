@@ -1553,7 +1553,7 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
             text = await hunter.why_text(db, await hunter.params_of(db, await reload()), addr)
         else:
             hours = float(arg) if arg.replace(".", "", 1).isdigit() else 24.0
-            text = await hunter.hunt_text(db, min(hours, 24 * 30))
+            text = await hunter.hunt_text(db, min(hours, 24 * 30), hunter.unchecked(await reload()))
         for part in fmt.split_html(text):
             await reply(m, part)
 

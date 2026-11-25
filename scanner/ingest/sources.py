@@ -484,6 +484,18 @@ class WatchSource(Source):
         self.resolve_pool: Callable[[str], Awaitable[str | None]] | None = None
         self.unresolved = 0
         self.skip_pools: dict[str, float] = {}  # пул → до какого времени не спрашивать (не к SOL / неизвестен)
+        # 27.11: резервы монет едут в этом же соединении (ReserveSource.attach / handle / detach) — одно соединение
+        self.passenger: Any = None
+        self._send_lock = asyncio.Lock()
+
+    async def send_json(self, obj: dict[str, Any]) -> bool:
+        """Отправка в соединение (и для пассажира-резервов): по очереди, без одновременных записей."""
+        ws = self._ws
+        if ws is None:
+            return False
+        async with self._send_lock:
+            await ws.send(json.dumps(obj))
+        return True
 
     def set_targets(self, wallets: list[str], coins: list[str]) -> None:
         """Кошельки важнее монет, но монетам остаётся до COIN_RESERVE подписок: без них оценке копий и выходам не
@@ -524,14 +536,17 @@ class WatchSource(Source):
                 rid = next(self._ids)
                 self.pending[rid] = addr
                 commitment = self.wallet_commitment if self.want.get(addr) == "wallet" else self.commitment
-                await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsSubscribe",
-                                          "params": [{"mentions": [addr]}, {"commitment": commitment}]}))
+                async with self._send_lock:
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsSubscribe",
+                                              "params": [{"mentions": [addr]}, {"commitment": commitment}]}))
                 await asyncio.sleep(0.02)
             for addr in [a for a in self.subs if a not in self.want]:
                 sid = self.subs.pop(addr)
                 rid = next(self._ids)
                 self.unsub_pending.add(rid)
-                await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsUnsubscribe", "params": [sid]}))
+                async with self._send_lock:
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsUnsubscribe",
+                                              "params": [sid]}))
                 await asyncio.sleep(0.02)
 
     def on_failure(self, exc: Exception) -> None:
@@ -564,15 +579,22 @@ class WatchSource(Source):
             self._changed.set()
             log.info("watch: подключено, адресов %d", len(self.want))
             sync = asyncio.create_task(self._sync(ws))
+            if self.passenger is not None:
+                await self.passenger.attach(self.send_json, sink)
             try:
                 async for raw in ws:
-                    self.bytes_in += len(raw)
                     try:
                         msg = json.loads(raw)
                     except ValueError:
+                        self.bytes_in += len(raw)
                         continue
                     if not isinstance(msg, dict):
+                        self.bytes_in += len(raw)
                         continue
+                    if self.passenger is not None and await self.passenger.handle(msg, len(raw)):
+                        self.passenger.bytes_in += len(raw)      # трафик резервов — в их счёт
+                        continue
+                    self.bytes_in += len(raw)
                     rid = msg.get("id")
                     if rid is not None:
                         if rid in self.pending:
@@ -596,6 +618,8 @@ class WatchSource(Source):
                     await self._emit(msg, sink)
             finally:
                 sync.cancel()
+                if self.passenger is not None:
+                    self.passenger.detach()
 
     async def _emit(self, msg: dict[str, Any], sink: Sink) -> None:
         for ev in LogsSource.parse_notification(msg, self.stats, self.pool_to_mint, source="watch"):

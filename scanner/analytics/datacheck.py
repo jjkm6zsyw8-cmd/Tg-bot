@@ -91,26 +91,55 @@ async def noprice_part(db: Any, hours: float, delay: float) -> tuple[list[str], 
             + (f"{nop} из {total - small} — {share:.0%} {ok} (цель ≤ 30%)" if share is not None else "покупок нет")], share
 
 
-async def model_vs_shadow(db: Any, days: float, delay: float) -> tuple[list[str], float | None]:
-    rows = await db.fetch(
-        """SELECT p.id, p.mint, p.trader, extract(epoch FROM p.opened_at) AS ts, p.pnl_pct,
-                  COALESCE(p.extra->>'rule', 'A') AS rule
+GAP_RULES = ("A", "B", "G")             # правила до 30 мин — модель их считает; R / F / W / тренды — дольше
+# 27.11: модель охотника — копия покупки кошелька; «мой дев» (вход на запуске после покупки дева при создании — там
+# снайперы того же блока, на выгрузке +21.5 п.п.) и тренды — не она, их в сверке модели не считаем
+MODEL_KINDS = ("copy", "smart", "bigcopy", "swing")
+
+
+def effective_rule(extra: dict[str, Any]) -> str:
+    """27.11: правило, по которому тень на самом деле вышла (executor.scheme_of): у позиции «за ним» — его правило
+    (best_exit: выбранное владельцем или лучшее по истории), иначе правило метода (extra.rule)."""
+    be = extra.get("best_exit")
+    if be in ("A", "B", "G", "R", "F", "W") and not extra.get("trial"):
+        return str(be)
+    return str(extra.get("rule") or "A")
+
+
+async def shadow_pairs(db: Any, days: float, delay: float, limit: int = 600) -> dict[str, Any]:
+    """Сделки тени за кошельками и копия модели на той же покупке — по тому же правилу. Две копии: с задержкой
+    delay (как оценивает охотник) и с настоящей задержкой тени (от его покупки до нашего входа)."""
+    import json as _json
+    rows = [dict(r) for r in await db.fetch(
+        """SELECT p.id, p.mint, p.trader, extract(epoch FROM p.opened_at) AS ts, extract(epoch FROM p.closed_at) AS cts,
+                  p.pnl_pct, p.entry_mc, p.exit_mc, p.exit_reason, p.venue, p.kind, p.extra
            FROM real_positions p WHERE p.mode = 'shadow' AND p.trader IS NOT NULL AND p.closed_at IS NOT NULL
              AND p.pnl_pct IS NOT NULL AND p.opened_at > now() - make_interval(days => $1)
              AND COALESCE(p.venue, '') <> 'jupiter' AND COALESCE(p.exit_reason, '') NOT IN ('reset', 'manual')
-           ORDER BY p.id DESC LIMIT 400""", days)
-    if not rows:
-        return ["5) Модель против тени: закрытых сделок тени за кошельками нет"], None
+           ORDER BY p.id DESC LIMIT $2""", days, limit)]
+    excluded: dict[str, int] = {}
+    keep = []
+    for r in rows:
+        ex = r["extra"] if isinstance(r["extra"], dict) else _json.loads(r["extra"] or "{}")
+        rule = effective_rule(ex)
+        if rule not in GAP_RULES:
+            excluded[rule] = excluded.get(rule, 0) + 1
+            continue
+        r["rule"] = rule
+        keep.append(r)
+    out: dict[str, Any] = {"total": len(rows), "excluded": excluded, "pairs": [], "no_buy": 0, "no_model": 0}
+    if not keep:
+        return out
     buys = await db.fetch(
         """SELECT p.id, t.slot, extract(epoch FROM t.ts) AS ts, t.sol_amount FROM unnest($1::bigint[], $2::text[],
                $3::text[], $4::float8[]) AS p(id, mint, trader, ts)
            JOIN LATERAL (SELECT slot, ts, sol_amount FROM trades WHERE mint = p.mint AND trader = p.trader AND is_buy
                          AND ts BETWEEN to_timestamp(p.ts - 60) AND to_timestamp(p.ts + 1)
                          ORDER BY ts DESC LIMIT 1) t ON true""",
-        [r["id"] for r in rows], [r["mint"] for r in rows], [r["trader"] for r in rows], [float(r["ts"]) for r in rows])
+        [r["id"] for r in keep], [r["mint"] for r in keep], [r["trader"] for r in keep], [float(r["ts"]) for r in keep])
     his = {b["id"]: b for b in buys}
-    win = {}
-    for r in rows:
+    win: dict[str, tuple[float, float]] = {}
+    for r in keep:
         if r["id"] in his:
             a, b = float(his[r["id"]]["ts"]) - 5, float(his[r["id"]]["ts"]) + 1900
             w = win.get(r["mint"])
@@ -120,27 +149,93 @@ async def model_vs_shadow(db: Any, days: float, delay: float) -> tuple[list[str]
     meta = {m["mint"]: (m["created"], m["deployer"]) for m in await db.fetch(
         "SELECT mint, extract(epoch FROM created_at) AS created, deployer FROM tokens WHERE mint = ANY($1::text[])",
         list(win))}
-    diffs, both = [], 0
-    for r in rows:
+    for r in keep:
         b = his.get(r["id"])
         if b is None:
+            out["no_buy"] += 1
             continue
         e = CM.Entry(r["mint"], float(b["ts"]), b["slot"], float(b["sol_amount"] or 0))
         created, dev = meta.get(r["mint"], (None, None))
-        sc = SCHEMES.get(r["rule"]) or SCHEMES["A"]
-        c = CM.copy_trade(e, [t for t in ticks.get(r["mint"], []) if e.ts - 5 <= t.ts <= e.ts + 1900], r["trader"],
-                          dev, float(created) if created is not None else None, sc, covered=cover.get(r["mint"]),
-                          entry_delay_s=delay)
-        if c.res is None:
+        tk = [t for t in ticks.get(r["mint"], []) if e.ts - 5 <= t.ts <= e.ts + 1900]
+        lag = max(0.0, float(r["ts"]) - e.ts)
+
+        def model(d: float) -> CM.Copy:
+            return CM.copy_trade(e, tk, r["trader"], dev, float(created) if created is not None else None,
+                                 SCHEMES[r["rule"]], covered=cover.get(r["mint"]), entry_delay_s=d)
+        m, ml = model(delay), model(lag)
+        if m.res is None:
+            out["no_model"] += 1
             continue
-        both += 1
-        diffs.append(float(c.res) - float(r["pnl_pct"]))
-    if not diffs:
-        return [f"5) Модель против тени: {len(rows)} сделок тени, у модели цены нет ни для одной"], None
+        out["pairs"].append({"rule": r["rule"], "venue": r["venue"] or "pump", "kind": r["kind"], "lag": lag, "m": m,
+                             "ml": ml if ml.res is not None else None, "s_res": float(r["pnl_pct"]),
+                             "s_entry": float(r["entry_mc"] or 0), "s_exit": float(r["exit_mc"] or 0),
+                             "s_reason": r["exit_reason"] or "?", "s_hold": float(r["cts"]) - float(r["ts"])})
+    return out
+
+
+async def model_gap(db: Any, days: float = 3.0, delay: float = 1.36) -> list[str]:
+    """27.11 (владелец: модель против тени +15.4 п.п. — оценки охотника завышены): разница по частям при одном и том
+    же правиле. Части — в логарифмических пунктах (≈ п.п. при небольших разницах), в сумме дают разницу итогов:
+    цена входа ln(вход тени / вход модели), цена выхода ln(выход модели / выход тени), издержки и доли продаж — остаток."""
+    import math
+    d = await shadow_pairs(db, days, delay)
+    every = d["pairs"]
+    ps = [p for p in every if p["kind"] in MODEL_KINDS]
+    exc = ", ".join(f"{k} {v}" for k, v in sorted(d["excluded"].items())) or "нет"
+    head = [f"6) Модель против тени по частям ({days:g} дн, одно правило на паре, копии кошельков — "
+            f"{'/'.join(MODEL_KINDS)}): сделок тени {d['total']}, сверено {len(ps)}; не сверялись — правило дольше 30 "
+            f"мин ({exc}), нет его покупки в базе {d['no_buy']}, у модели нет цены {d['no_model']}, другие методы "
+            f"{len(every) - len(ps)}"]
+    if not ps:
+        return head
+    def mean(xs: list[float]) -> float:
+        return statistics.fmean(xs) if xs else 0.0
+    diff = [p["m"].res - p["s_res"] for p in ps]
+    full = [p for p in ps if p["s_entry"] > 0 and p["s_exit"] > 0 and p["m"].entry_mc > 0 and p["m"].exit_mc > 0
+            and 1 + p["s_res"] > 0 and 1 + p["m"].res > 0]
+    ent = [math.log(p["s_entry"] / p["m"].entry_mc) for p in full]
+    ext = [math.log(p["m"].exit_mc / p["s_exit"]) for p in full]
+    tot = [math.log((1 + p["m"].res) / (1 + p["s_res"])) for p in full]
+    cst = [t - a - b for t, a, b in zip(tot, ent, ext)]
+    lagged = [p["ml"].res - p["s_res"] for p in ps if p["ml"] is not None]
+    lags = [p["lag"] for p in ps]
+    lines = head + [
+        f"   разница итогов: в среднем {mean(diff) * 100:+.1f} п.п., медиана {_med(diff) * 100:+.1f}",
+        f"   по частям ({len(full)} сделок с ценами входа и выхода, в среднем): вход {mean(ent) * 100:+.1f} · выход "
+        f"{mean(ext) * 100:+.1f} · издержки и частичные продажи {mean(cst) * 100:+.1f} (сумма {mean(tot) * 100:+.1f})",
+        f"   задержка тени от его покупки: медиана {_med(lags):.1f} с (модель — {delay:g} с); модель с задержкой тени: "
+        + (f"разница {mean(lagged) * 100:+.1f} п.п. на {len(lagged)}" if lagged else "—"),
+        f"   удержание: модель медиана {_med([p['m'].hold_s for p in ps]) / 60:.1f} мин, тень "
+        f"{_med([p['s_hold'] for p in ps]) / 60:.1f} мин"]
+    pairs: dict[tuple[str, str], list[float]] = {}
+    for p, x in zip(ps, diff):
+        pairs.setdefault((p["m"].reason or "?", p["s_reason"]), []).append(x)
+    lines.append("   причина выхода (модель → тень): " + "; ".join(
+        f"{a} → {b}: {len(v)}, {mean(v) * 100:+.1f}" for (a, b), v in sorted(pairs.items(), key=lambda kv: -len(kv[1]))[:8]))
+    for name, key in (("метод (все, вкл. не модель)", "kind"), ("правило", "rule"), ("биржа", "venue")):
+        groups: dict[str, list[float]] = {}
+        for p in (every if key == "kind" else ps):
+            groups.setdefault(str(p[key]), []).append(p["m"].res - p["s_res"])
+        lines.append(f"   {name}: " + "; ".join(f"{k} {len(v)}, {mean(v) * 100:+.1f}" for k, v in sorted(groups.items())))
+    return lines
+
+
+async def model_vs_shadow(db: Any, days: float, delay: float) -> tuple[list[str], float | None]:
+    """Проверка 4: модель против тени на одних сделках. 27.11: правило — то, по которому тень вышла на самом деле
+    (effective_rule), и только правила до 30 мин (A/B/G); разложение по частям — model_gap (datacheck --gap)."""
+    d = await shadow_pairs(db, days, delay, limit=400)
+    ps = [p for p in d["pairs"] if p["kind"] in MODEL_KINDS]
+    if not d["total"]:
+        return ["5) Модель против тени: закрытых сделок тени за кошельками нет"], None
+    if not ps:
+        return [f"5) Модель против тени: {d['total']} сделок тени, сверить нечего (правило дольше 30 мин, нет его "
+                "покупки в базе или у модели нет цены)"], None
+    diffs = [p["m"].res - p["s_res"] for p in ps]
     mean = statistics.fmean(diffs)
     ok = "✅" if abs(mean) <= 0.05 else "❌"
-    return [f"5) Модель против тени на одних сделках ({days:g} дн): {both} из {len(rows)}, разница в среднем "
-            f"{mean * 100:+.1f} п.п. {ok} (цель ≤ 5), медиана |разницы| {_med([abs(x) for x in diffs]) * 100:.1f} п.п."], mean
+    return [f"5) Модель против тени на копиях кошельков ({days:g} дн, то же правило): {len(ps)} из {d['total']}, "
+            f"разница в среднем {mean * 100:+.1f} п.п. {ok} (цель ≤ 5), медиана |разницы| "
+            f"{_med([abs(x) for x in diffs]) * 100:.1f} п.п. — по частям: datacheck --gap"], mean
 
 
 PP_SOL_PER_MSG = 0.01 / 10_000          # PumpPortal: 0.01 SOL за 10 тыс. сообщений сделок (документация 27.11)

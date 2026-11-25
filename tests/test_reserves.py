@@ -315,3 +315,49 @@ async def test_retention_keeps_tracked_wallets_30_days():
         assert left == ["HUNTED10", "TRACKED10"]       # чужие 10 дней — удалены, свои 40 дней — удалены (> 30)
     finally:
         await db.close()
+
+
+async def test_reserves_ride_in_watch_connection(monkeypatch):
+    """27.11 (владелец): резервы — в соединении слежки (одно соединение): подписки на кошельки и на счета идут через
+    один сокет, уведомления о счетах доходят до резервов, обрыв закрывает окна и снимает «соединение есть»."""
+    from scanner.ingest import sources as S
+    monkeypatch.setattr(R.ReserveSource, "SUB_GAP_S", 0.0)
+    res = R.ReserveSource("wss://x")
+    watch = S.WatchSource("wss://x", {})
+    watch.passenger = res
+    watch.set_targets(["WALLET1"], [])
+    res.set_target("M", R.Target("pump-amm", ["BASE", "QUOTE"]))
+
+    def acks(ws):
+        return [{"id": m["id"], "result": 70 + i} for i, m in enumerate(ws.sent)
+                if m["method"] in ("accountSubscribe", "logsSubscribe")]
+    sids = {}
+
+    def notes(ws):
+        for i, m in enumerate(ws.sent):
+            if m["method"] == "accountSubscribe":
+                sids[m["params"][0]] = 70 + i
+        return [note(sids["BASE"], vault(100 * 10**6), 5), note(sids["QUOTE"], vault(2 * 10**9), 5)]
+    ws = FakeWS(res, [acks, notes])
+    monkeypatch.setattr(S.websockets, "connect", lambda *a, **k: ws)
+    got = []
+
+    async def sink(ev):
+        got.append(ev)
+    await watch._session(sink)
+    await asyncio.sleep(0)
+    methods = sorted(m["method"] for m in ws.sent)
+    assert methods.count("accountSubscribe") == 2 and methods.count("logsSubscribe") == 1
+    assert "WALLET1" in watch.subs and {"BASE", "QUOTE"} <= set(res.subs)
+    ticks = [e for e in got if isinstance(e, ReserveTick)]
+    assert len(ticks) == 1 and ticks[0].mc_sol == pytest.approx(R.pool_mc(100 * 10**6, 2 * 10**9, 0))
+    assert res.bytes_in > 0 and res.connected is False                  # после обрыва — «нет соединения»
+    assert any(isinstance(e, ReserveCover) for e in got)
+
+
+def test_receiver_puts_reserves_into_watch_connection():
+    from scanner.config import Env, Settings, YamlConfig
+    rec = Receiver(Env(helius_api_key="k"), Settings(YamlConfig("config/config.yaml")), SimpleNamespace())
+    if rec.watch is None or rec.reserves is None:
+        pytest.skip("слежка выключена в настройках")
+    assert rec.watch.passenger is rec.reserves and rec.watch.MAX_SUBS == 700 and rec.reserves.MAX_SUBS == 250

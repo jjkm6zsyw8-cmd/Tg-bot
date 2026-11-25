@@ -324,3 +324,32 @@ async def test_pp_cost_per_day(db):
     text = await pp_cost_text(db)
     assert "1,200,000 · 24 ч · 1.200 SOL" in text and "5,000 ·  5 ч · 0.005 SOL" in text
     assert "в среднем 1,200,000 сделок ≈ 1.200 SOL в день" in text and "999" not in text
+
+
+async def test_model_gap_parts_and_effective_rule(db):
+    """27.11: модель против тени по частям при одном правиле; правило «за ним» (best_exit) важнее правила метода,
+    R / F / W (дольше 30 мин) не сверяются."""
+    from scanner.analytics import datacheck as DC
+    assert DC.effective_rule({"rule": "A", "best_exit": "G"}) == "G" and DC.effective_rule({"rule": "G"}) == "G"
+    assert DC.effective_rule({"rule": "A", "best_exit": "R", "trial": True}) == "A"
+    now = datetime.now(timezone.utc)
+    m, r = "GAPA" + "g" * 40, "GAPR" + "r" * 40
+    t = now - timedelta(hours=2)
+    for mint in (m, r):
+        await put_coin(db, mint, t - timedelta(minutes=2))
+        await put_trade(db, mint, ME, t, True, 50, 100)
+        await put_trade(db, mint, OTHER, t + timedelta(seconds=20), True, 70, 140)      # тейк A по модели
+    for mint, extra in ((m, '{"rule": "A"}'), (r, '{"rule": "A", "best_exit": "R"}')):
+        await db.execute(
+            """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
+                   exit_mc, exit_reason, pnl_sol, pnl_pct, extra)
+               VALUES ('shadow', 'copy', $1, $2, $3::timestamptz, $3::timestamptz + interval '30 seconds', 0.14, 1, 55, 63, 'take_profit',
+                       0.014, 0.10, $4::jsonb)""", mint, ME, t + timedelta(seconds=3), extra)
+    lines = await DC.model_gap(db, 3, 1.36)
+    text = "\n".join(lines)
+    assert "сделок тени 2, сверено 1" in text and "правило дольше 30 мин (R 1)" in text
+    assert "вход +9.5" in text and "выход +10.5" in text                 # ln(55/50), ln(70/63)
+    assert "take_profit → take_profit: 1" in text and "правило: A 1" in text
+    assert "задержка тени от его покупки: медиана 3.0 с" in text
+    short, mean = await DC.model_vs_shadow(db, 3, 1.36)
+    assert "1 из 2" in short[0] and mean is not None and mean > 0.15

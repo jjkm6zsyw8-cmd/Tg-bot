@@ -310,6 +310,15 @@ def ago(sec: float | None) -> str:
     return fmt.ago(sec) if sec is not None else "?"
 
 
+UNCHECKED = " ⚠️ оценка не сверена с тенью"
+
+
+def unchecked(cfg: dict[str, Any] | None) -> str:
+    """27.11 (владелец: модель против тени +15.4 п.п. на 366 сделках): пока разница не исправлена
+    (hunter_model_checked: false), у $ в день — пометка."""
+    return "" if (cfg or {}).get("hunter_model_checked") else UNCHECKED
+
+
 def bot_line(s: Stats) -> str:
     """27.11 (владелец): ботов жёстко не отсеивать — в алерте метка «бот: N сделок/день, баланс ~0»."""
     bal = "?" if s.balance is None else ("~0" if s.balance < BOT_LOW_BALANCE else f"{s.balance:,.2f} SOL")
@@ -318,7 +327,8 @@ def bot_line(s: Stats) -> str:
     return f"Сделок в день: {s.trades_day:,.0f} · баланс {bal}"
 
 
-def alert_text(s: Stats, now: float, prm: Params | None = None) -> tuple[str, list[list[dict[str, Any]]]]:
+def alert_text(s: Stats, now: float, prm: Params | None = None,
+               note: str = UNCHECKED) -> tuple[str, list[list[dict[str, Any]]]]:
     prm = prm or Params()
     active = s.last_buy is not None and now - s.last_buy <= ACTIVE_S
     coins = ", ".join(f"${fmt.esc(sym)} {res:+.0%}" for sym, res in s.top)
@@ -330,7 +340,7 @@ def alert_text(s: Stats, now: float, prm: Params | None = None) -> tuple[str, li
             f"<b>{s.win:.0%}</b>, t={s.t:.1f} ({s.n} копий, без цены {s.noprice:.0%})\n"
             f"Правило {s.rule}: на второй половине {test}; со входом «блок +2» {b2}\n"
             f"<b>${s.usd_day:,.0f} в день</b> при {STAKE_SOL:g} SOL · ${s.usd_day_max:,.0f} при 3% пула · "
-            f"{s.per_day:.0f} сделок в день\n"
+            f"{s.per_day:.0f} сделок в день{note}\n"
             f"Всплеск (+25% за 30 с): {s.burst:.0%} · слив на копировщиков: {s.dump:.0%}\n"
             f"Удержание у него: медиана {ago(s.hold_s)} · последняя покупка "
             f"{ago(now - s.last_buy) if s.last_buy else '?'} назад — {'🟢 активен' if active else '⚪ сейчас не торгует'}\n"
@@ -343,9 +353,10 @@ def alert_text(s: Stats, now: float, prm: Params | None = None) -> tuple[str, li
     return text, kb
 
 
-def ready_text(addr: str, res: dict[str, Any], usd_after: float | None) -> tuple[str, list[list[dict[str, Any]]]]:
+def ready_text(addr: str, res: dict[str, Any], usd_after: float | None,
+               note: str = UNCHECKED) -> tuple[str, list[list[dict[str, Any]]]]:
     """Допуск к бою готов: кнопка «Бой 0.14» (дальше — подтверждение)."""
-    usd = f", ${usd_after:,.0f}/день по модели" if usd_after is not None else ""
+    usd = f", ${usd_after:,.0f}/день по модели{note}" if usd_after is not None else ""
     text = (f"✅ <b>Можно в бой</b> <code>{addr}</code>: список «в бой»{usd}; в тени за ним {res['n']} сд, в среднем "
             f"{res['avg']:+.1%}, {res['sol']:+.3f} SOL. Бой — только по кнопке, {STAKE_SOL:g} SOL на покупку.")
     return text, [[{"text": f"💵 Бой {STAKE_SOL:g}", "callback": f"hn:l:{addr}", "style": "danger"},
@@ -504,7 +515,7 @@ class Hunter:
         known = {r["address"]: r for r in await db.fetch("SELECT address, status, list, cooled_at FROM hunter_wallets")}
         hot = []
         farms: list[tuple[str, str]] = []
-        unchecked = 0
+        not_checked = 0
         bar = bar_of(self.e.cfg)
         cands = await candidates(db, since, now, bar.min_coins)
         for c in cands:
@@ -528,7 +539,7 @@ class Hunter:
                     farms.append((c["trader"], farm))
                     continue
                 if not checked:
-                    unchecked += 1
+                    not_checked += 1
                     continue
                 s.balance = await self.balance(c["trader"])
                 hot.append(s)
@@ -536,12 +547,12 @@ class Hunter:
                 await db.execute("UPDATE hunter_wallets SET farm_at = now() WHERE address = $1", c["trader"])
                 # 27.11 (владелец): всех найденных — сразу в тень (без денег) и «наблюдение»
                 await follow(db, self.e.cfg, self.e.costs(), c["trader"], "shadow")
-                await self.say(*alert_text(s, now, prm))
+                await self.say(*alert_text(s, now, prm, unchecked(self.e.cfg)))
         if farms:
             await self.say(f"🚜 <b>Охотник: отсеяно ферм {len(farms)}</b> — в архив, за ними не повторяем:\n"
                            + "\n".join(f"<code>{a}</code> — {fmt.esc(w)}" for a, w in farms[:10]))
         self.stats = {"at": now, "candidates": len(cands), "hot": len(hot), "farms": len(farms),
-                      "farm_unchecked": unchecked}
+                      "farm_unchecked": not_checked}
         return hot
 
     async def balance(self, addr: str) -> float | None:
@@ -610,8 +621,8 @@ class Hunter:
                    WHERE address = $1""", addr, len(res), avg, usd, new_list, reason)
             if new_list == "battle" and r["list"] != "battle":
                 await self.say(f"🎯 <code>{addr}</code> → список <b>«{LIST_NAMES[new_list]}»</b>: после находки "
-                               f"{len(res)} копий, в среднем {avg:+.1%}, ${usd:,.0f}/день при {STAKE_SOL:g} SOL. "
-                               "В бой — после 24 ч тени, кнопкой.")
+                               f"{len(res)} копий, в среднем {avg:+.1%}, ${usd:,.0f}/день при {STAKE_SOL:g} SOL"
+                               f"{unchecked(self.e.cfg)}. В бой — после 24 ч тени, кнопкой.")
             elif new_list == "archive" and r["list"] != "archive" and reason and "сливает" not in reason:
                 # 27.11: шум отсеивает тень — в архиве копирование (тень и бой) снимается
                 stopped = r["status"] in ("shadow", "live")
@@ -659,7 +670,7 @@ class Hunter:
                                           r["address"])
                     res = await our_results(db, r["address"], w["followed_at"])
                     await self.say(*ready_text(r["address"], res, float(w["usd_day_after"])
-                                               if w["usd_day_after"] is not None else None))
+                                               if w["usd_day_after"] is not None else None, unchecked(self.e.cfg)))
         for addr in set(old) - set(ok):
             live = await db.fetchval("SELECT status FROM hunter_wallets WHERE address = $1", addr) == "live"
             if live:
@@ -879,7 +890,7 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
     return "\n".join(out)
 
 
-async def hunt_text(db: Any, hours: float = 24.0) -> str:
+async def hunt_text(db: Any, hours: float = 24.0, note: str = UNCHECKED) -> str:
     """A8: кого нашёл за hours часов и все из списков «в бой» и «наблюдение»."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     rows = await db.fetch(
@@ -890,7 +901,8 @@ async def hunt_text(db: Any, hours: float = 24.0) -> str:
     if not rows:
         return f"🎯 Охотник: за {hours:g} ч никого не нашёл, в списках пусто."
     status = {"new": "без решения", "shadow": "👻 тень", "live": "💵 бой", "ignored": "игнор", "cooled": "🧊 остыл"}
-    lines = [f"🎯 <b>Охотник</b>: найдены за {hours:g} ч и списки"] + await shadow_total(db)
+    lines = [f"🎯 <b>Охотник</b>: найдены за {hours:g} ч и списки"
+             + (f"\n$/день — оценка модели:{note}" if note else "")] + await shadow_total(db)
     for r in rows:
         after = (f"после находки {int(r['n_after'] or 0)} коп., {float(r['avg_after'] or 0):+.1%}, "
                  f"${float(r['usd_day_after'] or 0):,.0f}/день" if r["n_after"] else "после находки копий ещё нет")
