@@ -264,18 +264,25 @@ async def run_tool(cmd: str, db: Database) -> None:
         # или python -m scanner hunt (один проход сейчас: кто горячий за 72 ч, без алертов)
         import time as _t
         from .analytics import hunter as H
+        from datetime import datetime as _dt, timezone as _tz
         days = float(args[args.index("--days") + 1]) if "--days" in args else 7.0
         step = float(args[args.index("--step") + 1]) if "--step" in args else 6.0
         mx = int(args[args.index("--max") + 1]) if "--max" in args else 500
+        arg = lambda k: args[args.index(k) + 1] if k in args else None   # noqa: E731
+        day = lambda v: _dt.strptime(v, "%Y-%m-%d").replace(tzinfo=_tz.utc).timestamp() if v else None   # noqa: E731
+        bar = H.Bar(min_coins=int(arg("--min-coins") or H.BAR.min_coins),
+                    min_t=float(arg("--min-t") or H.BAR.min_t))
         if "--history" in args:
-            print(await H.history(db, days, step, mx))
+            # --from / --to — даты ГГГГ-ММ-ДД (UTC); --wallet адрес — разбор одного кошелька по точкам проверки
+            print(await H.history(db, days, step, mx, until=day(arg("--to")), bar=bar, trace=arg("--wallet"),
+                                  start=day(arg("--from"))))
         else:
             now = _t.time()
-            cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, H.HOT_MIN_COINS, mx)
-            print(f"Кошельков с {H.HOT_MIN_COINS}+ монетами за {H.WINDOW_H} ч: {len(cands)}")
+            cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, bar.min_coins, mx)
+            print(f"Кошельков с {bar.min_coins}+ монетами за {H.WINDOW_H} ч: {len(cands)}")
             for c in cands:
                 s = await H.evaluate(db, c["trader"], now - H.WINDOW_H * 3600, now, cand=c)
-                why = s.hot()
+                why = s.hot(bar)
                 if why is None or "--all" in args:
                     print(f"{'🔥' if why is None else '  '} {c['trader']} монет {s.coins} копий {s.n} ср. {s.avg:+.1%} "
                           f"в плюсе {s.win:.0%} без цены {s.noprice:.0%}" + (f" — {why}" if why else ""))

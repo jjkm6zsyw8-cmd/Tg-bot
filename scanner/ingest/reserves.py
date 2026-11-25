@@ -65,20 +65,30 @@ def token_amount(data: bytes) -> int | None:
 
 
 class ReserveSource(Source):
+    """25.11 (2): на сервере за час 2 монеты вместо ~30 и last_error 429. Причина в коде: при первом 429 от Helius
+    источник навсегда уходил на запасной публичный узел Solana (там подписки режутся тем же 429) и не возвращался.
+    Теперь: только основной узел (публичный для этого не годится), подписки не залпом (SUB_GAP_S), подключение — после
+    слежки за кошельками (ready), паузы после отказа — от 30 с; счётчики ошибок — в health:ingest.reserves."""
     name = "reserves"
     MAX_SUBS = 400
+    SUB_GAP_S = 0.2                # не больше 5 запросов подписки в секунду
+    START_DELAY_S = 5.0            # перед каждым подключением (+10 с перед первым) — не в одну секунду с другими
+    min_backoff = 30.0
 
-    def __init__(self, url: str, fallback: str = ""):
+    def __init__(self, url: str, fallback: str = "", ready: Callable[[], bool] | None = None):
         super().__init__()
         self.url = url
         self.primary = url
-        self.fallback = fallback if fallback and fallback != url else ""
+        self.ready = ready                           # подключаться, когда слежка за кошельками уже на связи
+        self.refused = 0                             # сколько раз узел отказал (429 и т. п.)
+        self.sub_errors = 0
+        self.last_sub_error = ""
         self.targets: dict[str, Target] = {}         # монета → что слушаем
         self.acc_mint: dict[str, str] = {}           # счёт → монета
         self.subs: dict[str, int] = {}               # счёт → id подписки
         self.sid_acc: dict[int, str] = {}
         self.pending: dict[int, str] = {}            # id запроса → счёт
-        self._ids = iter(range(10, 1 << 62))
+        self._ids = iter(range(1 << 40, 1 << 62))     # не пересекаются с номерами запросов слежки
         self._changed = asyncio.Event()
         self.ticks = 0
         self.on_complete: Callable[[str], Awaitable[None]] | None = None   # кривая закрылась → переезд на пул
@@ -112,9 +122,10 @@ class ReserveSource(Source):
             if self.acc_mint.get(a) == mint:
                 self.acc_mint.pop(a, None)
 
-    def counts(self) -> dict[str, int]:
+    def counts(self) -> dict[str, Any]:
         return {"coins": len(self.targets), "accounts": len(self.acc_mint), "active": len(self.subs),
-                "ticks": self.ticks}
+                "ticks": self.ticks, "refused": self.refused, "sub_errors": self.sub_errors,
+                "last_sub_error": self.last_sub_error}
 
     # ------------------------------------------------------------------ окно слежения
     def _cover(self, mint: str, t: Target, final: bool = False) -> None:
@@ -180,21 +191,26 @@ class ReserveSource(Source):
                 self.pending[rid] = acc
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "accountSubscribe",
                                           "params": [acc, {"encoding": "base64", "commitment": "confirmed"}]}))
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(self.SUB_GAP_S)
             for acc in [a for a in self.subs if a not in self.acc_mint]:
                 sid = self.subs.pop(acc)
                 self.sid_acc.pop(sid, None)
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": next(self._ids), "method": "accountUnsubscribe",
                                           "params": [sid]}))
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(self.SUB_GAP_S)
 
     def on_failure(self, exc: Exception) -> None:
-        if self.fallback and self.url == self.primary and any(c in str(exc) for c in ("429", "401", "403")):
-            self.url = self.fallback
-            log.warning("reserves: основной узел недоступен (%s) — запасной", str(exc)[:120])
+        if any(c in str(exc) for c in ("429", "401", "403")):
+            self.refused += 1
+            log.warning("reserves: узел отказал (%s) — повтор после паузы, на публичный узел не ухожу", str(exc)[:120])
 
     async def _session(self, sink: Sink) -> None:
         self._sink = sink
+        for _ in range(120):                         # до 2 мин ждём, пока подключится слежка за кошельками
+            if self.ready is None or self.ready():
+                break
+            await asyncio.sleep(1.0)
+        await asyncio.sleep(self.START_DELAY_S * (1 + 2 * (self.reconnects == 0)))
         async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2**22,
                                       open_timeout=20) as ws:
             self._ws = ws
@@ -225,7 +241,10 @@ class ReserveSource(Source):
                             if t is not None and t.started is None and self._all_subscribed(mint):
                                 t.started = time.time()
                         elif acc is not None and "error" in msg:
-                            log.warning("reserves: подписка на %s отклонена: %s", acc, msg["error"])
+                            self.sub_errors += 1
+                            self.last_sub_error = str(msg["error"])[:160]
+                            if self.sub_errors <= 5 or self.sub_errors % 100 == 0:
+                                log.warning("reserves: подписка на %s отклонена: %s", acc, msg["error"])
                         continue
                     if msg.get("method") != "accountNotification":
                         continue

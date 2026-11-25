@@ -12,6 +12,12 @@ from scanner.analytics.curve import Costs
 from tests.test_copymodel import DEV, ME, OTHER, db, put_coin, put_trade  # noqa: F401 — фикстура db
 
 NOW = 1_795_000_000.0
+OLD = H.Bar(min_coins=15, min_t=0.0)          # планка до 25.11 — на маленьких синтетических данных
+
+
+@pytest.fixture(autouse=True)
+def _small_bar(monkeypatch):
+    monkeypatch.setattr(H, "BAR", OLD)
 
 
 def copy(mint: str, res: float | None, ts: float = NOW) -> tuple[M.Entry, M.Copy]:
@@ -22,7 +28,7 @@ def test_hot_criteria():
     good = [copy(f"M{i}", 0.2 if i % 4 else -0.1) for i in range(20)]          # 20 монет, 75% в плюсе
     s = H.stats_of("W", good, [])
     assert s.coins == 20 and s.win == 0.75 and s.avg == pytest.approx(0.125) and s.hot() is None
-    assert H.stats_of("W", good[:14], []).hot().startswith("монет с ценой 14")
+    assert H.stats_of("W", good[:14], []).hot().startswith("монет 14")
     lose = [copy(f"M{i}", 0.4 if i % 2 else -0.05) for i in range(20)]           # +17.5% в среднем, но 50% в плюсе
     assert H.stats_of("W", lose, []).hot().startswith("в плюсе 50%")
     flat = [copy(f"M{i}", 0.05) for i in range(20)]
@@ -168,7 +174,7 @@ async def test_history_run(db):
     await hot_wallet(db, ME, n=20)
     # монеты 40…21 ч назад: в точке −24 ч за 72 ч до неё 17 монет — горячий; дальше 3 копии и 12 ч без покупок
     text = await H.history(db, days=5, step_h=6)
-    assert "Горячих нашлось бы: 1" in text and "кошельков с 15+ монетами: 2" in text     # второй — OTHER, не горячий
+    assert "Горячих нашлось бы: 1" in text and "кошельков с 15+ монетами (не дев, не бандл): 2" in text     # второй — OTHER, не горячий
     assert "После находки (модель, пока не остыл): копий 3" in text and "остыл: нет покупок 12 ч" in text
 
 
@@ -183,3 +189,18 @@ async def test_follow_stake_in_executor(db):
     assert why is None and stake == int(min(0.14 * sol_usd, S.max_stake_usd()) / sol_usd * 1e9)
     other, _ = tr.stake_lamports(10**15, "smart", "X")
     assert other == int(float(tr.get("real_stake_usd")) / sol_usd * 1e9)          # у остальных — как было
+
+
+def test_new_bar_50_coins_and_t3():
+    """25.11 (владелец): горячий — от 50 монет и t ≥ 3."""
+    new = H.Bar()
+    assert new.min_coins == 50 and new.min_t == 3.0
+    many = [copy(f"M{i}", 0.3 if i % 3 else -0.1) for i in range(60)]          # 60 монет, 67% в плюсе
+    s = H.stats_of("W", many, [])
+    assert s.t > 3 and s.hot(new) is None
+    noisy = [copy(f"M{i}", 1.5 if i % 3 == 0 else -0.45) for i in range(60)]   # +20% в среднем, но 33% в плюсе
+    assert H.stats_of("W", noisy, []).hot(new).startswith("в плюсе")
+    shaky = [copy(f"M{i}", 0.9 if i % 5 < 3 else -0.95) for i in range(55)]    # 60% в плюсе, +16%, разброс большой
+    st = H.stats_of("W", shaky, [])
+    assert st.t < 3 and st.hot(new).startswith("t ")
+    assert H.stats_of("W", many[:40], []).hot(new) == "монет 40 < 50"

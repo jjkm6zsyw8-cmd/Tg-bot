@@ -94,8 +94,11 @@ class Receiver:
             self.watch.resolve_pool = self.resolve_pool
         # 25.11: подписка на резервы (кривая / хранилища пула) монет, купленных отслеживаемыми и кандидатами, — цена
         # на каждом изменении (reserves.py); своё соединение и свой лимит трафика
-        self.reserves: ReserveSource | None = (ReserveSource(env.watch_ws_url, env.watch_fallback_ws)
-                                               if env.watch_ws_url and rel.get("reserve_watch", True) else None)
+        self.reserves: ReserveSource | None = (
+            ReserveSource(env.watch_ws_url, ready=lambda: self.watch is None or self.watch.connected)
+            if env.watch_ws_url and rel.get("reserve_watch", True) else None)
+        self.reserve_stats = {"added": 0, "no_account": 0, "not_sol": 0, "rpc_error": 0, "full": 0}
+        self.reserve_last_error = ""
         if self.reserves is not None:
             self.reserves.on_complete = self.reserve_migrated
         self.reserve_until: dict[str, float] = {}     # монета → до какого времени слушать резервы
@@ -340,14 +343,19 @@ class Receiver:
                 if c is not None and not c[2]:
                     if self.reserves is not None and self.reserves.set_target(mint, Target("pump", [curve])):
                         self.buf_reserves.append(ReserveTick(mint, c[0], "pump", None, c[1], source="reserves_start"))
+                        self.reserve_stats["added"] += 1
+                    else:
+                        self.reserve_stats["full"] += 1
                     return
             pool = await self.db.fetchval("SELECT amm_pool FROM tokens WHERE mint = $1", mint) \
                 or str(pumpswap.pool_address(mk))
             data = await self._account(pool)
             if not data:
+                self.reserve_stats["no_account"] += 1
                 return
             p = pumpswap.parse_pool(pool, data)
             if p.quote_mint != str(pump.WSOL):
+                self.reserve_stats["not_sol"] += 1
                 return                                  # пул не к SOL — цену в SOL не считаем
             res = await self.rpc.call("getMultipleAccounts", [[p.base_vault, p.quote_vault],
                                                               {"encoding": "base64", "commitment": "confirmed"}])
@@ -356,11 +364,17 @@ class Receiver:
             amounts = [token_amount(b64.b64decode(v[0])) if v else None for v in vals]
             if self.reserves is not None and self.reserves.set_target(
                     mint, Target("pump-amm", [p.base_vault, p.quote_vault], p.virtual_quote)):
+                self.reserve_stats["added"] += 1
                 if len(amounts) == 2 and amounts[0] and amounts[1] is not None:
                     self.buf_reserves.append(ReserveTick(mint, pool_mc(amounts[0], amounts[1], p.virtual_quote),
                                                          "pump-amm", None, amounts[1] / 1e9, source="reserves_start"))
-        except Exception as exc:  # noqa: BLE001 — монету без резервов просто не слушаем
-            log.debug("резервы %s: %s", mint, exc)
+            else:
+                self.reserve_stats["full"] += 1
+        except Exception as exc:  # noqa: BLE001 — монету без резервов просто не слушаем (счётчик — в health)
+            self.reserve_stats["rpc_error"] += 1
+            self.reserve_last_error = f"{type(exc).__name__}: {exc}"[:200]
+            if self.reserve_stats["rpc_error"] <= 5 or self.reserve_stats["rpc_error"] % 100 == 0:
+                log.warning("резервы %s: %s", mint, self.reserve_last_error)
         finally:
             self._reserve_busy.discard(mint)
 
@@ -881,7 +895,9 @@ class Receiver:
                 "reserves": None if self.reserves is None else {
                     "connected": self.reserves.connected, **self.reserves.counts(),
                     "mb_today": round(usage.get("bytes_reserves", 0) / 1e6, 1), "capped": self.reserve_capped,
-                    "reconnects": self.reserves.reconnects, "last_error": self.reserves.last_error},
+                    "reconnects": self.reserves.reconnects, "last_error": self.reserves.last_error,
+                    "url_public": "api.mainnet-beta" in self.reserves.url, **self.reserve_stats,
+                    "rpc_last_error": self.reserve_last_error},
             })
 
     def _usage_snapshot(self) -> dict[str, float]:

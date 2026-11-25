@@ -1,9 +1,10 @@
 """25.11 (владелец): режим «охотник» — горячие кошельки по копии «как бот».
 
-1. Раз в час: все кошельки, купившие за 72 ч от HOT_MIN_COINS разных монет (из базы сделок), — копия copymodel (вход
+1. Раз в час: все кошельки, купившие за 72 ч от BAR.min_coins разных монет (из базы сделок), — копия copymodel (вход
    блок +2, правило A, ставка 0.14 SOL, издержки как в тени; цена — сделки и резервы монет).
-2. «Горячий»: от 15 разных монет с ценой копии, в среднем от +10%, в плюсе от 60%, без цены не больше половины копий,
-   не покупал свои монеты (не дев), не бандл (покупки в блоке создания монеты — меньше BUNDLE_SHARE).
+2. «Горячий»: от 50 разных купленных монет (25.11 — было 15 с ценой копии), устойчивость t ≥ 3 (средний итог копии / его
+   ошибка), в среднем от +10%, в плюсе от 60%, без цены не больше половины копий, не покупал свои монеты (не дев),
+   не бандл (покупки в блоке создания монеты — меньше BUNDLE_SHARE).
 3. Алерт владельцу: адрес, монеты, средний %, % в плюсе, удержание, активен ли сейчас; кнопки «Тень» / «Бой 0.14» /
    «Игнор» (бой — с подтверждением; только у кошельков бота в режиме «бой»; ставка — не выше потолка сервера).
 4. Пока следим: итог за 24 ч; минус на 10+ сделках за 24 ч или у него нет покупок 12 ч — «остыл», копирование стоп.
@@ -29,7 +30,20 @@ from . import copymodel as CM
 log = logging.getLogger(__name__)
 
 WINDOW_H = 72
-HOT_MIN_COINS, HOT_MIN_AVG, HOT_MIN_WIN, HOT_MAX_NOPRICE = 15, 0.10, 0.60, 0.5
+
+
+@dataclass(frozen=True)
+class Bar:
+    """Планка «горячего». 25.11 (владелец, после прогона 18–25.11: при 15 монетах горячесть не держалась — после
+    находки −6%): 50+ монет и t ≥ 3."""
+    min_coins: int = 50
+    min_avg: float = 0.10
+    min_win: float = 0.60
+    max_noprice: float = 0.5
+    min_t: float = 3.0
+
+
+BAR = Bar()
 BUNDLE_SHARE = 0.3                 # доля покупок в блоке создания монеты — от неё кошелёк считается бандлом
 ACTIVE_S = 3600                    # «активен сейчас»: последняя покупка не старше часа
 COOL_MIN_N, COOL_IDLE_H = 10, 12
@@ -45,6 +59,7 @@ DAY_KEY, WEEK_KEY = "hunter:day_at", "hunter:week_at"
 class Stats:
     address: str
     coins: int = 0                 # разных монет с ценой копии
+    coins_all: int = 0             # разных монет, которые он купил (25.11: планка — по ним)
     n: int = 0                     # копий с ценой
     total: int = 0                 # всех копий
     avg: float = 0.0
@@ -54,22 +69,26 @@ class Stats:
     last_buy: float | None = None
     own: int = 0                   # покупок своих монет (он их дев)
     bundled: float = 0.0           # доля покупок в блоке создания монеты
+    t: float = 0.0                 # устойчивость: средний итог копии / его стандартная ошибка
     top: list[tuple[str, float]] = field(default_factory=list)   # (символ, итог копии) — для алерта
 
-    def hot(self) -> str | None:
-        """None — горячий, иначе — почему нет."""
+    def hot(self, bar: Bar | None = None) -> str | None:
+        """None — горячий, иначе — почему нет (планка — BAR, если не задана)."""
+        bar = bar or BAR
         if self.own:
             return "покупает свои монеты (дев)"
         if self.bundled >= BUNDLE_SHARE:
             return f"бандл: {self.bundled:.0%} покупок в блоке создания"
-        if self.coins < HOT_MIN_COINS:
-            return f"монет с ценой {self.coins} < {HOT_MIN_COINS}"
-        if self.noprice > HOT_MAX_NOPRICE:
+        if self.coins_all < bar.min_coins:
+            return f"монет {self.coins_all} < {bar.min_coins}"
+        if self.noprice > bar.max_noprice:
             return f"без цены {self.noprice:.0%}"
-        if self.avg < HOT_MIN_AVG:
+        if self.avg < bar.min_avg:
             return f"в среднем {self.avg:+.1%}"
-        if self.win < HOT_MIN_WIN:
+        if self.win < bar.min_win:
             return f"в плюсе {self.win:.0%}"
+        if self.t < bar.min_t:
+            return f"t {self.t:.1f} < {bar.min_t:g}"
         return None
 
 
@@ -80,10 +99,13 @@ def stats_of(address: str, copies: list[tuple[CM.Entry, CM.Copy]], trades: list[
     priced = [(e, c) for e, c in copies if c.res is not None]
     s.n = len(priced)
     s.coins = len({e.mint for e, _c in priced})
+    s.coins_all = len({e.mint for e, _c in copies})
     if priced:
         res = [c.res for _e, c in priced]
         s.avg = statistics.fmean(res)
         s.win = sum(1 for x in res if x > 0) / len(res)
+        sd = statistics.stdev(res) if len(res) > 1 else 0.0
+        s.t = s.avg / (sd / len(res) ** 0.5) if sd > 0 else (99.0 if s.avg > 0 else 0.0)
     s.noprice = 1 - s.n / s.total if s.total else 0.0
     first_buy: dict[str, float] = {}
     holds = []
@@ -100,9 +122,11 @@ def stats_of(address: str, copies: list[tuple[CM.Entry, CM.Copy]], trades: list[
     return s
 
 
-async def candidates(db: Any, since: float, until: float, min_coins: int = HOT_MIN_COINS,
+async def candidates(db: Any, since: float, until: float, min_coins: int | None = None,
                      limit: int = MAX_WALLETS) -> list[dict[str, Any]]:
-    """Кошельки с покупками от min_coins разных монет за окно; своих монет и бандлы считаем тут же."""
+    """Кошельки с покупками от min_coins разных монет за окно (по умолчанию — планка BAR); свои монеты и бандлы
+    считаем тут же."""
+    min_coins = BAR.min_coins if min_coins is None else min_coins
     rows = await db.fetch(
         """WITH b AS (SELECT trader, mint, min(slot) AS slot, min(ts) AS ts FROM trades
                       WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2) GROUP BY 1, 2)
@@ -138,7 +162,7 @@ def alert_text(s: Stats, now: float) -> tuple[str, list[list[dict[str, Any]]]]:
     coins = ", ".join(f"${fmt.esc(sym)} {res:+.0%}" for sym, res in s.top)
     text = (f"🎯 <b>Охотник: горячий кошелёк</b> <code>{s.address}</code>\n"
             f"За {WINDOW_H} ч, копия «как бот» (блок +2, правило A, {STAKE_SOL:g} SOL, издержки тени): "
-            f"<b>{s.coins} монет</b>, в среднем <b>{s.avg:+.1%}</b>, в плюсе <b>{s.win:.0%}</b> "
+            f"<b>{s.coins_all} монет</b> ({s.coins} с ценой), в среднем <b>{s.avg:+.1%}</b>, в плюсе <b>{s.win:.0%}</b>, t={s.t:.1f} "
             f"({s.n} копий, без цены {s.noprice:.0%})\n"
             f"Удержание у него: медиана {ago(s.hold_s)} · последняя покупка {ago(now - s.last_buy) if s.last_buy else '?'}"
             f" назад — {'🟢 активен' if active else '⚪ сейчас не торгует'}\n"
@@ -244,7 +268,7 @@ class Hunter:
         known = {r["address"]: r for r in await db.fetch(
             "SELECT address, status, cooled_at FROM hunter_wallets")}
         hot = []
-        cands = await candidates(db, since, now)
+        cands = await candidates(db, since, now, BAR.min_coins)
         for c in cands:
             k = known.get(c["trader"])
             if k is not None and (k["status"] in ("new", "shadow", "live", "ignored") or (
@@ -354,32 +378,49 @@ async def weekly_text(db: Any, now: float) -> str:
 
 # ---------------------------------------------------------------------- исторический прогон
 async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: int = 500,
-                  until: float | None = None) -> str:
+                  until: float | None = None, bar: Bar | None = None, trace: str | None = None,
+                  start: float | None = None) -> str:
     """Как охотник сработал бы на прошлых данных: в каждой точке (шаг step_h) — горячие за 72 ч до неё; первый раз
     найденный кошелёк ведём вперёд по модели до «остыл» (минус на 10+ копиях за 24 ч или 12 ч без покупок) или до
     конца данных. Итог: сколько нашлось, сколько осталось в плюсе после находки."""
+    bar = bar or BAR
     until = until or time.time()
-    start = until - days * 86400
-    cands = await candidates(db, start, until, HOT_MIN_COINS, max_wallets)
+    start = start if start is not None else until - days * 86400
+    # точки проверки: с начала периода (окно 72 ч может уходить раньше начала — данные берём и оттуда)
+    lo = start - WINDOW_H * 3600
+    cands = await candidates(db, lo, until, bar.min_coins, max_wallets)
     cands = [c for c in cands if not c["own"] and int(c["bundled"]) / max(1, int(c["coins"])) < BUNDLE_SHARE]
+    n_cands = len(cands)
+    if trace and not any(c["trader"] == trace for c in cands):
+        cands.append({"trader": trace, "coins": 0, "own": 0, "bundled": 0})
     found: list[dict[str, Any]] = []
+    tr_lines: list[str] = []
     for c in cands:
-        trades = await CM.wallet_trades(db, c["trader"], start, until)
-        copies = await CM.evaluate_trades(db, c["trader"], trades, start, until, limit=100_000)
+        trades = await CM.wallet_trades(db, c["trader"], lo, until)
+        copies = await CM.evaluate_trades(db, c["trader"], trades, lo, until, limit=100_000)
         if not copies:
+            if c["trader"] == trace:
+                tr_lines.append("  копий нет: в базе нет его покупок за период")
             continue
-        t = start + WINDOW_H * 3600
+        t = start
         while t <= until:
             win = [(e, x) for e, x in copies if t - WINDOW_H * 3600 <= e.ts < t]
             s = stats_of(c["trader"], win, [d for d in trades if t - WINDOW_H * 3600 <= d["ts"] < t])
-            if s.hot() is None:
+            why = s.hot(bar)
+            if c["trader"] == trace and s.total:
+                tr_lines.append(f"  {datetime.fromtimestamp(t, timezone.utc):%d.%m %H:%M}: {s.coins_all} мон. "
+                                f"({s.coins} с ценой), "
+                                f"{s.n}/{s.total} коп., {s.avg:+.1%}, в плюсе {s.win:.0%}, t={s.t:.1f}, без цены "
+                                f"{s.noprice:.0%} → {'🔥 ГОРЯЧИЙ' if why is None else why}")
+            if why is None:
                 fwd = forward(copies, [d for d in trades if d["ts"] >= t], t, until)
                 found.append({"address": c["trader"], "at": t, "stats": s, **fwd})
                 break
             t += step_h * 3600
     lines = [f"Исторический прогон охотника: {datetime.fromtimestamp(start, timezone.utc):%d.%m %H:%M} – "
-             f"{datetime.fromtimestamp(until, timezone.utc):%d.%m %H:%M} UTC, шаг {step_h:g} ч, кошельков с "
-             f"{HOT_MIN_COINS}+ монетами: {len(cands)}",
+             f"{datetime.fromtimestamp(until, timezone.utc):%d.%m %H:%M} UTC, шаг {step_h:g} ч, планка: "
+             f"{bar.min_coins}+ монет, ≥ {bar.min_avg:+.0%}, в плюсе ≥ {bar.min_win:.0%}, t ≥ {bar.min_t:g}; "
+             f"кошельков с {bar.min_coins}+ монетами (не дев, не бандл): {n_cands}",
              f"Горячих нашлось бы: {len(found)}"]
     with_fwd = [f for f in found if f["n"]]
     if with_fwd:
@@ -394,10 +435,21 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
         for f in sorted(with_fwd, key=lambda x: -x["sum"])[:15]:
             s = f["stats"]
             lines.append(f"  {f['address'][:4]}…{f['address'][-4:]} найден {datetime.fromtimestamp(f['at'], timezone.utc):%d.%m %H:%M}"
-                         f" ({s.coins} мон., {s.avg:+.0%}, {s.win:.0%}) → {f['n']} коп., {statistics.fmean(f['res']):+.1%}"
+                         f" ({s.coins_all} мон., {s.avg:+.0%}, {s.win:.0%}, t={s.t:.1f}) → {f['n']} коп., {statistics.fmean(f['res']):+.1%}"
                          f"{' · остыл: ' + f['cooled'] if f['cooled'] else ''}")
     elif found:
         lines.append("После находки копий с ценой нет — данных после находки не хватает.")
+    if trace:
+        f = next((x for x in found if x["address"] == trace), None)
+        lines += ["", f"Кошелёк {trace}:"] + (tr_lines or ["  за период не было окна с его копиями"])
+        if f:
+            res = f["res"]
+            lines.append(f"  Найден {datetime.fromtimestamp(f['at'], timezone.utc):%d.%m %H:%M}; после находки: "
+                         f"{len(res)} копий с ценой" + (f", в среднем {statistics.fmean(res):+.1%}, в плюсе "
+                                                       f"{sum(1 for x in res if x > 0) / len(res):.0%}" if res else "")
+                         + f", без цены {f['noprice']}" + (f" · остыл: {f['cooled']}" if f["cooled"] else ""))
+        else:
+            lines.append("  Не найден.")
     return "\n".join(lines)
 
 

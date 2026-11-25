@@ -91,6 +91,8 @@ def note(sid, data, slot):
 
 
 async def test_session_subscribes_and_emits(monkeypatch):
+    monkeypatch.setattr(R.ReserveSource, "START_DELAY_S", 0.0)
+    monkeypatch.setattr(R.ReserveSource, "SUB_GAP_S", 0.0)
     src = R.ReserveSource("wss://x")
     src.set_target("M", R.Target("pump-amm", ["BASE", "QUOTE"]))
     acks = lambda ws: [{"id": m["id"], "result": 70 + i} for i, m in enumerate(ws.sent)   # noqa: E731
@@ -207,3 +209,43 @@ async def test_flush_writes_ticks_and_cover():
         assert await db.fetchval("SELECT count(*) FROM reserve_cover") == 1      # одно окно, конец продлён
     finally:
         await db.close()
+
+
+def test_refusal_does_not_switch_to_public_node():
+    """25.11 (2): при 429 источник уходил на публичный узел навсегда (там подписки режутся тем же 429) — 2 монеты в час.
+    Теперь остаётся на основном и повторяет после паузы."""
+    src = R.ReserveSource("wss://helius", fallback="wss://api.mainnet-beta.solana.com")
+    src.on_failure(Exception("server rejected WebSocket connection: HTTP 429"))
+    assert src.url == "wss://helius" and src.refused == 1 and src.counts()["refused"] == 1
+    assert src.min_backoff >= 30 and src.SUB_GAP_S >= 0.2
+
+
+async def test_session_waits_for_watch(monkeypatch):
+    monkeypatch.setattr(R.ReserveSource, "START_DELAY_S", 0.0)
+    flag = {"ok": False}
+    src = R.ReserveSource("wss://x", ready=lambda: flag["ok"])
+    calls = []
+
+    def connect(*a, **k):
+        calls.append(1)
+        return FakeWS(src, [])
+    monkeypatch.setattr(R.websockets, "connect", connect)
+    task = asyncio.create_task(src._session(lambda ev: asyncio.sleep(0)))
+    await asyncio.sleep(1.2)
+    assert not calls                                   # слежка ещё не на связи — не подключаемся
+    flag["ok"] = True
+    await asyncio.wait_for(task, 5)
+    assert calls == [1]
+
+
+async def test_receiver_counts_reserve_failures():
+    rec = receiver(Rpc({}))
+    await REAL_ADD(rec, MINT)                          # ни кривой, ни пула
+    assert rec.reserve_stats["no_account"] == 1
+
+    class Boom:
+        async def call(self, *a):
+            raise RuntimeError("HTTP 429")
+    rec.rpc = Boom()
+    await REAL_ADD(rec, MINT)
+    assert rec.reserve_stats["rpc_error"] == 1 and "429" in rec.reserve_last_error
