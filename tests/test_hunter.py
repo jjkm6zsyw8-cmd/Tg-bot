@@ -37,7 +37,9 @@ def test_hot_criteria_and_new_bar():
     assert s.hot().startswith("правило A на второй половине")            # A2: на второй половине — минус
     s.rule_test, s.dump = 0.05, 0.4
     assert s.hot().startswith("сливает на копировщиков")                  # C2
-    new = H.Bar()
+    assert H.Bar() == OLD and H.bar_of({}) == OLD                           # 27.11: мягкая планка по умолчанию
+    assert H.bar_of({"hunter_min_coins": 50, "hunter_min_t": 3}) == H.STRICT_BAR
+    new = H.STRICT_BAR
     assert new.min_coins == 50 and new.min_t == 3.0
     many = [copy(f"M{i}", 0.3 if i % 3 else -0.1) for i in range(60)]
     assert H.stats_of("W", many, []).hot(new) is None
@@ -99,7 +101,8 @@ def test_lists_and_cooling():
     assert H.list_for(30, 55.0) == ("watch", None)                         # $ есть, но копий < 50
     assert H.list_for(30, 16.0) == ("watch", None)
     assert H.list_for(25, 5.0)[0] == "archive" and "< $15" in H.list_for(25, 5.0)[1]
-    assert H.list_for(5, 5.0) == ("new", None)                             # мало данных — ждём
+    assert H.list_for(5, 5.0) == ("watch", None)                           # мало данных — в «наблюдении», в тени
+    assert H.list_for(19, 0.0) == ("watch", None)
     assert H.cool_reason(12, -2.5, NOW, NOW - 3600, NOW).startswith("12 сделок")
     assert H.cool_reason(12, -1.0, NOW, NOW - 3600, NOW) is None           # минус, но неустойчивый — не снимаем
     assert H.cool_reason(3, 1.0, NOW - 13 * 3600, NOW - 20 * 3600, NOW) == "нет покупок 12 ч"
@@ -122,7 +125,10 @@ def test_alert_text_has_money_burst_and_buttons():
     text, kb = H.alert_text(s, NOW, NOPOOL)
     assert "$52 в день" in text and "$140 при 3% пула" in text and "Всплеск (+25% за 30 с): 50%" in text
     assert "правило <b>B</b>" in text and "🟢 активен" in text and "через 1.36 с" in text
-    assert [b["callback"] for b in kb[0]] == ["hn:s:W", "hn:l:W", "hn:i:W"]
+    assert "→ 👻 тень и «наблюдение»" in text and "пришлю кнопку «Бой 0.14»" in text
+    assert [b["callback"] for b in kb[0]] == ["hn:i:W"]                    # найденный — сразу в тени, денег нет
+    text, kb = H.ready_text("W", {"n": 7, "avg": 0.05, "sol": 0.03}, 44.0)
+    assert "Можно в бой" in text and [b["callback"] for b in kb[0]] == ["hn:l:W", "hn:i:W"]
     addr = "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5"
     assert all(len(f"hn:{a}:{addr}".encode()) <= 64 for a in "slLix")
 
@@ -174,8 +180,11 @@ async def test_scan_finds_hot_wallet_once_and_skips_dev_and_bundles(db):
     assert s.coins_all == 16 and s.win == 1.0 and 0.2 < s.avg < 0.4 and s.usd_day > 0 and s.rule in H.RULES
     alerts = [p for p in e.sent if "горячий кошелёк" in p["text"]]
     assert len(alerts) == 1 and "в день" in alerts[0]["text"]
-    r = await db.fetchrow("SELECT status, list, rule, usd_day FROM hunter_wallets WHERE address = $1", ME)
-    assert r["status"] == "new" and r["list"] == "new" and r["rule"] == s.rule and r["usd_day"] > 0
+    r = await db.fetchrow("SELECT status, list, rule, usd_day, followed_at FROM hunter_wallets WHERE address = $1", ME)
+    # 27.11: найденный — сразу в тень и «наблюдение»; денег нет
+    assert r["status"] == "shadow" and r["list"] == "watch" and r["rule"] == s.rule and r["usd_day"] > 0
+    assert r["followed_at"] is not None and (await db.kv_get("real:follow"))[ME] == "shadow"
+    assert ME not in (await db.kv_get("real:follow_stake") or {})
     assert await H.Hunter(e).scan(now) == []
 
 
@@ -196,10 +205,8 @@ async def test_track_lists_copies_and_battle_gate(db):
     try:
         await h.track(time.time())
         assert await db.fetchval("SELECT list FROM hunter_wallets WHERE address = $1", ME) == "battle"
-        assert "не в списке" not in (await H.battle_ready(db, ME) or "") and await H.battle_ready(db, ME) == \
-            "сначала 24 ч тени"
-        await H.follow(db, e.cfg, Costs(), ME, "shadow")
-        assert "меньше 24 ч" in await H.battle_ready(db, ME)
+        assert "не в списке" not in (await H.battle_ready(db, ME) or "")
+        assert "меньше 24 ч" in await H.battle_ready(db, ME)                # тень включена при находке
         await db.execute("UPDATE hunter_wallets SET followed_at = now() - interval '25 hours' WHERE address = $1", ME)
         assert "сделок" in await H.battle_ready(db, ME)                    # в тени ещё нет сделок
         for _ in range(5):
@@ -210,8 +217,47 @@ async def test_track_lists_copies_and_battle_gate(db):
         assert await H.battle_ready(db, ME) is None
         ok = await h.battle_list(time.time())
         assert ME in ok and ME in (await db.kv_get(H.BATTLE_KEY))
+        ready = [p for p in e.sent if "Можно в бой" in p["text"]]
+        assert len(ready) == 1 and ready[0]["keyboard"][0][0]["callback"] == f"hn:l:{ME}"
+        await h.battle_list(time.time())
+        assert len([p for p in e.sent if "Можно в бой" in p["text"]]) == 1       # кнопка — один раз
     finally:
         H.BATTLE_N, H.BATTLE_USD = monkey
+
+
+async def test_archive_by_results_stops_shadow(db):
+    """27.11: шум отсеивает тень — 20+ копий после находки и меньше $15/день → архив, копирование снято."""
+    await hot_wallet(db, ME, hours_ago=60)
+    e = Engine(db, hunter_on=True)
+    h = H.Hunter(e)
+    await h.scan(time.time())
+    await db.execute("UPDATE hunter_wallets SET found_at = now() - interval '50 hours' WHERE address = $1", ME)
+    monkey = H.ARCHIVE_MIN_N, H.WATCH_USD
+    H.ARCHIVE_MIN_N, H.WATCH_USD = 3, 10_000.0
+    try:
+        await h.track(time.time())
+    finally:
+        H.ARCHIVE_MIN_N, H.WATCH_USD = monkey
+    r = await db.fetchrow("SELECT list, status, cool_reason FROM hunter_wallets WHERE address = $1", ME)
+    assert r["list"] == "archive" and r["status"] == "cooled" and "< $10000" in r["cool_reason"]
+    assert ME not in (await db.kv_get("real:follow") or {})
+    assert any("→ архив" in p["text"] and "снято" in p["text"] for p in e.sent)
+
+
+def test_journey_moves_to_battle_after_24h_and_splits_copies():
+    """До перевода в «в бой» — тень (копии считаются отдельно), перевод — по итогу после находки и 24 ч тени."""
+    t0 = NOW
+    cs = [copy(f"J{i}", 0.12 if i % 5 else -0.05, t0 + 600 + 1200 * i) for i in range(120)]   # 3 копии в час, 40 ч
+    trades = [{"ts": e.ts, "is_buy": True} for e, _c in cs]
+    j = H.journey(cs, trades, t0, t0 + 41 * 3600, 150.0)
+    assert j["battle_at"] is not None and j["battle_at"] - t0 >= 24 * 3600          # не раньше 24 ч тени
+    assert j["list"] == "battle" and len(j["pre"]) >= 50 and j["bat"] and j["out"] == 0
+    assert len(j["pre"]) + len(j["bat"]) == j["n"] == 120
+    assert all(e.ts < j["battle_at"] for e, _c in cs[:len(j["pre"])])
+    weak = [copy(f"K{i}", 0.01 if i % 2 else -0.012, t0 + 600 + 1200 * i) for i in range(60)]
+    k = H.journey(weak, [{"ts": e.ts, "is_buy": True} for e, _c in weak], t0, t0 + 21 * 3600, 150.0)
+    assert k["list"] == "archive" and k["battle_at"] is None and k["n"] < 60 and "< $15" in k["why_not"]
+    assert "до перевода" not in H.phase_text([], 150.0) and "$+25" in H.phase_text([0.6, 0.6], 150.0)
 
 
 async def test_follow_uses_wallet_rule_and_cools_on_steady_minus(db):
@@ -264,6 +310,7 @@ async def test_history_run(db):
     text = await H.history(db, days=5, step_h=6, prm=NOPOOL, trace=ME)
     assert "Горячих нашлось бы: 1" in text and "кошельков с 15+ монетами (не дев, не бандл): 2" in text
     assert "Найден" in text and "Для сравнения вход «блок +2»" in text
+    assert "Переведены в «в бой»" in text and "До перевода в «в бой» (тень, денег нет)" in text
 
 
 async def test_follow_stake_in_executor(db):

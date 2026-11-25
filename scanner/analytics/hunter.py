@@ -22,6 +22,11 @@ C1. В пул меньше real_min_pool_sol (30 SOL) бот не входит �
 C2. «Сливает на копировщиков»: доля его продаж в первые 30 с после всплеска чужих покупок (3+ покупателя за 10 с
     после него); выросла — алерт и стоп.
 
+27.11 (владелец): мягкая планка — 15+ монет за 72 ч (≥ +10%, в плюсе ≥ 60%, без требования к t; hunter_min_coins /
+hunter_min_t в config.local.yaml). Всех найденных — сразу в тень и список «наблюдение» (без денег); шум отсеивает тень, а
+не планка: архив (и стоп тени) — 20+ копий после находки и меньше $15/день, «остыл» — как раньше. В «в бой» — по итогу
+после находки (от $40/день на 50+ копиях); когда допуск к бою готов (24 ч тени), бот присылает кнопку «Бой 0.14».
+
 Поиск раз в час — только если владелец включил (/hunter on). Слежение за найденными (списки, «остыл», слив,
 допуск к бою) работает всегда. Результаты охотника и копии после находки хранятся бессрочно (hunter_wallets,
 hunter_copies). Исторический прогон: python -m scanner hunt --history [--from --to --step --wallet …].
@@ -32,7 +37,7 @@ import asyncio
 import logging
 import statistics
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -47,15 +52,25 @@ WINDOW_H = 72
 
 @dataclass(frozen=True)
 class Bar:
-    """Планка «горячего» (25.11): 50+ купленных монет за 72 ч и t ≥ 3, в среднем от +10%, в плюсе от 60%."""
-    min_coins: int = 50
+    """Планка «горячего». 27.11 (владелец): мягкая — 15+ купленных монет за 72 ч, в среднем от +10%, в плюсе от 60%,
+    t не требуется: найденные идут только в тень и «наблюдение», шум отсеивает тень. Строгая (25.11) — STRICT_BAR."""
+    min_coins: int = 15
     min_avg: float = 0.10
     min_win: float = 0.60
     max_noprice: float = 0.5
-    min_t: float = 3.0
+    min_t: float = 0.0
 
 
 BAR = Bar()
+STRICT_BAR = Bar(min_coins=50, min_t=3.0)      # 25.11: 50+ монет и t ≥ 3 — находит на сутки позже (контроль 7BNaxx)
+
+
+def bar_of(cfg: dict[str, Any] | None = None) -> Bar:
+    """Планка из настроек (hunter_min_coins, hunter_min_t), остальное — BAR."""
+    cfg = cfg or {}
+    return replace(BAR, min_coins=int(cfg.get("hunter_min_coins", BAR.min_coins)),
+                   min_t=float(cfg.get("hunter_min_t", BAR.min_t)))
+
 RULES = ("A", "B", "G")             # правила выхода с удержанием до 30 мин (R держит сутки — цены нет)
 ENTRY_DELAY_S = 1.36                 # медиана из боя: от его покупки до нашей
 MAX_STAKE_SHARE = 0.03               # максимальная ставка — 3% SOL пула
@@ -67,7 +82,7 @@ COOL_MIN_N, COOL_T, COOL_IDLE_H = 10, -2.0, 12
 SHADOW_BEFORE_LIVE_H, SHADOW_MIN_N = 24, 5
 DUMP_BUYERS, DUMP_WIN_S, DUMP_SELL_S, DUMP_ALERT, DUMP_RISE = 3, 10.0, 30.0, 0.3, 0.1
 STAKE_SOL = 0.14
-MAX_WALLETS = 300
+MAX_WALLETS = 600                    # мягкая планка — кандидатов больше
 EVAL_LIMIT = 200
 REALERT_COOLED_D = 7
 TOPIC = "copy"
@@ -290,7 +305,7 @@ def alert_text(s: Stats, now: float, prm: Params | None = None) -> tuple[str, li
     coins = ", ".join(f"${fmt.esc(sym)} {res:+.0%}" for sym, res in s.top)
     test = f"{s.rule_test:+.1%}" if s.rule_test is not None else "?"
     b2 = f"{s.block2_avg:+.1%}" if s.block2_avg is not None else "?"
-    text = (f"🎯 <b>Охотник: горячий кошелёк</b> <code>{s.address}</code>\n"
+    text = (f"🎯 <b>Охотник: горячий кошелёк</b> <code>{s.address}</code> → 👻 тень и «наблюдение»\n"
             f"За {WINDOW_H} ч, наш бот за ним (вход через {prm.delay:g} с, правило <b>{s.rule}</b>, издержки тени): "
             f"<b>{s.coins_all} монет</b> ({s.coins} с ценой), в среднем <b>{s.avg:+.1%}</b>, в плюсе "
             f"<b>{s.win:.0%}</b>, t={s.t:.1f} ({s.n} копий, без цены {s.noprice:.0%})\n"
@@ -301,11 +316,20 @@ def alert_text(s: Stats, now: float, prm: Params | None = None) -> tuple[str, li
             f"Удержание у него: медиана {ago(s.hold_s)} · последняя покупка "
             f"{ago(now - s.last_buy) if s.last_buy else '?'} назад — {'🟢 активен' if active else '⚪ сейчас не торгует'}\n"
             f"Монеты: {coins}\n"
-            f"Бой — только после 24 ч тени и списка «в бой» (от ${BATTLE_USD:g}/день на {BATTLE_N}+ новых сделках).")
-    kb = [[{"text": "👻 Тень", "callback": f"hn:s:{s.address}"},
-           {"text": f"💵 Бой {STAKE_SOL:g}", "callback": f"hn:l:{s.address}", "style": "danger"},
-           {"text": "🙈 Игнор", "callback": f"hn:i:{s.address}"}]]
+            f"Тень за ним включена (без денег). В «в бой» — по итогу после находки: от ${BATTLE_USD:g}/день на "
+            f"{BATTLE_N}+ новых копиях; после 24 ч тени пришлю кнопку «Бой {STAKE_SOL:g}». Архив и снятие тени — "
+            f"{ARCHIVE_MIN_N}+ копий и меньше ${WATCH_USD:g}/день.")
+    kb = [[{"text": "🙈 Игнор (снять тень)", "callback": f"hn:i:{s.address}"}]]
     return text, kb
+
+
+def ready_text(addr: str, res: dict[str, Any], usd_after: float | None) -> tuple[str, list[list[dict[str, Any]]]]:
+    """Допуск к бою готов: кнопка «Бой 0.14» (дальше — подтверждение)."""
+    usd = f", ${usd_after:,.0f}/день по модели" if usd_after is not None else ""
+    text = (f"✅ <b>Можно в бой</b> <code>{addr}</code>: список «в бой»{usd}; в тени за ним {res['n']} сд, в среднем "
+            f"{res['avg']:+.1%}, {res['sol']:+.3f} SOL. Бой — только по кнопке, {STAKE_SOL:g} SOL на покупку.")
+    return text, [[{"text": f"💵 Бой {STAKE_SOL:g}", "callback": f"hn:l:{addr}", "style": "danger"},
+                   {"text": "🙈 Игнор", "callback": f"hn:i:{addr}"}]]
 
 
 def live_confirm(addr: str, cap_usd: float, rule: str = "A") -> tuple[str, list[list[dict[str, Any]]]]:
@@ -322,10 +346,10 @@ async def upsert(db: Any, s: Stats) -> None:
         """INSERT INTO hunter_wallets(address, found_at, status, coins, avg_pct, win, hold_s, n_copies, noprice,
                last_alert_at, list, rule, rule_train, rule_test, usd_day, usd_day_max, burst, block2_avg, dump_share,
                list_at)
-           VALUES ($1, now(), 'new', $2, $3, $4, $5, $6, $7, now(), 'new', $8, $9, $10, $11, $12, $13, $14, $15, now())
+           VALUES ($1, now(), 'new', $2, $3, $4, $5, $6, $7, now(), 'watch', $8, $9, $10, $11, $12, $13, $14, $15, now())
            ON CONFLICT (address) DO UPDATE SET found_at = now(), status = 'new', coins = $2, avg_pct = $3, win = $4,
                hold_s = $5, n_copies = $6, noprice = $7, last_alert_at = now(), followed_at = NULL, cooled_at = NULL,
-               cool_reason = NULL, list = 'new', rule = $8, rule_train = $9, rule_test = $10, usd_day = $11,
+               cool_reason = NULL, list = 'watch', rule = $8, rule_train = $9, rule_test = $10, usd_day = $11,
                usd_day_max = $12, burst = $13, block2_avg = $14, dump_share = $15, list_at = now(),
                list_reason = NULL, n_after = NULL, avg_after = NULL, usd_day_after = NULL""",
         s.address, s.coins_all, s.avg, s.win, s.hold_s, s.n, s.noprice, s.rule, s.rule_train, s.rule_test, s.usd_day,
@@ -402,14 +426,13 @@ def cool_reason(n: int, t: float, last_buy: float | None, since: float, now: flo
 
 
 def list_for(n_after: int, usd_after: float) -> tuple[str, str | None]:
-    """A5: список по новым сделкам после находки."""
+    """A5 (27.11): список по новым сделкам после находки. Найденный сразу в «наблюдении» (и в тени); «в бой» — от
+    $40/день на 50+ копиях; архив (тень снимается) — 20+ копий и меньше $15/день; иначе — «наблюдение»."""
     if n_after >= BATTLE_N and usd_after >= BATTLE_USD:
         return "battle", None
-    if usd_after >= WATCH_USD:
-        return "watch", None
-    if n_after >= ARCHIVE_MIN_N:
+    if n_after >= ARCHIVE_MIN_N and usd_after < WATCH_USD:
         return "archive", f"после находки ${usd_after:,.0f}/день < ${WATCH_USD:g} ({n_after} копий)"
-    return "new", None
+    return "watch", None
 
 
 class Hunter:
@@ -446,7 +469,8 @@ class Hunter:
         since = now - WINDOW_H * 3600
         known = {r["address"]: r for r in await db.fetch("SELECT address, status, list, cooled_at FROM hunter_wallets")}
         hot = []
-        cands = await candidates(db, since, now, BAR.min_coins)
+        bar = bar_of(self.e.cfg)
+        cands = await candidates(db, since, now, bar.min_coins)
         for c in cands:
             k = known.get(c["trader"])
             if k is not None and (k["status"] in ("new", "shadow", "live", "ignored") or k["list"] in ("battle", "watch")
@@ -456,9 +480,11 @@ class Hunter:
             if c["own"] or int(c["bundled"]) / max(1, int(c["coins"])) >= BUNDLE_SHARE:
                 continue
             s = await evaluate(db, c["trader"], since, now, prm, cand=c)
-            if s.hot() is None:
+            if s.hot(bar) is None:
                 hot.append(s)
                 await upsert(db, s)
+                # 27.11 (владелец): всех найденных — сразу в тень (без денег) и «наблюдение»
+                await follow(db, self.e.cfg, self.e.costs(), c["trader"], "shadow")
                 await self.say(*alert_text(s, now, prm))
         self.stats = {"at": now, "candidates": len(cands), "hot": len(hot)}
         return hot
@@ -500,7 +526,14 @@ class Hunter:
                                f"{len(res)} копий, в среднем {avg:+.1%}, ${usd:,.0f}/день при {STAKE_SOL:g} SOL. "
                                "В бой — после 24 ч тени, кнопкой.")
             elif new_list == "archive" and r["list"] != "archive" and reason and "сливает" not in reason:
-                await self.say(f"🗄 <code>{addr}</code> → архив: {reason}.")
+                # 27.11: шум отсеивает тень — в архиве копирование (тень и бой) снимается
+                stopped = r["status"] in ("shadow", "live")
+                if stopped:
+                    await follow(db, self.e.cfg, self.e.costs(), addr, None)
+                    await db.execute("UPDATE hunter_wallets SET status = 'cooled', cooled_at = now(), cool_reason = $2 "
+                                     "WHERE address = $1", addr, reason)
+                await self.say(f"🗄 <code>{addr}</code> → архив: {reason}."
+                               + (" Копирование за ним снято." if stopped else ""))
 
     # ------------------------------------------------------------------ остыл (A6)
     async def watch(self, now: float) -> list[str]:
@@ -530,9 +563,16 @@ class Hunter:
         db = self.e.db
         old = dict(await db.kv_get(BATTLE_KEY) or {})
         ok: dict[str, float] = {}
-        for r in await db.fetch("SELECT address FROM hunter_wallets WHERE list = 'battle' AND status IN ('shadow', 'live')"):
+        for r in await db.fetch("SELECT address, status FROM hunter_wallets "
+                                "WHERE list = 'battle' AND status IN ('shadow', 'live')"):
             if await battle_ready(db, r["address"], now) is None:
                 ok[r["address"]] = old.get(r["address"], now)
+                if r["address"] not in old and r["status"] != "live":
+                    w = await db.fetchrow("SELECT followed_at, usd_day_after FROM hunter_wallets WHERE address = $1",
+                                          r["address"])
+                    res = await our_results(db, r["address"], w["followed_at"])
+                    await self.say(*ready_text(r["address"], res, float(w["usd_day_after"])
+                                               if w["usd_day_after"] is not None else None))
         for addr in set(old) - set(ok):
             live = await db.fetchval("SELECT status FROM hunter_wallets WHERE address = $1", addr) == "live"
             if live:
@@ -681,17 +721,10 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
                                 f"в плюсе {s.win:.0%}, t={s.t:.1f}, без цены {s.noprice:.0%} → "
                                 f"{'🔥 ГОРЯЧИЙ' if why is None else why}")
             if why is None:
-                fwd = forward(by_rule[rule], [d for d in trades if d["ts"] >= t], t, until)
+                j = journey(by_rule[rule], [d for d in trades if d["ts"] >= t], t, until, prm.sol_usd)
                 b2 = [x.res for e, x in CM.run(p, SCHEMES[rule], min_pool_sol=prm.min_pool)
-                      if e.ts >= t and x.res is not None and (fwd["end"] is None or e.ts <= fwd["end"])]
-                fdays = max(((fwd["end"] or until) - t) / 86400, 1 / 24)
-                usd = (fwd["n"] + fwd["noprice"]) / fdays * STAKE_SOL * (statistics.fmean(fwd["res"]) if fwd["res"]
-                                                                          else 0.0) * prm.sol_usd
-                lst, reason = list_for(fwd["n"], usd)
-                if lst == "new":
-                    lst, reason = "archive", f"мало копий после находки ({fwd['n']})"
-                found.append({"address": c["trader"], "at": t, "stats": s, **fwd, "usd": usd, "list": lst,
-                              "reason": reason, "b2": b2})
+                      if t <= e.ts <= j["end"] and x.res is not None]
+                found.append({"address": c["trader"], "at": t, "stats": s, **j, "b2": b2})
                 break
             t += step_h * 3600
     by_list: dict[str, list[dict[str, Any]]] = {}
@@ -707,17 +740,28 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
     with_fwd = [f for f in found if f["n"]]
     if with_fwd:
         allres = [r for f in with_fwd for r in f["res"]]
-        lines.append(f"После находки (модель, пока не остыл): копий {len(allres)}, в среднем "
+        lines.append(f"После находки (модель, пока не остыл и не в архиве): копий {len(allres)}, в среднем "
                      f"{statistics.fmean(allres):+.1%}, в плюсе {sum(1 for x in allres if x > 0) / len(allres):.0%}; "
                      f"кошельков в плюсе {sum(1 for f in with_fwd if f['sum'] > 0)} из {len(with_fwd)}; итог "
                      f"{sum(f['sum'] for f in with_fwd) * STAKE_SOL:+.3f} SOL при {STAKE_SOL:g} SOL на копию; "
                      f"без цены {sum(f['noprice'] for f in with_fwd)} копий")
+        moved = [f for f in found if f["battle_at"] is not None]
+        pre = [r for f in found for r in f["pre"]]
+        bat = [r for f in found for r in f["bat"]]
+        lines.append(f"Переведены в «в бой» (от ${BATTLE_USD:g}/день на {BATTLE_N}+ копиях после находки, 24 ч тени): "
+                     f"{len(moved)} из {len(found)}")
+        lines.append("  до перевода — тень, денег нет: " + phase_text(pre, prm.sol_usd))
+        lines.append("  в бою (с перевода, пока в списке «в бой»): " + phase_text(bat, prm.sol_usd))
         for f in sorted(with_fwd, key=lambda x: -x["usd"])[:20]:
             s = f["stats"]
+            bt = (f" · в бой {datetime.fromtimestamp(f['battle_at'], timezone.utc):%d.%m %H:%M}: до {len(f['pre'])} коп."
+                  f", в бою {len(f['bat'])} коп. ${sum(f['bat']) * STAKE_SOL * prm.sol_usd:+,.0f}"
+                  if f["battle_at"] is not None else "")
             lines.append(f"  {LIST_NAMES[f['list']]:<11} {f['address'][:4]}…{f['address'][-4:]} найден "
                          f"{datetime.fromtimestamp(f['at'], timezone.utc):%d.%m %H:%M} ({s.coins_all} мон., {s.rule} "
                          f"{s.avg:+.0%}, t={s.t:.1f}) → {f['n']} коп., {statistics.fmean(f['res']):+.1%}, "
-                         f"${f['usd']:,.0f}/день" + (f" · остыл: {f['cooled']}" if f["cooled"] else ""))
+                         f"${f['usd']:,.0f}/день{bt}" + (f" · остыл: {f['cooled']}" if f["cooled"] else "")
+                         + (f" · архив: {f['reason']}" if f["list"] == "archive" and f["reason"] else ""))
     elif found:
         lines.append("После находки копий с ценой нет — данных после находки не хватает.")
     if trace:
@@ -731,12 +775,99 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
                             f"{sum(1 for x in res if x > 0) / len(res):.0%}" if res else "")
                          + f", без цены {f['noprice']}, ${f['usd']:,.0f}/день → {LIST_NAMES[f['list']]}"
                          + (f" · остыл: {f['cooled']}" if f["cooled"] else ""))
+            lines.append(f"  До перевода в «в бой» (тень, денег нет): " + phase_text(f["pre"], prm.sol_usd, f["pre_np"]))
+            if f["battle_at"] is not None:
+                bdays = max((f["end"] - f["battle_at"]) / 86400, 1 / 24)
+                lines.append(f"  В «в бой» — {datetime.fromtimestamp(f['battle_at'], timezone.utc):%d.%m %H:%M} "
+                             f"(через {(f['battle_at'] - f['at']) / 3600:.0f} ч после находки)")
+                lines.append(f"  В бою: " + phase_text(f["bat"], prm.sol_usd, f["bat_np"])
+                             + f", ≈${sum(f['bat']) * STAKE_SOL * prm.sol_usd / bdays:,.0f}/день за {bdays * 24:.0f} ч"
+                             + (" (выпадал из «в бой»: " + str(f["out"]) + " коп. в это время — только тень)"
+                                if f["out"] else ""))
+            else:
+                lines.append(f"  В «в бой» не перешёл до {datetime.fromtimestamp(f['end'], timezone.utc):%d.%m %H:%M}"
+                             f" — {f['why_not']}")
             if f["b2"]:
                 lines.append(f"  Для сравнения вход «блок +2» на тех же: {len(f['b2'])} копий, "
                              f"{statistics.fmean(f['b2']):+.1%}")
         else:
             lines.append("  Не найден.")
     return "\n".join(lines)
+
+
+EXIT_LAG_S = 1800.0                  # правила A/B/G держат до 30 мин: итог копии известен не раньше
+
+
+def phase_text(res: list[float], sol_usd: float, noprice: int | None = None) -> str:
+    if not res:
+        return "копий с ценой нет" + (f" (без цены {noprice})" if noprice else "")
+    usd = sum(res) * STAKE_SOL * sol_usd
+    return (f"{len(res)} коп., в среднем {statistics.fmean(res):+.1%}, в плюсе "
+            f"{sum(1 for x in res if x > 0) / len(res):.0%}, ${usd:+,.0f} при {STAKE_SOL:g} SOL"
+            + (f", без цены {noprice}" if noprice else ""))
+
+
+def journey(copies: list[tuple[CM.Entry, CM.Copy]], trades: list[dict[str, Any]], t0: float, until: float,
+            sol_usd: float, check_s: float = 3600.0) -> dict[str, Any]:
+    """27.11: после находки t0 — как в боте. Сразу тень и «наблюдение»; раз в час — список по копиям после находки,
+    итог которых уже известен (list_for, как Hunter.track); «в бой» — когда список «в бой», прошло 24 ч тени и в тени
+    5+ копий не в минусе (как battle_ready) — с этого часа копии идут на деньги; выпал из «в бой» — снова только тень;
+    архив — копирование снято; «остыл» — как forward. Копии делятся на «до перевода» (pre) и «в бою» (bat)."""
+    fwd = forward(copies, trades, t0, until)
+    end = fwd["end"] if fwd["end"] is not None else until
+    seq = sorted(((e, c) for e, c in copies if t0 <= e.ts <= end and c.why != CM.SMALL_POOL), key=lambda x: x[0].ts)
+
+    def state(t: float) -> tuple[str, str | None, float, bool, int, float]:
+        done = [c for e, c in seq if e.ts + EXIT_LAG_S <= t]
+        res = [c.res for c in done if c.res is not None]
+        avg = statistics.fmean(res) if res else 0.0
+        usd = len(done) / max((t - t0) / 86400, 1 / 24) * STAKE_SOL * avg * sol_usd
+        lst, why = list_for(len(res), usd)
+        ready = (lst == "battle" and t - t0 >= SHADOW_BEFORE_LIVE_H * 3600 and len(res) >= SHADOW_MIN_N and avg >= 0)
+        return lst, why, usd, ready, len(res), avg
+
+    pre: list[tuple[CM.Entry, CM.Copy]] = []
+    bat: list[tuple[CM.Entry, CM.Copy]] = []
+    battle_at = archived_at = None
+    reason = None
+    gap: list[tuple[CM.Entry, CM.Copy]] = []
+    in_battle = False
+    tick = t0 + check_s
+    for e, c in seq:
+        while tick <= e.ts and archived_at is None:
+            lst, why, _usd, ready, _n, _avg = state(tick)
+            if lst == "archive":
+                archived_at, reason = tick, why
+            else:
+                in_battle = ready
+                if ready and battle_at is None:
+                    battle_at = tick
+            tick += check_s
+        if archived_at is not None:
+            break
+        if in_battle:
+            bat.append((e, c))
+        elif battle_at is None:
+            pre.append((e, c))
+        else:
+            gap.append((e, c))                          # выпал из «в бой» — эти копии только в тени
+    stop = archived_at if archived_at is not None else end
+    lst, why, usd, _ready, n, avg = state(stop)
+    if archived_at is not None:
+        lst = "archive"
+    elif lst == "battle" and battle_at is None:
+        lst = "watch"                                   # «в бой» по итогу, но 24 ч тени ещё не прошло
+    why_not = (reason or why) if lst == "archive" else (
+        f"после находки {n} коп. с ценой, ${usd:,.0f}/день (нужно {BATTLE_N}+ и ${BATTLE_USD:g})"
+        if battle_at is None else None)
+    followed = pre + bat + gap
+    res = [c.res for _e, c in followed if c.res is not None]
+    return {"n": len(res), "res": res, "sum": sum(res),
+            "noprice": sum(1 for _e, c in followed if c.res is None), "cooled": fwd["cooled"] if archived_at is None
+            else None, "end": stop, "usd": usd, "list": lst, "reason": reason or why, "why_not": why_not,
+            "battle_at": battle_at, "pre": [c.res for _e, c in pre if c.res is not None],
+            "pre_np": sum(1 for _e, c in pre if c.res is None), "bat": [c.res for _e, c in bat if c.res is not None],
+            "bat_np": sum(1 for _e, c in bat if c.res is None), "out": len(gap)}
 
 
 def forward(copies: list[tuple[CM.Entry, CM.Copy]], trades: list[dict[str, Any]], t0: float,

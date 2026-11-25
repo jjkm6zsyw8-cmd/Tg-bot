@@ -271,11 +271,12 @@ async def run_tool(cmd: str, db: Database) -> None:
         mx = int(args[args.index("--max") + 1]) if "--max" in args else 500
         arg = lambda k: args[args.index(k) + 1] if k in args else None   # noqa: E731
         day = lambda v: _dt.strptime(v, "%Y-%m-%d").replace(tzinfo=_tz.utc).timestamp() if v else None   # noqa: E731
-        bar = H.Bar(min_coins=int(arg("--min-coins") or H.BAR.min_coins),
-                    min_t=float(arg("--min-t") or H.BAR.min_t))
         from .config import Settings as HSettings, YamlConfig as HYaml, load_env as h_env
         hs = HSettings(HYaml(h_env().config_path))
         hs.overrides = await db.get_overrides()
+        base = H.bar_of(hs.effective())                  # 27.11: мягкая планка 15 монет (hunter_min_coins / _min_t)
+        bar = H.Bar(min_coins=int(arg("--min-coins") or base.min_coins),
+                    min_t=float(arg("--min-t") if arg("--min-t") is not None else base.min_t))
         prm = await H.params_of(db, hs.effective())
         if arg("--delay"):
             prm.delay = float(arg("--delay"))            # вход через N с (по умолчанию — hunter_entry_delay_s, 1.36)
