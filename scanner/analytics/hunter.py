@@ -427,6 +427,14 @@ def cool_reason(n: int, t: float, last_buy: float | None, since: float, now: flo
     return None
 
 
+def idle_reason(last_buy: float | None, now: float) -> str | None:
+    """27.11: при находке кошелёк должен торговать — последняя покупка не старше COOL_IDLE_H (как в «остыл»): 25.11
+    первый поиск нашёл 4 кошелька по окну 72 ч, у которых после находки не было ни одной сделки."""
+    if last_buy is None or now - float(last_buy) > COOL_IDLE_H * 3600:
+        return f"нет покупок {COOL_IDLE_H} ч"
+    return None
+
+
 def list_for(n_after: int, usd_after: float) -> tuple[str, str | None]:
     """A5 (27.11): список по новым сделкам после находки. Найденный сразу в «наблюдении» (и в тени); «в бой» — от
     $40/день на 50+ копиях; архив (тень снимается) — 20+ копий и меньше $15/день; иначе — «наблюдение»."""
@@ -481,6 +489,8 @@ class Hunter:
                 continue
             if c["own"] or int(c["bundled"]) / max(1, int(c["coins"])) >= BUNDLE_SHARE:
                 continue
+            if idle_reason(c.get("last_buy"), now):
+                continue                    # 27.11: уже не торгует — «остыл» снял бы его через 12 ч без единой копии
             s = await evaluate(db, c["trader"], since, now, prm, cand=c)
             if s.hot(bar) is None:
                 hot.append(s)
@@ -745,6 +755,8 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
         since = found.timestamp()
         trades = await CM.wallet_trades(db, addr, since - 120, now)
         buys = [d for d in trades if d["is_buy"] and d["ts"] >= since]
+        before = await db.fetchval("SELECT extract(epoch FROM max(ts)) FROM trades WHERE trader = $1 AND is_buy "
+                                   "AND ts < $2", addr, found)
         rule = r["rule"] if r["rule"] in SCHEMES else "A"
         p = await CM.prepare(db, addr, trades, since, now, limit=100_000)
         cs = CM.run(p, SCHEMES[rule], entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
@@ -755,7 +767,11 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
                 f"  покупок после находки: {len(buys)} (монет {len({d['mint'] for d in buys})})"
                 + (f", последняя {datetime.fromtimestamp(buys[-1]['ts'], timezone.utc):%d.%m %H:%M}" if buys else "")
                 + (f"; все сделки в базе до {datetime.fromtimestamp(trades[-1]['ts'], timezone.utc):%d.%m %H:%M}"
-                   if trades else "; его сделок в базе нет"))
+                   if trades else "; его сделок в базе нет")
+                + (f"\n  до находки последняя покупка {datetime.fromtimestamp(float(before), timezone.utc):%d.%m %H:%M}"
+                   f" — за {(since - float(before)) / 3600:.0f} ч до находки"
+                   + (" (уже не торговал)" if since - float(before) > COOL_IDLE_H * 3600 else "")
+                   if before is not None else "\n  до находки его покупок в базе нет"))
         out.append(head)
         if not cs:
             continue
@@ -847,7 +863,7 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
             s.rule, s.rule_train, s.rule_test = rule, train, test
             s.per_day = s.total / (WINDOW_H / 24)
             s.usd_day = s.per_day * STAKE_SOL * s.avg * prm.sol_usd
-            why = s.hot(bar)
+            why = s.hot(bar) or idle_reason(s.last_buy, t)
             if c["trader"] == trace and s.total:
                 half = f" (2-я половина {test:+.1%})" if test is not None else ""
                 tr_lines.append(f"  {datetime.fromtimestamp(t, timezone.utc):%d.%m %H:%M}: {s.coins_all} мон. "

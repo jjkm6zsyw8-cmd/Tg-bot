@@ -134,7 +134,7 @@ def test_alert_text_has_money_burst_and_buttons():
 
 
 # ====================================================================== база
-async def hot_wallet(db, addr=ME, n=16, own=False, bundled=False, hours_ago=40.0):
+async def hot_wallet(db, addr=ME, n=16, own=False, bundled=False, hours_ago=20.0):
     """n монет: покупка → через 20 с чужая покупка на +40% (тейк A) → его продажа через 40 с."""
     now = datetime.now(timezone.utc)
     for i in range(n):
@@ -186,6 +186,9 @@ async def test_scan_finds_hot_wallet_once_and_skips_dev_and_bundles(db):
     assert r["followed_at"] is not None and (await db.kv_get("real:follow"))[ME] == "shadow"
     assert ME not in (await db.kv_get("real:follow_stake") or {})
     assert await H.Hunter(e).scan(now) == []
+    await db.execute("DELETE FROM hunter_wallets")
+    assert await H.Hunter(e).scan(now + 13 * 3600) == []                  # 27.11: 12+ ч без покупок — не берём
+    assert H.idle_reason(now - 3600, now) is None and H.idle_reason(None, now) == "нет покупок 12 ч"
 
 
 async def test_track_lists_copies_and_battle_gate(db):
@@ -194,7 +197,7 @@ async def test_track_lists_copies_and_battle_gate(db):
     await hot_wallet(db, ME, hours_ago=60)
     e = Engine(db, hunter_on=True)
     h = H.Hunter(e)
-    await h.scan(time.time())
+    await h.scan(time.time() - 44 * 3600)                                # поиск тогда, когда он торговал
     await db.execute("UPDATE hunter_wallets SET found_at = now() - interval '50 hours' WHERE address = $1", ME)
     await h.track(time.time())
     r = await db.fetchrow("SELECT list, n_after, avg_after, usd_day_after FROM hunter_wallets WHERE address = $1", ME)
@@ -231,7 +234,7 @@ async def test_archive_by_results_stops_shadow(db):
     await hot_wallet(db, ME, hours_ago=60)
     e = Engine(db, hunter_on=True)
     h = H.Hunter(e)
-    await h.scan(time.time())
+    await h.scan(time.time() - 44 * 3600)
     await db.execute("UPDATE hunter_wallets SET found_at = now() - interval '50 hours' WHERE address = $1", ME)
     monkey = H.ARCHIVE_MIN_N, H.WATCH_USD
     H.ARCHIVE_MIN_N, H.WATCH_USD = 3, 10_000.0
@@ -363,7 +366,7 @@ async def test_why_text_explains_each_buy_after_find(db):
     """/hunt why: покупки после находки и что с ними стало — модель, журнал копий, бот."""
     await hot_wallet(db, ME, hours_ago=60)
     e = Engine(db, hunter_on=True)
-    await H.Hunter(e).scan(time.time())
+    await H.Hunter(e).scan(time.time() - 44 * 3600)
     await db.execute("UPDATE hunter_wallets SET found_at = now() - interval '50 hours' WHERE address = $1", ME)
     mint = await db.fetchval("SELECT mint FROM trades WHERE trader = $1 AND is_buy AND ts > now() - interval '49 hours' "
                              "ORDER BY ts LIMIT 1", ME)
@@ -373,7 +376,7 @@ async def test_why_text_explains_each_buy_after_find(db):
     text = await H.why_text(db, NOPOOL)
     assert ME in text and "покупок после находки:" in text and "модель: с ценой" in text
     assert "бот: мелкий пул, не входим — 1" in text and "ни сигнала, ни пропуска бота" in text
-    assert "без фильтра пула с ценой было бы" in text
+    assert "без фильтра пула с ценой было бы" in text and "до находки последняя покупка" in text
     assert await H.why_text(db, NOPOOL, wallet="NOPE") == "Такого кошелька у охотника нет."
 
 
