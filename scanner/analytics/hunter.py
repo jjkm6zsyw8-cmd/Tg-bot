@@ -45,6 +45,7 @@ from typing import Any
 
 from ..alerts import format as fmt
 from . import copymodel as CM
+from . import farm as FARM
 from .paper import SCHEMES
 
 log = logging.getLogger(__name__)
@@ -427,6 +428,12 @@ def cool_reason(n: int, t: float, last_buy: float | None, since: float, now: flo
     return None
 
 
+async def archive_farm(db: Any, addr: str, why: str) -> None:
+    """Ферма — в архив навсегда (охотник её больше не предложит)."""
+    await db.execute("""UPDATE hunter_wallets SET list = 'archive', status = 'ignored', list_reason = $2, farm = $2,
+                            farm_at = now(), list_at = now() WHERE address = $1""", addr, why)
+
+
 def idle_reason(last_buy: float | None, now: float) -> str | None:
     """27.11: при находке кошелёк должен торговать — последняя покупка не старше COOL_IDLE_H (как в «остыл»): 25.11
     первый поиск нашёл 4 кошелька по окну 72 ч, у которых после находки не было ни одной сделки."""
@@ -479,6 +486,8 @@ class Hunter:
         since = now - WINDOW_H * 3600
         known = {r["address"]: r for r in await db.fetch("SELECT address, status, list, cooled_at FROM hunter_wallets")}
         hot = []
+        farms: list[tuple[str, str]] = []
+        unchecked = 0
         bar = bar_of(self.e.cfg)
         cands = await candidates(db, since, now, bar.min_coins)
         for c in cands:
@@ -493,13 +502,34 @@ class Hunter:
                 continue                    # 27.11: уже не торгует — «остыл» снял бы его через 12 ч без единой копии
             s = await evaluate(db, c["trader"], since, now, prm, cand=c)
             if s.hot(bar) is None:
+                # 27.11 (владелец): отсев ферм обязателен — создавал монеты, получал комиссию создателя или
+                # профинансировал больше 20 кошельков → архив «ферма»; не проверен (RPC) — в следующий час
+                farm, checked = await self.farm_check(c["trader"])
+                if farm:
+                    await upsert(db, s)
+                    await archive_farm(db, c["trader"], farm)
+                    farms.append((c["trader"], farm))
+                    continue
+                if not checked:
+                    unchecked += 1
+                    continue
                 hot.append(s)
                 await upsert(db, s)
+                await db.execute("UPDATE hunter_wallets SET farm_at = now() WHERE address = $1", c["trader"])
                 # 27.11 (владелец): всех найденных — сразу в тень (без денег) и «наблюдение»
                 await follow(db, self.e.cfg, self.e.costs(), c["trader"], "shadow")
                 await self.say(*alert_text(s, now, prm))
-        self.stats = {"at": now, "candidates": len(cands), "hot": len(hot)}
+        if farms:
+            await self.say(f"🚜 <b>Охотник: отсеяно ферм {len(farms)}</b> — в архив, за ними не повторяем:\n"
+                           + "\n".join(f"<code>{a}</code> — {fmt.esc(w)}" for a, w in farms[:10]))
+        self.stats = {"at": now, "candidates": len(cands), "hot": len(hot), "farms": len(farms),
+                      "farm_unchecked": unchecked}
         return hot
+
+    async def farm_check(self, addr: str) -> tuple[str | None, bool]:
+        rpc = getattr(self.e, "rpc", None)
+        over = getattr(self.e, "rpc_over_budget", None)
+        return await FARM.check(self.e.db, rpc, addr, over)
 
     # ------------------------------------------------------------------ после находки (A5, C2, B4)
     async def track(self, now: float, prm: Params | None = None) -> None:
@@ -508,6 +538,22 @@ class Hunter:
         rows = await db.fetch("SELECT * FROM hunter_wallets WHERE list <> 'archive' AND status <> 'ignored'")
         for r in rows:
             addr, start = r["address"], r["found_at"].timestamp()
+            if r["farm_at"] is None:
+                # 27.11: найденные до отсева ферм — проверить сейчас (ферма — снять тень, в архив)
+                farm, checked = await self.farm_check(addr)
+                if farm:
+                    from ..bot import board
+                    mine = addr in (await db.kv_get(board.UNTIL_KEY) or {})   # ты сам поставил /follow — не трогаю
+                    stopped = r["status"] in ("shadow", "live") and not mine
+                    if stopped:
+                        await follow(db, self.e.cfg, self.e.costs(), addr, None)
+                    await archive_farm(db, addr, farm)
+                    await self.say(f"🚜 <code>{addr}</code> — {fmt.esc(farm)}: в архив"
+                                   + (", копирование за ним снято." if stopped else
+                                      "; тень по твоему /follow оставил — сними сам, если согласен." if mine else "."))
+                    continue
+                if checked:
+                    await db.execute("UPDATE hunter_wallets SET farm_at = now() WHERE address = $1", addr)
             trades = await CM.wallet_trades(db, addr, start - 120, now)
             p = await CM.prepare(db, addr, trades, start, now, limit=100_000)
             rule = r["rule"] if r["rule"] in SCHEMES else "A"

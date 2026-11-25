@@ -720,6 +720,9 @@ CREATE TABLE IF NOT EXISTS hunter_copies (
     stake    double precision,
     PRIMARY KEY (address, mint, entry_at)
 );
+-- 27.11: отсев ферм (analytics/farm.py): причина и когда проверен
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS farm text;
+ALTER TABLE hunter_wallets ADD COLUMN IF NOT EXISTS farm_at timestamptz;
 -- 27.11: удержание копии — для «по монете один раз» (пока копия открыта, такая же покупка другого кошелька — мимо)
 ALTER TABLE hunter_copies ADD COLUMN IF NOT EXISTS hold_s double precision;
 -- 25.11: продажа без подписи не могла «лечь в блок» (списание «покупателей нет», токенов нет на счёте) — no_tx

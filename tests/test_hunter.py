@@ -147,9 +147,34 @@ async def hot_wallet(db, addr=ME, n=16, own=False, bundled=False, hours_ago=20.0
         await put_trade(db, m, addr, t + timedelta(seconds=40), False, 65, 1000 + i * 100 + 80)
 
 
+class FakeRpc:
+    """RPC для отсева ферм: подписи и транзакции кошельков (по умолчанию — пусто, кошелёк чистый)."""
+    def __init__(self, sigs=None, txs=None):
+        self.sigs, self.txs, self.calls = sigs or {}, txs or {}, 0
+
+    async def signatures_for(self, addr, limit=100, before=None, until=None):
+        self.calls += 1
+        return self.sigs.get(addr, [])
+
+    async def transaction(self, sig):
+        self.calls += 1
+        return self.txs.get(sig)
+
+
+def transfer_tx(src, dst, extra_program=None):
+    ixs = [{"programId": "ComputeBudget111111111111111111111111111111", "parsed": None},
+           {"programId": "11111111111111111111111111111111", "program": "system",
+            "parsed": {"type": "transfer", "info": {"source": src, "destination": dst, "lamports": 10_000_000}}}]
+    if extra_program:
+        ixs.append({"programId": extra_program, "accounts": [], "data": ""})
+    return {"meta": {"err": None, "logMessages": []}, "transaction": {"message": {
+        "accountKeys": [{"pubkey": src, "signer": True}], "instructions": ixs}}}
+
+
 class Engine:
-    def __init__(self, db, **cfg):
+    def __init__(self, db, rpc=None, **cfg):
         self.db, self._cfg, self.sent = db, {"trader_min_trades_30d": 5, "real_min_pool_sol": 0, **cfg}, []
+        self.rpc = rpc if rpc is not None else FakeRpc()
         orig = db.enqueue
 
         async def enqueue(kind, payload, priority=5):
@@ -420,3 +445,73 @@ async def test_removewallet_by_prefix_also_stops_shadow(db):
     act = {r["address"]: r["active"] for r in await db.fetch("SELECT address, active FROM traders")}
     assert act == {a: False, b: False, c: True, d: True}
     assert await db.kv_get("real:follow") == {c: "shadow"}
+
+
+
+# ====================================================================== 27.11: отсев ферм
+def test_farm_scan_tx_counts_only_plain_transfers_and_fee_claims():
+    from scanner.analytics import farm as F
+    assert F.scan_tx(transfer_tx("ME", "W1"), "ME")["to"] == {"W1"}
+    pump = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+    assert F.scan_tx(transfer_tx("ME", "TIP", pump), "ME")["to"] == set()          # перевод внутри сделки — не в счёт
+    assert F.scan_tx(transfer_tx("OTHER", "ME"), "ME")["to"] == set()              # входящий — не в счёт
+    fee = transfer_tx("ME", "X", pump)
+    fee["meta"]["logMessages"] = [f"Program {pump} invoke [1]", "Program log: Instruction: CollectCreatorFee"]
+    assert F.scan_tx(fee, "ME")["fee"] and not F.scan_tx(fee, "OTHER")["fee"]
+
+
+async def test_farm_check_db_and_rpc(db):
+    from scanner.analytics import farm as F
+    w = "FARM" + "1" * 40
+    assert await F.check(db, FakeRpc(), w) == (None, True)
+    assert await F.check(db, None, w) == (None, False)                             # без RPC — не проверен
+    sigs = [{"signature": f"s{i}", "err": None} for i in range(25)]
+    rpc = FakeRpc({w: sigs}, {f"s{i}": transfer_tx(w, f"D{i}") for i in range(25)})
+    why, done = await F.check(db, rpc, w)
+    assert done and why == "ферма: профинансировал 21+ кошельков" and rpc.calls == 22     # остановился на 21-м
+    await db.execute("INSERT INTO tokens(mint, signature, deployer, current_owner, created_at, initial_mc_sol, source) "
+                     "VALUES ('FM', 'sFM', $1, $1, now(), 28, 'rpc')", w)
+    assert await F.check(db, FakeRpc(), w) == ("ферма: создал монет 1", True)
+    assert (await F.check(db, FakeRpc(), w, over_budget=lambda: True))[0]          # по базе — и без бюджета
+
+
+async def test_scan_archives_farm_and_track_drops_old_farm(db):
+    """Ферма при находке — в архив «ферма», без тени и алерта о находке; найденный раньше — проверка в track."""
+    await hot_wallet(db, ME)
+    sigs = [{"signature": f"f{i}", "err": None} for i in range(30)]
+    rpc = FakeRpc({ME: sigs}, {f"f{i}": transfer_tx(ME, f"D{i}") for i in range(30)})
+    e = Engine(db, rpc=rpc, hunter_on=True)
+    h = H.Hunter(e)
+    assert await h.scan(time.time()) == [] and h.stats["farms"] == 1
+    r = await db.fetchrow("SELECT list, status, farm FROM hunter_wallets WHERE address = $1", ME)
+    assert r["list"] == "archive" and r["status"] == "ignored" and r["farm"].startswith("ферма: профинансировал")
+    assert ME not in (await db.kv_get("real:follow") or {})
+    assert any("отсеяно ферм 1" in p["text"] for p in e.sent) and not any("горячий кошелёк" in p["text"] for p in e.sent)
+    assert await h.scan(time.time()) == []                                         # больше не предлагает
+    # найден до отсева ферм (farm_at пусто), в тени → track проверяет, снимает тень
+    await db.execute("UPDATE hunter_wallets SET list = 'watch', status = 'new', farm = NULL, farm_at = NULL")
+    await H.follow(db, e.cfg, Costs(), ME, "shadow")
+    await h.track(time.time())
+    r = await db.fetchrow("SELECT list, status, farm FROM hunter_wallets WHERE address = $1", ME)
+    assert r["list"] == "archive" and r["status"] == "ignored" and ME not in (await db.kv_get("real:follow") or {})
+    assert any("🚜" in p["text"] and "снято" in p["text"] for p in e.sent)
+    # свой /follow (со сроком) проверка не снимает — только сообщает
+    from scanner.bot import board
+    await db.execute("UPDATE hunter_wallets SET list = 'watch', status = 'shadow', farm = NULL, farm_at = NULL")
+    await H.follow(db, e.cfg, Costs(), ME, "shadow")
+    await board.set_follow_rule(db, ME, "G", time.time() + 3 * 86400)
+    await h.track(time.time())
+    assert (await db.kv_get("real:follow"))[ME] == "shadow"
+    assert any("оставил" in p["text"] for p in e.sent)
+
+
+async def test_scan_waits_when_farm_check_incomplete(db):
+    await hot_wallet(db, ME)
+    e = Engine(db, hunter_on=True)
+    e.rpc = None                                                                    # узел не ответил
+    h = H.Hunter(e)
+    assert await h.scan(time.time()) == [] and h.stats["farm_unchecked"] == 1
+    assert not await db.fetchval("SELECT count(*) FROM hunter_wallets")              # в следующий час — снова
+    e.rpc = FakeRpc()
+    assert [s.address for s in await h.scan(time.time())] == [ME]
+    assert await db.fetchval("SELECT farm_at IS NOT NULL FROM hunter_wallets WHERE address = $1", ME)
