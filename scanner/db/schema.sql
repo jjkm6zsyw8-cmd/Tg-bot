@@ -720,10 +720,18 @@ CREATE TABLE IF NOT EXISTS hunter_copies (
     stake    double precision,
     PRIMARY KEY (address, mint, entry_at)
 );
--- 27.11: весь рынок из pumpdata.fun (ingest/pumpdata.py) — только охотник и модели, в сигналы бота не идёт
+-- 27.11: весь рынок из pumpdata.fun (ingest/pumpdata.py) — только охотник и модели, в сигналы бота не идёт.
+-- Первая версия таблицы (ключ slot+idx) теряла вторую сделку одной транзакции — пересоздаётся (в ней минуты данных)
+DO $$ BEGIN
+    IF to_regclass('market_trades') IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM information_schema.columns WHERE table_name = 'market_trades' AND column_name = 'sub') THEN
+        DROP TABLE market_trades;
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS market_trades (
     slot         bigint NOT NULL,
     idx          integer NOT NULL,
+    sub          bigint NOT NULL,
     ts           timestamptz NOT NULL,
     mint         text NOT NULL,
     trader       text NOT NULL,
@@ -732,7 +740,7 @@ CREATE TABLE IF NOT EXISTS market_trades (
     token_amount double precision,
     mc_sol       double precision,
     pool         text,
-    PRIMARY KEY (slot, idx)
+    PRIMARY KEY (slot, idx, sub)
 );
 CREATE INDEX IF NOT EXISTS market_trades_trader_idx ON market_trades (trader, ts);
 CREATE INDEX IF NOT EXISTS market_trades_mint_idx ON market_trades (mint, ts);

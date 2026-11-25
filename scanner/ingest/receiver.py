@@ -202,7 +202,7 @@ class Receiver:
         что ведёт слежка Helius (кошельки и монеты — там быстрее и с подписью)."""
         if not self.pp_silent():
             return False
-        mint, wallet = row[3], row[4]
+        mint, wallet = row.mint, row.wallet
         if self.watch is not None and (wallet in self.watch.want or mint in self.watch.want):
             return False
         born = self.known_mints.get(mint)

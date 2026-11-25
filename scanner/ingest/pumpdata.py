@@ -23,9 +23,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import zlib
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import websockets
 
@@ -37,7 +38,23 @@ log = logging.getLogger(__name__)
 TOTAL_SUPPLY = 1_000_000_000.0
 MAX_QUEUE = 200_000
 BATCH = 5_000
-Row = tuple[int, int, datetime, str, str, bool, float, float, float, str]
+WSOL = "So11111111111111111111111111111111111111112"
+
+
+class Row(NamedTuple):
+    """Строка market_trades. 27.11 (проверка живого потока): idx — номер транзакции в блоке, в одной транзакции бывает
+    несколько сделок (бандл) — sub отличает их (crc32 монеты, кошелька, стороны и токенов)."""
+    slot: int
+    idx: int
+    sub: int
+    ts: datetime
+    mint: str
+    wallet: str
+    is_buy: bool
+    sol: float
+    tokens: float
+    mc: float
+    pool: str
 
 
 def _ts(v: Any) -> datetime:
@@ -54,15 +71,22 @@ def _ts(v: Any) -> datetime:
 
 
 def parse(msg: Any) -> Row | None:
-    """Сделка потока → строка market_trades: (slot, idx, ts, mint, кошелёк, покупка, SOL, токенов, MC в SOL, пул)."""
-    if not isinstance(msg, dict) or msg.get("type") != "trade" or msg.get("quote_mint"):
+    """Сделка потока → строка market_trades. Пул в другой валюте — мимо; у пулов к SOL quote_mint = WSOL (сумма в
+    `sol`, quote_amount — в лампортах); «монета» WSOL (арбитраж SOL↔SOL на тысячи SOL) — мимо."""
+    if not isinstance(msg, dict) or msg.get("type") != "trade":
         return None
+    quote = msg.get("quote_mint")
     mint, wallet, slot, idx = msg.get("mint"), msg.get("wallet"), msg.get("slot"), msg.get("idx")
+    if (quote and quote != WSOL) or mint == WSOL:
+        return None
     side = str(msg.get("side") or "").lower()
     if not mint or not wallet or slot is None or idx is None or side not in ("buy", "sell", "b", "s"):
         return None
     try:
-        sol, tok = float(msg.get("sol") or 0), float(msg.get("token_amount") or 0)
+        sol = msg.get("sol")
+        if sol is None and quote == WSOL and msg.get("quote_amount") is not None:
+            sol = float(msg["quote_amount"]) / 1e9
+        sol, tok = float(sol or 0), float(msg.get("token_amount") or 0)
     except (TypeError, ValueError):
         return None
     if sol > 1e5:
@@ -73,8 +97,9 @@ def parse(msg: Any) -> Row | None:
         return None
     venue = str(msg.get("venue") or "").lower()
     pool = "pump-amm" if ("swap" in venue or "amm" in venue) else "pump"
-    return (int(slot), int(idx), _ts(msg.get("block_time") or msg.get("ts")), str(mint), str(wallet),
-            side in ("buy", "b"), sol, tok, sol / tok * TOTAL_SUPPLY, pool)
+    sub = zlib.crc32(f"{mint}|{wallet}|{side}|{msg.get('token_amount')}".encode())
+    return Row(int(slot), int(idx), sub, _ts(msg.get("block_time") or msg.get("ts")), str(mint), str(wallet),
+               side in ("buy", "b"), sol, tok, sol / tok * TOTAL_SUPPLY, pool)
 
 
 def curve_reserves(sol: float, tokens: float, is_buy: bool,
@@ -93,14 +118,14 @@ def curve_reserves(sol: float, tokens: float, is_buy: bool,
 
 
 def to_trade(row: Row) -> Trade:
-    """Строка потока → событие сделки основного потока (подпись условная: pd:блок:номер)."""
-    slot, idx, ts, mint, wallet, is_buy, sol, tok, mc, pool = row
+    """Строка потока → событие сделки основного потока (подпись условная: pd:блок:номер:сделка)."""
+    slot, idx, sub, ts, mint, wallet, is_buy, sol, tok, mc, pool = row
     if pool == "pump":
         v_sol, v_tok = curve_reserves(sol, tok, is_buy)
         real = max(0.0, v_tok - 279_900_000.0)
     else:
         v_sol, v_tok, real = mc, TOTAL_SUPPLY, None
-    return Trade(signature=f"pd:{slot}:{idx}", mint=mint, trader=wallet, is_buy=is_buy, sol_amount=sol,
+    return Trade(signature=f"pd:{slot}:{idx}:{sub}", mint=mint, trader=wallet, is_buy=is_buy, sol_amount=sol,
                  token_amount=tok, v_sol=v_sol, v_tokens=v_tok, real_tokens=real, pool=pool, slot=slot, ts=ts,
                  source="pumpdata", received_at=datetime.now(timezone.utc))
 
@@ -142,7 +167,7 @@ class PumpDataStream:
             if self.feed is not None and self.route is not None and self.route(row):
                 self.feed(to_trade(row))
                 self.fed += 1
-            if row[6] < self.min_sol:
+            if row.sol < self.min_sol:
                 continue
             if len(self.queue) >= MAX_QUEUE:
                 self.dropped += 1
@@ -175,8 +200,9 @@ class PumpDataStream:
             return 0
         rows = [self.queue.popleft() for _ in range(min(len(self.queue), BATCH))]
         await self.db.p.executemany(
-            """INSERT INTO market_trades(slot, idx, ts, mint, trader, is_buy, sol_amount, token_amount, mc_sol, pool)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (slot, idx) DO NOTHING""", rows)
+            """INSERT INTO market_trades(slot, idx, sub, ts, mint, trader, is_buy, sol_amount, token_amount, mc_sol,
+                                         pool)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (slot, idx, sub) DO NOTHING""", rows)
         self.rows += len(rows)
         if self.on_rows is not None:
             self.on_rows(len(rows))
