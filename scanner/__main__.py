@@ -36,6 +36,11 @@ def setup_logging(level: str, name: str) -> None:
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 
+# разовые команды (run_tool): новая команда — и сюда, иначе «неизвестная команда» (tests/test_cli.py)
+TOOLS = ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
+         "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat")
+
+
 async def main(cmd: str) -> None:
     env = load_env()
     settings = Settings(YamlConfig(env.config_path))
@@ -44,8 +49,7 @@ async def main(cmd: str) -> None:
     if cmd == "migrate":
         await db.close()
         return
-    if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-               "patterns", "dips", "whynot", "migration", "research", "copycheck"):
+    if cmd in TOOLS:
         await run_tool(cmd, db)
         await db.close()
         return

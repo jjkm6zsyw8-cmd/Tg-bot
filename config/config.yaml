@@ -109,7 +109,7 @@ links:
   solscan_token: "https://solscan.io/token/{mint}"
   solscan_wallet: "https://solscan.io/account/{wallet}"
   # true — кнопка ведёт прямо на pump_web (если проверено, что ссылка сама открывает приложение)
-  use_direct_pump_link: false
+  use_direct_pump_link: true
 
 # Известные адреса бирж: цепочка вывода SOL на них обрывается.
 # Дополнительно работает эвристика: кошелёк с очень большим числом транзакций считается сервисом.
