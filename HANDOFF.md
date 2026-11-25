@@ -702,3 +702,15 @@ C, D, E, F новых сделок не открывают. Копии свое�
 - `python -m scanner jupcheck [--days N] [--lp 0.9]` (`real/jupcheck.py`): сделки trendj / majorj (тень и бой) с
   фильтрами — все, LP нет данных (до 24.11), LP открыт, LP закрыт, и LP закрыт + пул старше N = 0/1/3/6/12/24 ч: сделок,
   средний %, SOL, $, в плюсе, раги; по сделкам боя — почему отсеялись бы. С даты «считать с нуля», если она задана.
+- 25.11 (владелец): признаки входа трендов — на каждом входе `trend` и `trendj` (тень и бой) после записи позиции
+  фоном (`executor._features_safe`, покупку не задерживает) пишется `real_positions.extra.feat` (`real/features.py`):
+  кластер дева и создатель (GMGN `stat.dev_team_hold_rate`, `creator_hold_rate`), топ-10 (GMGN; `sig_top10` — наш RPC
+  на сигнале), продажи дева / инсайдеров (`rat_trader`) / бандлов / снайперов — держат сейчас, доля проданного из
+  купленного, кошельков (GMGN `token_top_traders` с меткой, `adapters.summarize_tagged`), доля объёма бандлов,
+  холдеры, рост за 5 и 30 мин до входа (минутные свечи GeckoTerminal пула сигнала; 5 мин запасной — GMGN), объём за
+  5 мин / SOL в пуле (pump.fun — из сети, иначе GMGN `pool.quote_reserve`), возраст монеты и сколько с переезда
+  (GMGN `launchpad_status`, `pool.creation_timestamp`; запасной — возраст пары PumpSwap), поля сигнала (`sig_*`).
+  `src` — какие источники ответили. GMGN на вход: info (1) + security (1) + 4 × traders (5) = 22 веса.
+  Выгрузка: `python -m scanner trendfeat [--compare] [--days N] [--kind trend|trendj] [--mode shadow|live]`
+  (`real/featexport.py`: CSV или медианы признаков у растущих (итог > 0) и падающих). Тренды pump.fun (`trend`)
+  по-прежнему в `RETIRED` — входов нет; признаки пишутся у `trendj`.

@@ -34,7 +34,7 @@ from solders.pubkey import Pubkey
 from ..alerts import format as fmt
 from ..analytics.paper import (BIGCOPY, MAIN, MYDEV, SCHEMES, SCOUT, SMART_SET, SWING, TINY_REBUY_SOL, TREND,
                                Position, decide_exit, sell_fill)
-from . import jupswap, pump, pumpswap, settings as S, tx as rtx
+from . import features, jupswap, pump, pumpswap, settings as S, tx as rtx
 from .keys import Wallet, load_wallet
 
 if TYPE_CHECKING:
@@ -213,6 +213,7 @@ class RealTrader:
         self.lost: dict[str, float] = {}            # монета → время убыточного выхода
         self.to_close: dict[str, tuple[str, float, int]] = {}   # монета → (программа токена, когда, попытка)
         self._busy: dict[str, str] = {}             # монета → режим: по ней сейчас идёт вход
+        self._feat_ctx: dict[str, dict[str, Any]] = {}   # 25.11: монета → сигнал тренда для признаков входа
         self._sweeping = False
         self._checking = False
         self._last_poll = 0.0
@@ -594,6 +595,7 @@ class RealTrader:
             self._skip(mode, kind, f"сбой: {type(exc).__name__}")
         finally:
             self._busy.pop(mint, None)
+            getattr(self, "_feat_ctx", {}).pop(mint, None)
 
     def entry_block(self, mint: str, kind: str, mode: str, data: dict[str, Any]) -> str | None:
         """Причина не входить (до запросов к сети) или None."""
@@ -882,6 +884,9 @@ class RealTrader:
                           and data.get("trigger_ts") else None)}
         if base["best_exit"]:
             base["rule"] = base["best_exit"]       # «за ним» — продаём по его лучшему выходу (wallet_rules)
+        if trend:
+            liq = getattr(st.get("curve") or st.get("pool"), "liquidity_sol", None)
+            self._feat_ctx[mint_s] = {"data": data, "chain_sol": liq, "on_curve": st["venue"] == "pump"}
         if mode == "live":
             await self._buy_live(st, mint, base, expected, bh)
         else:
@@ -1128,6 +1133,8 @@ class RealTrader:
                 "holders": holders, "top10": top10, "creator": creator,
                 "pool": (rc or {}).get("market") or (data.get("trend") or {}).get("pair"),
                 "market": (rc or {}).get("market_type"), "target_mc": None, "dec": dec}
+        if kind == "trendj":
+            self._feat_ctx[mint_s] = {"data": data, "chain_sol": None, "on_curve": None, "rug": rc}
         if mode == "live":
             if dec is None:
                 return self._skip("live", kind, "другая биржа: Jupiter не сообщил знаки токена")
@@ -1598,6 +1605,19 @@ class RealTrader:
         sol = q["out"] / 1e9
         return max(0.0, sol - self.fees_sol()), sol / (raw6 / 1e6) * 1e9
 
+    async def _features_safe(self, pid: int, mint: str, ctx: dict[str, Any]) -> None:
+        """Снимок монеты на входе тренда → real_positions.extra.feat (features.py)."""
+        ext = getattr(self.e, "ext", None)
+        if ext is None:
+            return
+        try:
+            f = await features.collect(ext, mint, ctx["data"], self.sol_usd(), chain_sol=ctx.get("chain_sol"),
+                                       on_curve=ctx.get("on_curve"), rug=ctx.get("rug"))
+            await self.db.execute("UPDATE real_positions SET extra = extra || jsonb_build_object('feat', $2::jsonb) "
+                                  "WHERE id = $1", pid, f)
+        except Exception:  # noqa: BLE001 — признаки не должны мешать торговле
+            log.exception("реальный бот: признаки входа %s", mint)
+
     def _mark_no_route(self, mint: str, amount: int | None = None) -> None:
         if not hasattr(self, "_no_route"):
             self._no_route: dict[str, float] = {}
@@ -1783,6 +1803,10 @@ class RealTrader:
                    "token_program": base["token_program"], "tokens_raw": tokens_raw, "rent": rent_sol,
                    "last_mc": entry_mc, "entry_slot": slot, "best_exit": base.get("best_exit"),
                    "dec": base.get("dec"), "creator": base.get("creator"), "pool": base.get("pool")})
+        ctx = getattr(self, "_feat_ctx", {}).pop(base["mint"], None)
+        if ctx is not None and pid is not None:
+            # 25.11 (владелец): признаки входа тренда — фоном, покупку не задерживают
+            asyncio.create_task(self._features_safe(pid, base["mint"], ctx))
         if self.get("real_rule_trials"):
             try:
                 await self._open_trials(base, pid, entry_mc, cost_sol - rent_sol, tokens_raw, slot)

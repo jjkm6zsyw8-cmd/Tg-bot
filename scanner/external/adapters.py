@@ -185,6 +185,25 @@ class Gmgn(ExternalSource):
             return parse_gmgn_security(await self._get("/v1/token/security", {"chain": "sol", "address": mint}, 1))
         return await self.cached("security", mint, TTL_SECURITY, fetch)
 
+    async def token_info(self, mint: str) -> dict[str, Any] | None:
+        """25.11: GMGN token/info — холдеры, топ-10, доля команды дева, метки кошельков, пул, время создания и переезда
+        (снимок на вход: кеш 60 с)."""
+        async def fetch() -> dict[str, Any] | None:
+            return parse_gmgn_info(await self._get("/v1/token/info", {"chain": "sol", "address": mint}, 1))
+        return await self.cached("info", mint, 60, fetch)
+
+    async def tagged_traders(self, mint: str, tag: str, limit: int = 100) -> dict[str, Any] | None:
+        """25.11: трейдеры монеты с меткой GMGN (dev, rat_trader, sniper, bundler) — сводка: кошельков, доля выпуска у
+        них сейчас, доля проданного из купленного (вес 5)."""
+        async def fetch() -> dict[str, Any] | None:
+            data = await self._get("/v1/market/token_top_traders",
+                                   {"chain": "sol", "address": mint, "tag": tag, "limit": limit}, 5)
+            if data is None:
+                return None
+            rows = (data or {}).get("list") if isinstance(data, dict) else data
+            return summarize_tagged(rows or [])
+        return await self.cached(f"traders_{tag}", mint, 60, fetch)
+
     async def holder_tags(self, mint: str) -> dict[str, Any] | None:
         """Сколько смарт-мани и KOL среди холдеров (теги smart_degen, renowned)."""
         async def fetch() -> dict[str, Any] | None:
@@ -240,7 +259,65 @@ def parse_gmgn_security(d: Any) -> dict[str, Any] | None:
         "rug_ratio": _f(d.get("rug_ratio")),
         "sniper_count": d.get("sniper_count"),
         "creator_token_status": d.get("creator_token_status"),
+        # 25.11: признаки входа трендов
+        "dev_team_hold_rate": _f(d.get("dev_team_hold_rate")),
+        "creator_balance_rate": _f(d.get("creator_balance_rate")),
+        "insider_hold_rate": _f(d.get("suspected_insider_hold_rate")),
+        "bundler_volume_rate": _f(d.get("bundler_trader_amount_rate")),
+        "insider_volume_rate": _f(d.get("rat_trader_amount_rate")),
+        "burn_status": d.get("burn_status"),
     }
+
+
+def parse_gmgn_info(d: Any) -> dict[str, Any] | None:
+    """GMGN token/info → плоский словарь (доли 0–1, время — Unix-секунды)."""
+    if not isinstance(d, dict):
+        return None
+    stat, tags, pool, dev, price = (d.get(k) if isinstance(d.get(k), dict) else {}
+                                    for k in ("stat", "wallet_tags_stat", "pool", "dev", "price"))
+    holders = d.get("holder_count") if d.get("holder_count") is not None else stat.get("holder_count")
+    return {
+        "holders": int(_f(holders)) if _f(holders) is not None else None,
+        "top10": _f(stat.get("top_10_holder_rate")) if stat.get("top_10_holder_rate") is not None
+        else _f(dev.get("top_10_holder_rate")),
+        "dev_team_hold": _f(stat.get("dev_team_hold_rate")),
+        "creator_hold": _f(stat.get("creator_hold_rate")),
+        "creator_status": dev.get("creator_token_status"),
+        "creator": dev.get("creator_address"),
+        "bundler_volume": _f(stat.get("top_bundler_trader_percentage")),
+        "insider_volume": _f(stat.get("top_rat_trader_percentage")),
+        "fresh_rate": _f(stat.get("fresh_wallet_rate")),
+        "snipers_n": _f(tags.get("sniper_wallets")),
+        "bundlers_n": _f(tags.get("bundler_wallets")),
+        "insiders_n": _f(tags.get("rat_trader_wallets")),
+        "created_ts": _f(d.get("creation_timestamp")),
+        "open_ts": _f(d.get("open_timestamp")),
+        "launchpad": d.get("launchpad"),
+        "launchpad_status": _f(d.get("launchpad_status")),
+        "migrated_pool": d.get("migrated_pool"),
+        "pool": pool.get("pool_address"),
+        "pool_exchange": pool.get("exchange"),
+        "pool_created_ts": _f(pool.get("creation_timestamp")),
+        "pool_quote": pool.get("quote_symbol"),
+        "pool_quote_reserve": _f(pool.get("quote_reserve")),
+        "pool_quote_usd": _f(pool.get("quote_reserve_value")),
+        "liq_usd": _f(d.get("liquidity")),
+        "price": _f(price.get("price")),
+        "price_5m": _f(price.get("price_5m")),
+        "price_1h": _f(price.get("price_1h")),
+        "volume_5m": _f(price.get("volume_5m")),
+    }
+
+
+def summarize_tagged(rows: list[Any]) -> dict[str, Any]:
+    """Сводка трейдеров с одной меткой: кошельков, доля выпуска у них сейчас, доля проданного из купленного,
+    сколько вышли целиком."""
+    rows = [r for r in rows if isinstance(r, dict) and str(r.get("addr_type")) != "2"]   # без бирж и пулов
+    bought = sum(_f(r.get("buy_amount_cur")) or 0.0 for r in rows)
+    sold = sum(_f(r.get("sell_amount_cur")) or 0.0 for r in rows)
+    return {"n": len(rows), "hold": sum(_f(r.get("amount_percentage")) or 0.0 for r in rows),
+            "sold": min(1.0, sold / bought) if bought > 0 else (1.0 if sold > 0 else 0.0) if rows else None,
+            "exited": sum(1 for r in rows if (_f(r.get("sell_amount_percentage")) or 0.0) >= 0.99)}
 
 
 def parse_gmgn_trader(r: dict[str, Any]) -> dict[str, Any]:

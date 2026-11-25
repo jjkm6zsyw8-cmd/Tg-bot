@@ -246,6 +246,15 @@ async def run_tool(cmd: str, db: Database) -> None:
         days = float(args[args.index("--days") + 1]) if "--days" in args else None
         lp = float(args[args.index("--lp") + 1]) if "--lp" in args else 0.9
         print(await jup_run(db, lp, days))
+    elif cmd == "trendfeat":
+        # 25.11: признаки входа трендов: python -m scanner trendfeat [--compare] [--days N] [--kind trend|trendj]
+        # [--mode shadow|live] (CSV — в stdout: … > /opt/tg-bot/trend_feat.csv)
+        from .real.featexport import compare, load, to_csv
+        days = float(args[args.index("--days") + 1]) if "--days" in args else None
+        kind = args[args.index("--kind") + 1] if "--kind" in args else None
+        mode = args[args.index("--mode") + 1] if "--mode" in args else None
+        rows = await load(db, days, kind, mode)
+        print(compare(rows) if "--compare" in args else to_csv(rows).rstrip("\n"))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

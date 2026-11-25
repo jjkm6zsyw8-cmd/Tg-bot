@@ -25,3 +25,13 @@ def _mechanics(request, monkeypatch):
     if request.node.get_closest_marker("policy") is None:
         monkeypatch.setattr(S, "RETIRED", frozenset())
         monkeypatch.setattr(pp, "PAPER_TRADING", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_gecko(monkeypatch):
+    """25.11: признаки входа трендов берут свечи GeckoTerminal — в тестах без сети."""
+    from scanner.real import features
+
+    async def no_candles(pool, http=None):
+        return None
+    monkeypatch.setattr(features, "gecko_candles", no_candles)

@@ -322,6 +322,20 @@ class ExternalHub:
         _ok, v = await self._call(self.jupiter, self.jupiter.tokens(category, interval, limit), 9.0)
         return v or []
 
+    async def gmgn_token_info(self, mint: str) -> dict[str, Any] | None:
+        """GMGN token/info (разобранный) или None."""
+        _ok, v = await self._call(self.gmgn, self.gmgn.token_info(mint), 8.0)
+        return v
+
+    async def gmgn_security(self, mint: str) -> dict[str, Any] | None:
+        _ok, v = await self._call(self.gmgn, self.gmgn.token_security(mint), 8.0)
+        return v
+
+    async def gmgn_tagged(self, mint: str, tag: str) -> dict[str, Any] | None:
+        """Сводка трейдеров монеты с меткой GMGN (dev, rat_trader, sniper, bundler) или None."""
+        _ok, v = await self._call(self.gmgn, self.gmgn.tagged_traders(mint, tag), 10.0)
+        return v
+
     async def rug_report(self, mint: str) -> dict[str, Any] | None:
         """Отчёт RugCheck (разобранный, с долей заблокированной ликвидности главного пула) или None."""
         _ok, v = await self._call(self.rugcheck, self.rugcheck.report(mint), 6.0)
