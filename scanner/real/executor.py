@@ -126,7 +126,12 @@ LIVE_CHECK_N, LIVE_CHECK_MIN, LIVE_GAP = 12, 8, 0.05   # сверка боя Jup
 # Jupiter «маршрута нет», продать некому. Тень в таком случае писала выход по последней цене (завышала итог) — теперь:
 NO_ROUTE = "покупателей нет: Jupiter не находит маршрут (ликвидность убрали?)"
 NO_ROUTE_KEEP_S = 1800.0              # монета без маршрута: столько помним (пробы и тень — по нулю)
-RUG_WRITE_OFF_S = 600.0               # бой: покупателей нет столько — позиция списывается в ноль (токены остаются)
+# 25.11 (владелец, позиции 1847 и 1863): «покупателей нет» больше НЕ закрывает боевую позицию как rug −100% —
+# позиция остаётся открытой, бот повторяет продажу и пишет владельцу. Раньше через 10 мин бот списывал её в ноль
+# и записывал продажу «landed» без подписи (транзакции не было)
+NO_ROUTE_RETRY_S = 30.0               # бой: покупателей нет — повтор продажи через столько
+NO_ROUTE_ALERT_S = 1800.0             # …и напоминание владельцу не чаще раза в столько
+STALE_ALERT_REPEAT_S = 1800.0         # бой: цена позиции не обновляется — повтор алерта не чаще раза в столько
 # 24.11: плюс «заблокированных» пулов в бумаге дали клоны (JENSEN, Green cat, MARS…): пул PumpSwap с заблокированной
 # ликвидностью, но 9–31 держатель — создатель продаёт свои монеты в пул и выкачивает весь SOL. На деньги — только монеты
 # с живой аудиторией: держателей от TRENDJ_MIN_HOLDERS и топ-10 (без пулов и локеров) не больше TRENDJ_MAX_TOP10
@@ -873,6 +878,10 @@ class RealTrader:
 
     async def _order(self, pid: int | None, base: dict[str, Any], side: str, status: str, **kw: Any) -> int | None:
         """Запись заявки в журнал. Возвращает её номер (None — запись не удалась)."""
+        if status == "landed" and not kw.get("signature"):
+            # 25.11: заявка без подписи не может «лечь в блок» — транзакции не было
+            log.error("реальный бот: заявка %s без подписи записана бы как landed — пишу no_tx", base.get("mint"))
+            status = "no_tx"
         try:
             return await self.db.fetchval(
                 """INSERT INTO real_orders(position_id, mode, side, mint, stake_sol, tokens_raw, min_out, slippage,
@@ -891,7 +900,8 @@ class RealTrader:
             return
         try:
             await self.db.execute(
-                """UPDATE real_orders SET status=$2, error=$3, slot=COALESCE($4, slot), wait_ms=COALESCE($5, wait_ms),
+                """UPDATE real_orders SET status=CASE WHEN $2 = 'landed' AND signature IS NULL THEN 'no_tx' ELSE $2 END,
+                       error=$3, slot=COALESCE($4, slot), wait_ms=COALESCE($5, wait_ms),
                        fee_sol=COALESCE($6, fee_sol), tokens_raw=COALESCE($7, tokens_raw),
                        position_id=COALESCE($8, position_id), note=COALESCE($9, note) WHERE id=$1""",
                 oid, status, (str(kw["error"])[:300] if kw.get("error") else None), kw.get("slot"), kw.get("wait_ms"),
@@ -1338,6 +1348,7 @@ class RealTrader:
         last_mc = float(p.extra.get("last_mc") or p.entry_mc)
         if p.extra.get("stuck") and await self._prior_sell(p):
             return
+        r: dict[str, Any] = {}
         for attempt, k in enumerate(SELL_SLIPPAGE_STEPS, 1):
             if attempt > 1 and await self._prior_sell(p):
                 return
@@ -1368,35 +1379,36 @@ class RealTrader:
                 await self.refresh_balance(force=True)
                 return
             if r.get("why") == NO_ROUTE:
-                since = float(p.extra.setdefault("no_route_since", time.time()))
-                if time.time() - since >= RUG_WRITE_OFF_S:
-                    await self._write_off_rug(p, last_mc)
-                    return
+                p.extra.setdefault("no_route_since", time.time())
+                break                                  # шире лимит проскальзывания не поможет: продать некому
             if not r.get("sent"):
                 await asyncio.sleep(UNTRADABLE_RETRY_S)  # котировки нет / проверка не сошлась — повтор с лимитом шире
         if await self._prior_sell(p):
             return
         p.closing = False
-        p.extra["retry_at"] = time.time() + 20
+        now = time.time()
+        if r.get("why") == NO_ROUTE:
+            # 25.11: покупателей нет — позиция ОСТАЁТСЯ открытой (в ноль не списываем, токены на кошельке), продажа
+            # повторяется, владельцу — алерт сразу и напоминание раз в NO_ROUTE_ALERT_S
+            p.extra["retry_at"] = now + NO_ROUTE_RETRY_S
+            since = float(p.extra.get("no_route_since") or now)
+            if now - float(p.extra.get("no_route_alert_at") or 0) >= NO_ROUTE_ALERT_S:
+                p.extra["no_route_alert_at"] = now
+                mins = (now - since) / 60
+                await self._say(f"🆘 💵 Покупателей нет: ${fmt.esc(p.symbol or '?')} ({EXIT_NAMES.get(reason, reason)}) — "
+                                f"Jupiter не находит маршрут продажи{f' уже {mins:.0f} мин' if mins >= 1 else ''}. "
+                                f"Позиция открыта, в ноль не списываю, токены на кошельке. Повторяю продажу каждые "
+                                f"{NO_ROUTE_RETRY_S:.0f} с, напишу, когда продам. Монета: <code>{p.mint}</code>")
+            return
+        p.extra.pop("no_route_since", None)
+        p.extra["retry_at"] = now + 20
         p.extra["stuck"] = int(p.extra.get("stuck") or 0) + 1
-        if p.extra["stuck"] in (1, 5, 20):
-            why = ("покупателей нет — Jupiter не находит маршрут (похоже, ликвидность убрали); через "
-                   f"{RUG_WRITE_OFF_S / 60:.0f} мин без покупателей спишу в ноль" if p.extra.get("no_route_since")
-                   else f"{len(SELL_SLIPPAGE_STEPS)} попытки не прошли")
+        if p.extra["stuck"] in (1, 5, 20) or p.extra["stuck"] % 90 == 0:     # дальше — раз в ~30 мин
+            why = f" ({fmt.esc(str(r['why'])[:120])})" if r.get("why") else ""
             await self._say(f"🆘 💵 НЕ СМОГ ПРОДАТЬ ${fmt.esc(p.symbol or '?')} ({EXIT_NAMES.get(reason, reason)}, "
-                            f"Jupiter): {why}. Повторяю каждые 20 с. Монета: <code>{p.mint}</code>")
+                            f"Jupiter): {len(SELL_SLIPPAGE_STEPS)} попытки не прошли{why}. Повторяю каждые 20 с "
+                            f"(попытка {p.extra['stuck']}). Монета: <code>{p.mint}</code>")
         await self._check_fail_pause()
-
-    async def _write_off_rug(self, p: Position, last_mc: float) -> None:
-        """Бой: покупателей нет RUG_WRITE_OFF_S — позиция закрывается в учёте с выручкой ноль (ликвидность убрали).
-        Токены остаются на кошельке: если покупатели вернутся, продать можно вручную."""
-        mins = (time.time() - float(p.extra.get("no_route_since") or time.time())) / 60
-        await self._settle(p, "rug", 1.0, int(p.extra["tokens_raw"]), 0.0, 0.0, sig=None, slot=None, wait_ms=None,
-                           fee=0.0)
-        self.to_close.pop(p.mint, None)              # счёт с токенами не закрыть — и не пытаемся
-        await self._say(f"⛔ 💵 ${fmt.esc(p.symbol or '?')}: покупателей нет {mins:.0f} мин — у монеты забрали "
-                        f"ликвидность (скам). Списал в ноль: −${p.cost_sol * self.sol_usd():.2f}. Токены остались на "
-                        f"кошельке. Монета: <code>{p.mint}</code>")
 
     async def _dead_watch_safe(self) -> None:
         try:
@@ -1659,6 +1671,8 @@ class RealTrader:
             stale = bool(slot and entry_slot and int(slot) <= int(entry_slot))
             if reason is None and (mc <= 0 or stale):
                 continue
+            if mc > 0 and not stale:
+                p.extra["price_at"] = time.time()
             self._check(p, mc if mc > 0 and not stale else float(p.extra.get("last_mc") or p.entry_mc), reason)
 
     def _check(self, p: Position, mc: float, reason: str | None = None, confirmed: bool = False) -> None:
@@ -1998,11 +2012,15 @@ class RealTrader:
         p.tokens = p.extra["tokens_raw"] / 1e6
         p.max_mc = max(p.max_mc or 0.0, mc)
         p.extra.pop("stuck", None)
+        waited = p.extra.pop("no_route_since", None)
+        p.extra.pop("no_route_alert_at", None)
         note = EXIT_NAMES.get(reason, reason)
         if order_id is not None:
             await self._order_done(order_id, "landed", slot=slot, wait_ms=wait_ms, fee_sol=fee, note=note)
         else:
-            await self._order(p.id, {"mode": mode, "mint": p.mint}, "sell", "landed" if mode == "live" else "simulated",
+            # бой без подписи (токенов на счёте нет — проданы вручную) — транзакции бота не было: no_tx, не landed
+            await self._order(p.id, {"mode": mode, "mint": p.mint}, "sell",
+                              ("landed" if sig else "no_tx") if mode == "live" else "simulated",
                               tokens_raw=raw, signature=sig, slot=slot, wait_ms=wait_ms, fee_sol=fee, note=note)
         if share < 1 and p.extra["tokens_raw"] > 0:
             p.tp_done, p.closing = True, False
@@ -2028,8 +2046,10 @@ class RealTrader:
             if self.get("real_close_ata") and reason != "gone":
                 self.to_close[p.mint] = (str(p.extra.get("token_program")), time.time() + 20, 1)
         if mode == "live" or self.get("real_notify_shadow"):
+            late = (f" · покупателей не было {(time.time() - float(waited)) / 60:.0f} мин"
+                    if waited and mode == "live" else "")
             await self._say(f"{'✅' if pnl > 0 else '❌'} {MODE_ICON.get(mode, '')} Продал "
-                            f"${fmt.esc(p.symbol or '?')}: {pct:+.0%} ({pnl * sol_usd:+.2f}$) · {note} · "
+                            f"${fmt.esc(p.symbol or '?')}: {pct:+.0%} ({pnl * sol_usd:+.2f}$) · {note}{late} · "
                             f"за день {self.day_pnl[mode] * sol_usd:+.2f}$")
         await self._profit_watch(mode, pnl, p)
         if mode == "live":
@@ -2177,6 +2197,7 @@ class RealTrader:
             self._check(p, float(p.extra.get("last_mc") or p.entry_mc), None, confirmed=True)   # выходы по времени
         for t in [t for t in self.trials.values() if not t.closing]:
             self._check(t, float(t.extra.get("last_mc") or t.entry_mc), None, confirmed=True)
+        await self._stale_watch(now)
         if now - self._follow_at >= 30:
             self._follow_at = now
             try:
@@ -2207,6 +2228,28 @@ class RealTrader:
         if now - self._last_status >= 5:
             await self.publish_status()
 
+    async def _stale_watch(self, now: float) -> None:
+        """25.11 (владелец): цена боевой позиции не обновлялась дольше real_price_stale_min — алерт (стоп и тейк по
+        цене без неё не срабатывают); повтор раз в STALE_ALERT_REPEAT_S, цена вернулась — сообщение. Позиции, которые
+        сейчас продаются или ждут повтора продажи, — не здесь: у них свои сообщения."""
+        limit = 60.0 * float(self.get("real_price_stale_min"))
+        for p in list(self.positions.values()):
+            if p.extra.get("mode") != "live":
+                continue
+            age = now - float(p.extra.get("price_at") or p.opened_ts)
+            if age >= limit and not p.closing and not p.extra.get("retry_at"):
+                if now - float(p.extra.get("stale_alert_at") or 0) < STALE_ALERT_REPEAT_S:
+                    continue
+                p.extra["stale_alert_at"] = now
+                src = "Jupiter" if p.extra.get("venue") == JUP_VENUE else "блокчейн"
+                why = " Jupiter не находит покупателей (маршрута нет)." if self.no_route(p.mint) else ""
+                await self._say(f"⚠️ 💵 ${fmt.esc(p.symbol or '?')}: цена позиции не обновлялась {age / 60:.0f} мин "
+                                f"(источник: {src}).{why} Стоп и тейк по цене без неё не сработают, по времени — "
+                                f"сработает. Монета: <code>{p.mint}</code>")
+            elif age < limit and p.extra.get("stale_alert_at"):
+                p.extra.pop("stale_alert_at", None)
+                await self._say(f"✅ 💵 ${fmt.esc(p.symbol or '?')}: цена позиции снова обновляется.")
+
     def pollable(self) -> list[Position]:
         """Открытые позиции, цену которых надо проверить (не продаются прямо сейчас и не ждут повтора продажи)."""
         return [p for p in self.positions.values() if not p.closing and not p.extra.get("retry_at")]
@@ -2216,9 +2259,10 @@ class RealTrader:
         return self.pollable() + [t for t in self.trials.values() if not t.closing]
 
     def on_state(self, p: Position, st: dict[str, Any]) -> None:
-        """Цена позиции из сети (кривая / пул) — решение о выходе."""
+        """Цена позиции из сети (кривая / пул / Jupiter) — решение о выходе."""
         if st.get("venue") and st.get("mc"):
             p.extra["venue"] = st["venue"]
+            p.extra["price_at"] = time.time()
             self._check(p, float(st["mc"]), None, confirmed=True)
 
     async def _poll(self, ps: list[Position]) -> None:

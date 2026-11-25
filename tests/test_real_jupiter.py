@@ -429,10 +429,9 @@ async def test_rug_in_shadow_is_counted_as_zero(db):
     assert trials and all(t["exit_reason"] == "rug" and t["pnl_pct"] < -0.99 for t in trials)
 
 
-async def test_live_rug_is_written_off_after_no_buyers(db, monkeypatch):
-    """Бой: покупателей нет (маршрута нет) — бот не повторяет продажу вечно: через RUG_WRITE_OFF_S списывает позицию в
-    ноль с сообщением; токены остаются на кошельке, счёт не закрывается."""
-    monkeypatch.setattr(ex, "RUG_WRITE_OFF_S", 0.0)
+async def test_live_no_buyers_keeps_position_open_and_retries(db, monkeypatch):
+    """25.11 (владелец, позиции 1847 и 1863): «покупателей нет» не закрывает боевую позицию как rug −100% — позиция
+    остаётся открытой, бот повторяет продажу и шлёт алерт; продажа без подписи не пишется как landed."""
     chain = FakeChain()
     coin = other_coin(chain, "rug-live")
     tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
@@ -448,11 +447,99 @@ async def test_live_rug_is_written_off_after_no_buyers(db, monkeypatch):
     assert p.extra["mode"] == "live"
     ext.rugged = True
     await tr._sell_jup_live(p, "max_hold", 1.0)
-    assert not tr.positions and len(chain.sent) == 1          # продажа не отправлялась — продать некому
-    r = await db.fetchrow("SELECT exit_reason, pnl_pct FROM real_positions")
-    assert r["exit_reason"] == "rug" and r["pnl_pct"] < -0.99
-    assert any("покупателей нет" in t and "Списал в ноль" in t for t in said)
-    assert chain.tokens_of(tr.wallet.pubkey, coin) > 0 and str(coin) not in tr.to_close
+    assert tr.positions and len(chain.sent) == 1               # позиция открыта, продажа не отправлялась
+    assert p.extra["retry_at"] > time.time() and p.extra["no_route_since"] and not p.closing
+    r = await db.fetchrow("SELECT closed_at, exit_reason FROM real_positions")
+    assert r["closed_at"] is None and r["exit_reason"] is None
+    assert sum("Покупателей нет" in t and "в ноль не списываю" in t for t in said) == 1
+    await tr._sell_jup_live(p, "max_hold", 1.0)                 # повтор: алерт не чаще раза в 30 мин
+    assert tr.positions and sum("Покупателей нет" in t for t in said) == 1
+    assert await db.fetchval("SELECT count(*) FROM real_orders WHERE status = 'landed' AND signature IS NULL") == 0
+    ext.rugged = False                                          # покупатели вернулись — продаёт по-настоящему
+    await tr._sell_jup_live(p, "max_hold", 1.0)
+    assert not tr.positions and len(chain.sent) == 2
+    r = await db.fetchrow("SELECT exit_reason, sell_sig, pnl_pct FROM real_positions")
+    assert r["exit_reason"] == "max_hold" and r["sell_sig"] and r["pnl_pct"] > -0.2
+    o = await db.fetchrow("SELECT status, signature FROM real_orders WHERE side = 'sell'")
+    assert o["status"] == "landed" and o["signature"] == r["sell_sig"]
+    assert any("Продал" in t and "покупателей не было" in t for t in said)
+
+
+async def test_order_without_signature_is_never_landed(db, monkeypatch):
+    chain = FakeChain()
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
+    await tr.start()
+    oid = await tr._order(None, {"mode": "live", "mint": "X"}, "sell", "landed")
+    assert await db.fetchval("SELECT status FROM real_orders WHERE id = $1", oid) == "no_tx"
+    oid = await tr._order(None, {"mode": "live", "mint": "X"}, "sell", "sent")
+    await tr._order_done(oid, "landed")
+    assert await db.fetchval("SELECT status FROM real_orders WHERE id = $1", oid) == "no_tx"
+    oid = await tr._order(None, {"mode": "live", "mint": "X"}, "sell", "sent", signature="SIG1")
+    await tr._order_done(oid, "landed")
+    assert await db.fetchval("SELECT status FROM real_orders WHERE id = $1", oid) == "landed"
+
+
+async def test_stale_price_alert(db, monkeypatch):
+    """25.11: цена боевой позиции не обновлялась дольше real_price_stale_min — алерт; вернулась — сообщение."""
+    chain = FakeChain()
+    coin = other_coin(chain, "stale")
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True, real_price_stale_min=5)
+    tr.e.ext = Ext(chain)
+    said = []
+
+    async def say(text):
+        said.append(text)
+    tr._say = say
+    await tr.start()
+    await signal(tr, coin)
+    p = only(tr)
+    said.clear()                                                # сообщение о покупке
+    now = time.time()
+    p.extra["price_at"] = now - 200
+    await tr._stale_watch(now)
+    assert not said                                             # 3 мин — ещё не повод
+    p.extra["price_at"] = now - 6 * 60
+    await tr._stale_watch(now)
+    assert len(said) == 1 and "цена позиции не обновлялась 6 мин" in said[0] and "Jupiter" in said[0]
+    await tr._stale_watch(now + 60)
+    assert len(said) == 1                                       # повтор — не чаще раза в 30 мин
+    await tr._stale_watch(now + 31 * 60)
+    assert len(said) == 2
+    p.extra["price_at"] = now + 31 * 60
+    await tr._stale_watch(now + 31 * 60 + 1)
+    assert "снова обновляется" in said[-1]
+
+
+async def test_price_from_quote_when_price_api_is_silent(db, monkeypatch):
+    """25.11: 1847 и 1863 — Price API Jupiter перестал отдавать цену, позиция 2.5 ч стояла без цены. Теперь — цена
+    по котировке продажи всей позиции; маршрута нет — цены нет и монета отмечена «покупателей нет»."""
+    from scanner.real.desk import RealDesk
+    chain = FakeChain()
+    coin = other_coin(chain, "silent")
+    tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
+    tr.e.ext = ext = Ext(chain)
+    await tr.start()
+    await signal(tr, coin)
+    p = only(tr)
+
+    async def silent(mints, ttl=3.0):
+        return {}
+    ext.jup_prices = silent
+    p.extra["price_at"] = 0.0
+    ext.price *= 0.7                                           # цена упала на 30% — стоп должен узнать
+    desk = RealDesk.__new__(RealDesk)
+    await desk._poll_jupiter([tr], [(tr, p)])
+    assert p.extra["price_at"] > time.time() - 5
+    assert float(p.extra["last_mc"]) < p.entry_mc * 0.75 or p.closing
+    p2_at = p.extra["price_at"]
+    await desk._poll_jupiter([tr], [(tr, p)])                  # раз в 10 с на монету — не чаще
+    assert p.extra["price_at"] == p2_at
+    if not p.closing:
+        ext.rugged = True
+        desk._jq_price_at.clear()
+        tr._jq_cache.clear()                                   # кэш котировки 2 с
+        await desk._poll_jupiter([tr], [(tr, p)])
+        assert p.extra["price_at"] == p2_at and tr.no_route(p.mint)
 
 
 async def test_live_only_for_coins_older_than_limit(db, monkeypatch):
@@ -501,8 +588,8 @@ async def test_live_only_when_pool_liquidity_is_locked(db, monkeypatch):
 
 async def test_dead_watch_sells_written_off_tokens_when_buyers_return(db, monkeypatch):
     """24.11: «сторож» — списанная в ноль (скам) боевая позиция: если у монеты снова есть покупатели и дают от $1,
-    бот продаёт остаток сам и дописывает выручку в сделку."""
-    monkeypatch.setattr(ex, "RUG_WRITE_OFF_S", 0.0)
+    бот продаёт остаток сам и дописывает выручку в сделку. 25.11: бот больше не списывает сам — сторож нужен для
+    списанных раньше (1847, 1863)."""
     chain = FakeChain()
     coin = other_coin(chain, "dead-back")
     tr = jlive(db, chain, monkeypatch, real_live_trendj=True)
@@ -516,7 +603,10 @@ async def test_dead_watch_sells_written_off_tokens_when_buyers_return(db, monkey
     await signal(tr, coin)
     p = only(tr)
     ext.rugged = True
-    await tr._sell_jup_live(p, "max_hold", 1.0)
+    # так списывал бот до 25.11: позиция закрыта в учёте с выручкой ноль, токены на кошельке
+    await db.execute("UPDATE real_positions SET closed_at = now(), exit_reason = 'rug', proceeds_sol = 0, "
+                     "pnl_sol = -cost_sol, pnl_pct = -1 WHERE id = $1", p.id)
+    tr.positions.pop(p.id)
     assert (await db.fetchval("SELECT exit_reason FROM real_positions")) == "rug"
     await tr._dead_watch()                                     # покупателей всё ещё нет — ничего не делает
     assert len(chain.sent) == 1

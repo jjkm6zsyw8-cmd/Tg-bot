@@ -628,7 +628,7 @@ CREATE TABLE IF NOT EXISTS real_orders (
     min_out     bigint,                          -- лимит: минимум токенов (покупка) или лампортов (продажа)
     slippage    double precision,
     signature   text,                            -- подпись транзакции: проверяется на solscan.io/tx/<подпись>
-    status      text NOT NULL,                   -- simulated | sent | landed | failed | expired
+    status      text NOT NULL,                   -- simulated | sent | landed | failed | expired | no_tx
     error       text,
     slot        bigint,
     wait_ms     integer,                         -- от отправки до подтверждения
@@ -657,6 +657,8 @@ CREATE TABLE IF NOT EXISTS real_wallets (
 );
 ALTER TABLE real_positions ADD COLUMN IF NOT EXISTS wallet_id bigint;
 ALTER TABLE real_orders ADD COLUMN IF NOT EXISTS wallet_id bigint;
+-- 25.11: продажа без подписи не могла «лечь в блок» (списание «покупателей нет», токенов нет на счёте) — no_tx
+UPDATE real_orders SET status = 'no_tx' WHERE status = 'landed' AND signature IS NULL;
 CREATE INDEX IF NOT EXISTS real_positions_wallet_idx ON real_positions (wallet_id, opened_at);
 
 -- Почему реальный бот не вошёл по сигналу (с 18.11): по каждой монете, чтобы «Против бумаги» назвал причину у сделок,

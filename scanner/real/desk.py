@@ -31,6 +31,8 @@ from .executor import TOPIC, RealTrader, make_chain
 from .keys import Wallet, load_wallet
 from .vault import Vault, load_vault
 
+JUP_QUOTE_PRICE_S = 10.0     # 25.11: цены Jupiter нет — котировка продажи позиции вместо неё не чаще раза в столько
+
 if TYPE_CHECKING:
     from ..analytics.engine import Engine
 
@@ -157,10 +159,33 @@ class RealDesk:
             log.warning("реальный бот: цены Jupiter: %s", str(exc)[:120])
             return
         sol_usd = lanes[0].sol_usd()
+        missing: dict[str, list[tuple[Any, Any]]] = {}
         for lane, p in jup:
             v = prices.get(p.mint)
             if v:
                 lane.on_state(p, {"venue": "jupiter", "mc": float(v) * 1e9 / sol_usd})
+            else:
+                missing.setdefault(p.mint, []).append((lane, p))
+        # 25.11 (позиции 1847 и 1863: цена 2.5 ч не обновлялась): Price API не отдаёт цену монеты (лимит, сеть или
+        # Jupiter перестал её оценивать — так бывает, когда ликвидность убрали) — цена по котировке продажи всей
+        # позиции, раз в JUP_QUOTE_PRICE_S на монету. Маршрута нет — цены нет (бот отметит «покупателей нет»)
+        now = time.time()
+        if not hasattr(self, "_jq_price_at"):
+            self._jq_price_at: dict[str, float] = {}
+        for mint, items in missing.items():
+            if now - self._jq_price_at.get(mint, 0.0) < JUP_QUOTE_PRICE_S:
+                continue
+            self._jq_price_at[mint] = now
+            lane, p = max(items, key=lambda x: (x[1].extra.get("mode") == "live", int(x[1].extra.get("tokens_raw") or 0)))
+            try:
+                jq = await lane._jup_sell(p, int(p.extra.get("tokens_raw") or 0))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("реальный бот: цена %s по котировке Jupiter: %s", mint, str(exc)[:120])
+                continue
+            if jq and jq[1] > 0:
+                for ln, x in items:
+                    ln.on_state(x, {"venue": "jupiter", "mc": jq[1]})
+        self._jq_price_at = {m: t for m, t in self._jq_price_at.items() if now - t < 600}
 
     async def poll_prices(self) -> None:
         """Цена открытых позиций всех кошельков — из сети, одним запросом на 16 монет (а не запрос на кошелёк)."""
