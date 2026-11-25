@@ -130,7 +130,7 @@ reliability:
   silence_failover_s: 30
   coverage_target: 0.995
   parse_error_alert_per_min: 20
-  raw_trades_days: 30
+  raw_trades_days: 7
   pumpportal_trade_window_min: 60   # сколько минут держать подписку на сделки новой монеты
   withdrawal_poll_s: 15
   withdrawal_hops: 3
