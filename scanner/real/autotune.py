@@ -7,8 +7,10 @@
   2. Источник в минусе — дев («мой дев») или кошелёк (копии, smart, ракеты) с 8+ закрытыми сделками, итог < 0 и в
      среднем хуже −5% — его сигналы 3 дня не идут на деньги (тень мерит). Кошельки, за которыми ты сам включил
      «за ним», не трогаются.
-  3. Правило продажи метода: если по пробам другое правило заметно лучше (на 2+ п.п. на сделку, 30+ сделок, в плюсе),
-     метод переходит на него — только когда метод не торгует в бою (в бою — только совет в отчёте).
+  3. Правило продажи метода (25.11, владелец: «2 п.п. при погрешности ~10 п.п. — это шум»): сравнение только на одних
+     и тех же позициях — пары проб «текущее правило / другое» на одном входе, за 7 дней. Другое правило лучше, если
+     пар 100+, разница в среднем 2+ п.п., t ≥ 2 и само в плюсе; переход — только если это держится ещё 24 ч (кандидат
+     запоминается и проверяется следующими проходами). Метод в бою — только совет в отчёте.
   4. «Новый дев»: окно цены входа — из корзин капитализации, где итог закрытых сделок в плюсе (только для денег).
 Отчёт «что поменял и почему» — в тему «Реальный бот». Последний — /autotune.
 """
@@ -35,12 +37,37 @@ MIN_RULE_N = 30                       # правило: проб для реше
 MIN_SRC_N = 8                         # источник: закрытых сделок для решения
 SRC_BAD_AVG = -0.05
 RULE_EDGE = 0.02
+MIN_PAIRS = 100                       # пар проб «текущее / другое правило» на одних позициях
+PAIR_T = 2.0                          # t разницы на парах
+RULE_WINDOW_D = 7                     # окно сравнения правил
+CONFIRM_S = 24 * 3600                 # кандидат должен держаться столько, прежде чем правило сменится
+PENDING_KEY = "real:autotune_pending"  # {kind: {"rule", "since", "d", "n", "t"}}
 BANDS = ((0, 35), (35, 45), (45, 57), (57, 80), (80, 100))
 MIN_BAND_N = 10
 
 
 def _pct(v: float) -> str:
     return f"{v * 100:+.1f}%"
+
+
+async def better_rule(db: Any, kind: str, cur: str, now: float) -> dict[str, Any] | None:
+    """Правило лучше текущего на одних и тех же позициях (пары проб за RULE_WINDOW_D дней): {rule, n, d, t, a} или None.
+    d — средняя разница результата «другое − текущее» на паре, t — её устойчивость, a — средний результат другого."""
+    since = datetime.fromtimestamp(now, timezone.utc) - timedelta(days=RULE_WINDOW_D)
+    rows = await db.fetch(
+        """SELECT c.rule, count(*) n, avg(c.pnl_pct - b.pnl_pct) d, stddev_samp(c.pnl_pct - b.pnl_pct) sd,
+                  avg(c.pnl_pct) a
+           FROM real_rule_trials b JOIN real_rule_trials c ON c.position_id = b.position_id AND c.rule <> b.rule
+           WHERE b.kind = $1 AND b.rule = $2 AND b.position_id IS NOT NULL AND b.closed_at IS NOT NULL
+             AND c.closed_at IS NOT NULL AND b.pnl_pct IS NOT NULL AND c.pnl_pct IS NOT NULL AND b.opened_at > $3
+           GROUP BY c.rule""", kind, cur, since)
+    ok = []
+    for r in rows:
+        n, d, sd = int(r["n"]), float(r["d"] or 0), float(r["sd"] or 0)
+        t = d / (sd / n ** 0.5) if sd > 0 and n > 1 else (99.0 if d > 0 else 0.0)
+        if n >= MIN_PAIRS and d >= RULE_EDGE and t >= PAIR_T and float(r["a"] or 0) > 0:
+            ok.append({"rule": r["rule"], "n": n, "d": d, "t": t, "a": float(r["a"])})
+    return max(ok, key=lambda x: x["d"]) if ok else None
 
 
 async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | None = None) -> list[str]:
@@ -53,6 +80,7 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
     expired = [k for k in (block.get("kinds") or {}) if k not in kinds_bl]
     expired_src = len(block.get("sources") or {}) - len(srcs_bl)
     lines: list[str] = []
+    pending: dict[str, Any] = dict(await db.kv_get(PENDING_KEY) or {})
 
     # ---------------------------------------------------------------- 1, 3: методы и правила продажи
     # итог метода — только сделки по его нынешнему правилу продажи: сменили подход (например «мой дев» → D) —
@@ -84,20 +112,29 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
                          f"({m['n']} сд, в среднем {_pct(float(m['a']))}; лучшее правило {best['rule']} "
                          f"{_pct(float(best['a']))}). В тени мерю дальше.")
             continue
-        if not tr:
-            continue
         cur = S.get(cfg, S.SCHEME_KEYS[kind])
-        best = max(tr.values(), key=lambda v: float(v["a"]))
-        cur_a = float(tr[cur]["a"]) if cur in tr else None
-        if best["rule"] != cur and float(best["a"]) > 0 and (cur_a is None or float(best["a"]) - cur_a >= RULE_EDGE):
-            why = (f"{best['rule']} {_pct(float(best['a']))} на сделку ({best['n']} проб) против {cur} "
-                   + (_pct(cur_a) if cur_a is not None else "— мало проб"))
-            if kind in live_kinds:
-                lines.append(f"💡 <b>{name}</b>: правило продажи лучше {best['rule']} — {why}. Метод в бою — сам не меняю, "
-                             "переключи в 🎯 Методы.")
-            else:
-                await db.set_override(S.SCHEME_KEYS[kind], best["rule"])
-                lines.append(f"🔁 <b>{name}</b>: продаю по правилу {best['rule']} вместо {cur} — {why}.")
+        best = await better_rule(db, kind, cur, now)
+        had = pending.get(kind)
+        if best is None:
+            if had:
+                pending.pop(kind, None)
+                lines.append(f"↩️ <b>{name}</b>: кандидат {had['rule']} больше не лучше {cur} на одних позициях — "
+                             "правило не меняю.")
+            continue
+        why = (f"{best['rule']} лучше {cur} на {_pct(best['d'])} на сделку на одних и тех же позициях ({best['n']} пар, "
+               f"t={best['t']:.1f}; {best['rule']} в среднем {_pct(best['a'])})")
+        if not had or had.get("rule") != best["rule"]:
+            pending[kind] = {"rule": best["rule"], "since": now, **{k: best[k] for k in ("d", "n", "t")}}
+            lines.append(f"🔎 <b>{name}</b>: {why}. Проверю ещё 24 ч — если удержится, переключу.")
+            continue
+        if now - float(had.get("since", now)) < CONFIRM_S:
+            continue                          # ждём, пока кандидат продержится сутки
+        pending.pop(kind, None)
+        if kind in live_kinds:
+            lines.append(f"💡 <b>{name}</b>: {why}, держится сутки. Метод в бою — сам не меняю, переключи в 🎯 Методы.")
+        else:
+            await db.set_override(S.SCHEME_KEYS[kind], best["rule"])
+            lines.append(f"🔁 <b>{name}</b>: продаю по правилу {best['rule']} вместо {cur} — {why}, держится сутки.")
     for k in expired:
         lines.append(f"🔄 <b>{S.KIND_NAMES.get(k, k)}</b>: 3 дня прошли — снова допускается на деньги.")
 
@@ -127,9 +164,11 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
         lines.append(f"🔄 Источников снова допущено на деньги (3 дня прошли): {expired_src}")
 
     # ---------------------------------------------------------------- 4: окно цены входа «нового дева»
+    # 25.11: «новый дев» убран целиком (и из тени) — окно цены не считаем
     rows = await db.fetch(
         """SELECT entry_mc, pnl_pct FROM real_positions WHERE kind = 'newdev' AND mode = 'shadow'
-           AND closed_at IS NOT NULL AND closed_at > $1 AND entry_mc IS NOT NULL""", since)
+           AND closed_at IS NOT NULL AND closed_at > $1 AND entry_mc IS NOT NULL""", since) \
+        if S.active("newdev") else []
     if rows:
         good = []
         stats = []
@@ -152,6 +191,7 @@ async def run(db: Any, cfg: dict[str, Any], live_kinds: set[str], now: float | N
             lines.append(f"🎯 <b>Новый дев</b>: окна в плюсе нет ({'; '.join(stats)}) — меряю все цены входа.")
 
     await db.kv_set(BLOCK_KEY, {"kinds": kinds_bl, "sources": srcs_bl})
+    await db.kv_set(PENDING_KEY, pending or None)
     head = (f"🤖 <b>Автонастройка</b> (тень за {WINDOW_D} дня): не пускаю на деньги методов {len(kinds_bl)}, "
             f"источников {len(srcs_bl)}. Тень мерит всё.")
     text = "\n".join([head, *(lines or ["Изменений нет — данных для решений мало или всё в норме."])])

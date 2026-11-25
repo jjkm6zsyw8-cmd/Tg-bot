@@ -112,6 +112,14 @@ OBSERVE_USD = 10.0
 # 12.11: трейдер после нашего входа мелко докупил (≤0.06 SOL ≈ $5) — выходим сразу. По неделе (копии, 88 сделок):
 # цена через 5 мин после такой докупки −13% (медиана); «выйти сразу» +$71 против «держать» +$21
 TINY_REBUY_SOL = 0.06
+MAX_POOL_SHARE = 0.03          # 25.11: позиция бумаги — не больше 3% SOL в кривой / пуле
+
+
+def pool_depth_sol(mc: float, migrated: bool) -> float:
+    """SOL, от которого считается цена при этом MC: кривая — виртуальный резерв; пул PumpSwap — по состоянию на
+    переезде (85 SOL при MC 410.88), постоянное произведение."""
+    k = (85.005 * 206_900_000.0) if migrated else (30.0 * 1_073_000_000.0)
+    return (max(mc, 1e-9) * k / 1e9) ** 0.5
 # M — боевая версия: один портфель, как бот торговал бы на реальные деньги. Подбор — бэктест всех сигналов 6–9.11
 # по минутным свечам рынка (модель сверена с бумагой на ценах Jupiter: −11.8% против −10.9% на сделку), со схемой G:
 #   сильная копия (твой кошелёк + ещё один отслеживаемый)   +11.8% на сделку, в плюсе 3 дня из 4, четвёртый ≈ 0
@@ -1315,6 +1323,16 @@ class PaperTrader:
         size = max(size, min_size)                    # не мельче минимума…
         size = min(size, self.balance[name] * (float(self.cfg.get("paper_m_size_cap", M_SIZE_CAP)) if name == MAIN
                                                else 0.5))    # …но и не больше половины баланса (M — 30%)
+        # 25.11 (владелец): не больше 3% SOL, от которого считается цена (кривая — виртуальные резервы, пул PumpSwap —
+        # глубина по MC): 14–17.11 ставки 7–11 SOL в монеты с MC 20–30 SOL сдвигали цену своей покупкой — итог в SOL
+        # нечестный. 3% резерва ≈ +6% к цене своей покупкой
+        st = self.e.states.get(mint) if getattr(self.e, "states", None) else None
+        depth = pool_depth_sol(mc, bool(getattr(st, "migrated", False)))
+        cap_sol = float(self.cfg.get("paper_max_pool_share", MAX_POOL_SHARE)) * depth
+        if cap_sol < min_size:
+            self.skipped[name] = f"мелкий пул: 3% его SOL ({cap_sol:.3f}) меньше минимальной позиции"
+            return None
+        size = min(size, cap_sol)
         cap = self.day_cap_sol() if lottery else None     # дневной лимит суммы — только на лотерею
         if cap is not None and size >= min_size:
             # днём торговля в минусе (6.11: копии 08–18 −0.03…−0.44 SOL во всех портфелях) — днём в позициях

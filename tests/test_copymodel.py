@@ -161,6 +161,7 @@ async def test_control_text_compares_with_paper(db):
     text = await M.control_text(db, ME, (now - timedelta(hours=1)).timestamp(), now.timestamp())
     assert "1 из 1 копий посчитано" in text and "Бумага A за период: 1 сд, в среднем +30.0%" in text
     assert "На одних и тех же сделках (1)" in text
+    assert "Выходы на одних и тех же сделках" in text and "тейк" in text      # 25.11: разбивка выходов
 
 
 # ====================================================================== фильтр дельты 24 ч
@@ -208,3 +209,44 @@ def test_stale_migration_price_is_no_data():
     from scanner.analytics.engine import CURVE_FINAL_MC, stale_migrated
     assert round(CURVE_FINAL_MC, 2) == 410.88
     assert stale_migrated(50.0, 410.88) and stale_migrated(410.9) and not stale_migrated(380.0, 420.0, None)
+
+
+# ====================================================================== 25.11: цена PumpSwap, разбивка выходов
+def test_pumpportal_amm_trade_is_event_not_price():
+    """Сделки PumpPortal на PumpSwap несут MC без виртуальных резервов — цена по ним не берётся, но продажа трейдера
+    из такой сделки всё равно закрывает копию (по последней надёжной цене)."""
+    def amm(dt, mc, slot=None, who=OTHER, buy=True, ok=True):
+        return M.Tick(T0 + dt, mc, slot, who, buy, 1.0, M.AMM, ok)
+    assert M.entry_tick(entry(), [amm(0, 50, 100, ME), amm(0.3, 30, 101, ok=False), amm(0.6, 52, 102)]).mc == 52
+    ticks = [amm(0, 50, 100, ME), amm(0.5, 51, 101), amm(5, 90, ok=False),            # «+80%» без цены — не тейк
+             amm(20, 52), amm(30, 40, who=ME, buy=False, ok=False)]                    # продал — событие
+    c = M.copy_trade(entry(), ticks, ME, DEV, T0 - 60)
+    assert c.reason == "trader_sell" and c.exit_mc == 52 and c.entry_mc == 51
+
+
+async def test_load_ticks_marks_pumpportal_amm_unpriced(db):
+    m = "PRICE" + "q" * 39
+    now = datetime.now(timezone.utc)
+    await put_trade(db, m, ME, now, True, 50, 1, pool=M.AMM, sig="s1")
+    await put_trade(db, m, OTHER, now + timedelta(seconds=1), True, 51, 2, pool=M.AMM, sig="s2")
+    await put_trade(db, m, OTHER, now + timedelta(seconds=2), True, 52, 3, pool="pump", sig="s3")
+    await db.execute("UPDATE trades SET source = 'pumpportal' WHERE signature IN ('s1', 's3')")
+    await db.execute("UPDATE trades SET source = 'watch' WHERE signature = 's2'")
+    got = (await M.load_ticks(db, {m: (now.timestamp() - 5, now.timestamp() + 5)}))[m]
+    assert [t.price_ok for t in got] == [False, True, True]          # PumpPortal на AMM — без цены, кривая — с ценой
+
+
+def test_exits_table_same_trades():
+    pairs = [(0.30, "take_profit", 0.25, "take_profit"), (0.20, "take_profit", -0.05, "trader_sell"),
+             (-0.10, "trader_sell", -0.12, "trader_sell"), (0.02, "max_hold", 0.01, "max_hold"),
+             (-0.40, "emergency", -0.30, "stop")]
+    out = M.exits_table(pairs)
+    text = "\n".join(out)
+    assert M.exit_group("trailing") == "тейк" and M.exit_group("tiny_rebuy") == "за трейдером"
+    assert M.exit_group("max_hold") == "по таймеру" and M.exit_group("weird") == "прочее"
+    row = {line.split()[0] + (" " + line.split()[1] if line.startswith("за ") or line.startswith("по ") else ""): line
+           for line in out[2:] if not line.startswith("Расходятся")}
+    assert "2 · +25%" in row["тейк"] and "1 · +25%" in row["тейк"]        # модель 2 тейка, бумага 1
+    assert "1 · -10%" in row["за трейдером"] and "2 · -8%" in row["за трейдером"]
+    assert "1 · +2%" in row["по таймеру"]
+    assert "модель «тейк» ↔ бумага «за трейдером» — 1" in text

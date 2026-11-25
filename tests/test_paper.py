@@ -1071,3 +1071,30 @@ def test_h_copy_uses_wallets_best_exit():
     assert sc["tp_net"] == 0.25 and sc["stop"] == 0.08                  # правило G
     p.rule = "best:F"
     assert pp.PaperTrader.scheme_for(p)["tp_net"] is None              # «за ним»: без тейка, аварийный стоп
+
+
+async def test_stake_capped_by_pool_depth():
+    """25.11 (владелец): ставка бумаги — не больше 3% SOL кривой / пула, чтобы итог в SOL был честным."""
+    assert pp.pool_depth_sol(30.0, False) == pytest.approx(31.1, abs=0.1)       # кривая на старте ~31 SOL
+    assert pp.pool_depth_sol(410.88, True) == pytest.approx(85.0, rel=0.01)     # пул сразу после переезда — 85 SOL
+    ids = []
+
+    class DB:
+        async def fetchval(self, *a):
+            ids.append(a)
+            return len(ids)
+
+        async def execute(self, *a):
+            return None
+    tr = bare_trader({})
+    tr.balance = {"A": 300.0}
+    tr.rugged, tr.rug_devs, tr.loss_exits = {}, set(), {}
+    tr.priority = lambda: 0.0005
+    tr.fee_bps = lambda: 125
+    tr.db = DB()
+    size = await tr._open("A", "M1", "high", None, {}, "W", 30.0)
+    assert size == pytest.approx(0.03 * pp.pool_depth_sol(30.0, False), rel=1e-6)      # ~0.93 SOL, не 7–11 SOL
+    tr.e.states = {"M2": SimpleNamespace(migrated=True, mc=410.88, trades=[])}
+    assert await tr._open("A", "M2", "high", None, {}, "W", 410.88) == pytest.approx(0.03 * 85.0, rel=0.01)
+    tr.e.cfg["paper_max_pool_share"] = 0.0005
+    assert await tr._open("A", "M3", "high", None, {}, "W", 30.0) is None and "мелкий пул" in tr.skipped["A"]

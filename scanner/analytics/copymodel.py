@@ -54,6 +54,9 @@ class Tick:
     is_buy: bool = True
     sol: float = 0.0
     pool: str = "pump"
+    # 25.11: сделки PumpPortal на PumpSwap несут MC без виртуальных резервов пула (на 4–26% ниже, state.TradeRow) —
+    # как цена они не годятся, только как событие (трейдер / дев продал)
+    price_ok: bool = True
 
 
 @dataclass(slots=True)
@@ -104,13 +107,15 @@ def _price_at(ticks: list[Tick], ts: float) -> Tick | None:
     for t in ticks:
         if t.ts > ts:
             break
-        last = t
+        if t.price_ok:
+            last = t
     return last
 
 
 def entry_tick(e: Entry, ticks: list[Tick]) -> Tick | None:
     """Цена входа бота: худшая для покупки цена блоков (его блок; его блок + 2]; сделок там нет — цена после последней
     сделки до блока + 2 (это его же покупка). Блок неизвестен — цена через ENTRY_DELAY_S."""
+    ticks = [t for t in ticks if t.price_ok]
     if e.slot:
         win = [t for t in ticks if t.slot is not None and e.slot < t.slot <= e.slot + ENTRY_BLOCKS]
         if win:
@@ -173,7 +178,6 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
             return close(deadline, "max_hold")       # бот продаёт по времени по таймеру, не дожидаясь сделки
         if gap(t.ts):
             return Copy(None, "нет цены выхода", entry_mc=et.mc, venue=venue)
-        last_seen = t.ts
         if t.pool == AMM:
             venue = AMM
         reason = None
@@ -184,6 +188,11 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
         elif (t.trader == trader and t.is_buy and 0 < t.sol <= TINY_REBUY_SOL
               and (t.slot is None or entry_slot is None or t.slot > entry_slot)):
             reason = "tiny_rebuy"
+        if not t.price_ok:
+            if reason:                               # событие есть, цены у сделки нет — продажа по последней цене
+                return close(t.ts, reason)
+            continue
+        last_seen = t.ts
         d = decide_exit(pos, t.mc, t.ts, sc, FEE_BPS, FIXED_SOL, emergency=reason)
         if d is None:
             continue
@@ -282,14 +291,17 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]]) -> dict[s
         return {}
     mints = list(windows)
     rows = await db.fetch(
-        """SELECT p.mint, extract(epoch FROM t.ts) AS ts, t.mc_sol, t.slot, t.trader, t.is_buy, t.sol_amount, t.pool
+        """SELECT p.mint, extract(epoch FROM t.ts) AS ts, t.mc_sol, t.slot, t.trader, t.is_buy, t.sol_amount, t.pool,
+                  t.source
            FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
            JOIN trades t ON t.mint = p.mint AND t.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi) AND t.mc_sol > 0
            ORDER BY p.mint, t.ts""", mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints])
     out: dict[str, list[Tick]] = {}
     for r in rows:
+        pool = r["pool"] or "pump"
         out.setdefault(r["mint"], []).append(Tick(float(r["ts"]), float(r["mc_sol"]), r["slot"], r["trader"],
-                                                  bool(r["is_buy"]), float(r["sol_amount"] or 0), r["pool"] or "pump"))
+                                                  bool(r["is_buy"]), float(r["sol_amount"] or 0), pool,
+                                                  not (r["source"] == "pumpportal" and pool == AMM)))
     return out
 
 
@@ -376,13 +388,47 @@ async def cobuyers(db: Any, refs: list[str], window_s: float = 120.0, days: floa
 
 
 # ---------------------------------------------------------------------- контроль против бумаги A
+EXIT_GROUPS = (("тейк", ("take_profit", "target", "trailing")), ("за трейдером", ("trader_sell", "tiny_rebuy")),
+               ("по таймеру", ("max_hold", "time_stop")), ("дев / стоп", ("emergency", "stop")))
+
+
+def exit_group(reason: str | None) -> str:
+    for name, rs in EXIT_GROUPS:
+        if reason in rs:
+            return name
+    return "прочее"
+
+
+def exits_table(pairs: list[tuple[float, str | None, float, str | None]]) -> list[str]:
+    """Одни и те же сделки: (модель %, причина модели, бумага %, причина бумаги) → разбивка выходов и где расходятся."""
+    names = [n for n, _ in EXIT_GROUPS] + ["прочее"]
+    rows = [f"{'выход':<14}{'модель':>14}{'бумага':>14}"]
+    for n in names:
+        mm = [a for a, ra, _b, _rb in pairs if exit_group(ra) == n]
+        pp = [b for _a, _ra, b, rb in pairs if exit_group(rb) == n]
+        if not mm and not pp:
+            continue
+        cell = lambda xs: f"{len(xs)} · {statistics.fmean(xs):+.0%}" if xs else "—"   # noqa: E731
+        rows.append(f"{n:<14}{cell(mm):>14}{cell(pp):>14}")
+    diff: dict[tuple[str, str], int] = {}
+    for _a, ra, _b, rb in pairs:
+        k = (exit_group(ra), exit_group(rb))
+        if k[0] != k[1]:
+            diff[k] = diff.get(k, 0) + 1
+    out = ["Выходы на одних и тех же сделках (сделок · средний итог):", *rows]
+    if diff:
+        out.append("Расходятся: " + "; ".join(f"модель «{a}» ↔ бумага «{b}» — {n}"
+                                               for (a, b), n in sorted(diff.items(), key=lambda kv: -kv[1])))
+    return out
+
+
 async def control_text(db: Any, address: str, since: float, until: float) -> str:
     """Новая оценка кошелька за период против бумаги A на тех же монетах (контроль модели)."""
     summ, copies = await evaluate(db, address, since, until, limit=100_000)
     from datetime import datetime, timezone
     lo, hi = datetime.fromtimestamp(since, timezone.utc), datetime.fromtimestamp(until, timezone.utc)
     paper = await db.fetch(
-        """SELECT mint, extract(epoch FROM opened_at) AS ts, pnl_pct FROM paper_positions
+        """SELECT mint, extract(epoch FROM opened_at) AS ts, pnl_pct, exit_reason FROM paper_positions
            WHERE portfolio = 'A' AND source_wallet = $1 AND opened_at BETWEEN $2 AND $3 AND closed_at IS NOT NULL
              AND NOT suspect AND exit_reason IS DISTINCT FROM 'reset' AND pnl_pct IS NOT NULL""", address, lo, hi)
     lines = [f"Кошелёк {address}", f"Период: {lo:%d.%m %H:%M} – {hi:%d.%m %H:%M} UTC",
@@ -395,17 +441,18 @@ async def control_text(db: Any, address: str, since: float, until: float) -> str
                      f"в плюсе {sum(1 for x in pa if x > 0) / len(pa):.0%}")
         by = {}
         for r in paper:
-            by.setdefault(r["mint"], []).append((float(r["ts"]), float(r["pnl_pct"])))
+            by.setdefault(r["mint"], []).append((float(r["ts"]), float(r["pnl_pct"]), r["exit_reason"]))
         pairs = []
         for e, c in copies:
             if c.res is None:
                 continue
             near = [p for p in by.get(e.mint, []) if abs(p[0] - e.ts) <= 120]
             if near:
-                pairs.append((c.res, near[0][1]))
+                pairs.append((c.res, c.reason, near[0][1], near[0][2]))
         if pairs:
-            lines.append(f"На одних и тех же сделках ({len(pairs)}): модель {statistics.fmean(a for a, _ in pairs):+.1%},"
-                         f" бумага {statistics.fmean(b for _, b in pairs):+.1%}")
+            lines.append(f"На одних и тех же сделках ({len(pairs)}): модель {statistics.fmean(p[0] for p in pairs):+.1%},"
+                         f" бумага {statistics.fmean(p[2] for p in pairs):+.1%}")
+            lines += exits_table(pairs)
     else:
         lines.append("Бумага A по этому кошельку за период: сделок нет")
     lines.append("Без цены — копии, где в базе нет сделок монеты до выхода (пробел дольше "
