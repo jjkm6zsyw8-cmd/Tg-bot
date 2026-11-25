@@ -33,4 +33,4 @@ async def test_silent_scam_mark_blacklists_without_message():
 
 def test_auto_mark_names():
     assert eng_mod.AUTO_MARK_NAMES["scam"].startswith("☠️") and set(eng_mod.AUTO_MARK_NAMES) == {"great", "good", "fail",
-                                                                                                "scam"}
+                                                                                                "scam", "nodata"}

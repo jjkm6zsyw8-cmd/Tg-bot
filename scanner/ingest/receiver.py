@@ -92,6 +92,10 @@ class Receiver:
         if self.watch is not None:
             self.watch.resolve_pool = self.resolve_pool
         self.store_hours = float(rel.get("trade_store_hours", 24))
+        # 25.11: кандидаты в smart (посчитаны моделью «как бот», не в списке) — их сделки и сделки их монет после покупки
+        # (правило A держит до 30 мин) пишутся, как у отслеживаемых: иначе оценке не хватает цены выхода
+        self.candidate_limit = int(rel.get("candidate_track_limit", 150))
+        self.coin_track_s = 60 * float(rel.get("candidate_coin_min", 35))
         self.known_mints: dict[str, float] = {}   # mint → unix-время создания
         self.tracked_wallets: set[str] = set()
         self.scout_wallets: set[str] = set()       # кандидаты разведки: храним их сделки, монеты не подписываем
@@ -227,10 +231,11 @@ class Receiver:
                     await s.subscribe_tokens([ev.mint])
         elif isinstance(ev, Trade):
             if ev.trader in self.tracked_wallets and ev.is_buy and ev.trader not in self.scout_wallets:
-                # отслеживаемый трейдер купил — сделки монеты нужны для цены и выхода (30 минут)
-                self.extended[ev.mint] = max(self.extended.get(ev.mint, 0), time.time() + 1800)
+                # отслеживаемый трейдер или кандидат купил — сделки монеты нужны для цены и выхода (правило A — до
+                # 30 мин после входа, с запасом 35), в том числе на PumpSwap: их приносит только подписка на монету
+                self.extended[ev.mint] = max(self.extended.get(ev.mint, 0), time.time() + self.coin_track_s)
                 if self.watch is not None:
-                    self.watch_coin(ev.mint, 1800)
+                    self.watch_coin(ev.mint, self.coin_track_s)
             if not self.should_store(ev):
                 return
             self._track_mc(ev)
@@ -287,6 +292,16 @@ class Receiver:
         self.watch_coin_until[mint] = max(self.watch_coin_until.get(mint, 0), time.time() + seconds)
         self.watch.add_coin(mint)
 
+    async def candidates(self) -> list[str]:
+        """Кандидаты в smart: посчитаны моделью «как бот», не в списке, торговали за 7 дней — лучшие по копии."""
+        if self.candidate_limit <= 0:
+            return []
+        rows = await self.db.fetch(
+            """SELECT address FROM traders WHERE NOT active AND copy_n_30d IS NOT NULL
+               AND last_active > now() - interval '7 days' ORDER BY copy_30d DESC NULLS LAST LIMIT $1""",
+            self.candidate_limit)
+        return [r["address"] for r in rows]
+
     async def watch_targets(self) -> None:
         """Раз в минуту: кошельки (трейдеры, девы из списка) и монеты (позиции, наблюдение, свежие монеты девов)."""
         if self.watch is None:
@@ -295,6 +310,8 @@ class Receiver:
             """SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')
                UNION SELECT address FROM scout WHERE status = 'probation'""")
         wallets = [r["address"] for r in rows]
+        seen = set(wallets)
+        wallets += [a for a in await self.candidates() if a not in seen]      # кандидаты — последними
         self.watch_devs = {r["wallet"] for r in await self.db.fetch(
             """SELECT l.wallet FROM cluster_links l JOIN clusters c ON c.id = l.cluster_id
                WHERE l.status <> 'rejected' AND l.confidence <> 'low' AND NOT c.blacklisted AND NOT c.suspicious
@@ -683,7 +700,7 @@ class Receiver:
                 rows = await self.db.fetch(
                     "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist "
                     "WHERE kind IN ('trader', 'dev') UNION SELECT address FROM scout WHERE status = 'probation'")
-                wallets = {r["address"] for r in rows}
+                wallets = {r["address"] for r in rows} | set(await self.candidates())
                 # испытание разведки: цену и выход по ним бумага берёт из Jupiter — подписка на все сделки их
                 # монет (трафик Helius) не нужна, только на сделки самих кошельков
                 self.scout_wallets = {r["address"] for r in await self.db.fetch(

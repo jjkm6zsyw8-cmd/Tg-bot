@@ -4,6 +4,8 @@
   на паузе (по умолчанию 2 часа), уведомление о паузе и о снятии. За таким скальпером мы — выходная ликвидность.
 * Дельта цены: насколько дороже цели мы входим (MC нашего входа / MC сразу после его покупки − 1). Средняя по
   последним 20 копиям больше порога (15%) при 5+ замерах → кошелёк не копируем: между нами влезают боты.
+  25.11: замеры старше 24 ч не считаются — иначе блок был вечным (заблокированный кошелёк не копируется, новых
+  замеров нет: 7BNax с 11.11 стоял на 5 замерах +43%).
 * Журнал copy_log: каждая покупка/продажа своих кошельков — «скопировал» или «пропустил» с причиной (/copylog).
 * Конвейер: дев из своего списка запустил следующую монету быстрее N минут после прошлой → пропуск.
 * Вход дороже цели (по умолчанию выключено, /settings): наша цена входа выше MC сразу после его покупки больше
@@ -31,6 +33,7 @@ DEFAULTS: dict[str, float] = {
     "antipvp_pause_min": 120,      # длительность паузы
     "copy_max_delta": 0.15,        # средняя дельта входа больше 15% — не копируем
     "copy_delta_min_n": 5,         # замеров для решения
+    "copy_delta_max_age_h": 24,    # замеры старше — не в счёт
     "copy_entry_max_delta": 1.0,   # эта копия: цена выше его покупки больше порога — не входим (100% — выкл.:
                                    # на быстрых ракетах вроде CHICXU ×7 наш вход всегда сильно выше его покупки)
     "copy_dev_min_gap_min": 3,     # дев из списка запускает чаще — конвейер, пропуск
@@ -49,7 +52,7 @@ class CopyGuard:
         self.buys: dict[tuple[str, str], float] = {}          # (кошелёк, монета) → время его первой покупки
         self.holds: dict[str, deque[float]] = {}              # кошелёк → удержание последних 5 сделок, с
         self.paused: dict[str, float] = {}                    # кошелёк → до какого unix-времени пауза
-        self.deltas: dict[str, deque[float]] = {}             # кошелёк → дельты входа последних 20 копий
+        self.deltas: dict[str, deque[tuple[float, float]]] = {}   # кошелёк → (время, дельта) последних 20 копий
         self.dev_last: dict[str, float] = {}                  # дев → время прошлого запуска
 
     @property
@@ -61,11 +64,13 @@ class CopyGuard:
         now = time.time()
         self.paused = {w: float(t) for w, t in saved.items() if float(t) > now}
         rows = await self.db.fetch(
-            """SELECT wallet, delta FROM (SELECT wallet, delta, row_number() OVER (PARTITION BY wallet ORDER BY id DESC) n
-               FROM copy_log WHERE delta IS NOT NULL) x WHERE n <= 20 ORDER BY wallet, n DESC""")
+            """SELECT wallet, delta, extract(epoch FROM ts) AS t FROM (
+                   SELECT wallet, delta, ts, row_number() OVER (PARTITION BY wallet ORDER BY id DESC) n
+                   FROM copy_log WHERE delta IS NOT NULL AND ts > now() - make_interval(hours => $1::int)) x
+               WHERE n <= 20 ORDER BY wallet, n DESC""", int(q(self.cfg, "copy_delta_max_age_h")))
         self.deltas = {}
         for r in rows:
-            self.deltas.setdefault(r["wallet"], deque(maxlen=20)).append(r["delta"])
+            self.deltas.setdefault(r["wallet"], deque(maxlen=20)).append((float(r["t"]), float(r["delta"])))
 
     def label(self, wallet: str) -> str:
         t = self.e.traders.get(wallet) or self.e.my_devs.get(wallet) or {}
@@ -114,8 +119,12 @@ class CopyGuard:
         await self.db.kv_set("copy:paused", {w: t for w, t in self.paused.items()} or None)
 
     # ------------------------------------------------------------------ дельта цены
+    def fresh_deltas(self, wallet: str) -> list[float]:
+        cut = time.time() - 3600 * q(self.cfg, "copy_delta_max_age_h")
+        return [d for t, d in self.deltas.get(wallet) or () if t >= cut]
+
     def delta_reason(self, wallet: str) -> str | None:
-        ds = self.deltas.get(wallet)
+        ds = self.fresh_deltas(wallet)
         if not ds or len(ds) < q(self.cfg, "copy_delta_min_n"):
             return None
         avg = sum(ds) / len(ds)
@@ -127,7 +136,7 @@ class CopyGuard:
         if not ref_mc or ref_mc <= 0 or not entry_mc:
             return None
         delta = entry_mc / ref_mc - 1
-        self.deltas.setdefault(wallet, deque(maxlen=20)).append(delta)
+        self.deltas.setdefault(wallet, deque(maxlen=20)).append((time.time(), delta))
         await self.db.execute(
             """UPDATE copy_log SET entry_mc=$3, delta=$4 WHERE id = (SELECT id FROM copy_log WHERE wallet=$1 AND mint=$2
                AND action='copied' ORDER BY id DESC LIMIT 1)""", wallet, mint, entry_mc, delta)

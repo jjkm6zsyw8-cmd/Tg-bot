@@ -689,3 +689,7 @@ CREATE TABLE IF NOT EXISTS wallet_family (
 
 -- 20.11: устойчивость плюса копий трейдера за 30 дней (среднее / (разброс / √n)); ≥1.645 — не случайность
 ALTER TABLE traders ADD COLUMN IF NOT EXISTS copy_t_30d double precision;
+
+-- 25.11: копируемость «как бот» (analytics/copymodel.py): сколько копий посчитано и доля копий без цены
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS copy_n_30d int;
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS copy_noprice_30d double precision;

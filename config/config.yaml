@@ -40,7 +40,7 @@ defaults:
   smart_max_growth_1m: 1.0        # монета выросла за минуту не больше 100%
   consensus_window_min: 10
   trader_min_trades_30d: 30
-  trader_min_hold_s: 120
+  trader_min_hold_s: 120          # 25.11: не используется — скальпера отсекает копия «как бот» (copymodel.py)
   trader_max_snipe_share: 0.20
   trader_active_days: 7
 

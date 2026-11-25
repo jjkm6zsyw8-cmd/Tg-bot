@@ -113,7 +113,7 @@ async def evaluate(db: Any, address: str, cfg: dict[str, Any], costs: Any) -> di
     # 22.11: вход — со скоростью бота (4 блока ≈ 1 с), а не «руками» через 5 с: у Arkd (держит ~3 с) при 5 с все
     # выходы выходили около нуля, а бумага (вход через 4 блока) дала +$162 на 162 копиях
     delay = float(cfg.get("rules_delay_s", BOT_DELAY_S))
-    _s7, s30, all_trips = await compute_trader(db, address, {**cfg, "copy_delay_s": delay}, costs)
+    _s7, s30, all_trips = await compute_trader(db, address, {**cfg, "copy_delay_s": delay}, costs, model=False)
     all_trips = sorted(all_trips, key=lambda t: t.entry_ts)
     now = time.time()
     month = spread(all_trips, LAST_TRIPS)

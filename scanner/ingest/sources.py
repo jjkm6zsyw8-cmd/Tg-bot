@@ -434,6 +434,7 @@ class WatchSource(Source):
 
     name = "watch"
     MAX_SUBS = 950
+    COIN_RESERVE = 200          # 25.11: монетам — не меньше стольких подписок (сделки PumpSwap приходят только так)
 
     def __init__(self, url: str, pool_to_mint: dict[str, str], fallback: str = ""):
         super().__init__()
@@ -464,10 +465,12 @@ class WatchSource(Source):
         self.skip_pools: dict[str, float] = {}  # пул → до какого времени не спрашивать (не к SOL / неизвестен)
 
     def set_targets(self, wallets: list[str], coins: list[str]) -> None:
-        """Кошельки важнее монет: при переполнении режем монеты."""
+        """Кошельки важнее монет, но монетам остаётся до COIN_RESERVE подписок: без них оценке копий и выходам не
+        хватает цены на PumpSwap. Кошельки — в порядке важности (кандидаты в конце списка режутся первыми)."""
         want: dict[str, str] = {}
+        wallet_cap = self.MAX_SUBS - min(self.COIN_RESERVE, len(coins))
         for a in wallets:
-            if len(want) >= self.MAX_SUBS:
+            if len(want) >= wallet_cap:
                 break
             want.setdefault(a, "wallet")
         for a in coins:

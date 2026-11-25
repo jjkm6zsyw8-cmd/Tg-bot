@@ -1353,6 +1353,42 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
         text, kb = await board.top_view(db)
         await reply(m, text, kb)
 
+    @router.message(Command("follow"))
+    async def cmd_follow(m: Message, command: CommandObject) -> None:
+        """25.11: /follow адрес [дней] [A|B|G|R] — кошелёк в свой список и «👻 тень за ним» (без денег) по правилу
+        выхода (по умолчанию A) на N дней (по умолчанию 5); после срока «за ним» снимается само. Бой — только кнопкой
+        в карточке, с подтверждением."""
+        import time as _time
+        from . import board
+        parts = (command.args or "").split()
+        if not parts or not is_valid_address(parts[0]):
+            return await reply(m, "Формат: <code>/follow адрес 5 A</code> — тень за кошельком 5 дней, выход по правилу A")
+        addr = parts[0]
+        days = next((float(p) for p in parts[1:] if p.replace(".", "", 1).isdigit()), 5.0)
+        rule = next((p.upper() for p in parts[1:] if p.upper() in ("A", "B", "G", "R")), "A")
+        days = min(30.0, max(0.5, days))
+        cfg = await reload()
+        if not await db.fetchval("SELECT manual FROM traders WHERE address=$1", addr):
+            s7, s30, _ = await compute_trader(db, addr, cfg, views.costs_of(settings))
+            linked = await linked_to_dev(db, addr)
+            ok, _f = qualifies(s7, s30, linked, cfg)
+            await save_trader(db, addr, s7, s30, ok, linked, label=None, manual=True)
+        await db.execute("UPDATE traders SET active=true, manual=true WHERE address=$1", addr)
+        await board.set_follow(db, addr, "shadow")
+        until = _time.time() + days * 86400
+        await board.set_follow_rule(db, addr, rule, until)
+        await db.job("reload")
+        row = await db.fetchrow("SELECT copy_30d, copy_n_30d, copy_noprice_30d, median_hold_s FROM traders "
+                                "WHERE address=$1", addr)
+        est = ""
+        if row and row["copy_n_30d"] is not None:
+            est = (f"\nОценка «как бот» за 30 дней: {int(row['copy_n_30d'])} копий, в среднем "
+                   f"{float(row['copy_30d'] or 0):+.1%}, без цены {float(row['copy_noprice_30d'] or 0):.0%}.")
+        await reply(m, f"👻 Тень за <code>{addr}</code>: выход по правилу {rule}, {days:g} дн. (до "
+                       f"{datetime.fromtimestamp(until, timezone.utc):%d.%m %H:%M} UTC), без денег. Его покупки "
+                       "считаются в тени по настоящим ценам; итог — в его карточке и в «📊 Реальные цифры» → «За "
+                       "кошельками»." + est)
+
     @router.message(Command("card"))
     async def cmd_card(m: Message, command: CommandObject) -> None:
         """Карточка кошелька доски по началу адреса или метке: /card 6d7y."""
@@ -1391,6 +1427,11 @@ def setup(router: Router, env: Env, settings: Settings, db: Database, sender: An
                 await board.set_follow(db, arg, new)
                 toast = {"shadow": "Тень за ним включена", "live": "Бой за ним включён"}.get(new or "", "Не торгую за ним")
                 text, kb = await board.card_view(db, cfg, arg)
+        elif act == "r" and arg and len(parts) > 3:
+            until = (await db.kv_get(board.UNTIL_KEY) or {}).get(arg)
+            await board.set_follow_rule(db, arg, None if parts[3] == "best" else parts[3], until)
+            toast = "Выход за ним: " + ("лучший по истории" if parts[3] == "best" else parts[3])
+            text, kb = await board.card_view(db, cfg, arg)
         elif act == "x" and arg:
             if len(parts) > 3 and parts[3] == "!":
                 await remove(arg, "t")

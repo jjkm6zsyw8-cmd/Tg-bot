@@ -45,7 +45,7 @@ async def main(cmd: str) -> None:
         await db.close()
         return
     if cmd in ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
-               "patterns", "dips", "whynot", "migration", "research"):
+               "patterns", "dips", "whynot", "migration", "research", "copycheck"):
         await run_tool(cmd, db)
         await db.close()
         return
@@ -227,6 +227,18 @@ async def run_tool(cmd: str, db: Database) -> None:
         settings.overrides = await db.get_overrides()
         days = float(args[args.index("--days") + 1]) if "--days" in args else 7.0
         print(await whynot_run(db, settings.effective(), days=days, send="--no-send" not in args))
+    elif cmd == "copycheck":
+        # 25.11: контроль оценки копий «как бот» против бумаги A: python -m scanner copycheck [кошелёк] [с] [по]
+        # (даты ГГГГ-ММ-ДД, UTC; по умолчанию 7BNaxx… за 10–17.11)
+        from datetime import datetime, timezone
+        from .analytics.copymodel import control_text
+        from .analytics.copytrade import REFERENCE_WALLETS
+        named = [a for a in args if not a.startswith("-")]
+        wallet = next((a for a in named if len(a) > 30), REFERENCE_WALLETS[0])
+        dates = [datetime.strptime(a, "%Y-%m-%d").replace(tzinfo=timezone.utc) for a in named if len(a) == 10]
+        lo = dates[0] if dates else datetime(2026, 11, 10, tzinfo=timezone.utc)
+        hi = dates[1] if len(dates) > 1 else datetime(2026, 11, 18, tzinfo=timezone.utc)
+        print(await control_text(db, wallet, lo.timestamp(), hi.timestamp()))
     elif cmd == "real-export":
         # аварийный выход: ключи кошельков, созданных в Telegram, — только сюда, на экран сервера
         from .real.vault import load_vault

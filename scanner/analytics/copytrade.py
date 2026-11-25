@@ -1,8 +1,10 @@
 """Копируемость трейдера и отбор смарт-мани (разд. 4 ТЗ).
 
-Копируемость — средний чистый результат, который получил бы пользователь, повторяя
-сделки трейдера с задержкой на вход и выход (по фактическому MC через delay секунд),
-с комиссиями и проскальзыванием кривой.
+25.11: копируемость (copy_7d / copy_30d, copy_t_30d) — средний результат копии «как торгует бот»
+(analytics/copymodel.py): вход блок +2, выход по decide_exit правилом A с общими выходами, ставка 0.14 SOL,
+издержки бота (круг 3.2–3.8%), сдвиг цены по кривой или пулу PumpSwap; копии без цены выхода в оценку не идут — их
+доля хранится (copy_noprice_30d). Старый расчёт «вход и выход через 5 с за трейдером» остался только для пути цены
+в wallet_rules (выход F «за ним»). Порог удержания (120 с) убран: решает результат копии при реальной задержке.
 """
 from __future__ import annotations
 
@@ -52,6 +54,8 @@ class TraderStats:
     snipe_share: float
     last_active: float | None
     copy_t: float = 0.0         # устойчивость плюса копий: среднее / (разброс / √n)
+    copy_n: int = 0             # посчитано копий (модель «как бот»)
+    copy_noprice: float = 0.0   # доля копий без цены входа / выхода (в оценку не вошли)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -148,8 +152,17 @@ async def mc_lookup(db: Database, pairs: list[tuple[str, float]]) -> list[float 
     return [r["mc_sol"] for r in rows]
 
 
+REFERENCE_WALLETS = ("7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5",     # лучший smart 10–17.11 (бумага A +23%)
+                     "GgbCFRHHAPv5i1fqt1D1buf8FPNA31oKrkZvXDyZymsT")     # 25.11: владелец проверяет в тени по A
+
+
+def apply_model(s: TraderStats, summ: Any) -> None:
+    """Копируемость — по модели «как бот» (analytics/copymodel.Summary)."""
+    s.copyability, s.copy_t, s.copy_n, s.copy_noprice = summ.avg, summ.t, summ.priced, summ.no_price
+
+
 async def compute_trader(db: Database, address: str, cfg: dict[str, Any], costs: Costs,
-                         days: int = 30) -> tuple[TraderStats, TraderStats, list[RoundTrip]]:
+                         days: int = 30, model: bool = True) -> tuple[TraderStats, TraderStats, list[RoundTrip]]:
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = await db.fetch(
         """SELECT t.mint, t.ts, t.is_buy, t.sol_amount, t.token_amount, t.slot, t.mc_sol, k.created_slot
@@ -172,17 +185,28 @@ async def compute_trader(db: Database, address: str, cfg: dict[str, Any], costs:
     cut7 = (datetime.now(timezone.utc) - timedelta(days=7)).timestamp()
     s30 = stats_from_trips(trips, pos, costs)
     s7 = stats_from_trips([t for t in trips if t.entry_ts >= cut7], pos, costs)
+    if model:
+        from . import copymodel as CM
+        copies = await CM.evaluate_trades(db, address, trades, since.timestamp(),
+                                          limit=int(cfg.get("copy_model_limit", 120)), recent_from=cut7)
+        apply_model(s30, CM.summarize(copies))
+        apply_model(s7, CM.summarize(copies, cut7))
     return s7, s30, trips
 
 
 def qualifies(s7: TraderStats, s30: TraderStats, linked: bool, cfg: dict[str, Any]) -> tuple[bool, list[str]]:
     fails = []
     if not (s7.copyability > 0 and s30.copyability > 0):
-        fails.append("копируемость ≤ 0")
+        fails.append("копия «как бот» ≤ 0")
     if s30.trades < int(cfg.get("trader_min_trades_30d", 30)):
         fails.append(f"сделок {s30.trades} < {cfg.get('trader_min_trades_30d', 30)}")
-    if s30.median_hold_s < float(cfg.get("trader_min_hold_s", 120)):
-        fails.append(f"удержание {s30.median_hold_s:.0f} с — не повторить вручную")
+    # 25.11: порога удержания нет — скальпера отсекает сама копия с задержкой бота (блок +2)
+    min_copies = int(cfg.get("trader_min_copies", 10))
+    if s30.copy_n < min_copies:
+        fails.append(f"посчитано копий {s30.copy_n} < {min_copies}")
+    max_np = float(cfg.get("trader_max_noprice", 0.5))
+    if s30.copy_noprice > max_np:
+        fails.append(f"без цены выхода {s30.copy_noprice:.0%} копий — данных мало")
     if s30.snipe_share >= float(cfg.get("trader_max_snipe_share", 0.2)):
         fails.append("снайпер")
     if linked:
@@ -193,7 +217,7 @@ def qualifies(s7: TraderStats, s30: TraderStats, linked: bool, cfg: dict[str, An
     return not fails, fails
 
 
-OWN_SMART_MIN_HOLD_S = 180.0
+OWN_SMART_MIN_HOLD_S = 0.0     # 25.11: порог удержания убран — решает копия при задержке бота
 
 
 def smart_like(t: Any, cfg: dict[str, Any] | None = None) -> bool:
@@ -203,6 +227,8 @@ def smart_like(t: Any, cfg: dict[str, Any] | None = None) -> bool:
     get = t.get if hasattr(t, "get") else (lambda k, d=None: d)
     hold, copy = get("median_hold_s"), get("copy_30d")
     need = float((cfg or {}).get("own_smart_min_hold_s", OWN_SMART_MIN_HOLD_S))
+    if hold is None and need <= 0:
+        hold = 0.0
     # устойчивость плюса (t ≥ 1.645) здесь не нужна: такие кошельки меряют smart-портфели A/B/G, а на деньги и в
     # боевую M неустойчивых не пускает engine._steady_gate (20.11: иначе бумага осталась почти без сделок)
     return hold is not None and float(hold) >= need and copy is not None and float(copy) > 0 \
@@ -244,9 +270,9 @@ async def save_trader(db: Database, address: str, s7: TraderStats, s30: TraderSt
     await db.execute(
         """INSERT INTO traders(address, label, tier, manual, active, qualified, qualified_at, pnl_7d, pnl_30d,
                copy_7d, copy_30d, win_rate, trades_30d, median_hold_s, avg_entry_mc, snipe_share, linked_to_dev,
-               last_active, copy_t_30d, updated_at)
+               last_active, copy_t_30d, copy_n_30d, copy_noprice_30d, updated_at)
            VALUES ($1, $2, $3, COALESCE($4, false), $5, $5, CASE WHEN $5 THEN now() END, $6, $7, $8, $9, $10, $11,
-                   $12, $13, $14, $15, to_timestamp($16), $17, now())
+                   $12, $13, $14, $15, to_timestamp($16), $17, $18, $19, now())
            ON CONFLICT (address) DO UPDATE SET
                label = COALESCE(EXCLUDED.label, traders.label),
                tier = EXCLUDED.tier,
@@ -261,10 +287,11 @@ async def save_trader(db: Database, address: str, s7: TraderStats, s30: TraderSt
                copy_30d = EXCLUDED.copy_30d, win_rate = EXCLUDED.win_rate, trades_30d = EXCLUDED.trades_30d,
                median_hold_s = EXCLUDED.median_hold_s, avg_entry_mc = EXCLUDED.avg_entry_mc,
                snipe_share = EXCLUDED.snipe_share, linked_to_dev = EXCLUDED.linked_to_dev,
-               last_active = EXCLUDED.last_active, copy_t_30d = EXCLUDED.copy_t_30d, updated_at = now()""",
+               last_active = EXCLUDED.last_active, copy_t_30d = EXCLUDED.copy_t_30d,
+               copy_n_30d = EXCLUDED.copy_n_30d, copy_noprice_30d = EXCLUDED.copy_noprice_30d, updated_at = now()""",
         address, label, tier(s30), manual, ok, s7.pnl_sol, s30.pnl_sol, s7.copyability, s30.copyability,
         s30.win_rate, s30.trades, s30.median_hold_s, s30.avg_entry_mc, s30.snipe_share, linked,
-        s30.last_active or 0, s30.copy_t,
+        s30.last_active or 0, s30.copy_t, s30.copy_n, s30.copy_noprice,
     )
 
 
@@ -277,8 +304,21 @@ async def refresh_traders(db: Database, cfg: dict[str, Any], costs: Costs, limit
            ORDER BY sum(sol_amount) DESC LIMIT $2""", min_trades, limit)
     candidates = {r["trader"] for r in rows}
     candidates |= {r["address"] for r in await db.fetch("SELECT address FROM traders")}
-    qualified = 0
-    for addr in candidates:
+    # 25.11: кто покупал те же монеты, что эталонные кошельки, в пределах ±2 мин от них
+    refs = list(cfg.get("copy_reference_wallets") or REFERENCE_WALLETS)
+    try:
+        from .copymodel import cobuyers
+        candidates |= {a for a, _n in await cobuyers(db, refs, float(cfg.get("cobuy_window_s", 120)),
+                                                       min_shared=int(cfg.get("cobuy_min_shared", 2)))}
+    except Exception:  # noqa: BLE001 — поиск соседей не должен ломать пересчёт
+        log.exception("соседи эталонных кошельков")
+    # модель «как бот» тяжелее старой: кошелёк, посчитанный ею недавно, ждёт trader_recompute_h (новые — сразу)
+    fresh = {r["address"] for r in await db.fetch(
+        """SELECT address FROM traders WHERE copy_n_30d IS NOT NULL
+           AND updated_at > now() - make_interval(hours => $1::int)""", int(cfg.get("trader_recompute_h", 3)))}
+    qualified = int(await db.fetchval("SELECT count(*) FROM traders WHERE qualified AND address = ANY($1::text[])",
+                                      list(fresh & candidates)) or 0)
+    for addr in candidates - fresh:
         try:
             s7, s30, _ = await compute_trader(db, addr, cfg, costs)
             linked = await linked_to_dev(db, addr)
@@ -300,10 +340,10 @@ async def apply_external_labels(db: Database, ext: Any, cfg: dict[str, Any], lim
         return 0
     rows = await db.fetch(
         """SELECT address FROM traders WHERE copy_30d > 0 AND copy_7d > 0 AND NOT linked_to_dev
-               AND median_hold_s >= $1 AND snipe_share < $2 AND last_active > now() - interval '7 days'
+               AND snipe_share < $1 AND last_active > now() - interval '7 days'
                AND (tags_source IS NULL OR updated_at > now() - interval '1 day')
-           ORDER BY qualified, copy_30d DESC LIMIT $3""",
-        float(cfg.get("trader_min_hold_s", 120)), float(cfg.get("trader_max_snipe_share", 0.2)), limit)
+           ORDER BY qualified, copy_30d DESC LIMIT $2""",
+        float(cfg.get("trader_max_snipe_share", 0.2)), limit)
     added = 0
     for r in rows:
         info = await ext.wallet_info(r["address"], timeout=ext.command_timeout)

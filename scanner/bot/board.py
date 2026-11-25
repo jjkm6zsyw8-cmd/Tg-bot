@@ -20,6 +20,8 @@ from ..alerts.format import esc
 from ..real import settings as S
 
 FOLLOW_KEY = "real:follow"
+RULE_KEY = "real:follow_rule"            # 25.11: своё правило выхода «за ним» (A/B/G/R), иначе — лучший выход
+UNTIL_KEY = "real:follow_until"          # 25.11: «за ним» до этого времени (unix), потом снимается само
 SECTIONS = {"now": "🔥 Сейчас", "best": "🟢 Лучшие", "mid": "🟡 Средние", "bad": "🔴 На вылет"}
 TIER_ICON = {"top": "🟢", "ok": "🟡", "new": "⚪", "weak": "🟠", "paused": "🔴"}
 TIER_NAME = {"top": "топ", "ok": "норм", "new": "новый", "weak": "слабый", "paused": "пауза"}
@@ -275,13 +277,20 @@ async def card_view(db: Any, cfg: dict[str, Any], addr: str) -> tuple[str, list[
                          f"в среднем {float(r['a']):+.1%}, итог <b>{money(float(r['s']) * sol_usd)}</b>")
     else:
         lines.append("   сделок не было — реальных цифр по нему пока нет")
-    lines += [f"За ним сейчас: {FOLLOW_NAME.get(follow, '⚪ нет')}",
+    rule = (await db.kv_get(RULE_KEY) or {}).get(addr)
+    until = (await db.kv_get(UNTIL_KEY) or {}).get(addr)
+    lines += [f"За ним сейчас: {FOLLOW_NAME.get(follow, '⚪ нет')}"
+              + (f" · выход {rule}" if rule and follow else " · выход: лучший по его истории" if follow else "")
+              + (f" · до {datetime.fromtimestamp(float(until), timezone.utc):%d.%m %H:%M} UTC" if until and follow
+                 else ""),
               f"Как торгует он сам: удачных {wr} · сегодня {w['today']} · последняя {last} · держит ~{hold}"]
     if w.get("median_hold_s") is not None and float(w["median_hold_s"]) < 20:
         lines.append("⚠️ Держит меньше 20 с — бот-снайпер: копия покупает позже него и попадает под его продажу.")
     kb = [[{"text": ("● " if follow == "shadow" else "") + "👻 Тень за ним", "callback": f"bd:f:{addr}:shadow"},
            {"text": ("● " if follow == "live" else "") + "💵 В бой за ним…", "callback": f"bd:f:{addr}:live"}],
           [{"text": ("● " if not follow else "") + "⚪ Не торговать за ним", "callback": f"bd:f:{addr}:off"}],
+          [{"text": ("● " if (rule or "best") == r else "") + ("Выход: лучший" if r == "best" else f"Выход {r}"),
+            "callback": f"bd:r:{addr}:{r}"} for r in ("best", "A", "G")],
           [{"text": "GMGN ↗", "url": f"https://gmgn.ai/sol/address/{addr}"},
            {"text": "🗑 Убрать из списка…", "callback": f"bd:x:{addr}"}],
           [{"text": "← Доска", "callback": f"bd:s:{w['section']}"}]]
@@ -296,6 +305,17 @@ def live_confirm(cfg: dict[str, Any], addr: str) -> tuple[str, list[list[dict[st
             "Только у кошельков в режиме «бой» (REAL_LIVE и ключ на сервере); остальные считают это в тени.")
     return text, [[{"text": "Да, в бой за ним", "callback": f"bd:f:{addr}:live!", "style": "danger"},
                    {"text": "Нет", "callback": f"bd:w:{addr}"}]]
+
+
+async def set_follow_rule(db: Any, addr: str, rule: str | None, until: float | None = None) -> None:
+    """Правило выхода «за ним» (A/B/G/R; None — лучший выход по истории) и срок (unix; None — без срока)."""
+    for key, value in ((RULE_KEY, rule if rule in ("A", "B", "G", "R") else None), (UNTIL_KEY, until)):
+        cur = dict(await db.kv_get(key) or {})
+        if value:
+            cur[addr] = value
+        else:
+            cur.pop(addr, None)
+        await db.kv_set(key, cur)
 
 
 async def set_follow(db: Any, addr: str, mode: str | None) -> None:

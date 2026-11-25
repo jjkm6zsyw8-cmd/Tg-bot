@@ -44,7 +44,16 @@ DAILY_SENT_KEY = "daily:sent"
 # 45–57 — 2 из 29, 57–80 — 3 из 19, 80+ — 1 из 7. Победители растут в первые блоки — потолок поднят до 100: тень
 # меряет все цены входа, итог по корзинам цены — в /pnl
 NEWDEV_RANGES = ((0.5, 2.0, 100.0), (10.0, 1e9, 100.0))                  # дата последнего разбора дня — не слать повторно после перезапуска
-AUTO_MARK_NAMES = {"great": "🚀 отлично", "good": "✅ успех", "fail": "❌ провал", "scam": "☠️ скам (дев слил сразу)"}
+AUTO_MARK_NAMES = {"great": "🚀 отлично", "good": "✅ успех", "fail": "❌ провал", "scam": "☠️ скам (дев слил сразу)",
+                   "nodata": "⚪ нет данных (переехала на PumpSwap, цены нет)"}
+# 25.11: MC кривой pump.fun в момент завершения (переезда): v_sol 115.005 / 279.9 млн токенов × 1 млрд = 410.88 SOL.
+# Если цена «застыла» на нём — сделок PumpSwap после переезда в базе нет, итог — «нет данных», а не great / fail
+CURVE_FINAL_MC = 30.0 * 1_073_000_000.0 / (1_073_000_000.0 - 793_100_000.0) ** 2 * 1e9
+
+
+def stale_migrated(*mcs: float | None) -> bool:
+    """Цена — последнее состояние кривой при переезде (410.88 SOL ± 0.5%), а не рынок."""
+    return any(m is not None and abs(float(m) / CURVE_FINAL_MC - 1) < 0.005 for m in mcs)
 
 
 def trigger_of(r: Any) -> dict[str, Any]:
@@ -1384,6 +1393,16 @@ class Engine:
                        exit_reason='glitch', net_result=NULL, auto_mark='glitch', computed_at=now()""", aid)
                 await self.db.execute("UPDATE alerts SET closed_at=now() WHERE id=$1", aid)
             log.warning("итог %s: MC %.0f SOL не подтверждён Jupiter — сбой цены, итог не учитываю", st.symbol, exit_mc)
+            return
+        if stale_migrated(entry_mc, exit_mc):
+            for aid in e.alert_ids.values():
+                await self.db.execute(
+                    """INSERT INTO alert_outcomes(alert_id, max_mc, exit_mc, exit_reason, net_result, auto_mark)
+                       VALUES ($1, $2, $3, 'nodata', NULL, 'nodata') ON CONFLICT (alert_id) DO UPDATE SET
+                       max_mc=EXCLUDED.max_mc, exit_mc=EXCLUDED.exit_mc, exit_reason='nodata', net_result=NULL,
+                       auto_mark='nodata', computed_at=now()""", aid, max_mc, exit_mc)
+                await self.db.execute("UPDATE alerts SET closed_at=now() WHERE id=$1", aid)
+            log.info("итог %s: цена застыла на MC переезда (%.2f) — нет данных", st.symbol, CURVE_FINAL_MC)
             return
         rug = st.big_sell_ts is not None and st.big_sell_ts - t_alert < 30 and st.mc_at(st.big_sell_ts + 5) < 0.5 * entry_mc
         # предварительная оценка — по фактическому результату сигнала, а не по достижимому максимуму

@@ -150,7 +150,7 @@ async def test_copy_log_and_paper_ratio_in_db(monkeypatch):
         day = await tr.trades_text(24)
         assert "(лимфорк)" in day[0]
         await eng.copyguard.load()
-        assert list(eng.copyguard.deltas["W"]) == [pytest.approx(40 / 38 - 1), pytest.approx(40 / 30 - 1)]
+        assert eng.copyguard.fresh_deltas("W") == [pytest.approx(40 / 38 - 1), pytest.approx(40 / 30 - 1)]
     finally:
         await db.close()
 

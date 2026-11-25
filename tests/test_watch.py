@@ -40,8 +40,18 @@ def test_extract_from_csv_and_text():
 def test_watch_targets_priority_and_cap(monkeypatch):
     w = WatchSource("wss://x", {})
     monkeypatch.setattr(WatchSource, "MAX_SUBS", 3)
+    monkeypatch.setattr(WatchSource, "COIN_RESERVE", 1)
     w.set_targets([A, B], [C, addr("wd")])
     assert w.want == {A: "wallet", B: "wallet", C: "coin"}          # кошельки важнее монет
+    # 25.11: монетам — резерв подписок (сделки PumpSwap приходят только по подписке на монету); кошельки в конце
+    # списка (кандидаты) режутся первыми
+    monkeypatch.setattr(WatchSource, "COIN_RESERVE", 2)
+    w.set_targets([A, B], [C, addr("wd")])
+    assert w.want == {A: "wallet", C: "coin", addr("wd"): "coin"}
+    w.set_targets([A, B], [C, addr("wd")][:0])
+    assert w.want == {A: "wallet", B: "wallet"}                      # монет нет — резерв не держим
+    monkeypatch.setattr(WatchSource, "COIN_RESERVE", 1)
+    w.set_targets([A, B], [C, addr("wd")])
     w.add_coin(addr("we"))                                          # переполнено — не добавляем
     assert len(w.want) == 3 and w.counts() == {"wallets": 2, "coins": 1, "active": 0}
 

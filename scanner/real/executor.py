@@ -184,6 +184,10 @@ class RealTrader:
         # сигнала выключен; live — только когда сам кошелёк бота в бою
         self.follow: dict[str, str] = {}
         self.follow_auto: set[str] = set()          # кого «тень за ним» включил сам бот (wallet_rules.autofollow)
+        # 25.11: своё правило выхода «за ним» (kv real:follow_rule, адрес → A/B/G/R) и срок (real:follow_until,
+        # адрес → unix): по сроку «за ним» снимается само — проверка кошелька в тени на N дней
+        self.follow_rule: dict[str, str] = {}
+        self.follow_until: dict[str, float] = {}
         self._follow_at = 0.0
         self.balance: int | None = None             # лампорты на кошельке (кэш)
         self._balance_at = 0.0
@@ -354,8 +358,7 @@ class RealTrader:
     async def start(self) -> None:
         self._roll_day()
         try:
-            self.follow = dict(await self.db.kv_get("real:follow") or {})
-            self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
+            await self.load_follow()
             await self.load_autotune()
         except Exception:  # noqa: BLE001
             self.follow = {}
@@ -499,11 +502,25 @@ class RealTrader:
         if dev and hasattr(paper, "rug_devs"):
             paper.rug_devs.add(dev)
 
+    async def load_follow(self) -> None:
+        self.follow = dict(await self.db.kv_get("real:follow") or {})
+        self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
+        self.follow_rule = dict(await self.db.kv_get("real:follow_rule") or {})
+        self.follow_until = {a: float(t) for a, t in (await self.db.kv_get("real:follow_until") or {}).items()}
+
+    def follow_exit(self, wallet: str | None) -> str | None:
+        """Правило выхода «за ним»: выбранное владельцем (A/B/G/R) или лучший выход кошелька по его истории."""
+        rule = (getattr(self, "follow_rule", None) or {}).get(wallet or "")
+        return rule if rule in ("A", "B", "G", "R") else self.best_exit(wallet)
+
     def follow_mode(self, wallet: str | None) -> str | None:
         """«За ним» с доски кошельков: режим для его сигналов (live — только если этот кошелёк бота в бою)."""
         f = (getattr(self, "follow", None) or {}).get(wallet or "")
         if not f or self.mode() == "off":
             return None
+        until = (getattr(self, "follow_until", None) or {}).get(wallet or "")
+        if until and time.time() > until:
+            return None                  # срок проверки вышел
         if self.get("real_only_follow") and wallet in (getattr(self, "follow_auto", None) or set()):
             return None                  # «только выбранные мной»: тень, которую бот включил сам, — не в счёт
         return "live" if f == "live" and self.mode() == "live" else "shadow"
@@ -842,7 +859,7 @@ class RealTrader:
                 "stake": stake, "min_out": min_out, "slip": slip, "mc": st["mc"],
                 "rule": self.get(S.SCHEME_KEYS[kind]),
                 "filter": self.get("real_smart_filter") if kind == "smart" else "all",
-                "best_exit": self.best_exit(data.get("_followed")), "followed": bool(data.get("_followed")),
+                "best_exit": self.follow_exit(data.get("_followed")), "followed": bool(data.get("_followed")),
                 "fast": bool(data.get("fast")), "detect_ms": data.get("detect_ms"),
                 "target_mc": float(data["target_mc"]) if kind == "mydev" and data.get("target_mc") else None,
                 "age_s": (round(time.time() - float(data["trigger_ts"]), 3) if data.get("trigger_create")
@@ -2163,8 +2180,7 @@ class RealTrader:
         if now - self._follow_at >= 30:
             self._follow_at = now
             try:
-                self.follow = dict(await self.db.kv_get("real:follow") or {})
-                self.follow_auto = set(await self.db.kv_get("real:follow_auto") or [])
+                await self.load_follow()
                 await self.load_autotune()
             except Exception:  # noqa: BLE001
                 pass

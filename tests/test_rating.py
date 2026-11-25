@@ -117,7 +117,9 @@ async def test_cleanup_removes_losing_scalpers_but_keeps_smart_like():
 def test_smart_like():
     from scanner.analytics.copytrade import smart_like
     assert smart_like({"median_hold_s": 600, "copy_30d": 0.05})
-    assert not smart_like({"median_hold_s": 44, "copy_30d": 0.05})          # скальпер
+    # 25.11: порога удержания нет — скальпера отсекает сама копия «как бот» (copy_30d ≤ 0)
+    assert smart_like({"median_hold_s": 44, "copy_30d": 0.05})
+    assert not smart_like({"median_hold_s": 44, "copy_30d": -0.05})
     assert not smart_like({"median_hold_s": 600, "copy_30d": -0.02})        # держит, но копии в минусе
     assert not smart_like({"median_hold_s": 600, "copy_30d": 0.05, "linked_to_dev": True})
     assert not smart_like({"label": "без статистики"})
