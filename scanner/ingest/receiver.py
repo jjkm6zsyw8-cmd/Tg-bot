@@ -780,8 +780,9 @@ class Receiver:
             # без сделок PumpPortal база пишет обрывки: у монет, ушедших на PumpSwap за час, записана 1 сделка из сотен
             if self.pp.has_key and self.pp.connected and now - self.pp.connected_since > 600:
                 trades = sum(self.pp.messages_by_pool.values())
-                if (len(self.pp.token_subs) >= 50 and trades == self._pp_trades_seen
-                        and now - self._pp_warned > 6 * 3600):
+                pd_ok = self.pumpdata is not None and self.pumpdata.connected and self.pumpdata.feed is not None
+                if (len(self.pp.token_subs) >= 50 and trades == self._pp_trades_seen and not pd_ok
+                        and now - self._pp_warned > 6 * 3600):   # 27.11: сделки монет идут из pumpdata — не тревожим
                     self._pp_warned = now
                     await self.db.system("⛔ PumpPortal не отдаёт сделки монет — база собирает обрывки (бандлы, снайперы, "
                                          "пики и анализ — по неполным данным). Пополнить кошелёк API-ключа PumpPortal "
