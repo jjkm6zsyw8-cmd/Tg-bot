@@ -22,10 +22,11 @@ import aiohttp
 from ..analytics.curve import mc_sol
 from ..config import Env, Settings
 from ..db.pool import Database
-from ..models import Event, Migration, SolTransfer, TokenCreated, Trade
+from ..models import Event, Migration, ReserveCover, ReserveTick, SolTransfer, TokenCreated, Trade
 from ..solana import PUMP_PROGRAM
 from .pump_parser import ParseStats, parse_transaction
 from .rpc import RpcError, SolanaRpc
+from .reserves import ReserveSource, Target, curve_mc, pool_mc, token_amount
 from .sources import HeliusSource, LogsSource, PumpPortalSource, Source, WatchSource
 
 log = logging.getLogger(__name__)
@@ -91,6 +92,17 @@ class Receiver:
         self._http: aiohttp.ClientSession | None = None
         if self.watch is not None:
             self.watch.resolve_pool = self.resolve_pool
+        # 25.11: подписка на резервы (кривая / хранилища пула) монет, купленных отслеживаемыми и кандидатами, — цена
+        # на каждом изменении (reserves.py); своё соединение и свой лимит трафика
+        self.reserves: ReserveSource | None = (ReserveSource(env.watch_ws_url, env.watch_fallback_ws)
+                                               if env.watch_ws_url and rel.get("reserve_watch", True) else None)
+        if self.reserves is not None:
+            self.reserves.on_complete = self.reserve_migrated
+        self.reserve_until: dict[str, float] = {}     # монета → до какого времени слушать резервы
+        self.reserve_capped = False
+        self._reserve_busy: set[str] = set()
+        self.buf_reserves: list[ReserveTick] = []
+        self.buf_cover: list[ReserveCover] = []
         self.store_hours = float(rel.get("trade_store_hours", 24))
         # 25.11: кандидаты в smart (посчитаны моделью «как бот», не в списке) — их сделки и сделки их монет после покупки
         # (правило A держит до 30 мин) пишутся, как у отслеживаемых: иначе оценке не хватает цены выхода
@@ -193,6 +205,12 @@ class Receiver:
                 self.extended.pop(m, None)
 
     async def sink(self, ev: Event) -> None:
+        if isinstance(ev, ReserveTick):
+            self.buf_reserves.append(ev)
+            return
+        if isinstance(ev, ReserveCover):
+            self.buf_cover.append(ev)
+            return
         key = event_key(ev)
         is_new = self.seen.add(key)
         src = getattr(ev, "source", "") or "rpc"
@@ -236,6 +254,7 @@ class Receiver:
                 self.extended[ev.mint] = max(self.extended.get(ev.mint, 0), time.time() + self.coin_track_s)
                 if self.watch is not None:
                     self.watch_coin(ev.mint, self.coin_track_s)
+                self.reserve_watch(ev.mint, self.coin_track_s)
             if not self.should_store(ev):
                 return
             self._track_mc(ev)
@@ -285,6 +304,86 @@ class Receiver:
                 return None
         self._pool_miss[pool] = time.time()
         return None
+
+    # ------------------------------------------------------------------ резервы (reserves.py)
+    def reserve_watch(self, mint: str, seconds: float) -> None:
+        if self.reserves is None:
+            return
+        self.reserve_until[mint] = max(self.reserve_until.get(mint, 0), time.time() + seconds)
+        if mint not in self.reserves.targets and mint not in self._reserve_busy and not self.reserve_capped:
+            self._reserve_busy.add(mint)
+            asyncio.create_task(self._reserve_add(mint))
+
+    async def reserve_migrated(self, mint: str) -> None:
+        """Кривая закрылась — монета на PumpSwap: слушаем хранилища пула."""
+        if mint in self._reserve_busy:
+            return
+        self._reserve_busy.add(mint)
+        await self._reserve_add(mint, pool_only=True)
+
+    async def _account(self, addr: str) -> bytes | None:
+        import base64 as b64
+        res = await self.rpc.call("getAccountInfo", [addr, {"encoding": "base64", "commitment": "confirmed"}])
+        data = ((res or {}).get("value") or {}).get("data")
+        return b64.b64decode(data[0]) if data else None
+
+    async def _reserve_add(self, mint: str, pool_only: bool = False) -> None:
+        """Монета → что слушать (кривая или хранилища пула) + цена на момент подписки."""
+        from solders.pubkey import Pubkey
+        from ..real import pump, pumpswap
+        try:
+            mk = Pubkey.from_string(mint)
+            if not pool_only:
+                curve = str(pump.curve_address(mk))
+                data = await self._account(curve)
+                c = curve_mc(data) if data else None
+                if c is not None and not c[2]:
+                    if self.reserves is not None and self.reserves.set_target(mint, Target("pump", [curve])):
+                        self.buf_reserves.append(ReserveTick(mint, c[0], "pump", None, c[1], source="reserves_start"))
+                    return
+            pool = await self.db.fetchval("SELECT amm_pool FROM tokens WHERE mint = $1", mint) \
+                or str(pumpswap.pool_address(mk))
+            data = await self._account(pool)
+            if not data:
+                return
+            p = pumpswap.parse_pool(pool, data)
+            if p.quote_mint != str(pump.WSOL):
+                return                                  # пул не к SOL — цену в SOL не считаем
+            res = await self.rpc.call("getMultipleAccounts", [[p.base_vault, p.quote_vault],
+                                                              {"encoding": "base64", "commitment": "confirmed"}])
+            import base64 as b64
+            vals = [(v or {}).get("data") for v in ((res or {}).get("value") or [])]
+            amounts = [token_amount(b64.b64decode(v[0])) if v else None for v in vals]
+            if self.reserves is not None and self.reserves.set_target(
+                    mint, Target("pump-amm", [p.base_vault, p.quote_vault], p.virtual_quote)):
+                if len(amounts) == 2 and amounts[0] and amounts[1] is not None:
+                    self.buf_reserves.append(ReserveTick(mint, pool_mc(amounts[0], amounts[1], p.virtual_quote),
+                                                         "pump-amm", None, amounts[1] / 1e9, source="reserves_start"))
+        except Exception as exc:  # noqa: BLE001 — монету без резервов просто не слушаем
+            log.debug("резервы %s: %s", mint, exc)
+        finally:
+            self._reserve_busy.discard(mint)
+
+    async def reserve_targets(self) -> None:
+        """Раз в минуту: снять подписки, у которых прошли 35 мин; дневной лимит трафика."""
+        if self.reserves is None:
+            return
+        now = time.time()
+        for m in [m for m, t in self.reserve_until.items() if t <= now]:
+            self.reserve_until.pop(m, None)
+            self.reserves.drop(m)
+        for m in [m for m in self.reserves.targets if m not in self.reserve_until]:
+            self.reserves.drop(m)
+        for m, t in list(self.reserves.targets.items()):
+            if t.venue == "pump" and t.complete and m not in self._reserve_busy:
+                asyncio.create_task(self.reserve_migrated(m))     # пул ещё не появился — пробуем раз в минуту
+        limit_mb = float(self.settings.reliability().get("reserve_daily_mb", 150))
+        used_mb = (self.reserves.bytes_in - self._usage_base.get("bytes_reserves", 0)) / 1e6
+        capped = used_mb >= limit_mb
+        if capped and not self.reserve_capped:
+            await self.db.system(f"⚠️ Резервы монет: за сутки {used_mb:.0f} МБ (лимит {limit_mb:.0f}). Новые монеты до "
+                                 "конца суток (UTC) не подписываю, начатые дослушиваю.")
+        self.reserve_capped = capped
 
     def watch_coin(self, mint: str, seconds: float) -> None:
         if self.watch is None or self.watch_capped:
@@ -341,6 +440,7 @@ class Receiver:
         self.watch_capped = capped
         coins = [] if capped else sorted(self.watch_coin_until, key=lambda m: -self.watch_coin_until[m])
         self.watch.set_targets(wallets, coins)
+        await self.reserve_targets()
 
     def logs_alive(self) -> bool:
         """Поток со слотами (Helius/logs) подключён — слоты придут с ним, RPC для слотов не тратим."""
@@ -397,6 +497,10 @@ class Receiver:
         migr, self.buf_migr = self.buf_migr, []
         transfers, self.buf_transfers = self.buf_transfers, []
         screates, self.buf_source_creates = self.buf_source_creates, []
+        reserves, self.buf_reserves = self.buf_reserves, []
+        covers, self.buf_cover = self.buf_cover, []
+        if reserves or covers:
+            await self.flush_reserves(reserves, covers)
         if not (tokens or trades or migr or transfers or screates):
             return
         async with self.db.p.acquire() as conn:
@@ -749,7 +853,8 @@ class Receiver:
             cur = self._usage_snapshot()
             usage = {k: cur[k] - self._usage_base.get(k, 0) for k in cur}
             usage["helius_stream_credits"] = round(
-                (usage.get("bytes_helius", 0) + usage.get("bytes_logs", 0) + usage.get("bytes_watch", 0)) / 1e6 * 20)
+                (usage.get("bytes_helius", 0) + usage.get("bytes_logs", 0) + usage.get("bytes_watch", 0)
+                 + usage.get("bytes_reserves", 0)) / 1e6 * 20)
             await self.db.kv_set("usage:ingest", {"day": day, **usage})
             await self.db.kv_set("health:ingest", {
                 "at": datetime.now(timezone.utc).isoformat(),
@@ -773,6 +878,10 @@ class Receiver:
                     "devs": len(self.watch_devs), "reconnects": self.watch.reconnects,
                     "fallback": self.watch.on_fallback, "last_error": self.watch.last_error},
                 "rpc_fallback": self.rpc.on_fallback,
+                "reserves": None if self.reserves is None else {
+                    "connected": self.reserves.connected, **self.reserves.counts(),
+                    "mb_today": round(usage.get("bytes_reserves", 0) / 1e6, 1), "capped": self.reserve_capped,
+                    "reconnects": self.reserves.reconnects, "last_error": self.reserves.last_error},
             })
 
     def _usage_snapshot(self) -> dict[str, float]:
@@ -783,9 +892,24 @@ class Receiver:
         if self.watch is not None:
             snap["bytes_watch"] = self.watch.bytes_in
             snap["events_watch"] = self.watch.events
+        if self.reserves is not None:
+            snap["bytes_reserves"] = self.reserves.bytes_in
+            snap["events_reserves"] = self.reserves.events
         snap["pp_pump_msgs"] = self.pp.messages_by_pool.get("pump", 0)
         snap["pp_amm_msgs"] = self.pp.messages_by_pool.get("pump-amm", 0)
         return snap
+
+    async def flush_reserves(self, ticks: list[ReserveTick], covers: list[ReserveCover]) -> None:
+        if ticks:
+            await self.db.p.executemany(
+                "INSERT INTO reserve_ticks(mint, ts, slot, mc_sol, venue, quote_sol) VALUES ($1,$2,$3,$4,$5,$6)",
+                [(t.mint, t.ts, t.slot, t.mc_sol, t.venue, t.quote_sol) for t in ticks])
+        if covers:
+            await self.db.p.executemany(
+                """INSERT INTO reserve_cover(mint, started_at, ended_at) VALUES ($1,$2,$3)
+                   ON CONFLICT (mint, started_at) DO UPDATE SET ended_at = GREATEST(reserve_cover.ended_at,
+                                                                                    EXCLUDED.ended_at)""",
+                [(c.mint, c.started_at, c.ended_at) for c in covers])
 
     async def retention_loop(self) -> None:
         days = int(self.settings.reliability().get("raw_trades_days", 30))
@@ -794,6 +918,8 @@ class Receiver:
             await self.db.execute("DELETE FROM trades WHERE ts < now() - make_interval(days => $1)", days)
             await self.db.execute("DELETE FROM sol_transfers WHERE ts < now() - make_interval(days => $1)", days * 2)
             await self.db.execute("DELETE FROM outbox WHERE sent_at < now() - interval '7 days'")
+            await self.db.execute("DELETE FROM reserve_ticks WHERE ts < now() - make_interval(days => $1)", days)
+            await self.db.execute("DELETE FROM reserve_cover WHERE ended_at < now() - make_interval(days => $1)", days)
 
     async def run(self) -> None:
         await self.load_known_mints()
@@ -806,6 +932,8 @@ class Receiver:
         tasks = [asyncio.create_task(s.run(self.enqueue), name=s.name) for s in self.sources]
         if self.watch is not None:
             tasks.append(asyncio.create_task(self.watch.run(self.enqueue), name="watch"))
+        if self.reserves is not None:
+            tasks.append(asyncio.create_task(self.reserves.run(self.enqueue), name="reserves"))
         tasks += [asyncio.create_task(c()) for c in (
             self.worker, self.flush_loop, self.slot_loop, self.slot_research_loop, self.watchdog_loop, self.coverage_loop,
             self.accounts_loop, self.health_loop, self.retention_loop, self.extend_loop, self.backfill_worker)]

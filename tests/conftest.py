@@ -35,3 +35,14 @@ def _no_gecko(monkeypatch):
     async def no_candles(pool, http=None):
         return None
     monkeypatch.setattr(features, "gecko_candles", no_candles)
+
+
+@pytest.fixture(autouse=True)
+def _no_reserve_rpc(monkeypatch):
+    """25.11: подписка на резервы при покупке отслеживаемого спрашивает RPC — в тестах без сети (свои тесты резервов
+    вызывают настоящую функцию с поддельным RPC)."""
+    from scanner.ingest.receiver import Receiver
+
+    async def no_rpc(self, mint, pool_only=False):
+        self._reserve_busy.discard(mint)
+    monkeypatch.setattr(Receiver, "_reserve_add", no_rpc)

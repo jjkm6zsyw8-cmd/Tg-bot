@@ -74,4 +74,26 @@ class SolTransfer:
     ts: datetime = field(default_factory=utcnow)
 
 
-Event = TokenCreated | Trade | Migration | SolTransfer
+@dataclass(slots=True)
+class ReserveTick:
+    """25.11: цена монеты из резервов (счёт кривой или хранилища пула PumpSwap) — на каждом изменении, без сделки."""
+    mint: str
+    mc_sol: float
+    venue: str                  # pump | pump-amm
+    slot: int | None = None
+    quote_sol: float | None = None   # настоящих SOL в кривой / пуле
+    ts: datetime = field(default_factory=utcnow)
+    source: str = "reserves"
+
+
+@dataclass(slots=True)
+class ReserveCover:
+    """Окно, когда за резервами монеты следили: тишина внутри него = цена не менялась."""
+    mint: str
+    started_at: datetime
+    ended_at: datetime
+    source: str = "reserves"
+
+
+Event = TokenCreated | Trade | Migration | SolTransfer | ReserveTick | ReserveCover
+

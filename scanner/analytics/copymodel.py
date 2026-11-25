@@ -41,6 +41,7 @@ GAP_S = 90.0
 # монета на кривой молчала в окне полной записи не меньше DEAD_S до его конца — её бросили: цена дальше та же (иначе
 # такие копии — а это убыточные — выпадали бы из оценки и завышали её)
 DEAD_S = 600.0
+COVER_SLACK_S = 10.0             # 25.11: подписка на резервы начинается через 1–3 с после покупки трейдера
 RULE = "A"
 AMM = "pump-amm"
 
@@ -138,8 +139,10 @@ class Copy:
 
 
 def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, created_ts: float | None,
-               scheme: dict[str, Any] | None = None, stake: float = STAKE_SOL) -> Copy:
-    """Копия одной покупки трейдера: вход как у бота, выход по decide_exit (правило A и общие выходы)."""
+               scheme: dict[str, Any] | None = None, stake: float = STAKE_SOL,
+               covered: list[tuple[float, float]] | None = None) -> Copy:
+    """Копия одной покупки трейдера: вход как у бота, выход по decide_exit (правило A и общие выходы).
+    covered — окна слежения за резервами монеты (reserve_cover): внутри окна тишина значит «цена не менялась»."""
     sc = scheme or SCHEMES[RULE]
     ticks = sorted(ticks, key=lambda t: t.ts)
     et = entry_tick(e, ticks)
@@ -156,9 +159,13 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
     trusted_until = (created_ts + FULL_WINDOW_S) if created_ts is not None else -1.0
     last_seen = opened
 
+    def in_cover(a: float, b: float) -> bool:
+        return any(s <= a + COVER_SLACK_S and b <= e_ for s, e_ in covered or ())
+
     def gap(upto: float) -> bool:
-        """Пробел в данных между прошлой сделкой и upto: на PumpSwap или вне окна полной записи тишина > GAP_S."""
-        if upto - last_seen <= GAP_S:
+        """Пробел в данных между прошлой сделкой и upto: на PumpSwap или вне окна полной записи тишина > GAP_S
+        (25.11: кроме окна слежения за резервами — там цена известна на каждом изменении)."""
+        if upto - last_seen <= GAP_S or in_cover(last_seen, upto):
             return False
         return venue == AMM or upto > trusted_until
 
@@ -209,6 +216,8 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
     # значит, их не было), иначе — пробел в данных
     if venue != AMM and created_ts is not None and (deadline <= trusted_until or trusted_until - last_seen >= DEAD_S):
         return close(deadline, "max_hold")
+    if in_cover(last_seen, deadline):
+        return close(deadline, "max_hold")      # резервы слушали до конца — цена с последнего изменения та же
     return Copy(None, "нет цены выхода", entry_mc=et.mc, venue=venue)
 
 
@@ -286,6 +295,23 @@ def spread(items: list[Any], limit: int) -> list[Any]:
 
 
 # ---------------------------------------------------------------------- база
+async def load_cover(db: Any, windows: dict[str, tuple[float, float]]) -> dict[str, list[tuple[float, float]]]:
+    """Окна слежения за резервами монет (reserve_cover), пересекающие окна копий."""
+    if not windows:
+        return {}
+    mints = list(windows)
+    rows = await db.fetch(
+        """SELECT p.mint, extract(epoch FROM c.started_at) AS s, extract(epoch FROM c.ended_at) AS e
+           FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
+           JOIN reserve_cover c ON c.mint = p.mint AND c.ended_at >= to_timestamp(p.lo)
+                               AND c.started_at <= to_timestamp(p.hi)""",
+        mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints])
+    out: dict[str, list[tuple[float, float]]] = {}
+    for r in rows:
+        out.setdefault(r["mint"], []).append((float(r["s"]), float(r["e"])))
+    return out
+
+
 async def load_ticks(db: Any, windows: dict[str, tuple[float, float]]) -> dict[str, list[Tick]]:
     if not windows:
         return {}
@@ -302,6 +328,16 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]]) -> dict[s
         out.setdefault(r["mint"], []).append(Tick(float(r["ts"]), float(r["mc_sol"]), r["slot"], r["trader"],
                                                   bool(r["is_buy"]), float(r["sol_amount"] or 0), pool,
                                                   not (r["source"] == "pumpportal" and pool == AMM)))
+    # 25.11: цена из резервов (подписка на кривую / хранилища пула) — без сделки, только цена
+    for r in await db.fetch(
+            """SELECT p.mint, extract(epoch FROM r.ts) AS ts, r.mc_sol, r.slot, r.venue
+               FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
+               JOIN reserve_ticks r ON r.mint = p.mint AND r.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi)
+               WHERE r.mc_sol > 0""", mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints]):
+        out.setdefault(r["mint"], []).append(Tick(float(r["ts"]), float(r["mc_sol"]), r["slot"], "", True, 0.0,
+                                                  r["venue"] or "pump", True))
+    for m in out:
+        out[m].sort(key=lambda t: t.ts)
     return out
 
 
@@ -326,6 +362,7 @@ async def evaluate_trades(db: Any, address: str, trades: list[dict[str, Any]], s
         w = win.get(e.mint)
         win[e.mint] = (min(a, w[0]), max(b, w[1])) if w else (a, b)
     ticks = await load_ticks(db, win)
+    cover = await load_cover(db, win)
     meta = {r["mint"]: (r["created"], r["deployer"]) for r in await db.fetch(
         "SELECT mint, extract(epoch FROM created_at) AS created, deployer FROM tokens WHERE mint = ANY($1::text[])",
         list(win))}
@@ -334,7 +371,7 @@ async def evaluate_trades(db: Any, address: str, trades: list[dict[str, Any]], s
         created, dev = meta.get(e.mint, (None, None))
         hi = e.ts + ENTRY_DELAY_S + hold + 60
         c = copy_trade(e, [t for t in ticks.get(e.mint, []) if e.ts - 5 <= t.ts <= hi], address, dev or None,
-                       float(created) if created is not None else None, sc)
+                       float(created) if created is not None else None, sc, covered=cover.get(e.mint))
         out.append((e, c))
     return out
 
@@ -456,5 +493,6 @@ async def control_text(db: Any, address: str, since: float, until: float) -> str
     else:
         lines.append("Бумага A по этому кошельку за период: сделок нет")
     lines.append("Без цены — копии, где в базе нет сделок монеты до выхода (пробел дольше "
-                 f"{GAP_S:g} с на PumpSwap или после первых 30 мин монеты): в оценку не идут.")
+                 f"{GAP_S:g} с на PumpSwap или после первых 30 мин монеты, вне окна слежения за резервами): в оценку "
+                 "не идут.")
     return "\n".join(lines)

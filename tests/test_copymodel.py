@@ -250,3 +250,38 @@ def test_exits_table_same_trades():
     assert "1 · -10%" in row["за трейдером"] and "2 · -8%" in row["за трейдером"]
     assert "1 · +2%" in row["по таймеру"]
     assert "модель «тейк» ↔ бумага «за трейдером» — 1" in text
+
+
+# ====================================================================== 25.11: резервы как цена, окно слежения
+def test_reserve_cover_closes_gaps_on_pumpswap():
+    """Без резервов: на PumpSwap 170 с тишины — «нет цены выхода». С окном слежения за резервами тишина = цена та же:
+    копия досчитывается (выход по таймеру по последней цене)."""
+    amm = [tk(0, 50, 100, ME, pool=M.AMM), tk(30, 52, pool=M.AMM), tk(200, 53, pool=M.AMM)]
+    assert M.copy_trade(entry(), amm, ME, DEV, T0 - 60).why == "нет цены выхода"
+    cover = [(T0 + 2, T0 + 2400)]                                     # слушали резервы с 2-й секунды до 40-й минуты
+    c = M.copy_trade(entry(), amm, ME, DEV, T0 - 60, covered=cover)
+    assert c.res is not None and c.reason == "max_hold" and c.exit_mc == 53
+    short = [(T0 + 2, T0 + 600)]                                      # слушали только 10 мин — дальше пробел
+    assert M.copy_trade(entry(), amm, ME, DEV, T0 - 60, covered=short).why == "нет цены выхода"
+
+
+def test_reserve_ticks_drive_take_profit():
+    """Тики резервов (без трейдера) — цена: тейк A по ним, без единой сделки."""
+    ticks = [tk(0, 50, 100, ME, pool=M.AMM), tk(0.5, 51, 101, who="", pool=M.AMM), tk(40, 75, 180, who="", pool=M.AMM)]
+    c = M.copy_trade(entry(), ticks, ME, DEV, T0 - 60, covered=[(T0, T0 + 2400)])
+    assert c.reason == "take_profit" and c.entry_mc == 51 and c.exit_mc == 75
+
+
+async def test_load_ticks_and_cover_include_reserves(db):
+    m = "RSRV" + "r" * 40
+    now = datetime.now(timezone.utc)
+    await put_trade(db, m, ME, now, True, 50, 1, pool=M.AMM, sig="rs1")
+    await db.execute("INSERT INTO reserve_ticks(mint, ts, slot, mc_sol, venue, quote_sol) VALUES ($1, $2, 3, 55, "
+                     "'pump-amm', 80)", m, now + timedelta(seconds=2))
+    await db.execute("INSERT INTO reserve_cover(mint, started_at, ended_at) VALUES ($1, $2, $3)", m,
+                     now + timedelta(seconds=1), now + timedelta(minutes=40))
+    win = {m: (now.timestamp() - 5, now.timestamp() + 1900)}
+    ticks = (await M.load_ticks(db, win))[m]
+    assert [(t.mc, t.trader, t.price_ok) for t in ticks] == [(50, ME, True), (55, "", True)]
+    cover = (await M.load_cover(db, win))[m]
+    assert len(cover) == 1 and cover[0][1] - cover[0][0] == pytest.approx(2399, abs=1)

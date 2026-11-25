@@ -657,6 +657,24 @@ CREATE TABLE IF NOT EXISTS real_wallets (
 );
 ALTER TABLE real_positions ADD COLUMN IF NOT EXISTS wallet_id bigint;
 ALTER TABLE real_orders ADD COLUMN IF NOT EXISTS wallet_id bigint;
+-- 25.11 (владелец): цена из резервов монеты (кривая / хранилища пула PumpSwap) на каждом изменении — 35 мин после
+-- покупки отслеживаемого кошелька или кандидата (ingest/reserves.py); reserve_cover — когда слушали (тишина внутри
+-- окна = цена не менялась)
+CREATE TABLE IF NOT EXISTS reserve_ticks (
+    mint      text NOT NULL,
+    ts        timestamptz NOT NULL,
+    slot      bigint,
+    mc_sol    double precision NOT NULL,
+    venue     text NOT NULL,                     -- pump | pump-amm
+    quote_sol double precision                   -- настоящих SOL в кривой / пуле
+);
+CREATE INDEX IF NOT EXISTS reserve_ticks_mint_ts_idx ON reserve_ticks (mint, ts);
+CREATE TABLE IF NOT EXISTS reserve_cover (
+    mint       text NOT NULL,
+    started_at timestamptz NOT NULL,
+    ended_at   timestamptz NOT NULL,
+    PRIMARY KEY (mint, started_at)
+);
 -- 25.11: продажа без подписи не могла «лечь в блок» (списание «покупателей нет», токенов нет на счёте) — no_tx
 UPDATE real_orders SET status = 'no_tx' WHERE status = 'landed' AND signature IS NULL;
 CREATE INDEX IF NOT EXISTS real_positions_wallet_idx ON real_positions (wallet_id, opened_at);

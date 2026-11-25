@@ -1,0 +1,249 @@
+"""25.11 (владелец): подписка на резервы монеты — accountSubscribe на счёт кривой pump.fun или на два хранилища пула
+PumpSwap (base и quote), на 35 мин после покупки отслеживаемого кошелька или кандидата. Каждое изменение резервов —
+цена (ReserveTick) без потока всех сделок: полный путь цены для оценки копий «как бот».
+
+Своё соединение websocket к Helius (не мешает слежке за кошельками). Трафик: ~450–600 байт на изменение, 1–2 счёта на
+монету; 740 окон в сутки — оценка 10–100 МБ/сутки (20 кредитов Helius за МБ). Лимит — reliability.reserve_daily_mb.
+
+Цена пула = (quote + virtual_quote) / base (virtual_quote — из счёта пула, читается один раз). Оба хранилища меняются
+в одной транзакции и приходят двумя уведомлениями одного слота — цена выдаётся, когда у обоих один и тот же слот.
+Окно слежения (ReserveCover) отдаётся раз в минуту и при снятии подписки: внутри окна тишина = цена не менялась.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable
+
+import websockets
+
+from ..models import ReserveCover, ReserveTick
+from .sources import Sink, Source
+
+log = logging.getLogger(__name__)
+
+SUPPLY_RAW = 1_000_000_000 * 1_000_000      # 1 млрд токенов × 6 знаков
+LAMPORTS = 1_000_000_000
+COVER_EVERY_S = 60.0
+
+
+@dataclass
+class Target:
+    """Что слушать по монете: кривая (один счёт) или пул (два хранилища + виртуальный резерв SOL)."""
+    venue: str                              # pump | pump-amm
+    accounts: list[str]                     # pump: [кривая]; pump-amm: [base_vault, quote_vault]
+    virtual_quote: int = 0
+    base: tuple[int, int] | None = None     # (остаток, слот)
+    quote: tuple[int, int] | None = None
+    started: float | None = None            # когда подписались на все счета
+    cover_sent: float = 0.0
+    complete: bool = False                  # кривая закрылась — ждём пул PumpSwap
+
+
+def curve_mc(data: bytes) -> tuple[float, float, bool] | None:
+    """Счёт кривой → (MC в SOL, настоящих SOL, кривая закрыта)."""
+    from ..real.pump import parse_curve
+    try:
+        c = parse_curve(data)
+    except ValueError:
+        return None
+    mc = c.v_quote / c.v_tokens * SUPPLY_RAW / LAMPORTS if c.v_tokens else 0.0
+    return mc, c.real_quote / LAMPORTS, c.complete
+
+
+def pool_mc(base: int, quote: int, virtual_quote: int) -> float:
+    return (quote + virtual_quote) / base * 1e15 / 1e9 if base > 0 else 0.0
+
+
+def token_amount(data: bytes) -> int | None:
+    return int.from_bytes(data[64:72], "little") if len(data) >= 72 else None
+
+
+class ReserveSource(Source):
+    name = "reserves"
+    MAX_SUBS = 400
+
+    def __init__(self, url: str, fallback: str = ""):
+        super().__init__()
+        self.url = url
+        self.primary = url
+        self.fallback = fallback if fallback and fallback != url else ""
+        self.targets: dict[str, Target] = {}         # монета → что слушаем
+        self.acc_mint: dict[str, str] = {}           # счёт → монета
+        self.subs: dict[str, int] = {}               # счёт → id подписки
+        self.sid_acc: dict[int, str] = {}
+        self.pending: dict[int, str] = {}            # id запроса → счёт
+        self._ids = iter(range(10, 1 << 62))
+        self._changed = asyncio.Event()
+        self.ticks = 0
+        self.on_complete: Callable[[str], Awaitable[None]] | None = None   # кривая закрылась → переезд на пул
+        self._sink: Sink | None = None
+
+    # ------------------------------------------------------------------ цели
+    def set_target(self, mint: str, target: Target) -> bool:
+        """Добавить / заменить монету. False — нет места в подписках."""
+        old = self.targets.get(mint)
+        extra = len(target.accounts) - (len(old.accounts) if old else 0)
+        if old is None and len(self.acc_mint) + extra > self.MAX_SUBS:
+            return False
+        if old is not None:
+            self._drop_accounts(mint, old)
+        self.targets[mint] = target
+        for a in target.accounts:
+            self.acc_mint[a] = mint
+        self._changed.set()
+        return True
+
+    def drop(self, mint: str) -> None:
+        t = self.targets.pop(mint, None)
+        if t is None:
+            return
+        self._drop_accounts(mint, t)
+        self._cover(mint, t, final=True)
+        self._changed.set()
+
+    def _drop_accounts(self, mint: str, t: Target) -> None:
+        for a in t.accounts:
+            if self.acc_mint.get(a) == mint:
+                self.acc_mint.pop(a, None)
+
+    def counts(self) -> dict[str, int]:
+        return {"coins": len(self.targets), "accounts": len(self.acc_mint), "active": len(self.subs),
+                "ticks": self.ticks}
+
+    # ------------------------------------------------------------------ окно слежения
+    def _cover(self, mint: str, t: Target, final: bool = False) -> None:
+        if t.started is None or self._sink is None:
+            return
+        now = time.time()
+        if not final and now - t.cover_sent < COVER_EVERY_S:
+            return
+        t.cover_sent = now
+        ev = ReserveCover(mint, datetime.fromtimestamp(t.started, timezone.utc), datetime.fromtimestamp(now, timezone.utc))
+        asyncio.create_task(self._sink(ev))
+        if final:
+            t.started = None
+
+    def _all_subscribed(self, mint: str) -> bool:
+        t = self.targets.get(mint)
+        return bool(t) and all(a in self.subs for a in t.accounts)
+
+    # ------------------------------------------------------------------ уведомления
+    def on_account(self, acc: str, data: bytes, slot: int | None) -> ReserveTick | None:
+        """Изменение счёта → цена (или None, если пара хранилищ ещё не сошлась по слоту)."""
+        mint = self.acc_mint.get(acc)
+        t = self.targets.get(mint or "")
+        if t is None or mint is None:
+            return None
+        if t.venue == "pump":
+            r = curve_mc(data)
+            if r is None:
+                return None
+            mc, real_sol, complete = r
+            if complete and not t.complete:
+                t.complete = True
+                if self.on_complete is not None:
+                    asyncio.create_task(self.on_complete(mint))  # монета ушла на PumpSwap — слушаем пул
+            if complete or mc <= 0:
+                return None
+            return ReserveTick(mint, mc, "pump", slot, real_sol)
+        amount = token_amount(data)
+        if amount is None:
+            return None
+        if acc == t.accounts[0]:
+            t.base = (amount, slot or 0)
+        else:
+            t.quote = (amount, slot or 0)
+        if t.base is None or t.quote is None or t.base[1] != t.quote[1]:
+            return None
+        mc = pool_mc(t.base[0], t.quote[0], t.virtual_quote)
+        return ReserveTick(mint, mc, "pump-amm", slot, t.quote[0] / LAMPORTS) if mc > 0 else None
+
+    # ------------------------------------------------------------------ соединение
+    async def _sync(self, ws: Any) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=COVER_EVERY_S)
+            except asyncio.TimeoutError:
+                pass
+            self._changed.clear()
+            for mint, t in list(self.targets.items()):
+                self._cover(mint, t)
+            asked = set(self.pending.values())
+            for acc in [a for a in self.acc_mint if a not in self.subs and a not in asked]:
+                rid = next(self._ids)
+                self.pending[rid] = acc
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "accountSubscribe",
+                                          "params": [acc, {"encoding": "base64", "commitment": "confirmed"}]}))
+                await asyncio.sleep(0.02)
+            for acc in [a for a in self.subs if a not in self.acc_mint]:
+                sid = self.subs.pop(acc)
+                self.sid_acc.pop(sid, None)
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": next(self._ids), "method": "accountUnsubscribe",
+                                          "params": [sid]}))
+                await asyncio.sleep(0.02)
+
+    def on_failure(self, exc: Exception) -> None:
+        if self.fallback and self.url == self.primary and any(c in str(exc) for c in ("429", "401", "403")):
+            self.url = self.fallback
+            log.warning("reserves: основной узел недоступен (%s) — запасной", str(exc)[:120])
+
+    async def _session(self, sink: Sink) -> None:
+        self._sink = sink
+        async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2**22,
+                                      open_timeout=20) as ws:
+            self._ws = ws
+            self.subs.clear()
+            self.sid_acc.clear()
+            self.pending.clear()
+            self._set_connected(True)
+            self._changed.set()
+            log.info("reserves: подключено, монет %d, счетов %d", len(self.targets), len(self.acc_mint))
+            sync = asyncio.create_task(self._sync(ws))
+            try:
+                async for raw in ws:
+                    self.bytes_in += len(raw)
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    rid = msg.get("id")
+                    if rid is not None:
+                        acc = self.pending.pop(rid, None)
+                        if acc is not None and isinstance(msg.get("result"), int) and acc in self.acc_mint:
+                            self.subs[acc] = msg["result"]
+                            self.sid_acc[msg["result"]] = acc
+                            mint = self.acc_mint[acc]
+                            t = self.targets.get(mint)
+                            if t is not None and t.started is None and self._all_subscribed(mint):
+                                t.started = time.time()
+                        elif acc is not None and "error" in msg:
+                            log.warning("reserves: подписка на %s отклонена: %s", acc, msg["error"])
+                        continue
+                    if msg.get("method") != "accountNotification":
+                        continue
+                    res = (msg.get("params") or {}).get("result") or {}
+                    acc = self.sid_acc.get((msg.get("params") or {}).get("subscription"))
+                    data = ((res.get("value") or {}).get("data") or [None])[0]
+                    if acc is None or not data:
+                        continue
+                    try:
+                        raw_data = base64.b64decode(data)
+                    except ValueError:
+                        continue
+                    tick = self.on_account(acc, raw_data, (res.get("context") or {}).get("slot"))
+                    if tick is not None:
+                        self.ticks += 1
+                        self.mark_event()
+                        await sink(tick)
+            finally:
+                sync.cancel()
+                for mint, t in list(self.targets.items()):    # обрыв — окно слежения закрыто
+                    self._cover(mint, t, final=True)

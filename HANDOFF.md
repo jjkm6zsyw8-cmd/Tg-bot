@@ -714,3 +714,16 @@ C, D, E, F новых сделок не открывают. Копии свое�
   Выгрузка: `python -m scanner trendfeat [--compare] [--days N] [--kind trend|trendj] [--mode shadow|live]`
   (`real/featexport.py`: CSV или медианы признаков у растущих (итог > 0) и падающих). Тренды pump.fun (`trend`)
   по-прежнему в `RETIRED` — входов нет; признаки пишутся у `trendj`.
+- 25.11 (владелец): **подписка на резервы** (`ingest/reserves.py`, `ReserveSource`, своё websocket-соединение к Helius,
+  `accountSubscribe` base64 confirmed). Покупка отслеживаемого кошелька или кандидата → `Receiver.reserve_watch`
+  (35 мин, `candidate_coin_min`): монета на кривой — счёт кривой (`pump.curve_address`), закрыта / на PumpSwap — два
+  хранилища пула (`tokens.amm_pool` или канонический `pumpswap.pool_address`, виртуальный резерв из счёта пула один
+  раз), цена на момент подписки — сразу (`source='reserves_start'`). Каждое изменение → `ReserveTick` →
+  `reserve_ticks(mint, ts, slot, mc_sol, venue, quote_sol)`; пара хранилищ — когда у обоих один слот. Окно слежения →
+  `reserve_cover(mint, started_at, ended_at)` (раз в минуту и при снятии / обрыве). Кривая закрылась — переподписка на
+  пул (раз в минуту, пока пул не появится). Лимит: `reliability.reserve_daily_mb` (150), 400 счетов; выключить —
+  `reserve_watch: false`. Хранение — как сделки (`raw_trades_days`). Состояние — `health:ingest.reserves`.
+  В тестах RPC подписки подменён (`tests/conftest.py::_no_reserve_rpc`).
+- copymodel: тики резервов — цена (trader "", без события), `load_cover` → `copy_trade(covered=…)`: внутри окна
+  слежения тишина = цена та же (правило пробела `GAP_S` и конец данных не срабатывают; запас `COVER_SLACK_S` 10 с на
+  начало подписки).
