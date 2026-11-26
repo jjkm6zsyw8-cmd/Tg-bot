@@ -546,7 +546,7 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
                   f"{'●' if filt == 'all' else '○'} все smart-сигналы",
                   f"{'●' if filt == 'm' else '○'} только отобранные, как у M"
                   + (f" · бумага M: {n} сд · плюс {w / n:.0%} · {_usd(usd)}" if n else "")]
-    lines += ["", "<b>Правила</b>"] + [f"{x} — {S.SCHEME_TEXT[x]}" + (" (только проба)" if x == "W" else "")
+    lines += ["", "<b>Правила</b>"] + [f"{x} — {S.SCHEME_TEXT[x]}" + (" (только проба)" if x in S.PROBE_ONLY else "")
                                        for x in rules]
     exits = [{"text": ("● " if rule == x else "") + f"Выход {x}", "callback": f"rl:wmr:{tag}:{kind}:{x}"}
              for x in S.method_rules(kind)]

@@ -288,7 +288,7 @@ async def test_rule_trials_measure_all_exit_rules_on_same_entry(db):
     await tr.start()
     await fire(tr, chain)
     main = only(tr)
-    assert sorted(t.extra["rule"] for t in tr.trials.values()) == ["A", "B", "G", "L", "P", "Q", "R", "U", "V"]
+    assert sorted(t.extra["rule"] for t in tr.trials.values()) == ["A", "B", "G", "J", "L", "P", "Q", "R", "U", "V"]
     assert all(t.entry_mc == main.entry_mc and t.extra["mode"] == "shadow" for t in tr.trials.values())
     chain.set_mc(MINT, 54.0)                                   # +35%: тейк A и G, B продаёт 70%, R держит
     await trade(tr, chain)
@@ -308,7 +308,7 @@ async def test_rule_trials_measure_all_exit_rules_on_same_entry(db):
     rows = {r["rule"]: r for r in await db.fetch("SELECT * FROM real_rule_trials WHERE closed_at IS NOT NULL")}
     assert {k: r["exit_reason"] for k, r in rows.items()} == {"A": "take_profit", "B": "trailing",
                                                               "G": "take_profit", "R": "trailing", "U": "stop",
-                                                              "P": "stop"}
+                                                              "P": "stop", "J": "take_profit"}
     assert rows["A"]["pnl_pct"] > 0.25 and 0 < rows["B"]["pnl_pct"] < rows["A"]["pnl_pct"] and rows["R"]["pnl_pct"] < 0
     assert await db.fetchval("SELECT count(*) FROM real_positions") == 1    # пробы — не сделки бота
     main_pnl = await db.fetchval("SELECT pnl_sol FROM real_positions")
@@ -909,3 +909,34 @@ async def test_methods_screen_warns_when_wallet_off_or_paused_and_shadowwhy(db):
                      "'сигнал опоздал')", wid)
     why = await shadow_why_text(db, {})
     assert "тень · smart: сигнал опоздал — 1" in why and "кошелёк выключен" not in why
+
+
+async def test_probe_j_ignores_trader_sell_stops_and_times_out(db):
+    """27.11 (владелец): проба J — «A без выхода за трейдером»: тейк +25%, стоп −20%, через 10 мин — продать, его
+    продажу не смотрим; идёт рядом с остальными пробами на тех же позициях, методу не выбирается."""
+    assert "J" in S.trial_rules("smart") and "J" not in S.method_rules("smart") and "J" not in S.trial_rules("majorj")
+    chain = FakeChain()
+    chain.add_curve(MINT, 40.0)
+    tr = shadow(db, chain, real_max_open=10)
+    await tr.start()
+    await fire(tr, chain)
+    rules = lambda: {t.extra["rule"]: t for t in tr.trials.values()}          # noqa: E731
+    await trade(tr, chain, trader="TRADER", is_buy=False)                     # трейдер продал: A и др. — за ним
+    assert "J" in rules() and "A" not in rules()
+    rows = {r["rule"]: r["exit_reason"] for r in await db.fetch(
+        "SELECT rule, exit_reason FROM real_rule_trials WHERE closed_at IS NOT NULL")}
+    assert rows.get("A") == "trader_sell" and "J" not in rows
+    chain.set_mc(MINT, 31.0)                                                  # −22%: стоп −20%
+    await trade(tr, chain)
+    assert "J" not in rules()
+    assert await db.fetchval("SELECT exit_reason FROM real_rule_trials WHERE rule = 'J'") == "stop"
+    # тайм-стоп: через 10 мин — продать, даже без тейка и стопа
+    m2 = pk("probe-j-time")
+    chain.add_curve(m2, 40.0)
+    await fire(tr, chain, m2, alert_id=2)
+    j = next(t for t in tr.trials.values() if t.mint == str(m2) and t.extra["rule"] == "J")
+    j.opened_ts -= 601
+    await trade(tr, chain, m2, slot=chain.slot + 10)                         # сделка после нашего входа
+    assert j.id not in tr.trials
+    assert await db.fetchval("SELECT exit_reason FROM real_rule_trials WHERE rule = 'J' AND mint = $1",
+                             str(m2)) == "max_hold"

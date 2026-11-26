@@ -287,7 +287,8 @@ class RealTrader:
         if rule == "W":
             return {"stop": None, "tp_net": None, "tp_share": 0.0, "trail": None, "target": False, "time_stop_s": None,
                     "time_stop_gain": None, "max_hold_s": float(p.extra.get("w_hold") or 1.0)}
-        sc = self.rule_scheme(rule, p.extra.get("kind")) if rule in S.SCHEMES else self.scheme_for(p.extra.get("kind"))
+        sc = (self.rule_scheme(rule, p.extra.get("kind")) if rule in S.SCHEMES or rule in S.EXTRA_RULES
+              else self.scheme_for(p.extra.get("kind")))
         if p.extra.get("kind") == "newdev" and float(sc.get("max_hold_s") or 1e9) > NEWDEV_MAX_HOLD_S:
             # запуск: монета, которая за час не ушла на PumpSwap, почти наверняка мертва; у R стоп −50% ниже «пола»
             # кривой — без предела мёртвая монета висела бы сутки и тратила запросы цены

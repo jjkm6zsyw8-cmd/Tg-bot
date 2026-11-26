@@ -275,7 +275,7 @@ async def status_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
 
 
 MINE_USD = 10.0
-MINE_RULES = ("A", "B", "G", "R", "W")
+MINE_RULES = ("A", "B", "G", "R", "W", "J")
 
 
 async def mine_view(db: Any, cfg: dict[str, Any]) -> tuple[str, Kb]:
@@ -664,7 +664,8 @@ async def rules_lines(db: Any, since: datetime, sol_usd: float) -> list[str]:
             "<pre>" + "\n".join(table) + "</pre>",
             "A — всё на +25%, без стопа · B — 70% на +25%, остаток трейлинг 15% · G — +25%, стоп −8%, нет +10% за "
             "5 мин — выход · R — трейлинг 35% после +30%, стоп −50%, до суток · W — продать раньше трейдера: через его "
-            "обычное время удержания − 2 с (только проба, у копий)"]
+            "обычное время удержания − 2 с (только проба, у копий) · J — A без выхода за трейдером: +25%, стоп −20%, "
+            "через 10 мин — продать (только проба)"]
 
 
 def zero_back(back: str) -> str:
