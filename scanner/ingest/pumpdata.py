@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import zlib
 from collections import deque
 from datetime import datetime, timezone
@@ -43,6 +44,9 @@ WSOL = "So11111111111111111111111111111111111111112"
 # капитализация бывает только от старта (~28 SOL) до завершения (~411 SOL) — средняя цена сделки вне [20; 600] — мусор
 MIN_SOL = 0.001
 CURVE_MC = (20.0, 600.0)
+# 27.11 (владелец: «нет цены выхода» у FUEL3 16, B8n7 12): монету купил отслеживаемый кошелёк или кошелёк охотника —
+# все её сделки (без порога min_sol) пишем столько секунд: правило A держит до 30 мин, с запасом 35
+HOT_S = 35 * 60
 
 
 class Row(NamedTuple):
@@ -151,19 +155,22 @@ class PumpDataStream:
 
     def __init__(self, db: Any, url: str, key: str, min_sol: float = 0.2,
                  on_rows: Callable[[int], None] | None = None, route: Callable[[Row], bool] | None = None,
-                 feed: Callable[[Trade], None] | None = None):
+                 feed: Callable[[Trade], None] | None = None, track: Callable[[str], bool] | None = None):
         self.db, self.url, self.key, self.min_sol = db, url, key, float(min_sol)
         self.on_rows = on_rows
         self.route, self.feed = route, feed          # 27.11: сделки новых монет — в основной поток, пока нет PumpPortal
         self.fed = 0
+        self.track = track                           # 27.11: кошелёк отслеживается → его монета «горячая» HOT_S
+        self.hot: dict[str, float] = {}              # монета → до какого времени (monotonic) писать все её сделки
+        self.hot_rows = 0
         self.queue: deque[Row] = deque()
         self.connected = False
         self.events = self.rows = self.dropped = self.reconnects = 0
         self.last_error = ""
 
     def stream_url(self) -> str:
-        # для основного потока нужны все сделки новых монет — тогда без фильтра сервера, отбор здесь
-        if self.feed is not None:
+        # для основного потока и «горячих» монет нужны все сделки — тогда без фильтра сервера, отбор здесь
+        if self.feed is not None or self.track is not None:
             return f"{self.url}?key={self.key}&types=trade"
         return f"{self.url}?key={self.key}&types=trade&min_sol={self.min_sol:g}"
 
@@ -174,6 +181,7 @@ class PumpDataStream:
             msg = json.loads(raw)
         except ValueError:
             return
+        now = time.monotonic()
         for m in (msg if isinstance(msg, list) else [msg]):
             row = parse(m)
             if row is None:
@@ -183,8 +191,12 @@ class PumpDataStream:
             if self.feed is not None and self.route is not None and self.route(row):
                 self.feed(to_trade(row))
                 self.fed += 1
+            if self.track is not None and row.is_buy and self.track(row.wallet):
+                self.hot[row.mint] = now + HOT_S
             if row.sol < self.min_sol:
-                continue
+                if self.hot.get(row.mint, 0.0) < now:
+                    continue
+                self.hot_rows += 1
             if len(self.queue) >= MAX_QUEUE:
                 self.dropped += 1
                 continue
@@ -227,6 +239,9 @@ class PumpDataStream:
     async def flush_loop(self) -> None:
         while True:
             await asyncio.sleep(1.0)
+            if len(self.hot) > 2000:
+                now = time.monotonic()
+                self.hot = {m: t for m, t in self.hot.items() if t > now}
             try:
                 while await self.flush() == BATCH:
                     pass
@@ -235,6 +250,7 @@ class PumpDataStream:
 
     def health(self) -> dict[str, Any]:
         return {"connected": self.connected, "events": self.events, "rows": self.rows, "queue": len(self.queue),
-                "fed": self.fed,
+                "fed": self.fed, "hot": sum(1 for t in self.hot.values() if t > time.monotonic()),
+                "hot_rows": self.hot_rows,
                 "dropped": self.dropped, "reconnects": self.reconnects, "min_sol": self.min_sol,
                 "last_error": self.last_error}

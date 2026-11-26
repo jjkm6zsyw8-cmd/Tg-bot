@@ -914,7 +914,13 @@ class Engine:
         watch = manual or float(trader.get("copy_30d") or 0) >= float(cfg.get("smart_fallback_min_copy", 0.10))
         if r["is_buy"] and cfg.get("paper_swing", True) and swing_like(trader, cfg):
             self._on_swing_buy(st, r)
-        if not cfg.get("modes", {}).get("copy" if own else "smart", True):
+        mode_key = "copy" if own else "smart"
+        if not cfg.get("modes", {}).get(mode_key, True) and not self._follow_of(r["trader"]):
+            # 27.11 (владелец: «у кошельков охотника — ни сигнала, ни пропуска»): режим выключен в настройках — раньше
+            # покупка пропадала молча; «за ним» (тень / бой за кошельком) режим не выключает
+            if r["is_buy"] and watch:
+                await self.copyguard.log(r["trader"], st.mint, st.symbol, "buy", r["sol_amount"], r["mc_sol"],
+                                         "skipped", f"режим «{mode_key}» выключен в настройках")
             return
         line = {"is_buy": r["is_buy"], "label": trader["label"], "trader": r["trader"], "sol": r["sol_amount"],
                 "symbol": st.symbol, "mc": st.mc, "mint": st.mint}

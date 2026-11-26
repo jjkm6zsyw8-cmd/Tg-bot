@@ -483,6 +483,17 @@ async def test_why_text_explains_each_buy_after_find(db):
     assert "бот: мелкий пул, не входим — 1" in text and "ни сигнала, ни пропуска бота" in text
     assert "без фильтра пула с ценой было бы" in text and "до находки последняя покупка" in text
     assert await H.why_text(db, NOPOOL, wallet="NOPE") == "Такого кошелька у охотника нет."
+    # 27.11 (владелец: «до бота не дошли — из какого источника покупки, подписан ли в слежке Helius?»)
+    await db.kv_set("watch:state", {"connected": True, "wallets": 900, "wallets_in": 500, "coins_in": 200, "cap": 700,
+                                    "cut_n": 400, "key": {ME: "cut"}})
+
+    class Rpc:
+        async def signatures_for(self, addr, limit=100):
+            return [{"signature": "s", "blockTime": time.time() - 7200}]
+    text = await H.why_text(db, NOPOOL, rpc=Rpc())
+    assert "Слежка Helius: подключена, кошельков в подписке 500 из 900" in text and "не влезли 400" in text
+    assert "не влез в лимит подписок" in text and "источник его покупок: ?" in text
+    assert "в сети последняя транзакция" in text, text
 
 
 async def test_pnl_has_trades_and_average_per_method(db):

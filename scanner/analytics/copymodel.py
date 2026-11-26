@@ -519,18 +519,19 @@ async def wallet_trades(db: Any, address: str, since: float, until: float | None
     hi = datetime.fromtimestamp(until, timezone.utc) if until else datetime.now(timezone.utc)
     # 27.11: плюс весь рынок из pumpdata.fun (market_trades); та же сделка из обоих источников — один раз (по блоку)
     rows = await db.fetch(
-        """SELECT mint, extract(epoch FROM ts) AS ts, is_buy, sol_amount, token_amount, slot FROM trades
+        """SELECT mint, extract(epoch FROM ts) AS ts, is_buy, sol_amount, token_amount, slot, source FROM trades
            WHERE trader = $1 AND ts >= $2 AND ts <= $3
                  AND NOT (source = 'pumpdata' AND (sol_amount < 0.001 OR mc_sol < 1      -- 27.11: мусор pumpdata
                           OR (pool = 'pump' AND mc_sol NOT BETWEEN 20 AND 600)))
            UNION ALL
-           SELECT m.mint, extract(epoch FROM m.ts), m.is_buy, m.sol_amount, m.token_amount, m.slot FROM market_trades m
+           SELECT m.mint, extract(epoch FROM m.ts), m.is_buy, m.sol_amount, m.token_amount, m.slot, 'pumpdata'
+           FROM market_trades m
            WHERE m.trader = $1 AND m.ts >= $2 AND m.ts <= $3 AND m.sol_amount >= 0.001 AND m.mc_sol >= 1
                  AND (m.pool <> 'pump' OR m.mc_sol BETWEEN 20 AND 600) AND NOT EXISTS (
                SELECT 1 FROM trades t WHERE t.trader = $1 AND t.mint = m.mint AND t.slot = m.slot AND t.is_buy = m.is_buy)
            ORDER BY 2""", address, lo, hi)
     return [{"mint": r["mint"], "ts": float(r["ts"]), "is_buy": r["is_buy"], "sol": r["sol_amount"],
-             "tokens": r["token_amount"], "slot": r["slot"]} for r in rows]
+             "tokens": r["token_amount"], "slot": r["slot"], "src": r["source"] or "?"} for r in rows]
 
 
 async def evaluate(db: Any, address: str, since: float, until: float | None = None, limit: int = 120,

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -84,7 +85,7 @@ class Receiver:
                                            float(rel.get("pumpdata_min_sol", 0.2)),
                                            on_rows=lambda n: self._count("pumpdata_market", trades=n),
                                            route=self.pd_route if feed else None,
-                                           feed=self._pd_feed if feed else None)
+                                           feed=self._pd_feed if feed else None, track=self.pd_track)
         self.sources: list[Source] = [self.pp]
         self.helius: HeliusSource | None = None
         if env.helius_ws_url:
@@ -136,6 +137,7 @@ class Receiver:
         self.coin_track_s = 60 * float(rel.get("candidate_coin_min", 35))
         self.known_mints: dict[str, float] = {}   # mint → unix-время создания
         self.tracked_wallets: set[str] = set()
+        self.hunt_wallets: set[str] = set()
         self.scout_wallets: set[str] = set()       # кандидаты разведки: храним их сделки, монеты не подписываем
         self.tracked_mints: set[str] = set()      # алерты, бумажные позиции, наблюдение
         self.extended: dict[str, float] = {}      # mint → до какого unix-времени собирать сделки
@@ -213,6 +215,11 @@ class Receiver:
             return False
         born = self.known_mints.get(mint)
         return (born is not None and time.time() - born <= self.window_s) or self.keep_mint(mint)
+
+    def pd_track(self, wallet: str) -> bool:
+        """27.11: отслеживаемый кошелёк (свой список, наблюдение, разведка, кандидаты) или кошелёк охотника / «за ним»
+        — его монету pumpdata пишет целиком HOT_S (цена выхода модели и тени)."""
+        return wallet in self.tracked_wallets or wallet in self.hunt_wallets
 
     def _pd_feed(self, ev: Trade) -> None:
         try:
@@ -477,10 +484,23 @@ class Receiver:
         """Раз в минуту: кошельки (трейдеры, девы из списка) и монеты (позиции, наблюдение, свежие монеты девов)."""
         if self.watch is None:
             return
+        # 27.11 (владелец: «у всех кошельков охотника — ни сигнала, ни пропуска бота»): кошельков больше, чем мест
+        # (watch_max_subs_shared 700 минус монеты), а UNION шёл без порядка — под обрез мог попасть любой, в том числе
+        # тот, за кем бот повторяет. Теперь по важности: «за ним» (real:follow), свой список, кошельки охотника,
+        # остальные активные, разведка, кошельки и девы из наблюдения; кандидаты и девы монет — последними
         rows = await self.db.fetch(
-            """SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist WHERE kind IN ('trader', 'dev')
-               UNION SELECT address FROM scout WHERE status = 'probation'""")
-        wallets = [r["address"] for r in rows]
+            """SELECT address, min(p) AS p FROM (
+                   SELECT address, 1 AS p FROM traders WHERE active AND manual
+                   UNION ALL SELECT address, 2 FROM hunter_wallets
+                             WHERE list <> 'archive' AND status NOT IN ('ignored', 'cooled')
+                   UNION ALL SELECT address, 3 FROM traders WHERE active AND NOT manual
+                   UNION ALL SELECT address, 4 FROM scout WHERE status = 'probation'
+                   UNION ALL SELECT address, 5 FROM watchlist WHERE kind = 'trader'
+                   UNION ALL SELECT address, 6 FROM watchlist WHERE kind = 'dev') x
+               GROUP BY address ORDER BY 2, 1""")
+        follow = list(await self.db.kv_get("real:follow") or {})
+        wallets = list(dict.fromkeys(follow + [r["address"] for r in rows]))
+        key_wallets = set(follow) | {r["address"] for r in rows if r["p"] <= 2}
         seen = set(wallets)
         now0 = time.time()
         self.dev_watch_until = {a: t for a, t in self.dev_watch_until.items() if t > now0}
@@ -516,7 +536,28 @@ class Receiver:
         self.watch_capped = capped
         coins = [] if capped else sorted(self.watch_coin_until, key=lambda m: -self.watch_coin_until[m])
         self.watch.set_targets(wallets, coins)
+        await self.publish_watch(wallets, key_wallets)
         await self.reserve_targets()
+
+    async def publish_watch(self, wallets: list[str], key_wallets: set[str]) -> None:
+        """27.11: кого слежка Helius слушает — для /hunt why и shadowwhy: подписан / ждёт подписки / не влез в лимит.
+        key_wallets — «за ним», свой список, охотник (по ним статус каждого)."""
+        w = self.watch
+        if w is None:
+            return
+        cut = [a for a in wallets if a not in w.want]
+
+        def state(a: str) -> str:
+            return "sub" if a in w.subs else "wait" if a in w.want else "cut"
+        try:
+            await self.db.kv_set("watch:state", {
+                "at": datetime.now(timezone.utc).isoformat(), "connected": w.connected, "fallback": w.on_fallback,
+                "cap": w.MAX_SUBS, "wallets": len(wallets), "wallets_in": sum(1 for v in w.want.values() if v == "wallet"),
+                "coins_in": sum(1 for v in w.want.values() if v == "coin"), "subs": len(w.subs),
+                "cut_n": len(cut), "cut": cut[:300], "key": {a: state(a) for a in key_wallets},
+                "events": w.events, "last_error": re.sub(r"(?i)(api[-_]?key|key)=[^&\s]+", r"\1=…", w.last_error)})
+        except Exception:  # noqa: BLE001 — отчёт не должен ломать слежку
+            log.exception("watch:state")
 
     def logs_alive(self) -> bool:
         """Поток со слотами (Helius/logs) подключён — слоты придут с ним, RPC для слотов не тратим."""
@@ -888,6 +929,9 @@ class Receiver:
                     "SELECT address FROM scout WHERE status = 'probation'")} - {r["address"] for r in await self.db.fetch(
                     "SELECT address FROM traders WHERE active UNION SELECT address FROM watchlist")}
                 self.tracked_wallets = wallets
+                self.hunt_wallets = {r["address"] for r in await self.db.fetch(
+                    "SELECT address FROM hunter_wallets WHERE list <> 'archive' AND status <> 'ignored'")} \
+                    | set(await self.db.kv_get("real:follow") or {})
                 pp_wallets = wallets if self.pp_accounts else set()
                 self.tracked_mints = {r["mint"] for r in await self.db.fetch(
                     """SELECT mint FROM alerts WHERE created_at > now() - interval '1 day'

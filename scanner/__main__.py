@@ -319,7 +319,14 @@ async def run_tool(cmd: str, db: Database) -> None:
                 print(H.fmt.plain(await H.explain_text(db, prm, arg("--wallet"), int(arg("--top") or 3))))
         elif "--why" in args:
             # 27.11: что стало с покупками кошельков охотника после находки (модель, журнал копий, бот)
-            print(H.fmt.plain(await H.why_text(db, prm, arg("--wallet"))))
+            from .ingest.rpc import SolanaRpc
+            wenv = h_env()
+            wrpc = SolanaRpc(wenv.rpc_endpoint, rps=wenv.rpc_rps, fallback=wenv.rpc_fallback_url or None)
+            try:
+                print(H.fmt.plain(await H.why_text(db, prm, arg("--wallet"), rpc=wrpc)))
+            finally:
+                if hasattr(wrpc, "close"):
+                    await wrpc.close()
         else:
             now = _t.time()
             cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, bar.min_coins, mx, min_sol=prm.min_buy)

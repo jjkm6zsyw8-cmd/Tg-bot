@@ -211,3 +211,43 @@ def test_curve_mc_is_price_after_trade():
     after = 35.0 / (k / 35.0) * 1e9
     avg = 5.0 / out * 1e9
     assert abs(r.mc - after) < 1e-6 and avg < r.mc and abs(avg / after - 30 / 35) < 1e-6
+
+
+def test_hot_coin_of_tracked_wallet_keeps_all_trades():
+    """27.11 (владелец: «нет цены выхода» FUEL3 16, B8n7 12): монету купил отслеживаемый кошелёк или кошелёк охотника —
+    35 мин пишем все её сделки, без порога min_sol."""
+    st = PD.PumpDataStream(None, "wss://x/stream", "k", 0.2, track=lambda w: w == ME)
+    assert st.stream_url() == "wss://x/stream?key=k&types=trade"          # мелкие сделки нужны — без фильтра сервера
+    st.take(json.dumps(trade(mint="HOT", wallet=OTHER, sol=0.05, token_amount=1_000_000.0, idx=1)))   # до его покупки
+    st.take(json.dumps(trade(mint="HOT", wallet=ME, sol=0.05, token_amount=1_000_000.0, idx=2)))      # его мелкая покупка
+    st.take(json.dumps(trade(mint="HOT", wallet=OTHER, sol=0.01, token_amount=200_000.0, idx=3, side="sell")))
+    st.take(json.dumps(trade(mint="COLD", wallet=OTHER, sol=0.05, token_amount=1_000_000.0, idx=4)))
+    assert [(r.mint, r.idx) for r in st.queue] == [("HOT", 2), ("HOT", 3)] and st.hot_rows == 2
+    assert st.health()["hot"] == 1
+    st.hot["HOT"] = time.monotonic() - 1                                # 35 мин прошли — снова только крупные
+    st.take(json.dumps(trade(mint="HOT", wallet=OTHER, sol=0.05, token_amount=1_000_000.0, idx=5)))
+    assert len(st.queue) == 2
+
+
+async def test_watch_keeps_followed_and_hunter_wallets_first(db):
+    """27.11 (владелец: «у всех кошельков охотника — ни сигнала, ни пропуска бота»): мест в слежке Helius меньше, чем
+    кошельков — «за ним», свой список и охотник подписываются первыми, остальное режется; состояние — в watch:state."""
+    from scanner.config import Env, Settings, YamlConfig
+    from scanner.ingest.receiver import Receiver
+    rec = Receiver(Env(pumpportal_api_key="k", helius_api_key="SECRET", watch_stream="on"),
+                   Settings(YamlConfig("config/config.yaml")), db)
+    rec.watch.MAX_SUBS, rec._usage_base = 3, {}
+    for i in range(6):
+        await db.execute("INSERT INTO watchlist(kind, address, label) VALUES ('dev', $1, 'dev')", f"DEV{i}")
+    await db.execute("INSERT INTO traders(address, active, manual) VALUES ('MINE', true, true)")
+    await db.execute("INSERT INTO hunter_wallets(address, found_at, status, list) VALUES ('HUNT', now(), 'shadow', 'watch')")
+    await db.kv_set("real:follow", {"FOLLOWED": "shadow"})
+    await rec.watch_targets()
+    assert list(rec.watch.want) == ["FOLLOWED", "MINE", "HUNT"]
+    rec.watch.subs["FOLLOWED"] = 7
+    await rec.publish_watch(list(rec.watch.want) + ["DEV0"], {"FOLLOWED", "MINE", "HUNT", "GONE"})
+    st = await db.kv_get("watch:state")
+    assert st["key"] == {"FOLLOWED": "sub", "MINE": "wait", "HUNT": "wait", "GONE": "cut"} and st["cut_n"] == 1
+    rec.watch.last_error = "HTTP 429 wss://mainnet.helius-rpc.com/?api-key=SECRET"
+    await rec.publish_watch([], set())
+    assert "SECRET" not in str(await db.kv_get("watch:state"))

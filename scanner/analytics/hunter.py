@@ -918,7 +918,12 @@ def _reason(text: str | None) -> str:
     return t[:70]
 
 
-async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None, now: float | None = None) -> str:
+WATCH_STATE = {"sub": "подписан", "wait": "ждёт подписки",
+               "cut": "⚠️ не влез в лимит подписок — его сделки до бота не доходят"}
+
+
+async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None, now: float | None = None,
+                   rpc: Any = None) -> str:
     """27.11 (владелец: «найдены в 17:52, к 23:42 ни одной копии»): по каждому кошельку охотника в тени — его покупки
     после находки и что с каждой стало: модель (с ценой / мелкий пул < real_min_pool_sol / нет цены), журнал копий
     (сигнал взят или причина отказа), бот (позиция тени или причина пропуска из real_skips по той же монете ±3 мин), и
@@ -931,6 +936,17 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
         return "Кошельков охотника в тени нет." if not wallet else "Такого кошелька у охотника нет."
     out = [f"🔎 <b>Охотник: что стало с покупками после находки</b> (вход через {prm.delay:g} с, пул от "
            f"{prm.min_pool:g} SOL; время UTC)"]
+    # 27.11 (владелец: «у всех — ни сигнала, ни пропуска бота»): сигналы «за ним» идут только из слежки Helius —
+    # подписан ли кошелёк, жива ли слежка; источник его покупок; последняя транзакция в сети (торгует ли вообще)
+    ws = await db.kv_get("watch:state") if hasattr(db, "kv_get") else None
+    if ws:
+        out.append(f"Слежка Helius: {'подключена' if ws.get('connected') else '⚠️ НЕ подключена'}"
+                   + (" (запасной узел)" if ws.get("fallback") else "")
+                   + f", кошельков в подписке {ws.get('wallets_in')} из {ws.get('wallets')}, монет {ws.get('coins_in')}, "
+                   f"мест {ws.get('cap')}" + (f", ⚠️ не влезли {ws.get('cut_n')}" if ws.get("cut_n") else "")
+                   + (f"; ошибка: {fmt.esc(str(ws.get('last_error')))}" if ws.get("last_error") else ""))
+    else:
+        out.append("Слежка Helius: состояния нет (приёмник старой версии или слежка выключена)")
     for r in rows:
         addr, found = r["address"], r["found_at"]
         since = found.timestamp()
@@ -945,7 +961,20 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
         model = Counter("с ценой" if c.res is not None else (c.why or "?") for _e, c in cs)
         nopool = sum(1 for _e, c in CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay) if c.res is not None)
         small = [CM.pool_sol(c.entry_mc, c.venue) for _e, c in cs if c.why == CM.SMALL_POOL and c.entry_mc]
+        srcs = Counter(d.get("src") or "?" for d in buys)
+        helius = WATCH_STATE.get(((ws or {}).get("key") or {}).get(addr, ""), "не в списке слежки" if ws else "?")
+        chain = ""
+        if rpc is not None:
+            try:
+                sig = (await rpc.signatures_for(addr, limit=1) or [None])[0]
+                bt = sig.get("blockTime") if sig else None
+                chain = (f"; в сети последняя транзакция {datetime.fromtimestamp(bt, timezone.utc):%d.%m %H:%M} "
+                         f"({ago(now - bt)} назад)" if bt else "; в сети транзакций нет")
+            except Exception:  # noqa: BLE001 — узел не ответил: без этой строки
+                chain = "; сеть не ответила"
         head = (f"<code>{addr}</code> · найден {found:%d.%m %H:%M}, {r['status']}, правило {rule}\n"
+                f"  слежка Helius: {helius}" + (" · источник его покупок: " + ", ".join(
+                    f"{k} {v}" for k, v in srcs.most_common()) if srcs else "") + chain + "\n"
                 f"  покупок после находки: {len(buys)} (монет {len({d['mint'] for d in buys})})"
                 + (f", из них мельче {prm.min_buy:g} SOL (бот не копирует) — {tiny}" if (tiny := sum(
                     1 for d in buys if float(d["sol"] or 0) < prm.min_buy)) else "")

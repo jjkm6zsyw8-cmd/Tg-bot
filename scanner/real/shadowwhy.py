@@ -74,6 +74,24 @@ async def shadow_why_text(db: Any, cfg: dict[str, Any], hours: float = 24.0) -> 
         elif st_at is None or time.time() - st_at.timestamp() > STALE_S:
             verdicts.append(f"{w['name']}: исполнитель не отвечает (статус {_ago(st_at)}) — контейнер bot / analytics "
                             "не запущен или упал: docker compose ps.")
+    modes = cfg.get("modes") or {}
+    off = [k for k in ("smart", "copy", "dev") if modes.get(k) is False]
+    if off:
+        out.append("⚠️ Выключены режимы анализа (/settings): " + ", ".join(off)
+                   + " — их сигналы не создаются (кроме кошельков «за ним»)")
+        verdicts.append("Режимы анализа выключены: " + ", ".join(off) + " — включи в /settings.")
+    ws = await db.kv_get("watch:state") or {}
+    if ws:
+        out.append(f"Слежка Helius: {'подключена' if ws.get('connected') else '⚠️ НЕ подключена'}"
+                   + (" (запасной узел)" if ws.get("fallback") else "")
+                   + f", кошельков в подписке {ws.get('wallets_in')} из {ws.get('wallets')}"
+                   + (f", ⚠️ не влезли {ws.get('cut_n')}" if ws.get("cut_n") else ""))
+        if not ws.get("connected"):
+            verdicts.append("Слежка Helius не подключена — покупки отслеживаемых кошельков до бота не доходят.")
+        missing = [a for a, v in (ws.get("key") or {}).items() if v != "sub"]
+        if missing:
+            verdicts.append(f"Кошельки «за ним» / охотника без подписки Helius: {len(missing)} (" + ", ".join(
+                a[:4] + "…" for a in missing[:8]) + ")")
     # 2. сигналы выше по цепочке
     alerts = await db.fetch("SELECT mode, count(*) n FROM alerts WHERE created_at >= $1 GROUP BY 1 ORDER BY 2 DESC",
                             since)
