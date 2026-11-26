@@ -331,6 +331,54 @@ async def test_hunt_total_counts_coin_once(db):
     text = await H.hunt_text(db, 48)
     assert "Итого за 2 кошельками" in text and "3 копий, в среднем +10.0%" in text and "убрано 1" in text
     assert "+0.042 SOL" in text and "/день" in text and "Бот за ними" in text and "1 сд, в среднем +15.0%" in text
+    # 27.11 (/hunt: «без цены 24 из 44»): без цены — по причинам; моложе 35 мин — «ещё открыты», не «без цены»
+    for mint, ago, why in (("MD", 5000, "нет цены входа"), ("ME", 6000, "нет цены входа"), ("MF", 600, "нет цены выхода")):
+        await db.execute(
+            """INSERT INTO hunter_copies(address, mint, entry_at, rule, res, reason, hold_s)
+               VALUES ($1, $2, $3, 'A', NULL, $4, NULL)""", w1, mint, now - timedelta(seconds=ago), why)
+    text = await H.hunt_text(db, 48)
+    assert "без цены 2 (нет цены входа 2)" in text and "ещё открыты 1" in text
+
+
+async def test_save_copies_drops_vanished_entries(db):
+    """27.11: копия, которой при пересчёте больше нет (пыль, мусор pumpdata), из hunter_copies уходит; старше since —
+    остаётся (сделки за ней могли уже удалиться по сроку хранения)."""
+    now = time.time()
+    mk = lambda mint, ago: (M.Entry(mint, now - ago, 1, 1.0), M.Copy(0.1, reason="take_profit"))   # noqa: E731
+    await H.save_copies(db, ME, "A", [mk("OLD", 9000), mk("KEEP", 3000), mk("GONE", 2000)])
+    await H.save_copies(db, ME, "A", [mk("KEEP", 3000)], since=now - 5000)
+    left = {r["mint"] for r in await db.fetch("SELECT mint FROM hunter_copies WHERE address = $1", ME)}
+    assert left == {"OLD", "KEEP"}
+
+
+async def test_data_error_goes_to_archive_without_alert(db, monkeypatch):
+    """27.11 (владелец: FUEL3… «$3 769/день»): больше $200/день при 0.14 SOL или в среднем больше +100% — архив
+    «ошибка данных», без алерта и без тени; уже найденный с такой оценкой — тоже в архив, тень снимается."""
+    assert H.data_error(0.5, 150) is None and H.data_error(-0.5, -900) is None
+    assert "$3,769/день" in H.data_error(0.5, 3769) and "+150%" in H.data_error(1.5, 50)
+    await hot_wallet(db, ME)
+    e = Engine(db, hunter_on=True)
+    h = H.Hunter(e)
+    monkeypatch.setattr(H, "SANE_AVG", 0.1)
+    assert await h.scan(time.time()) == []
+    r = await db.fetchrow("SELECT list, status, list_reason FROM hunter_wallets WHERE address = $1", ME)
+    assert r["list"] == "archive" and r["status"] == "ignored" and "ошибка данных" in r["list_reason"]
+    assert not any("горячий кошелёк" in p["text"] for p in e.sent)
+    assert any("ошибка данных у 1" in p["text"] for p in e.sent) and ME not in (await db.kv_get("real:follow") or {})
+    # найденный раньше проверки: оценка при находке $3 769/день → track снимает тень и архивирует
+    monkeypatch.setattr(H, "SANE_AVG", 1.0)
+    await db.execute("DELETE FROM hunter_wallets")
+    await h.scan(time.time())
+    assert ME in (await db.kv_get("real:follow") or {})
+    await db.execute("UPDATE hunter_wallets SET usd_day = 3769 WHERE address = $1", ME)
+    await h.track(time.time())
+    r = await db.fetchrow("SELECT list, status, list_reason FROM hunter_wallets WHERE address = $1", ME)
+    assert r["list"] == "archive" and "$3,769/день" in r["list_reason"] and ME not in (await db.kv_get("real:follow") or {})
+    assert any("🧪" in p["text"] and "копирование за ним снято" in p["text"] for p in e.sent)
+    text = await H.explain_text(db, await H.params_of(db, e.cfg), ME)
+    assert "Откуда $/день" in text and "$3,769/день" in text and "При находке" in text and "вход:" in text
+    assert "самая высокая цена за удержание" in text
+    assert "Откуда $/день" in await H.explain_text(db, await H.params_of(db, e.cfg), ME[:5])     # начало адреса
 
 
 async def test_follow_uses_wallet_rule_and_cools_on_steady_minus(db):

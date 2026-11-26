@@ -82,6 +82,8 @@ BUNDLE_SHARE = 0.3                   # доля покупок в блоке с�
 ACTIVE_S = 3600                      # «активен сейчас»: последняя покупка не старше часа
 BATTLE_USD, BATTLE_N, WATCH_USD, ARCHIVE_MIN_N = 40.0, 50, 15.0, 20
 COOL_MIN_N, COOL_T, COOL_IDLE_H = 10, -2.0, 12
+KEEP_COPIES_S = 6 * 86400          # 27.11: пересчёт копий после находки — в пределах хранения сделок (7 дн)
+OPEN_S = 35 * 60                   # 27.11: копия моложе — ещё может быть открыта (выход не наступил)
 SHADOW_BEFORE_LIVE_H, SHADOW_MIN_N = 24, 5
 DUMP_BUYERS, DUMP_WIN_S, DUMP_SELL_S, DUMP_ALERT, DUMP_RISE = 3, 10.0, 30.0, 0.3, 0.1
 BOT_TRADES_DAY, BOT_LOW_BALANCE = 100, 0.05   # 27.11: метка «бот» (не отсев — решает модель копирования)
@@ -490,6 +492,25 @@ async def archive_farm(db: Any, addr: str, why: str) -> None:
                             farm_at = now(), list_at = now() WHERE address = $1""", addr, why)
 
 
+# 27.11 (владелец: FUEL3… «$3 769/день» — ошибка данных): проверка на здравый смысл. При 0.14 SOL на копию больше
+# $200 в день или в среднем больше +100% на копию — не трейдер, а сломанные цены; после находки — от 10 копий с ценой
+SANE_USD_DAY, SANE_AVG, SANE_MIN_N = 200.0, 1.0, 10
+
+
+def data_error(avg: float | None, usd_day: float | None) -> str | None:
+    if usd_day is not None and usd_day > SANE_USD_DAY:
+        return f"ошибка данных: ${usd_day:,.0f}/день при {STAKE_SOL:g} SOL (больше ${SANE_USD_DAY:g})"
+    if avg is not None and avg > SANE_AVG:
+        return f"ошибка данных: в среднем {avg:+.0%} на копию (больше +{SANE_AVG:.0%})"
+    return None
+
+
+async def archive_bad(db: Any, addr: str, why: str) -> None:
+    """Ошибка данных — в архив (охотник его больше не предложит)."""
+    await db.execute("""UPDATE hunter_wallets SET list = 'archive', status = 'ignored', list_reason = $2, list_at = now()
+                        WHERE address = $1""", addr, why)
+
+
 def idle_reason(last_buy: float | None, now: float) -> str | None:
     """27.11: при находке кошелёк должен торговать — последняя покупка не старше COOL_IDLE_H (как в «остыл»): 25.11
     первый поиск нашёл 4 кошелька по окну 72 ч, у которых после находки не было ни одной сделки."""
@@ -543,6 +564,7 @@ class Hunter:
         known = {r["address"]: r for r in await db.fetch("SELECT address, status, list, cooled_at FROM hunter_wallets")}
         hot = []
         farms: list[tuple[str, str]] = []
+        bad: list[tuple[str, str]] = []
         not_checked = 0
         bar = bar_of(self.e.cfg)
         cands = await candidates(db, since, now, bar.min_coins, min_sol=prm.min_buy)
@@ -557,6 +579,11 @@ class Hunter:
             if idle_reason(c.get("last_buy"), now):
                 continue                    # 27.11: уже не торгует — «остыл» снял бы его через 12 ч без единой копии
             s = await evaluate(db, c["trader"], since, now, prm, cand=c)
+            if s.hot(bar) is None and (err := data_error(s.avg, s.usd_day)):
+                await upsert(db, s)
+                await archive_bad(db, c["trader"], err)
+                bad.append((c["trader"], err))
+                continue
             if s.hot(bar) is None:
                 # 27.11 (владелец): отсев ферм обязателен — создавал монеты, получал комиссию создателя или
                 # профинансировал больше 20 кошельков → архив «ферма»; не проверен (RPC) — в следующий час
@@ -582,8 +609,12 @@ class Hunter:
         if farms:
             await self.say(f"🚜 <b>Охотник: отсеяно ферм {len(farms)}</b> — в архив, за ними не повторяем:\n"
                            + "\n".join(f"<code>{a}</code> — {fmt.esc(w)}" for a, w in farms[:10]))
+        if bad:
+            await self.say(f"🧪 <b>Охотник: ошибка данных у {len(bad)}</b> — в архив, за ними не повторяем "
+                           "(разбор: hunt --explain --wallet адрес):\n"
+                           + "\n".join(f"<code>{a}</code> — {fmt.esc(w)}" for a, w in bad[:10]))
         self.stats = {"at": now, "candidates": len(cands), "hot": len(hot), "farms": len(farms),
-                      "farm_unchecked": not_checked}
+                      "farm_unchecked": not_checked, "data_errors": len(bad)}
         return hot
 
     async def balance(self, addr: str) -> float | None:
@@ -625,11 +656,26 @@ class Hunter:
                     continue
                 if checked:
                     await db.execute("UPDATE hunter_wallets SET farm_at = now() WHERE address = $1", addr)
+            err = data_error(float(r["avg_pct"]) if r["avg_pct"] is not None else None,
+                             float(r["usd_day"]) if r["usd_day"] is not None else None)
+            if err:
+                # 27.11: найденные до проверки на здравый смысл — оценка при находке сломана → архив
+                from ..bot import board
+                mine = addr in (await db.kv_get(board.UNTIL_KEY) or {})
+                stopped = r["status"] in ("shadow", "live") and not mine
+                if stopped:
+                    await follow(db, self.e.cfg, self.e.costs(), addr, None)
+                await archive_bad(db, addr, err)
+                await self.say(f"🧪 <code>{addr}</code> — {fmt.esc(err)} (оценка при находке): в архив"
+                               + (", копирование за ним снято." if stopped else
+                                  "; тень по твоему /follow оставил — сними сам, если согласен." if mine else ".")
+                               + " Разбор: hunt --explain --wallet адрес")
+                continue
             trades = await CM.wallet_trades(db, addr, start - 120, now)
             p = await CM.prepare(db, addr, trades, start, now, limit=100_000, min_buy=prm.min_buy)
             rule = r["rule"] if r["rule"] in SCHEMES else "A"
             copies = CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
-            await save_copies(db, addr, rule, copies)
+            await save_copies(db, addr, rule, copies, since=max(start, now - KEEP_COPIES_S))
             done = [(e, c) for e, c in copies if c.why != CM.SMALL_POOL]
             res = [c.res for _e, c in done if c.res is not None]
             end = r["cooled_at"].timestamp() if r["cooled_at"] is not None else now
@@ -637,6 +683,8 @@ class Hunter:
             avg = statistics.fmean(res) if res else 0.0
             usd = len(done) / days * STAKE_SOL * avg * prm.sol_usd
             new_list, reason = list_for(len(res), usd)
+            if len(res) >= SANE_MIN_N and (err := data_error(avg, usd)):
+                new_list, reason = "archive", err + " (после находки)"
             dump = dump_share(p, trades)
             if dump >= DUMP_ALERT and dump >= float(r["dump_share"] or 0) + DUMP_RISE:
                 new_list, reason = "archive", f"сливает на копировщиков: {dump:.0%} продаж в первые 30 с всплеска"
@@ -742,10 +790,18 @@ class Hunter:
         return text
 
 
-async def save_copies(db: Any, addr: str, rule: str, copies: list[tuple[CM.Entry, CM.Copy]]) -> None:
-    """B4: копии после находки — бессрочно (hunter_copies)."""
+async def save_copies(db: Any, addr: str, rule: str, copies: list[tuple[CM.Entry, CM.Copy]],
+                      since: float | None = None) -> None:
+    """B4: копии после находки — бессрочно (hunter_copies). 27.11 (/hunt: «без цены 24 из 44»): копии, которых при
+    пересчёте с since больше нет (пылевая покупка, мусор pumpdata — модель их уже не берёт), удаляются — иначе висят
+    в итоге «без цены» навсегда. since — не раньше, чем хранятся сделки (KEEP_COPIES_S), чтобы старые не пропали."""
     rows = [(addr, e.mint, datetime.fromtimestamp(e.ts, timezone.utc), rule, c.res, c.why or c.reason, c.entry_mc,
              c.exit_mc, c.burst, c.stake, c.hold_s) for e, c in copies]
+    if since is not None:
+        await db.execute(
+            """DELETE FROM hunter_copies WHERE address = $1 AND entry_at >= $2
+                   AND (mint, entry_at) NOT IN (SELECT * FROM unnest($3::text[], $4::timestamptz[]))""",
+            addr, datetime.fromtimestamp(since, timezone.utc), [r[1] for r in rows], [r[2] for r in rows])
     if rows:
         await db.p.executemany(
             """INSERT INTO hunter_copies(address, mint, entry_at, rule, res, reason, entry_mc, exit_mc, burst, stake,
@@ -819,7 +875,7 @@ async def shadow_total(db: Any, now: float | None = None) -> list[str]:
     found = {r["address"]: r["found_at"].timestamp() for r in ws}
     live = {r["address"] for r in ws if r["status"] == "live" and r["address"] in ok}
     rows = await db.fetch(
-        """SELECT address, mint, extract(epoch FROM entry_at) AS ts, res, hold_s FROM hunter_copies
+        """SELECT address, mint, extract(epoch FROM entry_at) AS ts, res, hold_s, reason FROM hunter_copies
            WHERE address = ANY($1::text[]) AND reason IS DISTINCT FROM $2""", list(found), CM.SMALL_POOL)
     items = [(float(r["ts"]), float(r["ts"]) + float(r["hold_s"] if r["hold_s"] is not None else EXIT_LAG_S),
               r["mint"], r["address"] in live, r) for r in rows if float(r["ts"]) >= found[r["address"]]]
@@ -829,11 +885,16 @@ async def shadow_total(db: Any, now: float | None = None) -> list[str]:
     for addr, t0 in found.items():
         mine = [float(it[4]["res"]) for it in kept if it[4]["address"] == addr and it[4]["res"] is not None]
         usd_day += sum(mine) * STAKE_SOL * prm.sol_usd / max((now - t0) / 86400, 1 / 24)
-    noprice = sum(1 for it in kept if it[4]["res"] is None)
+    # 27.11 (/hunt: «без цены 24 из 44»): копии моложе OPEN_S ещё могут быть открыты — отдельно; без цены — по причинам
+    opened = sum(1 for it in kept if it[4]["res"] is None and it[0] > now - OPEN_S)
+    why_np = Counter(it[4]["reason"] or "?" for it in kept if it[4]["res"] is None and it[0] <= now - OPEN_S)
+    noprice = sum(why_np.values())
     lines = [f"Σ <b>Итого за {len(ws)} кошельками</b> (тень{' и бой' if live else ''}), модель после находки: "
              + (f"{len(res)} копий, в среднем {statistics.fmean(res):+.1%}, {sum(res) * STAKE_SOL:+.3f} SOL при "
                 f"{STAKE_SOL:g} SOL, ≈${usd_day:,.0f}/день" if res else "копий с ценой ещё нет")
-             + (f" · без цены {noprice}" if noprice else "")
+             + (f" · без цены {noprice} (" + ", ".join(f"{k} {v}" for k, v in why_np.most_common(3)) + ")"
+                if noprice else "")
+             + (f" · ещё открыты {opened}" if opened else "")
              + (f" · монета у нескольких — один раз (убрано {dup})" if dup else "")]
     n = sol = 0.0
     pct: list[float] = []
@@ -981,6 +1042,79 @@ async def entry_gap_text(db: Any, prm: Params, wallet: str, hours: float = 72.0,
     return "\n".join(out)
 
 
+async def explain_text(db: Any, prm: Params, wallet: str, top: int = 3, now: float | None = None) -> str:
+    """27.11 (владелец: FUEL3… «$3 769/день» — откуда цифра?): что записано у кошелька, пересчёт нынешней моделью при
+    находке (72 ч до неё) и после находки — формула $ в день и копии с самым большим плюсом: его покупка, вход, выход
+    и самая высокая цена за удержание — по какой сделке (источник, сумма, пул). Сломанная цена видна сразу."""
+    now = now or time.time()
+    if len(wallet) < 32:                                      # начало адреса (FUEL3…) — как в /hunt
+        hits = [x["address"] for x in await db.fetch(
+            "SELECT address FROM hunter_wallets WHERE address LIKE $1 ORDER BY found_at DESC LIMIT 3",
+            wallet.rstrip("….") + "%")]
+        if len(hits) != 1:
+            return (f"У охотника по «{wallet}» найдено {len(hits)}: " + ", ".join(hits)) if hits else \
+                f"У охотника нет кошелька, начинающегося на «{wallet}»."
+        wallet = hits[0]
+    r = await db.fetchrow("SELECT * FROM hunter_wallets WHERE address = $1", wallet)
+    out = [f"🧮 <b>Откуда $/день</b> — <code>{wallet}</code>: вход через {prm.delay:g} с, пул от {prm.min_pool:g} "
+           f"SOL, его покупки от {prm.min_buy:g} SOL, {STAKE_SOL:g} SOL на копию, SOL ${prm.sol_usd:,.0f}"]
+    if r is not None:
+        out.append(f"Записано: найден {r['found_at']:%d.%m %H:%M} UTC, {LIST_NAMES.get(r['list'], r['list'])}, "
+                   f"{r['status']}, правило {r['rule'] or 'A'}; при находке {int(r['n_copies'] or 0)} копий с ценой, "
+                   f"в среднем {float(r['avg_pct'] or 0):+.1%}, ${float(r['usd_day'] or 0):,.0f}/день; после находки "
+                   f"{int(r['n_after'] or 0)} коп., {float(r['avg_after'] or 0):+.1%}, "
+                   f"${float(r['usd_day_after'] or 0):,.0f}/день" + (f" · {r['list_reason']}" if r["list_reason"] else ""))
+        found = r["found_at"].timestamp()
+    else:
+        found = now
+        out.append(f"У охотника его нет — считаю последние {WINDOW_H} ч.")
+    segs = [(f"При находке ({WINDOW_H} ч до неё), нынешней моделью", found - WINDOW_H * 3600, found, None, EVAL_LIMIT)]
+    if r is not None and now - found > 600:
+        segs.append(("После находки", found, now, r["rule"] if r["rule"] in SCHEMES else "A", 100_000))
+    for title, lo, hi, rule, limit in segs:
+        trades = await CM.wallet_trades(db, wallet, lo - 120, hi)
+        p = await CM.prepare(db, wallet, trades, lo, hi, limit=limit, min_buy=prm.min_buy)
+        if not p.ents:
+            out.append(f"\n<b>{title}</b>: его покупок от {prm.min_buy:g} SOL нет.")
+            continue
+        days = max((hi - lo) / 86400, 1 / 24)
+        if rule is None:
+            rule = assess(p, trades, prm, days)[0].rule
+        cs = CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
+        done = [(e, c) for e, c in cs if c.why != CM.SMALL_POOL]
+        priced = [(e, c) for e, c in done if c.res is not None]
+        avg = statistics.fmean(c.res for _e, c in priced) if priced else 0.0
+        usd = len(done) / days * STAKE_SOL * avg * prm.sol_usd
+        err = data_error(avg, usd) if limit == EVAL_LIMIT or len(priced) >= SANE_MIN_N else None
+        out.append(f"\n<b>{title}</b>, правило {rule}: копий {len(done)} (с ценой {len(priced)}, мелкий пул "
+                   f"{len(cs) - len(done)}) за {days:.2f} дн = {len(done) / days:.1f}/день × {STAKE_SOL:g} SOL × "
+                   f"в среднем {avg:+.1%} × ${prm.sol_usd:,.0f} = <b>${usd:,.0f}/день</b>"
+                   + (f"\n⚠️ {err}" if err else ""))
+        if priced:
+            vals = sorted(c.res for _e, c in priced)
+            out.append(f"  результаты копий: медиана {statistics.median(vals):+.0%}, лучшая {vals[-1]:+.0%}, без "
+                       f"{min(top, len(vals))} лучших в среднем "
+                       + (f"{statistics.fmean(vals[:-top]):+.1%}" if len(vals) > top else "—"))
+        for e, c in sorted(priced, key=lambda x: -x[1].res)[:top]:
+            tk = [t for t in p.ticks.get(e.mint, []) if e.ts - 5 <= t.ts <= e.ts + c.hold_s + 120]
+            et = CM.entry_by_delay(e, tk, prm.delay)
+            held = [t for t in tk if t.price_ok and et is not None and et.ts <= t.ts <= e.ts + c.hold_s + 5]
+            hi_t = max(held, key=lambda t: t.mc) if held else None
+            sym = await db.fetchval("SELECT symbol FROM tokens WHERE mint = $1", e.mint)
+
+            def tick(t: Any) -> str:
+                sl = f"блок {t.slot - e.slot:+d}" if t.slot is not None and e.slot else "блок ?"
+                who = "его " if t.trader == wallet else ""
+                return (f"{t.ts - e.ts:+.1f} с, {sl}, MC {t.mc:,.1f} — {who}{'покупка' if t.is_buy else 'продажа'} "
+                        f"{t.sol:.3f} SOL ({t.src or '?'}, {t.pool})")
+            out.append(f"  <b>${fmt.esc(sym or e.mint[:6])}</b> <code>{e.mint}</code> {c.res:+.0%}: его покупка "
+                       f"{datetime.fromtimestamp(e.ts, timezone.utc):%d.%m %H:%M:%S}, {e.sol:.2f} SOL\n"
+                       f"    вход: " + (tick(et) if et else "?") + "\n"
+                       f"    выход: {c.reason}, MC {c.exit_mc:,.1f} через {c.hold_s:.0f} с; самая высокая цена за "
+                       f"удержание: " + (tick(hi_t) if hi_t else "?"))
+    return "\n".join(out)
+
+
 async def hunt_text(db: Any, hours: float = 24.0, note: str = UNCHECKED) -> str:
     """A8: кого нашёл за hours часов и все из списков «в бой» и «наблюдение»."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -1028,6 +1162,7 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
         cands.append({"trader": trace, "coins": 0, "own": 0, "bundled": 0})
     found: list[dict[str, Any]] = []
     farms: list[tuple[str, str]] = []
+    bad: list[tuple[str, str]] = []
     unchecked = 0
     tr_lines: list[str] = []
     for c in cands:
@@ -1054,6 +1189,11 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
                                 f"({s.coins} с ценой), {s.n}/{s.total} коп., правило {rule} {s.avg:+.1%}{half}, "
                                 f"в плюсе {s.win:.0%}, t={s.t:.1f}, без цены {s.noprice:.0%} → "
                                 f"{'🔥 ГОРЯЧИЙ' if why is None else why}")
+            if why is None and (err := data_error(s.avg, s.usd_day)):
+                bad.append((c["trader"], err))          # 27.11: проверка на здравый смысл, как при находке
+                if c["trader"] == trace:
+                    tr_lines.append(f"  → {err}: в архив, за ним не повторяем")
+                break
             if why is None:
                 # 27.11: отсев ферм, как при находке (база и RPC — нынешняя история кошелька: ферма остаётся фермой)
                 farm, checked = await FARM.check(db, rpc, c["trader"])
@@ -1077,13 +1217,17 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
              f"{prm.delay:g} с, правила {'/'.join(rules)} (выбор на 1-й половине окна), пул от {prm.min_pool:g} SOL; "
              f"планка: {bar.min_coins}+ монет, ≥ {bar.min_avg:+.0%}, в плюсе ≥ {bar.min_win:.0%}, t ≥ {bar.min_t:g}; "
              f"кошельков с {bar.min_coins}+ монетами (не дев, не бандл): {n_cands}",
-             f"Горячих по планке: {len(found) + len(farms)}, из них ферм {len(farms)}"
+             f"Горячих по планке: {len(found) + len(farms) + len(bad)}, из них ферм {len(farms)}, ошибка данных "
+             f"{len(bad)}"
              + (f" (не проверены через RPC: {unchecked})" if unchecked else ""),
              f"Горячих нашлось бы: {len(found)} · в бой {len(by_list.get('battle', []))}, наблюдение "
              f"{len(by_list.get('watch', []))}, архив {len(by_list.get('archive', []))}"]
     if farms:
         lines.append("Фермы (в архив, после находки не считаются): " + "; ".join(
             f"{a[:4]}…{a[-4:]} — {w.removeprefix('ферма: ')}" for a, w in farms[:20]))
+    if bad:
+        lines.append("Ошибка данных (в архив, после находки не считаются): " + "; ".join(
+            f"{a[:4]}…{a[-4:]} — {w.removeprefix('ошибка данных: ')}" for a, w in bad[:20]))
     with_fwd = [f for f in found if f["n"]]
     if with_fwd:
         # 27.11: монета у нескольких кошельков — один раз (как бот: пока копия открыта, вторая — мимо)

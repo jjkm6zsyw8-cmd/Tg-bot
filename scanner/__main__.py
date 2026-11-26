@@ -311,6 +311,12 @@ async def run_tool(cmd: str, db: Database) -> None:
             else:
                 print(H.fmt.plain(await H.entry_gap_text(db, prm, arg("--wallet"), float(arg("--hours") or 72),
                                                          int(arg("--top") or 3))))
+        elif "--explain" in args:
+            # 27.11: откуда $/день у кошелька (формула и копии с самым большим плюсом — по каким сделкам цена)
+            if not arg("--wallet"):
+                print("Укажите кошелёк: hunt --explain --wallet <адрес> [--top 3]")
+            else:
+                print(H.fmt.plain(await H.explain_text(db, prm, arg("--wallet"), int(arg("--top") or 3))))
         elif "--why" in args:
             # 27.11: что стало с покупками кошельков охотника после находки (модель, журнал копий, бот)
             print(H.fmt.plain(await H.why_text(db, prm, arg("--wallet"))))
