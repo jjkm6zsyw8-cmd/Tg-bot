@@ -316,8 +316,9 @@ async def run_tool(cmd: str, db: Database) -> None:
             print(H.fmt.plain(await H.why_text(db, prm, arg("--wallet"))))
         else:
             now = _t.time()
-            cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, bar.min_coins, mx)
-            print(f"Кошельков с {bar.min_coins}+ монетами за {H.WINDOW_H} ч: {len(cands)}")
+            cands = await H.candidates(db, now - H.WINDOW_H * 3600, now, bar.min_coins, mx, min_sol=prm.min_buy)
+            print(f"Кошельков с {bar.min_coins}+ монетами (покупки от {prm.min_buy:g} SOL) за {H.WINDOW_H} ч: "
+                  f"{len(cands)}")
             for c in cands:
                 s = await H.evaluate(db, c["trader"], now - H.WINDOW_H * 3600, now, prm, cand=c)
                 why = s.hot(bar)

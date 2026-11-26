@@ -101,6 +101,9 @@ async def test_pumpdata_trade_in_both_tables_counts_once_and_junk_is_skipped(db)
     ticks = (await M.load_ticks(db, {"MINTC": (t.timestamp() - 5, t.timestamp() + 5)}))["MINTC"]
     assert [(x.slot, x.trader) for x in ticks] == [(700, OTHER)]
     assert await M.wallet_trades(db, ME, t.timestamp() - 60) == []
+    cands = {c["trader"]: c for c in await H.candidates(db, t.timestamp() - 60, time.time(), 1, min_sol=0.1)}
+    assert ME not in cands and cands[OTHER]["coins"] == 1               # мусор и мелочь — не кандидаты
+    assert OTHER not in {c["trader"] for c in await H.candidates(db, t.timestamp() - 60, time.time(), 1, min_sol=1.0)}
 
 
 def test_pumpportal_counts_raw_messages_by_kind():

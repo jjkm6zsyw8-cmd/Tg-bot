@@ -236,16 +236,20 @@ def dump_share(p: CM.Prepared, trades: list[dict[str, Any]], since: float = 0.0)
 
 
 async def candidates(db: Any, since: float, until: float, min_coins: int | None = None,
-                     limit: int = MAX_WALLETS) -> list[dict[str, Any]]:
+                     limit: int = MAX_WALLETS, min_sol: float = 0.0) -> list[dict[str, Any]]:
     """Кошельки с покупками от min_coins разных монет за окно (по умолчанию — планка BAR); свои монеты и бандлы
-    считаем тут же."""
+    считаем тут же. 27.11 (Fn9n…: найден по «покупкам 0.00 SOL, MC 0.0» из pumpdata): мусор pumpdata и покупки
+    мельче min_sol (бот их не копирует) — не в счёт, иначе пылевые боты с тысячами монет занимают места в лимите."""
     min_coins = BAR.min_coins if min_coins is None else min_coins
     rows = await db.fetch(
         """WITH s AS (SELECT trader, mint, slot, ts FROM trades
-                      WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2)
+                      WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2) AND sol_amount >= $5
+                            AND NOT (source = 'pumpdata' AND (sol_amount < 0.001 OR mc_sol < 1
+                                     OR (pool = 'pump' AND mc_sol NOT BETWEEN 20 AND 600)))
                       UNION ALL                       -- 27.11: весь рынок из pumpdata.fun
                       SELECT trader, mint, slot, ts FROM market_trades
-                      WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2)),
+                      WHERE is_buy AND ts BETWEEN to_timestamp($1) AND to_timestamp($2) AND sol_amount >= $5
+                            AND sol_amount >= 0.001 AND mc_sol >= 1 AND (pool <> 'pump' OR mc_sol BETWEEN 20 AND 600)),
                 b AS (SELECT trader, mint, min(slot) AS slot, min(ts) AS ts FROM s GROUP BY 1, 2)
            SELECT b.trader, count(*) AS coins, count(*) FILTER (WHERE k.deployer = b.trader) AS own,
                   count(*) FILTER (WHERE k.created_slot IS NOT NULL AND b.slot IS NOT NULL
@@ -253,7 +257,7 @@ async def candidates(db: Any, since: float, until: float, min_coins: int | None 
                   extract(epoch FROM max(b.ts)) AS last_buy
            FROM b LEFT JOIN tokens k ON k.mint = b.mint
            GROUP BY b.trader HAVING count(*) >= $3 ORDER BY count(*) DESC LIMIT $4""",
-        since, until, int(min_coins), int(limit))
+        since, until, int(min_coins), int(limit), float(min_sol))
     return [dict(r) for r in rows]
 
 
@@ -541,7 +545,7 @@ class Hunter:
         farms: list[tuple[str, str]] = []
         not_checked = 0
         bar = bar_of(self.e.cfg)
-        cands = await candidates(db, since, now, bar.min_coins)
+        cands = await candidates(db, since, now, bar.min_coins, min_sol=prm.min_buy)
         for c in cands:
             k = known.get(c["trader"])
             if k is not None and (k["status"] in ("new", "shadow", "live", "ignored") or k["list"] in ("battle", "watch")
@@ -1014,7 +1018,7 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
     until = until or time.time()
     start = start if start is not None else until - days * 86400
     lo = start - WINDOW_H * 3600
-    cands = await candidates(db, lo, until, bar.min_coins, max_wallets)
+    cands = await candidates(db, lo, until, bar.min_coins, max_wallets, min_sol=prm.min_buy)
     cands = [c for c in cands if not c["own"] and int(c["bundled"]) / max(1, int(c["coins"])) < BUNDLE_SHARE]
     n_cands = len(cands)
     if trace and not any(c["trader"] == trace for c in cands):
