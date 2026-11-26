@@ -107,6 +107,7 @@ class Receiver:
         self._http: aiohttp.ClientSession | None = None
         if self.watch is not None:
             self.watch.resolve_pool = self.resolve_pool
+            self.watch.sub_per_s = float(rel.get("watch_sub_per_s", 10))
         # 25.11: подписка на резервы (кривая / хранилища пула) монет, купленных отслеживаемыми и кандидатами, — цена
         # на каждом изменении (reserves.py); своё соединение и свой лимит трафика
         self.reserves: ReserveSource | None = (
@@ -546,16 +547,22 @@ class Receiver:
         if w is None:
             return
         cut = [a for a in wallets if a not in w.want]
+        mask = lambda t: re.sub(r"(?i)(api[-_]?key|key)=[^&\s]+", r"\1=…", t or "")   # noqa: E731
 
         def state(a: str) -> str:
-            return "sub" if a in w.subs else "wait" if a in w.want else "cut"
+            if a not in w.want:
+                return "cut"
+            return ("sub" if a in w.subs else "wait") if w.connected else "down"
         try:
             await self.db.kv_set("watch:state", {
                 "at": datetime.now(timezone.utc).isoformat(), "connected": w.connected, "fallback": w.on_fallback,
                 "cap": w.MAX_SUBS, "wallets": len(wallets), "wallets_in": sum(1 for v in w.want.values() if v == "wallet"),
                 "coins_in": sum(1 for v in w.want.values() if v == "coin"), "subs": len(w.subs),
                 "cut_n": len(cut), "cut": cut[:300], "key": {a: state(a) for a in key_wallets},
-                "events": w.events, "last_error": re.sub(r"(?i)(api[-_]?key|key)=[^&\s]+", r"\1=…", w.last_error)})
+                "events": w.events, "last_error": mask(w.last_error), "cap_now": w.cap_by_url.get(w.url),
+                "primary_error": mask(w.primary_error),
+                "primary_error_at": w.primary_error_at.isoformat() if w.primary_error_at else None,
+                "rpc_fallback": self.rpc.on_fallback, "rpc_429": self.rpc.rate_limited})
         except Exception:  # noqa: BLE001 — отчёт не должен ломать слежку
             log.exception("watch:state")
 

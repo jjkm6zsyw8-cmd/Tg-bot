@@ -86,8 +86,14 @@ async def shadow_why_text(db: Any, cfg: dict[str, Any], hours: float = 24.0) -> 
                    + (" (запасной узел)" if ws.get("fallback") else "")
                    + f", кошельков в подписке {ws.get('wallets_in')} из {ws.get('wallets')}"
                    + (f", ⚠️ не влезли {ws.get('cut_n')}" if ws.get("cut_n") else ""))
+        if ws.get("fallback") and ws.get("primary_error"):
+            out.append(f"   основной узел Helius отказал: {esc(str(ws.get('primary_error')))}")
+        if ws.get("last_error"):
+            out.append(f"   последняя ошибка: {esc(str(ws.get('last_error')))}")
         if not ws.get("connected"):
-            verdicts.append("Слежка Helius не подключена — покупки отслеживаемых кошельков до бота не доходят.")
+            verdicts.append("Слежка Helius не подключена — покупки отслеживаемых кошельков до бота не доходят."
+                            + (" Основной узел Helius отказал (см. выше): при 429 — кончились кредиты или лимит "
+                               "тарифа, смотри Usage в кабинете Helius." if ws.get("fallback") else ""))
         missing = [a for a, v in (ws.get("key") or {}).items() if v != "sub"]
         if missing:
             verdicts.append(f"Кошельки «за ним» / охотника без подписки Helius: {len(missing)} (" + ", ".join(

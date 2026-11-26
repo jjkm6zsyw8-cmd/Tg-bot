@@ -247,6 +247,10 @@ async def test_watch_keeps_followed_and_hunter_wallets_first(db):
     rec.watch.subs["FOLLOWED"] = 7
     await rec.publish_watch(list(rec.watch.want) + ["DEV0"], {"FOLLOWED", "MINE", "HUNT", "GONE"})
     st = await db.kv_get("watch:state")
+    assert st["key"] == {"FOLLOWED": "down", "MINE": "down", "HUNT": "down", "GONE": "cut"} and st["cut_n"] == 1
+    rec.watch.connected = True                                          # «подписан» — только при живом соединении
+    await rec.publish_watch(list(rec.watch.want) + ["DEV0"], {"FOLLOWED", "MINE", "HUNT", "GONE"})
+    st = await db.kv_get("watch:state")
     assert st["key"] == {"FOLLOWED": "sub", "MINE": "wait", "HUNT": "wait", "GONE": "cut"} and st["cut_n"] == 1
     rec.watch.last_error = "HTTP 429 wss://mainnet.helius-rpc.com/?api-key=SECRET"
     await rec.publish_watch([], set())

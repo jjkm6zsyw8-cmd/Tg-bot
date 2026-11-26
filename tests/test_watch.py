@@ -479,3 +479,28 @@ async def test_main_topic_panel_sent_pinned_and_reused():
     assert "на месте" in await ensure(bot)                      # перезапуск — та же панель обновляется
     assert len(bot.sent) == 1 and bot.edited == [501]
     assert "main" in Settings(YamlConfig("config/config.yaml")).topics()
+
+
+async def test_watch_overloaded_node_gets_fewer_subscriptions():
+    """27.11 (сервер: «НЕ подключена (запасной узел)… 1013 Too many subscriptions attempted»): причина отказа основного
+    узла сохраняется; узел, который режет подписки, получает их меньше — ключевые кошельки (первые в want) первыми."""
+    import asyncio
+    w = WatchSource("wss://primary/?api-key=K", {}, fallback="wss://public")
+    w.on_failure(Exception("server rejected WebSocket connection: HTTP 429"))
+    assert w.on_fallback and "429" in w.primary_error and w.primary_error_at is not None
+    w.subs = {addr(f"s{i}"): i for i in range(60)}
+    w.on_failure(Exception("received 1013 (try again later) Rate limit reached: Too many subscriptions attempted."))
+    assert w.cap_by_url["wss://public"] == 42 and "429" in w.primary_error     # ошибка запасного — не вместо основной
+    w.subs = {}
+    w.sub_per_s = 1000.0
+    w.want = {addr(f"k{i}"): "wallet" for i in range(100)}
+    sent = []
+
+    class Ws:
+        async def send(self, raw):
+            sent.append(json.loads(raw)["params"][0]["mentions"][0])
+    w._changed.set()
+    task = asyncio.create_task(w._sync(Ws()))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    assert sent == list(w.want)[:42]

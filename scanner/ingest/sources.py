@@ -487,6 +487,14 @@ class WatchSource(Source):
         # 27.11: резервы монет едут в этом же соединении (ReserveSource.attach / handle / detach) — одно соединение
         self.passenger: Any = None
         self._send_lock = asyncio.Lock()
+        # 27.11 (сервер: «НЕ подключена (запасной узел)… 1013 Too many subscriptions attempted»): основной Helius
+        # отказал — его причину храним отдельно (на запасном last_error уже его); подписки — не чаще sub_per_s
+        # в секунду; узел ответил «слишком много подписок» — на этом адресе подписываемся не больше cap_by_url
+        # (ключевые кошельки — первые в want); на запасном узле резервы не подключаем — места только кошелькам
+        self.primary_error = ""
+        self.primary_error_at: datetime | None = None
+        self.sub_per_s = 10.0
+        self.cap_by_url: dict[str, int] = {}
 
     async def send_json(self, obj: dict[str, Any]) -> bool:
         """Отправка в соединение (и для пассажира-резервов): по очереди, без одновременных записей."""
@@ -532,14 +540,17 @@ class WatchSource(Source):
                 pass
             self._changed.clear()
             asked = set(self.pending.values())
+            cap = self.cap_by_url.get(self.url)
             for addr in [a for a in self.want if a not in self.subs and a not in asked]:
+                if cap is not None and len(self.subs) + len(self.pending) >= cap:
+                    break
                 rid = next(self._ids)
                 self.pending[rid] = addr
                 commitment = self.wallet_commitment if self.want.get(addr) == "wallet" else self.commitment
                 async with self._send_lock:
                     await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": "logsSubscribe",
                                               "params": [{"mentions": [addr]}, {"commitment": commitment}]}))
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(1.0 / max(1.0, self.sub_per_s))
             for addr in [a for a in self.subs if a not in self.want]:
                 sid = self.subs.pop(addr)
                 rid = next(self._ids)
@@ -554,6 +565,14 @@ class WatchSource(Source):
         час работаем через запасной публичный узел Solana, потом пробуем основной снова."""
         self.fails += 1
         text = str(exc)
+        if self.url == self.primary:
+            self.primary_error, self.primary_error_at = text[:200], datetime.now(timezone.utc)
+        if "1013" in text or "too many subscriptions" in text.lower():
+            # узел режет число подписок на соединение — в следующий раз на этом адресе меньше (не меньше 25)
+            had = len(self.subs) + (len(getattr(self.passenger, "acc_mint", {}) or {})
+                                    if self.passenger is not None and not self.on_fallback else 0)
+            self.cap_by_url[self.url] = max(25, int(min(had or 100, self.cap_by_url.get(self.url, 10**6)) * 0.7))
+            log.warning("watch: узел режет подписки — на нём теперь не больше %d", self.cap_by_url[self.url])
         refused = any(code in text for code in ("429", "401", "403"))
         if self.fallback and self.url == self.primary and (refused or self.fails >= 3):
             self.url = self.fallback
@@ -579,8 +598,9 @@ class WatchSource(Source):
             self._changed.set()
             log.info("watch: подключено, адресов %d", len(self.want))
             sync = asyncio.create_task(self._sync(ws))
-            if self.passenger is not None:
-                await self.passenger.attach(self.send_json, sink)
+            rider = self.passenger if not self.on_fallback else None
+            if rider is not None:
+                await rider.attach(self.send_json, sink)
             try:
                 async for raw in ws:
                     try:
@@ -591,8 +611,8 @@ class WatchSource(Source):
                     if not isinstance(msg, dict):
                         self.bytes_in += len(raw)
                         continue
-                    if self.passenger is not None and await self.passenger.handle(msg, len(raw)):
-                        self.passenger.bytes_in += len(raw)      # трафик резервов — в их счёт
+                    if rider is not None and await rider.handle(msg, len(raw)):
+                        rider.bytes_in += len(raw)               # трафик резервов — в их счёт
                         continue
                     self.bytes_in += len(raw)
                     rid = msg.get("id")
@@ -618,8 +638,8 @@ class WatchSource(Source):
                     await self._emit(msg, sink)
             finally:
                 sync.cancel()
-                if self.passenger is not None:
-                    self.passenger.detach()
+                if rider is not None:
+                    rider.detach()
 
     async def _emit(self, msg: dict[str, Any], sink: Sink) -> None:
         for ev in LogsSource.parse_notification(msg, self.stats, self.pool_to_mint, source="watch"):

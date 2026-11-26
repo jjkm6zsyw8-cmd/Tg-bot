@@ -919,7 +919,8 @@ def _reason(text: str | None) -> str:
 
 
 WATCH_STATE = {"sub": "подписан", "wait": "ждёт подписки",
-               "cut": "⚠️ не влез в лимит подписок — его сделки до бота не доходят"}
+               "cut": "⚠️ не влез в лимит подписок — его сделки до бота не доходят",
+               "down": "⚠️ слежка не подключена — его сделки до бота не доходят"}
 
 
 async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None, now: float | None = None,
@@ -944,7 +945,11 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
                    + (" (запасной узел)" if ws.get("fallback") else "")
                    + f", кошельков в подписке {ws.get('wallets_in')} из {ws.get('wallets')}, монет {ws.get('coins_in')}, "
                    f"мест {ws.get('cap')}" + (f", ⚠️ не влезли {ws.get('cut_n')}" if ws.get("cut_n") else "")
-                   + (f"; ошибка: {fmt.esc(str(ws.get('last_error')))}" if ws.get("last_error") else ""))
+                   + (f"; ошибка: {fmt.esc(str(ws.get('last_error')))}" if ws.get("last_error") else "")
+                   + (f"\n  основной узел Helius отказал {fmt.esc(str(ws.get('primary_error_at') or '')[:16])}: "
+                      f"{fmt.esc(str(ws.get('primary_error')))}" if ws.get("fallback") and ws.get("primary_error") else "")
+                   + (f"\n  узел режет подписки — подписываемся не больше {ws.get('cap_now')}" if ws.get("cap_now") else "")
+                   + ("\n  RPC тоже на запасном узле" if ws.get("rpc_fallback") else ""))
     else:
         out.append("Слежка Helius: состояния нет (приёмник старой версии или слежка выключена)")
     for r in rows:
