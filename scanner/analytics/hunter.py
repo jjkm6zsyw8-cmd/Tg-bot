@@ -672,8 +672,11 @@ class Hunter:
                                 "WHERE status IN ('shadow', 'live') AND followed_at IS NOT NULL"):
             addr = r["address"]
             res = await our_results(db, addr, r["followed_at"])
-            last_buy = await db.fetchval("SELECT extract(epoch FROM max(ts)) FROM trades WHERE trader = $1 AND is_buy",
-                                         addr)
+            # 27.11 (Fn9n… — пылевой бот: свопы по 0.00002–0.00005 SOL раз в 20 с): покупки мельче copy_min_buy_sol
+            # бот не копирует — для «остыл» это не покупки, иначе такой кошелёк висит в тени вечно
+            last_buy = await db.fetchval(
+                "SELECT extract(epoch FROM max(ts)) FROM trades WHERE trader = $1 AND is_buy AND sol_amount >= $2",
+                addr, float(self.e.cfg.get("copy_min_buy_sol", 0.1)))
             why = cool_reason(res["n"], res["t"], float(last_buy) if last_buy else None,
                               r["followed_at"].timestamp(), now)
             if why is None:

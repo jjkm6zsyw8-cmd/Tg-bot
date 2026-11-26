@@ -354,6 +354,21 @@ async def test_follow_uses_wallet_rule_and_cools_on_steady_minus(db):
     assert any("🧊 <b>Остыл</b>" in p["text"] for p in e.sent)
 
 
+async def test_dust_buys_do_not_keep_wallet_warm(db):
+    """27.11: пылевой бот (покупки по 0.00002 SOL) в тени — для «остыл» его мелочь не покупки."""
+    await hot_wallet(db, ME)
+    e = Engine(db, hunter_on=True)
+    h = H.Hunter(e)
+    await h.scan(time.time())
+    await H.follow(db, e.cfg, Costs(), ME, "shadow")
+    await db.execute("UPDATE hunter_wallets SET followed_at = now() - interval '13 hours' WHERE address = $1", ME)
+    await db.execute("DELETE FROM trades WHERE trader = $1", ME)
+    await put_trade(db, "DUST", ME, datetime.now(timezone.utc), True, 50.0, 9, sol=0.00002, tokens=400)
+    assert await h.watch(time.time()) == [ME]
+    r = await db.fetchrow("SELECT status, cool_reason FROM hunter_wallets WHERE address = $1", ME)
+    assert r["status"] == "cooled" and "нет покупок" in r["cool_reason"]
+
+
 async def test_hunt_text_daily_weekly(db):
     await hot_wallet(db, ME)
     e = Engine(db, hunter_on=True)
