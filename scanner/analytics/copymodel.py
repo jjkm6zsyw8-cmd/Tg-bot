@@ -26,6 +26,7 @@ from ..solana import INITIAL_V_SOL, INITIAL_V_TOKENS, TOTAL_SUPPLY
 
 STAKE_SOL = 0.14
 ENTRY_BLOCKS = 2
+SLOT_S = 0.4                   # 27.11: блок ≈ 0.4 с — задержка входа в блоках (у pumpdata время с точностью до секунды)
 ENTRY_DELAY_S = 1.0            # вход, если блок сделки неизвестен
 EXIT_DELAY_S = 1.0             # продажа «садится» через ~1 с после решения
 FEE_BPS = 125                  # как pump.FEE_BPS и pumpswap.FEE_BPS у реального бота
@@ -134,6 +135,16 @@ def entry_by_delay(e: Entry, ticks: list[Tick], delay_s: float) -> Tick | None:
     """26.11: вход с нашей настоящей задержкой (медиана из боя 1.36 с от его покупки до нашей): худшая для покупки
     цена сделок за (его покупка; + delay]; сделок нет — цена после его покупки."""
     ok = [t for t in ticks if t.price_ok]
+    if e.slot:
+        # 27.11: по блокам, когда они известны — у сделок pumpdata время с точностью до секунды, и окно «1.36 с»
+        # по времени теряло сделки той же секунды; 1.36 с ≈ 4 блока
+        last = e.slot + max(1, math.ceil(delay_s / SLOT_S))
+        win = [t for t in ok if t.slot is not None and e.slot < t.slot <= last]
+        if win:
+            return max(win, key=lambda t: t.mc)
+        before = [t for t in ok if t.slot is not None and t.slot <= last and t.ts >= e.ts - 2]
+        if before:
+            return max(before, key=lambda t: (t.slot, t.ts))
     win = [t for t in ok if e.ts < t.ts <= e.ts + delay_s]
     if win:
         return max(win, key=lambda t: t.mc)
@@ -387,12 +398,15 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]], reserves:
                   t.source
            FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
            JOIN trades t ON t.mint = p.mint AND t.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi) AND t.mc_sol > 0
+                AND NOT (t.source = 'pumpdata' AND (t.sol_amount < 0.001 OR t.mc_sol < 1
+                         OR (t.pool = 'pump' AND t.mc_sol NOT BETWEEN 20 AND 600)))
            UNION ALL
            SELECT p.mint, extract(epoch FROM m.ts), m.mc_sol, m.slot, m.trader, m.is_buy, m.sol_amount, m.pool,
                   'pumpdata'
            FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
            JOIN market_trades m ON m.mint = p.mint AND m.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi)
-                AND m.mc_sol > 0
+                AND m.mc_sol > 0 AND m.sol_amount >= 0.001 AND m.mc_sol >= 1      -- 27.11: мусор из записанного раньше
+                AND (m.pool <> 'pump' OR m.mc_sol BETWEEN 20 AND 600)
            ORDER BY 1, 2""", mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints])
     out: dict[str, list[Tick]] = {}
     for r in rows:

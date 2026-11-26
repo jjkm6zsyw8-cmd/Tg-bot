@@ -39,6 +39,10 @@ TOTAL_SUPPLY = 1_000_000_000.0
 MAX_QUEUE = 200_000
 BATCH = 5_000
 WSOL = "So11111111111111111111111111111111111111112"
+# 27.11 (разбор Fn9n…: «его покупка 0.00 SOL, MC 0.0»): пыль и сделки с невозможной ценой — мимо. На кривой
+# капитализация бывает только от старта (~28 SOL) до завершения (~411 SOL) — средняя цена сделки вне [20; 600] — мусор
+MIN_SOL = 0.001
+CURVE_MC = (20.0, 600.0)
 
 
 class Row(NamedTuple):
@@ -93,12 +97,15 @@ def parse(msg: Any) -> Row | None:
         sol /= 1e9                        # пришло в лампортах
     if tok > 1.1 * TOTAL_SUPPLY:
         tok /= 1e6                        # пришло в сырых единицах (6 знаков)
-    if sol <= 0 or tok <= 0:
+    if sol < MIN_SOL or tok <= 0:
         return None
     venue = str(msg.get("venue") or "").lower()
     pool = "pump-amm" if ("swap" in venue or "amm" in venue) else "pump"
     sub = zlib.crc32(f"{mint}|{wallet}|{side}|{msg.get('token_amount')}".encode())
     is_buy = side in ("buy", "b")
+    avg = sol / tok * TOTAL_SUPPLY
+    if (pool == "pump" and not CURVE_MC[0] <= avg <= CURVE_MC[1]) or avg < 1.0:
+        return None
     if pool == "pump":
         # 27.11: цена ПОСЛЕ сделки, как у остальных источников (v_sol / v_tokens), а не средняя цена сделки — у
         # крупной покупки на кривой средняя ниже итоговой (5 SOL на старте — на 14%), и вход модели «по цене после

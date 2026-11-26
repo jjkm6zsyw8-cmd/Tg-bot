@@ -339,7 +339,7 @@ async def test_model_gap_parts_and_effective_rule(db):
         await put_coin(db, mint, t - timedelta(minutes=2))
         await put_trade(db, mint, ME, t, True, 50, 100)
         for i in range(1, 10):                                          # цены каждые 2 с — без дыры перед тейком
-            await put_trade(db, mint, f"FILL{i}" + "f" * 38, t + timedelta(seconds=2 * i), True, 51, 100 + i)
+            await put_trade(db, mint, f"FILL{i}" + "f" * 38, t + timedelta(seconds=2 * i), True, 51, 100 + 5 * i)
         await put_trade(db, mint, OTHER, t + timedelta(seconds=20), True, 70, 140)      # тейк A по модели
     for mint, extra in ((m, '{"rule": "A"}'), (r, '{"rule": "A", "best_exit": "R"}')):
         await db.execute(
@@ -411,7 +411,26 @@ async def test_entry_gap_shows_where_block2_beats_delay(db):
     await put_trade(db, m, OTHER, t + timedelta(seconds=0.4), True, 42, 1001)           # блок +1 — вход «блок +2»
     await put_trade(db, m, "SNIP" + "s" * 40, t + timedelta(seconds=1.2), True, 120, 1003)   # через 1.2 с — ×3
     for i in range(1, 12):
-        await put_trade(db, m, f"F{i:02d}" + "f" * 40, t + timedelta(seconds=1.2 + 2 * i), True, 121, 1003 + i)
+        await put_trade(db, m, f"F{i:02d}" + "f" * 40, t + timedelta(seconds=1.2 + 2 * i), True, 121, 1003 + 5 * i)
     text = H.fmt.plain(await H.entry_gap_text(db, H.Params(1.36, 0.0, 150.0), ME, 6, 3))
     assert "1 копий" in text and "разрыв +" in text and "блок +2: вход +0.40 с, блок +1, MC 42.0" in text
     assert "1.36 с: вход +1.20 с, блок +3, MC 120.0" in text and "сделки до +3 с:" in text and ", его)" in text
+
+
+
+def test_delay_entry_counts_blocks_when_known():
+    """27.11: у pumpdata время с точностью до секунды — вход «через 1.36 с» считается по блокам (≈ 4 блока): сделка в
+    ту же секунду, но через 3 блока, в окно попадает; через 6 блоков — нет."""
+    e = M.Entry("MINT", T0, 1000, 1.0)
+    ticks = [tk(0, 50, 1000, ME), tk(0, 80, 1003), tk(1, 200, 1006)]   # время — целые секунды, как у pumpdata
+    assert M.entry_by_delay(e, ticks, 1.36).mc == 80
+    assert M.entry_by_delay(M.Entry("MINT", T0, None, 1.0), ticks, 1.36).mc == 200   # блока нет — по времени
+
+
+def test_pumpdata_drops_dust_and_impossible_curve_prices():
+    from scanner.ingest import pumpdata as PD
+    base = {"type": "trade", "venue": "curve", "mint": "M", "wallet": "W", "side": "buy", "slot": 1, "idx": 1, "ts": 1}
+    assert PD.parse({**base, "sol": 0.0004, "token_amount": 10_000.0}) is None             # пыль
+    assert PD.parse({**base, "sol": 0.004, "token_amount": 80_000_000.0}) is None          # MC 0.05 на кривой
+    assert PD.parse({**base, "sol": 1.0, "token_amount": 1_000_000.0}) is None             # MC 1000 на кривой
+    assert PD.parse({**base, "sol": 1.0, "token_amount": 30_000_000.0}) is not None

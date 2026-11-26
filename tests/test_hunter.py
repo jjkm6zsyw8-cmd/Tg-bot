@@ -67,10 +67,10 @@ def test_pick_rule_on_first_half_checks_second():
 
 
 def test_entry_by_our_delay_and_burst():
-    ticks = [tk(0, 50, 100, ME), tk(0.5, 54, 101), tk(1.2, 58, 102), tk(2.0, 70, 103), tk(20, 75, 140)]
+    ticks = [tk(0, 50, 100, ME), tk(0.5, 54, 101), tk(1.2, 58, 103), tk(2.0, 70, 105), tk(20, 75, 150)]
     e = M.Entry("MINT", T0, 100, 1.0)
     assert M.entry_by_delay(e, ticks, 1.36).mc == 58                       # худшая цена за 1.36 с
-    assert M.entry_tick(e, ticks).mc == 58                                 # блок +2 — те же сделки здесь
+    assert M.entry_tick(e, ticks).mc == 54                                 # блок +2 — только сделка блока +1
     c = M.copy_trade(e, ticks, ME, DEV, T0 - 60, entry_delay_s=1.36)
     assert c.burst                                                         # +25% от 58 за 30 с: 75 ≥ 72.5
     flat = [tk(0, 50, 100, ME), tk(10, 52), tk(29, 55)]
