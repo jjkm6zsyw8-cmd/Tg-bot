@@ -315,6 +315,22 @@ def ago(sec: float | None) -> str:
 UNCHECKED = " ⚠️ оценка не сверена с тенью"
 
 
+SHADOW_OFF = ("⚠️ Все кошельки бота выключены — тени за найденными нет, только оценка модели. Включить: «💵 Реальный "
+              "бот» → «👛 Мои кошельки» → кошелёк → «Тень» (методы можно не включать).")
+
+
+async def bot_watching(db: Any) -> bool | None:
+    """27.11 (владелец думал, что охотник считает тень сам): тень «за ним» идёт, только если хоть один кошелёк бота в
+    режиме «тень» или «бой» (real:desk). False — все выключены; None — состояние неизвестно."""
+    d = await db.kv_get("real:desk") if hasattr(db, "kv_get") else None
+    if not d:
+        return None
+    ws = d.get("wallets") or []
+    if not ws:
+        return None if d.get("common_accepts") else False
+    return any(w.get("mode") in ("shadow", "live") for w in ws)
+
+
 def unchecked(cfg: dict[str, Any] | None) -> str:
     """27.11 (владелец: модель против тени +15.4 п.п. на 366 сделках): пока разница не исправлена
     (hunter_model_checked: false), у $ в день — пометка."""
@@ -549,7 +565,10 @@ class Hunter:
                 await db.execute("UPDATE hunter_wallets SET farm_at = now() WHERE address = $1", c["trader"])
                 # 27.11 (владелец): всех найденных — сразу в тень (без денег) и «наблюдение»
                 await follow(db, self.e.cfg, self.e.costs(), c["trader"], "shadow")
-                await self.say(*alert_text(s, now, prm, unchecked(self.e.cfg)))
+                text, kb = alert_text(s, now, prm, unchecked(self.e.cfg))
+                if await bot_watching(db) is False:
+                    text += "\n" + SHADOW_OFF
+                await self.say(text, kb)
         if farms:
             await self.say(f"🚜 <b>Охотник: отсеяно ферм {len(farms)}</b> — в архив, за ними не повторяем:\n"
                            + "\n".join(f"<code>{a}</code> — {fmt.esc(w)}" for a, w in farms[:10]))
@@ -901,10 +920,12 @@ async def hunt_text(db: Any, hours: float = 24.0, note: str = UNCHECKED) -> str:
            LIMIT 40""", since)
     ok = set(await db.kv_get(BATTLE_KEY) or {})
     if not rows:
-        return f"🎯 Охотник: за {hours:g} ч никого не нашёл, в списках пусто."
+        off = await bot_watching(db) is False
+        return f"🎯 Охотник: за {hours:g} ч никого не нашёл, в списках пусто." + (f"\n{SHADOW_OFF}" if off else "")
     status = {"new": "без решения", "shadow": "👻 тень", "live": "💵 бой", "ignored": "игнор", "cooled": "🧊 остыл"}
     lines = [f"🎯 <b>Охотник</b>: найдены за {hours:g} ч и списки"
-             + (f"\n$/день — оценка модели:{note}" if note else "")] + await shadow_total(db)
+             + (f"\n$/день — оценка модели:{note}" if note else "")
+             + (f"\n{SHADOW_OFF}" if await bot_watching(db) is False else "")] + await shadow_total(db)
     for r in rows:
         after = (f"после находки {int(r['n_after'] or 0)} коп., {float(r['avg_after'] or 0):+.1%}, "
                  f"${float(r['usd_day_after'] or 0):,.0f}/день" if r["n_after"] else "после находки копий ещё нет")

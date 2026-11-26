@@ -532,3 +532,17 @@ async def test_scan_waits_when_farm_check_incomplete(db):
     e.rpc = FakeRpc()
     assert [s.address for s in await h.scan(time.time())] == [ME]
     assert await db.fetchval("SELECT farm_at IS NOT NULL FROM hunter_wallets WHERE address = $1", ME)
+
+
+
+async def test_warns_when_all_bot_wallets_off(db):
+    """27.11: тень «за ним» идёт только при кошельке бота в «тени» или «бое» — иначе охотник прямо об этом говорит."""
+    assert await H.bot_watching(db) is None
+    await db.kv_set("real:desk", {"wallets": [{"id": 1, "mode": "off"}, {"id": 2, "mode": "off"}]})
+    assert await H.bot_watching(db) is False and "Все кошельки бота выключены" in await H.hunt_text(db, 24)
+    await hot_wallet(db, ME)
+    e = Engine(db, hunter_on=True)
+    await H.Hunter(e).scan(time.time())
+    assert any("горячий кошелёк" in p["text"] and "Все кошельки бота выключены" in p["text"] for p in e.sent)
+    await db.kv_set("real:desk", {"wallets": [{"id": 1, "mode": "off"}, {"id": 2, "mode": "shadow"}]})
+    assert await H.bot_watching(db) is True and "выключены" not in await H.hunt_text(db, 24)
