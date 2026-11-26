@@ -38,6 +38,7 @@ FULL_WINDOW_S = 30 * 60        # приёмник пишет все сделки
 # подписку на монету, а у неё лимит. Поэтому на PumpSwap и вне окна полной записи тишина дольше GAP_S между входом и
 # выходом — это пробел в данных, а не «цена стояла»: такая копия не идёт в оценку
 GAP_S = 90.0
+HOLE_S = 4.0    # 27.11: дольше бот без цены не бывает (опрос раз в 4 с) — тейк после такой дыры продаётся по уровню тейка
 # монета на кривой молчала в окне полной записи не меньше DEAD_S до его конца — её бросили: цена дальше та же (иначе
 # такие копии — а это убыточные — выпадали бы из оценки и завышали её)
 DEAD_S = 600.0
@@ -111,6 +112,21 @@ def _price_at(ticks: list[Tick], ts: float) -> Tick | None:
         if t.price_ok:
             last = t
     return last
+
+
+def take_level(pos: Position, sc: dict[str, Any], lo: float, hi: float) -> float:
+    """27.11: цена (MC), на которой чистый итог позиции ровно доходит до тейка — между прошлой ценой lo и ценой hi,
+    на которой тейк сработал (итог растёт с ценой: поиск делением пополам)."""
+    tp = float(sc["tp_net"])
+    if pos.net_if_sold(lo, FEE_BPS, FIXED_SOL) >= tp:
+        return lo
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if pos.net_if_sold(mid, FEE_BPS, FIXED_SOL) >= tp:
+            hi = mid
+        else:
+            lo = mid
+    return hi
 
 
 def entry_by_delay(e: Entry, ticks: list[Tick], delay_s: float) -> Tick | None:
@@ -192,6 +208,7 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
 
     trusted_until = (created_ts + FULL_WINDOW_S) if created_ts is not None else -1.0
     last_seen = opened
+    last_px_ts, last_px_mc = opened, et.mc            # последняя известная цена (для дыр перед тейком)
 
     def in_cover(a: float, b: float) -> bool:
         return any(s <= a + COVER_SLACK_S and b <= e_ for s, e_ in covered or ())
@@ -203,10 +220,10 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
             return False
         return venue == AMM or upto > trusted_until
 
-    def close(at: float, why: str) -> Copy:
+    def close(at: float, why: str, mc_at: float | None = None) -> Copy:
         px = _price_at(ticks, at + xd)
-        mc = px.mc if px is not None else et.mc
-        v = AMM if (px is not None and px.pool == AMM) else venue
+        mc = mc_at if mc_at is not None else (px.mc if px is not None else et.mc)
+        v = venue if mc_at is not None else (AMM if (px is not None and px.pool == AMM) else venue)
         pos.proceeds_sol += sell_sol(mc, v, pos.tokens) - FIXED_SOL
         return Copy(pos.proceeds_sol / pos.cost_sol - 1, None, why, et.mc, mc, venue, at - opened, stake, burst)
 
@@ -233,19 +250,27 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
             if reason:                               # событие есть, цены у сделки нет — продажа по последней цене
                 return close(t.ts, reason)
             continue
-        last_seen = t.ts
+        # 27.11 (владелец): дыра в ценах (бот без цены не бывает дольше HOLE_S, вне окна слежения за резервами) — тейк
+        # продаётся по уровню тейка: бот увидел бы его раньше, а не по первой цене после дыры (раздувало кошельки
+        # со всплеском: выгрузка — +87% у модели против +25% у тени после 4 мин без цен)
+        hole = t.ts - last_px_ts > HOLE_S and not in_cover(last_px_ts, t.ts)
+        prev_mc = last_px_mc
+        last_seen = last_px_ts = t.ts
+        last_px_mc = t.mc
         d = decide_exit(pos, t.mc, t.ts, sc, FEE_BPS, FIXED_SOL, emergency=reason)
         if d is None:
             continue
         share = float(d[1])
+        at_take = take_level(pos, sc, prev_mc, t.mc) if d[0] == "take_profit" and hole else None
         if share < 1 and pos.tokens > 0:
             part = pos.tokens * share
             px = _price_at(ticks, t.ts + xd)
-            pos.proceeds_sol += sell_sol(px.mc if px else t.mc, venue, part) - FIXED_SOL
+            mc_sell = at_take if at_take is not None else (px.mc if px else t.mc)
+            pos.proceeds_sol += sell_sol(mc_sell, venue, part) - FIXED_SOL
             pos.tokens -= part
             pos.tp_done = True
             continue
-        return close(t.ts, d[0])
+        return close(t.ts, d[0], at_take)
     # сделок до конца удержания больше нет: цена известна, только если монета ещё в окне полной записи (сделок нет —
     # значит, их не было), иначе — пробел в данных
     if venue != AMM and created_ts is not None and (deadline <= trusted_until or trusted_until - last_seen >= DEAD_S):

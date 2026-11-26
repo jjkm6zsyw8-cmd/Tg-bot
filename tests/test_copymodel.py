@@ -338,6 +338,8 @@ async def test_model_gap_parts_and_effective_rule(db):
     for mint in (m, r):
         await put_coin(db, mint, t - timedelta(minutes=2))
         await put_trade(db, mint, ME, t, True, 50, 100)
+        for i in range(1, 10):                                          # цены каждые 2 с — без дыры перед тейком
+            await put_trade(db, mint, f"FILL{i}" + "f" * 38, t + timedelta(seconds=2 * i), True, 51, 100 + i)
         await put_trade(db, mint, OTHER, t + timedelta(seconds=20), True, 70, 140)      # тейк A по модели
     for mint, extra in ((m, '{"rule": "A"}'), (r, '{"rule": "A", "best_exit": "R"}')):
         await db.execute(
@@ -359,11 +361,27 @@ async def test_model_gap_parts_and_effective_rule(db):
 def test_exit_delay_and_without_reserves():
     """27.11: задержка продажи — параметр модели; без резервов — те же входы без тиков резервов и окон слежения."""
     e = M.Entry("MINT", T0, 100, 1.0)
-    ticks = [tk(0, 50, 100, ME), tk(20, 70, 140), tk(21.5, 90, 145), tk(40, 95, 160)]
+    ticks = [tk(0, 50, 100, ME)] + [tk(2 + 2 * i, 52, 104 + i) for i in range(9)] + \
+        [tk(20, 70, 140), tk(21.5, 90, 145), tk(23, 95, 150)]          # цены каждые 2 с — дыр нет
     fast = M.copy_trade(e, ticks, ME, DEV, T0 - 60, entry_delay_s=1.36)
     slow = M.copy_trade(e, ticks, ME, DEV, T0 - 60, entry_delay_s=1.36, exit_delay_s=2.0)
     assert fast.reason == "take_profit" and fast.exit_mc == 70 and slow.exit_mc == 90
     p = M.Prepared(ME, [e], {"MINT": ticks + [M.Tick(T0 + 5, 60, None, "", True, 0.0, "pump", True)]},
                    {"MINT": [(T0, T0 + 600)]}, {}, 1800)
     q = M.without_reserves(p)
-    assert len(q.ticks["MINT"]) == 4 and q.cover == {} and len(p.ticks["MINT"]) == 5
+    assert len(q.ticks["MINT"]) == len(ticks) and q.cover == {} and len(p.ticks["MINT"]) == len(ticks) + 1
+
+
+
+def test_take_after_price_hole_sells_at_take_level():
+    """27.11 (владелец): после дыры в ценах (дольше 4 с без цены, вне окна резервов) тейк продаётся по уровню тейка,
+    а не по первой цене после дыры — иначе кошельки со всплеском раздуваются (+87% у модели против +25% у тени)."""
+    e = M.Entry("MINT", T0, 100, 1.0)
+    holey = [tk(0, 50, 100, ME), tk(2, 51, 104), tk(200, 110, 300)]   # 3 мин без цен, потом сразу +115%
+    c = M.copy_trade(e, holey, ME, DEV, T0 - 60, entry_delay_s=1.36)
+    assert c.reason == "take_profit" and 60 < c.exit_mc < 70 and 0.20 < c.res < 0.30   # уровень тейка A (+25% чистыми)
+    dense = [tk(0, 50, 100, ME)] + [tk(2 + 3 * i, 51, 104 + i) for i in range(66)] + [tk(200, 110, 300)]
+    d = M.copy_trade(e, dense, ME, DEV, T0 - 60, entry_delay_s=1.36)
+    assert d.exit_mc == 110 and d.res > 0.8                              # цена видна до скачка — скачок настоящий
+    covered = M.copy_trade(e, holey, ME, DEV, T0 - 60, entry_delay_s=1.36, covered=[(T0, T0 + 600)])
+    assert covered.exit_mc == 110                                        # окно резервов: тишина — цена не менялась
