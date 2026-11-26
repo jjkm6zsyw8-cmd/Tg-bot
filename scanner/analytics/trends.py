@@ -1,0 +1,672 @@
+"""Режим «Тренды»: монеты Solana, которые прямо сейчас продвигают и покупают.
+
+Источники (официальные публичные API, без ключей):
+  * DexScreener — свежие бусты, топ бустов, новые профили токенов, данные пар (объём/покупки/цена за 5 мин);
+  * GeckoTerminal — новые и трендовые пулы Solana (жёсткий лимит, опрашиваем редко);
+  * Solana RPC — топ-10 холдеров (getTokenLargestAccounts) для отсечения монет «у одного кошелька».
+
+Каждые 30 с: собрать кандидатов → пакетно получить пары → импульс → фильтр ботов (разные покупатели,
+GeckoTerminal) → лесенка (минутные свечи) → ждём отката → холдеры → алерт. Отсеянные — в теневой учёт.
+Сопровождение открытых — каждые 5 с (пачкой до 30 монет за запрос).
+Сопровождение 60 минут по данным DexScreener: цель, разворот (экстренный выход), итог.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import aiohttp
+
+from ..alerts import format as fmt
+from ..ingest.rpc import RpcError
+from ..solana import is_valid_address
+from ..external.adapters import good_quote
+from . import trendcheck as tc
+
+if TYPE_CHECKING:
+    from .engine import AlertEntry, Engine
+
+log = logging.getLogger(__name__)
+TREND_TARGET = "T"                     # портфель/цель «тренды» у реального бота (executor.kinds_of)
+
+
+def cfg_x_to_real(cfg: dict) -> bool:
+    """Тренды, отсеянные за «топ-10 держат много», на других биржах — в реальный бот (тень)."""
+    return bool(cfg.get("trend_x_to_real", True))
+
+DEX = "https://api.dexscreener.com"
+GECKO = "https://api.geckoterminal.com/api/v2/networks/solana"
+
+DEFAULTS: dict[str, float] = {
+    "trend_mc_min_usd": 15_000,
+    "trend_mc_max_usd": 5_000_000,
+    "trend_min_liq_usd": 8_000,
+    "trend_min_vol_m5_usd": 2_000,
+    "trend_min_buys_m5": 15,
+    "trend_min_buy_ratio_m5": 1.3,     # покупок / продаж за 5 минут
+    "trend_pc_m5_min": 3,              # цена за 5 мин, % — растёт
+    "trend_pc_m5_max": 60,             # но не вершина свечи
+    "trend_pc_h1_max": 500,
+    "trend_max_age_h": 72,
+    "trend_max_top10": 0.45,           # доля топ-10 холдеров без пула
+    "trend_exit_drop": 0.20,           # падение от цены алерта → выход
+    "trend_exit_m5_drop": 15,          # падение за 5 мин, % → выход
+}
+
+
+def p(cfg: dict[str, Any], key: str) -> float:
+    v = cfg.get(key)
+    return float(v) if v is not None else DEFAULTS[key]
+
+
+@dataclass
+class PairInfo:
+    mint: str
+    symbol: str
+    name: str
+    pair: str
+    dex: str
+    price: float
+    mc_usd: float
+    liq_usd: float
+    vol_m5: float
+    vol_h1: float
+    buys_m5: int
+    sells_m5: int
+    pc_m5: float
+    pc_h1: float
+    age_h: float
+    boosts: int
+    socials: int
+    liq_base: float
+    good_quote: bool = True
+
+    @classmethod
+    def from_pair(cls, d: dict[str, Any]) -> "PairInfo":
+        tx = (d.get("txns") or {}).get("m5") or {}
+        vol = d.get("volume") or {}
+        pc = d.get("priceChange") or {}
+        liq = d.get("liquidity") or {}
+        info = d.get("info") or {}
+        created = d.get("pairCreatedAt") or 0
+        base = d.get("baseToken") or {}
+        return cls(
+            mint=base.get("address", ""), symbol=base.get("symbol", ""), name=base.get("name", ""),
+            pair=d.get("pairAddress", ""), dex=d.get("dexId", ""), price=float(d.get("priceUsd") or 0),
+            mc_usd=float(d.get("marketCap") or d.get("fdv") or 0), liq_usd=float(liq.get("usd") or 0),
+            vol_m5=float(vol.get("m5") or 0), vol_h1=float(vol.get("h1") or 0),
+            buys_m5=int(tx.get("buys") or 0), sells_m5=int(tx.get("sells") or 0),
+            pc_m5=float(pc.get("m5") or 0), pc_h1=float(pc.get("h1") or 0),
+            age_h=(time.time() - created / 1000) / 3600 if created else 1e9,
+            boosts=int((d.get("boosts") or {}).get("active") or 0),
+            socials=len(info.get("socials") or []) + len(info.get("websites") or []),
+            liq_base=float(liq.get("base") or 0),
+            good_quote=good_quote(d),
+        )
+
+
+def score(pi: PairInfo, cfg: dict[str, Any]) -> tuple[bool, str]:
+    """Импульс: растёт, покупают больше, чем продают, есть ликвидность и объём, не вершина свечи."""
+    if not (p(cfg, "trend_mc_min_usd") <= pi.mc_usd <= p(cfg, "trend_mc_max_usd")):
+        return False, "mc"
+    if pi.liq_usd < p(cfg, "trend_min_liq_usd"):
+        return False, "liquidity"
+    if pi.age_h > p(cfg, "trend_max_age_h"):
+        return False, "old"
+    if pi.vol_m5 < p(cfg, "trend_min_vol_m5_usd") or pi.buys_m5 < p(cfg, "trend_min_buys_m5"):
+        return False, "volume"
+    if pi.buys_m5 < p(cfg, "trend_min_buy_ratio_m5") * max(1, pi.sells_m5):
+        return False, "pressure"
+    if not (p(cfg, "trend_pc_m5_min") <= pi.pc_m5 <= p(cfg, "trend_pc_m5_max")):
+        return False, "price_m5"
+    if pi.pc_h1 > p(cfg, "trend_pc_h1_max"):
+        return False, "price_h1"
+    return True, ""
+
+
+@dataclass
+class Tracked:
+    mint: str
+    alert_price: float
+    alert_ts: float
+    target_price: float
+    max_price: float = 0.0
+    exit_price: float | None = None
+    exit_reason: str | None = None
+    last_price: float = 0.0
+    flags: set[str] = field(default_factory=set)
+
+
+class Trends:
+    def __init__(self, engine: "Engine"):
+        self.e = engine
+        self.cands: dict[str, float] = {}      # mint → когда впервые увидели
+        self.boosts: dict[str, int] = {}
+        self.alerted_at: dict[str, float] = {}
+        self.tracked: dict[str, Tracked] = {}
+        self.edited: dict[str, float] = {}
+        self.tuned: dict[str, Any] = {}        # пороги, подобранные по истории (analytics/tuning.py)
+        self.pending: dict[str, tc.Pending] = {}     # прошли фильтры, ждём отката
+        self.rejected_at: dict[str, float] = {}
+        self.shadow: dict[str, tc.Shadow] = {}       # теневой учёт отсеянных: что было бы через час
+        self.gecko_budget = tc.RateBudget(12, 60)    # GeckoTerminal: бесплатный лимит небольшой, держим запас
+        self.gecko_pause_until = 0.0                 # после 429 — минута тишины
+        self.ohlcv_misses: dict[str, int] = {}
+        self.largest_cache: dict[str, tuple[float, float | None, list[dict[str, Any]]]] = {}
+        self.holder_budget = tc.RateBudget(30, 3600) # проверка холдеров: ~22 запроса RPC, не больше 30 в час
+        self.tick = 0
+        self.stats: dict[str, Any] = {"candidates": 0, "checked": 0, "alerts": 0, "errors": 0, "rejected": {}}
+
+    async def _get(self, http: aiohttp.ClientSession, url: str) -> Any:
+        if url.startswith(DEX):
+            # DexScreener — через адаптер: общий лимит, пауза после 429, статистика в /health
+            from ..external.base import Unavailable
+            path_key = "tokens" if "/tokens/" in url else "profiles"
+            try:
+                return await self.e.ext.dex.get_json(url, path_key)
+            except Unavailable:
+                self.stats["errors"] += 1
+                return None
+        if url.startswith(GECKO) and (time.time() < self.gecko_pause_until or not self.gecko_budget.take()):
+            return None
+        try:
+            async with http.get(url, headers={"Accept": "application/json"}) as r:
+                if r.status == 429 and url.startswith(GECKO):
+                    self.gecko_pause_until = time.time() + 60
+                    self.stats["gecko_429"] = self.stats.get("gecko_429", 0) + 1
+                if r.status != 200:
+                    self.stats["errors"] += 1
+                    return None
+                return await r.json(content_type=None)
+        except Exception:  # noqa: BLE001
+            self.stats["errors"] += 1
+            return None
+
+    async def discover(self, http: aiohttp.ClientSession) -> None:
+        now = time.time()
+        for path in ("/token-boosts/latest/v1", "/token-boosts/top/v1", "/token-profiles/latest/v1"):
+            for x in await self._get(http, DEX + path) or []:
+                if x.get("chainId") == "solana" and is_valid_address(x.get("tokenAddress")):
+                    m = x["tokenAddress"]
+                    self.cands.setdefault(m, now)
+                    if x.get("totalAmount"):
+                        self.boosts[m] = int(x["totalAmount"])
+        if self.tick % 6 == 0:  # GeckoTerminal: ~30 запросов в минуту на всех — раз в 3 минуты
+            for path in ("/new_pools", "/trending_pools"):
+                data = await self._get(http, GECKO + path)
+                for pool in (data or {}).get("data") or []:
+                    rel = ((pool.get("relationships") or {}).get("base_token") or {}).get("data") or {}
+                    tid = rel.get("id", "")
+                    m = tid.split("_", 1)[1] if tid.startswith("solana_") else ""
+                    if is_valid_address(m):
+                        self.cands.setdefault(m, now)
+        # свежие монеты из нашего потока, которые уже набрали покупателей (могли мигрировать)
+        for st in list(self.e.states.values()):
+            if st.migrated or (st.progress() or 0) > 0.8:
+                self.cands.setdefault(st.mint, now)
+        cut = now - 3 * 3600
+        for m in [m for m, t in self.cands.items() if t < cut and m not in self.tracked]:
+            self.cands.pop(m, None)
+        self.stats["candidates"] = len(self.cands)
+
+    async def pairs(self, http: aiohttp.ClientSession, mints: list[str]) -> dict[str, PairInfo]:
+        out: dict[str, PairInfo] = {}
+        for i in range(0, len(mints), 30):
+            data = await self._get(http, f"{DEX}/tokens/v1/solana/{','.join(mints[i:i + 30])}")
+            for d in data or []:
+                pi = PairInfo.from_pair(d)
+                cur = out.get(pi.mint)
+                if pi.mint in mints[i:i + 30] and (cur is None or (pi.good_quote, pi.liq_usd) > (cur.good_quote, cur.liq_usd)):
+                    out[pi.mint] = pi
+            await asyncio.sleep(0.25)
+        return out
+
+    async def top10_share(self, pi: PairInfo) -> float | None:
+        share, _accs = await self.largest(pi)
+        return share
+
+    async def largest(self, pi: PairInfo) -> tuple[float | None, list[dict[str, Any]]]:
+        """Доля топ-10 холдеров без кошелька пула и сами токен-аккаунты (RPC: 2 запроса, кеш 10 минут)."""
+        hit = self.largest_cache.get(pi.mint)
+        if hit and time.time() - hit[0] < 600:
+            return hit[1], hit[2]
+        if self.e.rpc_over_budget():
+            return None, []
+        share, accs = await self._largest(pi)
+        self.largest_cache[pi.mint] = (time.time(), share, accs)
+        if len(self.largest_cache) > 2000:
+            cut = time.time() - 600
+            self.largest_cache = {k: v for k, v in self.largest_cache.items() if v[0] > cut}
+        return share, accs
+
+    async def _largest(self, pi: PairInfo) -> tuple[float | None, list[dict[str, Any]]]:
+        rpc = self.e.rpc
+        try:
+            supply = await rpc.call("getTokenSupply", [pi.mint])
+            largest = await rpc.call("getTokenLargestAccounts", [pi.mint])
+        except RpcError:
+            return None, []
+        total = float(((supply or {}).get("value") or {}).get("uiAmount") or 0)
+        accs = [a for a in ((largest or {}).get("value") or []) if float(a.get("uiAmount") or 0) > 0]
+        if total <= 0 or not accs:
+            return None, []
+        first = float(accs[0].get("uiAmount") or 0)
+        if pi.liq_base and abs(first - pi.liq_base) / max(pi.liq_base, 1) < 0.05:
+            accs = accs[1:]          # первый — пул ликвидности
+        elif pi.dex in ("pumpfun", "pump"):
+            accs = accs[1:]          # на кривой крупнейший — аккаунт bonding curve
+        return sum(float(a.get("uiAmount") or 0) for a in accs[:10]) / total, accs
+
+    async def holder_check(self, accounts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Топ-10 холдеров: свежие, общий источник денег, пополнены в одно время. ~22 запроса RPC,
+        кошельки кешируются в таблице wallets. Не больше 30 проверок в час."""
+        if not accounts or self.e.rpc_over_budget() or not self.holder_budget.take():
+            return None
+        from datetime import datetime, timedelta, timezone
+
+        from . import services as svc
+        rpc, db = self.e.rpc, self.e.db
+        try:
+            res = await rpc.call("getMultipleAccounts", [[a["address"] for a in accounts[:10]],
+                                                         {"encoding": "jsonParsed"}])
+        except RpcError:
+            return None
+        owners: list[str] = []
+        for v in (res or {}).get("value") or []:
+            try:
+                owners.append(v["data"]["parsed"]["info"]["owner"])
+            except (KeyError, TypeError):
+                continue
+        owners = list(dict.fromkeys(owners))
+        if not owners:
+            return None
+        now = datetime.now(timezone.utc)
+        known = {r["address"]: r for r in await db.fetch(
+            "SELECT address, created_est, funded_by, funded_at FROM wallets WHERE address = ANY($1)", owners)}
+
+        async def one(w: str) -> tc.HolderInfo | None:
+            r = known.get(w)
+            if r and r["created_est"] and (r["funded_by"] or r["created_est"] < now - timedelta(days=7)):
+                return tc.HolderInfo(w, r["created_est"], r["funded_by"], r["funded_at"])
+            try:
+                sigs = await rpc.signatures_for(w, limit=100)
+            except RpcError:
+                return None
+            if not sigs:
+                return None
+            if len(sigs) >= 100:
+                created, funder, funded_at, sol = datetime(2000, 1, 1, tzinfo=timezone.utc), None, None, 0.0
+            else:
+                bt = sigs[-1].get("blockTime")
+                created = datetime.fromtimestamp(bt, tz=timezone.utc) if bt else None
+                try:
+                    tx = await rpc.transaction(sigs[-1]["signature"])
+                except RpcError:
+                    tx = None
+                funder, sol = tc.funding_of(tx, w)
+                funded_at = created if funder else None
+            await db.execute(
+                """INSERT INTO wallets(address, created_est, funded_by, funded_at, funded_sol) VALUES ($1,$2,$3,$4,$5)
+                   ON CONFLICT (address) DO UPDATE SET created_est = COALESCE(wallets.created_est, EXCLUDED.created_est),
+                   funded_by = COALESCE(wallets.funded_by, EXCLUDED.funded_by),
+                   funded_at = COALESCE(wallets.funded_at, EXCLUDED.funded_at),
+                   funded_sol = COALESCE(wallets.funded_sol, EXCLUDED.funded_sol)""", w, created, funder, funded_at, sol)
+            return tc.HolderInfo(w, created, funder, funded_at)
+
+        tasks = [asyncio.create_task(one(w)) for w in owners]
+        done, rest = await asyncio.wait(tasks, timeout=8.0)
+        for t in rest:
+            t.cancel()
+        hs = [t.result() for t in done if not t.exception() and t.result() is not None]
+        funders = [h.funder for h in hs if h.funder]
+        services = set(self.e.settings.exchanges()) | set(svc.STATIC_SERVICES)
+        if funders:
+            services |= {r["address"] for r in await db.fetch(
+                "SELECT address FROM wallets WHERE address = ANY($1) AND (is_exchange OR role IN ('service', 'exchange'))",
+                funders)}
+        return tc.holder_stats(hs, services, now)
+
+    def tcfg(self) -> dict[str, Any]:
+        """Настройки режима: подобранные по истории пороги поверх базовых; ручные настройки — главнее."""
+        cfg = dict(self.e.cfg)
+        if cfg.get("trend_autotune", True):
+            manual = self.e.settings.overrides
+            for k, v in self.tuned.items():
+                if k not in manual:
+                    cfg[k] = v
+        return cfg
+
+    async def run(self) -> None:
+        from .tuning import KV_KEY
+        await asyncio.sleep(20)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
+            while True:
+                try:
+                    if self.tick % 10 == 0:
+                        self.tuned = await self.e.db.kv_get(KV_KEY) or {}
+                    cfg = self.tcfg()
+                    if cfg.get("modes", {}).get("trend", True):
+                        await self.discover(http)
+                        await self.scan(http, cfg)
+                    await self.e.db.kv_set("health:trends", {**self.stats, "tracked": len(self.tracked),
+                                                             "pending": len(self.pending), "shadow": len(self.shadow)})
+                except Exception:  # noqa: BLE001
+                    log.exception("trends")
+                self.tick += 1
+                await asyncio.sleep(30)
+
+    async def fast_follow_loop(self) -> None:
+        """Сопровождение тренд-монет каждые 5 с (пачкой до 30 монет за запрос) — выход по развороту раньше."""
+        await asyncio.sleep(25)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
+            n = 0
+            while True:
+                try:
+                    cfg = self.tcfg()
+                    await self.follow(http, cfg)
+                    await self.follow_pending(http, cfg)
+                    if n % 6 == 0:
+                        await self.follow_shadow(http)
+                except Exception:  # noqa: BLE001
+                    log.exception("trends follow")
+                n += 1
+                await asyncio.sleep(5)
+
+    async def scan(self, http: aiohttp.ClientSession, cfg: dict[str, Any]) -> None:
+        now = time.time()
+        bad_hours = set(cfg.get("trend_bad_hours") or [])
+        if time.gmtime(now).tm_hour in bad_hours:
+            return   # по истории алерты в этот час (UTC) проигрывают — автоподбор фильтров
+        mints = [m for m in self.cands if now - self.alerted_at.get(m, 0) > 6 * 3600 and m not in self.tracked
+                 and m not in self.pending and now - self.rejected_at.get(m, 0) > 1800]
+        info = await self.pairs(http, mints)
+        self.stats["checked"] = len(info)
+        passed: list[tuple[PairInfo, float | None, list[dict[str, Any]], int | None]] = []
+        for m, pi in info.items():
+            ok, _why = score(pi, cfg)
+            if not ok:
+                continue
+            row = await self.e.db.fetchrow(
+                """SELECT k.cluster_id, c.blacklisted FROM tokens k LEFT JOIN clusters c ON c.id = k.cluster_id
+                   WHERE k.mint=$1""", m)
+            if row and row["blacklisted"]:
+                continue
+            st = self.e.states.get(m)
+            if st is not None and (st.big_sell_ts or any(not t.is_buy and t.trader == st.deployer for t in st.trades)):
+                continue  # дев уже сливал — не входим
+            passed.append((pi, None, [], row["cluster_id"] if row else None))
+        if not passed:
+            return
+        # 1) боты: разные покупатели и продавцы за 5 минут (GeckoTerminal, до 30 пулов одним запросом)
+        pools = await self.gecko_pools(http, [x[0].pair for x in passed])
+        if pools is None:
+            return   # лимит GeckoTerminal — проверим на следующем круге
+        for pi, top10, accs, cid in passed:
+            g = pools.get(pi.pair)
+            if g is None:
+                self.reject(pi, "no_data", "пула нет в GeckoTerminal")
+                continue
+            why = tc.bot_flow(g.get("transactions"), cfg)
+            if why:
+                self.reject(pi, "bots", why)
+                continue
+            # 2) лесенка и ровный объём по минутным свечам
+            ohlcv = await self.gecko_ohlcv(http, pi.pair)
+            if ohlcv is None:
+                # лимит GeckoTerminal: дважды подряд нет свечей — идём дальше без проверки лесенки,
+                # иначе при долгом лимите «Тренды» замолчат совсем
+                self.ohlcv_misses[pi.mint] = self.ohlcv_misses.get(pi.mint, 0) + 1
+                if self.ohlcv_misses[pi.mint] < 3:
+                    continue
+                self.stats["no_candles"] = self.stats.get("no_candles", 0) + 1
+            self.ohlcv_misses.pop(pi.mint, None)
+            stair = tc.staircase(ohlcv, cfg)
+            if stair:
+                self.reject(pi, *stair)
+                continue
+            # топ-10 холдеров (2 запроса RPC) — только для прошедших бесплатные фильтры, с кешем на 10 минут
+            top10, accs = await self.largest(pi)
+            x = False
+            if top10 is not None and top10 > p(cfg, "trend_max_top10"):
+                self.reject(pi, "top10", f"топ-10 держат {top10:.0%}")
+                if not cfg.get("paper_trend_x", True):
+                    continue
+                # 21.11: такие монеты 20.11 через час росли лучше алертов — опыт: тот же путь (откат, холдеры), но
+                # покупает только бумажный портфель X, без алерта в чат и без реального бота
+                x = True
+            m5 = (g.get("transactions") or {}).get("m5") or {}
+            extra = {"top10": top10, "accounts": accs, "cluster_id": cid, "buyers": int(m5.get("buyers") or 0),
+                     "sellers": int(m5.get("sellers") or 0), "signal_price": pi.price, "x": x}
+            if cfg.get("trend_wait_pullback", True):
+                # 4) не покупаем вершину свечи: ждём отката и отскока (сопровождение каждые 5 с)
+                self.pending[pi.mint] = tc.Pending(pi.mint, now, pi.price, pi.price, extra=extra)
+            else:
+                await self.final_checks(pi, cfg, extra)
+
+    async def gecko_pools(self, http: aiohttp.ClientSession, pairs: list[str]) -> dict[str, dict[str, Any]] | None:
+        out: dict[str, dict[str, Any]] = {}
+        pairs = [x for x in dict.fromkeys(pairs) if x]
+        for i in range(0, len(pairs), 30):
+            data = await self._get(http, f"{GECKO}/pools/multi/{','.join(pairs[i:i + 30])}")
+            if data is None:
+                return out or None
+            for x in data.get("data") or []:
+                a = x.get("attributes") or {}
+                if a.get("address"):
+                    out[a["address"]] = a
+        return out
+
+    async def gecko_ohlcv(self, http: aiohttp.ClientSession, pair: str) -> list[list[float]] | None:
+        data = await self._get(http, f"{GECKO}/pools/{pair}/ohlcv/minute?aggregate=1&limit=30")
+        if data is None:
+            return None
+        return ((data.get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
+
+    async def plausible(self, mint: str, price: float, last: float) -> bool:
+        """Цена DexScreener правдоподобна: без скачка в 5+ раз или скачок подтверждён Jupiter (±2×)."""
+        if last <= 0 or 1 / 5 <= price / last <= 5:
+            return True
+        jp = await self.e.ext.jup_price(mint) if getattr(self.e, "ext", None) is not None else None
+        ok = bool(jp) and 0.5 <= price / jp <= 2.0
+        if not ok:
+            self.stats["bad_prices"] = self.stats.get("bad_prices", 0) + 1
+            log.warning("тренды: %s цена %.3g при прошлой %.3g, Jupiter %s — сбой, пропускаю", mint, price, last, jp)
+        return ok
+
+    def reject(self, pi: PairInfo, code: str, detail: str = "") -> None:
+        now = time.time()
+        self.rejected_at[pi.mint] = now
+        rej = self.stats.setdefault("rejected", {})
+        rej[code] = rej.get(code, 0) + 1
+        log.info("тренды: %s отсеяна — %s %s", pi.symbol, tc.REASONS.get(code, code), detail)
+        if pi.mint not in self.shadow and len(self.shadow) < 400 and pi.price > 0:
+            self.shadow[pi.mint] = tc.Shadow(pi.mint, pi.symbol, code, detail[:200], now, pi.price, pi.price, pi.price)
+
+    async def follow_pending(self, http: aiohttp.ClientSession, cfg: dict[str, Any]) -> None:
+        if not self.pending:
+            return
+        info = await self.pairs(http, list(self.pending))
+        now = time.time()
+        for m, pd in list(self.pending.items()):
+            pi = info.get(m)
+            if pi is None or pi.price <= 0:
+                if now - pd.ts > 2 * tc.q(cfg, "trend_pullback_wait_s"):
+                    self.pending.pop(m, None)
+                continue
+            res = tc.pullback_step(pd, pi.price, now, cfg)
+            if res is None:
+                continue
+            self.pending.pop(m, None)
+            if res == "enter":
+                pd.extra["pullback"] = 1 - (pd.low or pi.price) / pd.peak
+                await self.final_checks(pi, cfg, pd.extra)
+            else:
+                self.reject(pi, res, f"пик {pd.peak / pd.signal_price - 1:+.0%} от сигнала")
+
+    async def final_checks(self, pi: PairInfo, cfg: dict[str, Any], extra: dict[str, Any]) -> None:
+        """3) холдеры — прямо перед алертом (дорого по RPC, поэтому последним)."""
+        ext = getattr(self.e, "ext", None)
+        jp = await ext.jup_price(pi.mint) if ext is not None else None
+        if jp and not 0.5 <= pi.price / jp <= 2.0:
+            self.reject(pi, "bad_price", f"DexScreener {pi.price:.3g} $, Jupiter {jp:.3g} $")
+            return
+        hs = await self.holder_check(extra.get("accounts") or [])
+        bad = tc.holder_verdict(hs or {}, cfg)
+        if bad:
+            self.reject(pi, *bad)
+            return
+        extra["holders"] = hs
+        await self.alert(pi, cfg, extra.get("top10"), extra.get("cluster_id"), extra)
+
+    async def follow_shadow(self, http: aiohttp.ClientSession) -> None:
+        """Отсеянные монеты: максимум и цена через час. Итог — в таблицу trend_shadow (разбор дня, /health)."""
+        if not self.shadow:
+            return
+        info = await self.pairs(http, list(self.shadow))
+        now = time.time()
+        for m, sh in list(self.shadow.items()):
+            pi = info.get(m)
+            if pi and pi.price > 0 and 1 / 5 <= pi.price / (sh.last_price or sh.price) <= 5:
+                sh.max_price = max(sh.max_price, pi.price)   # скачки в 5+ раз за 30 с — сбой цены, не учитываем
+                sh.last_price = pi.price
+            if now - sh.ts >= 3600:
+                self.shadow.pop(m, None)
+                await self.e.db.execute(
+                    """INSERT INTO trend_shadow(mint, symbol, reason, detail, created_at, price, max_price, last_price)
+                       VALUES ($1,$2,$3,$4,to_timestamp($5),$6,$7,$8)""",
+                    m, sh.symbol, sh.reason, sh.detail, sh.ts, sh.price, sh.max_price, sh.last_price)
+
+    async def alert(self, pi: PairInfo, cfg: dict[str, Any], top10: float | None, cluster_id: int | None,
+                    extra: dict[str, Any] | None = None) -> None:
+        extra = extra or {}
+        sol = self.e.price.value or 150
+        thr = float(cfg.get("min_net_profit", 0.3))
+        costs = self.e.costs()
+        f = costs.fee_bps / 10_000 + costs.extra_slippage_bps / 10_000
+        target_mult = (1 + thr) / max(0.5, (1 - f) ** 2)
+        mc_sol = pi.mc_usd / sol
+        self.alerted_at[pi.mint] = time.time()
+        if not extra.get("x"):                # опыт X — без сопровождения в чате
+            self.tracked[pi.mint] = Tracked(pi.mint, pi.price, time.time(), pi.price * target_mult, max_price=pi.price)
+            self.stats["alerts"] += 1
+        boosts = self.boosts.get(pi.mint) or pi.boosts
+        # бусты — платная реклама команды монеты, силой сигнала не считаются.
+        # «Сильный» — много РАЗНЫХ покупателей, вдвое больше продавцов, чистые холдеры.
+        hs = extra.get("holders") or {}
+        buyers, sellers = int(extra.get("buyers") or 0), int(extra.get("sellers") or 0)
+        clean = bool(hs) and hs.get("fresh", 1) <= 0.2 and not hs.get("same_funder") and not hs.get("same_time")
+        level = "strong" if buyers >= 30 and buyers >= 2 * max(1, sellers) and clean else "normal"
+        metrics: dict[str, Any] = {}
+        if top10 is not None:
+            metrics["top10"] = top10
+        if hs.get("checked"):
+            metrics["fresh_wallets"] = hs.get("fresh")
+        data = {
+            "symbol": pi.symbol, "mc": mc_sol, "age_s": pi.age_h * 3600, "trend_at": time.time(),
+            "signal": "откат после импульса" if extra.get("pullback") else "импульс",
+            "entry_mc": mc_sol, "entry_max_mc": mc_sol * 1.1, "target_mc": mc_sol * target_mult,
+            "metrics": metrics, "violations": [],
+            "cluster_id": cluster_id, "stage": "мигрировала" if pi.dex != "pumpfun" else "на кривой",
+            "exit_rule": "Выход при развороте (продажи > покупок)",
+            "trend": {"pc_m5": pi.pc_m5, "buys": pi.buys_m5, "sells": pi.sells_m5, "vol_m5": pi.vol_m5,
+                      "liq": pi.liq_usd, "boosts": boosts, "pc_h1": pi.pc_h1, "mc_usd": pi.mc_usd,
+                      "age_h": pi.age_h, "buyers": buyers, "sellers": sellers, "pair": pi.pair, "dex": pi.dex,
+                      "pullback": extra.get("pullback"), "holders": {k: v for k, v in hs.items() if k != "funder"}},
+        }
+        if extra.get("x"):
+            # опыт X: только бумага, без алерта и сопровождения
+            self.stats["x_signals"] = self.stats.get("x_signals", 0) + 1
+            paper = getattr(self.e, "paper", None)
+            if paper is not None:
+                asyncio.create_task(paper.on_alert(pi.mint, level, None, {**data, "modes": ["trendx"]}, None))
+            # 23.11: на других биржах фильтр «топ-10 держат много» отсеивает хорошие монеты — бумага X 20–22.11:
+            # 15 сд, +$22 (+14.6% на сделку), а на pump.fun −$24 на 7. Монеты не с pump.fun — и в реальный бот
+            # (тень «тренды на других биржах»)
+            real = getattr(self.e, "real", None)
+            if real is not None and not pi.mint.endswith("pump") and cfg_x_to_real(self.e.cfg):
+                asyncio.create_task(real.on_signal(pi.mint, level, None, {**data, "modes": ["trend"], "top10_x": True},
+                                                   None, {TREND_TARGET}))
+            return
+        await self.e.compose("trend", pi.mint, level, data, signal="impulse")
+
+    async def follow(self, http: aiohttp.ClientSession, cfg: dict[str, Any]) -> None:
+        if not self.tracked:
+            return
+        info = await self.pairs(http, list(self.tracked))
+        now = time.time()
+        for m, tr in list(self.tracked.items()):
+            pi = info.get(m)
+            e = self.e.alerts.get(m)
+            if pi and pi.price > 0 and not await self.plausible(m, pi.price, tr.last_price or tr.alert_price):
+                pi = None            # скачок в 5+ раз, который Jupiter не подтвердил — сбой данных, пропускаем
+            if pi and pi.price > 0:
+                tr.last_price = pi.price
+                tr.max_price = max(tr.max_price, pi.price)
+                if e is not None:
+                    e.data["mc"] = pi.mc_usd / (self.e.price.value or 150)
+                    if now - self.edited.get(m, 0) >= 90:   # проверяем каждые 5 с, а сообщение правим раз в 90 с
+                        self.edited[m] = now
+                        await self.e._edit(e)
+                if tr.exit_price is None:
+                    if pi.price >= tr.target_price and "target" not in tr.flags:
+                        tr.flags.add("target")
+                        await self._msg(m, pi, "target")
+                    drop = pi.price <= tr.alert_price * (1 - p(cfg, "trend_exit_drop"))
+                    rev = pi.pc_m5 <= -p(cfg, "trend_exit_m5_drop") or (
+                        pi.sells_m5 > 2 * max(1, pi.buys_m5) and pi.pc_m5 < 0)
+                    if drop or rev:
+                        tr.exit_price, tr.exit_reason = pi.price, "emergency"
+                        await self._msg(m, pi, "trend_exit", emergency=True,
+                                        extra=f"разворот 5м {pi.pc_m5:+.0f}% · 🟢{pi.buys_m5}/🔴{pi.sells_m5}")
+            if now - tr.alert_ts > 2 * 3600:   # итог подводит engine через finalize(); это страховка от утечки
+                self.tracked.pop(m, None)
+                self.edited.pop(m, None)
+
+    async def _msg(self, mint: str, pi: PairInfo, kind: str, emergency: bool = False, extra: str = "") -> None:
+        mc_sol = pi.mc_usd / (self.e.price.value or 150)
+        text = fmt.render_follow(kind, {"mint": mint, "symbol": pi.symbol, "mc": mc_sol}, self.e.price.value, extra)
+        kb = fmt.exit_keyboard(mint, self.e.settings.links(), self.e.env.redirect_base) if emergency else None
+        await self.e.db.enqueue("follow", {"mint": mint, "text": text, "keyboard": kb, "emergency": emergency,
+                                           "kind": kind}, priority=0 if emergency else 5)
+
+    async def finalize(self, e: "AlertEntry") -> None:
+        """Итог алерта «Тренды» по ценам DexScreener."""
+        tr = self.tracked.pop(e.mint, None)
+        self.edited.pop(e.mint, None)
+        if tr is None:
+            return
+        costs = self.e.costs()
+        f = costs.fee_bps / 10_000 + costs.extra_slippage_bps / 10_000
+        entry = tr.alert_price
+        exit_p = tr.exit_price or tr.max_price
+        if tr.exit_price is None and "target" in tr.flags:
+            exit_p, reason = tr.target_price, "target"
+        elif tr.exit_price is not None:
+            reason = tr.exit_reason or "emergency"
+        else:
+            reason = "timeout"
+        net = (exit_p / entry) * (1 - f) ** 2 - 1 if entry else 0.0
+        best = (tr.max_price / entry) * (1 - f) ** 2 - 1 if entry else 0.0
+        thr = float(self.e.cfg.get("min_net_profit", 0.3))
+        auto = "great" if net >= max(1.0, 2 * thr) else "good" if net >= 0.05 else "fail"
+        sol = self.e.price.value or 150
+        base_mc = e.data.get("entry_mc") or e.data.get("mc") or 0
+        outcome = {"max_mc": base_mc * tr.max_price / entry if entry else None,
+                   "exit_mc": base_mc * exit_p / entry if entry else None, "entry_mc": base_mc,
+                   "exit_reason": "trend_exit" if reason == "emergency" else reason, "net_result": net,
+                   "achievable_profit": best, "auto_mark": auto}
+        for aid in e.alert_ids.values():
+            await self.e.db.execute(
+                """INSERT INTO alert_outcomes(alert_id, max_mc, exit_reason, net_result, achievable_profit, auto_mark)
+                   VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (alert_id) DO UPDATE SET max_mc=EXCLUDED.max_mc,
+                   exit_reason=EXCLUDED.exit_reason, net_result=EXCLUDED.net_result,
+                   achievable_profit=EXCLUDED.achievable_profit, auto_mark=EXCLUDED.auto_mark, computed_at=now()""",
+                aid, outcome["max_mc"], reason, net, best, auto)
+            await self.e.db.execute("UPDATE alerts SET closed_at=now() WHERE id=$1", aid)
+        main_id = next(iter(e.alert_ids.values()), None)
+        text = fmt.render_final({**e.data, "mint": e.mint}, outcome, sol)
+        await self.e.db.enqueue("final", {"mint": e.mint, "text": text,
+                                          "keyboard": fmt.marks_keyboard(main_id) if main_id else None}, priority=5)

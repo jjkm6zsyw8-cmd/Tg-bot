@@ -1,0 +1,200 @@
+"""Клиент Solana JSON-RPC: досбор пропущенных транзакций, слоты, переводы SOL."""
+from __future__ import annotations
+
+import asyncio
+import itertools
+import re
+import logging
+import time
+from typing import Any
+
+import aiohttp
+
+log = logging.getLogger(__name__)
+
+
+class RpcError(RuntimeError):
+    pass
+
+
+class RateLimiter:
+    def __init__(self, rps: float):
+        self.interval = 1.0 / rps if rps > 0 else 0.0
+        self._next = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        if not self.interval:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            if self._next > now:
+                await asyncio.sleep(self._next - now)
+            self._next = max(now, self._next) + self.interval
+
+
+class SolanaRpc:
+    def __init__(self, url: str, rps: float = 20, concurrency: int = 8, timeout: float = 10,
+                 fallback: str | None = None):
+        self.primary = url
+        self.fallback = fallback if fallback and fallback != url else None
+        self.fallback_until = 0.0       # до какого времени ходим на запасной узел
+        self.url = url
+        self.limiter = RateLimiter(rps)
+        self.sem = asyncio.Semaphore(concurrency)
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self._ids = itertools.count(1)
+        self._session: aiohttp.ClientSession | None = None
+        self.calls = 0
+        self.rate_limited = 0
+        self.denied = 0                 # ответов 401/403 (ключ не принят)
+        self.max_tx_version = 1         # Solana: транзакции v0 и v1 (2026); выше — поднимется по ответу узла
+        self.pause_until = 0.0          # общая пауза после 429: запросы ждут, а не долбят RPC
+        self._consecutive_429 = 0
+        self.day = time.strftime("%Y-%m-%d", time.gmtime())
+        self.day_calls = 0
+        self.budget: int | None = None      # запросов в сутки (UTC) на «необязательные» задачи; None — без лимита
+
+    def over_budget(self) -> bool:
+        """Дневной лимит исчерпан: фоновые задачи (слежка за выводами, холдеры, кластеры) ждут следующих суток."""
+        self._roll_day()
+        return self.budget is not None and self.day_calls >= self.budget
+
+    def _roll_day(self) -> None:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if today != self.day:
+            self.day, self.day_calls = today, 0
+
+    async def session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self.timeout)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session:
+            await self._session.close()
+
+    @property
+    def on_fallback(self) -> bool:
+        return self.url != self.primary
+
+    async def call(self, method: str, params: list[Any], retries: int = 2) -> Any:
+        if self.on_fallback and time.monotonic() > self.fallback_until:
+            self.url = self.primary            # пробуем вернуться на основной
+        body = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
+        delay = 1.0
+        for attempt in range(retries + 1):
+            wait = self.pause_until - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)          # во время паузы после 429 запросов нет
+            await self.limiter.wait()
+            try:
+                async with self.sem:
+                    s = await self.session()
+                    self.calls += 1
+                    self._roll_day()
+                    self.day_calls += 1
+                    async with s.post(self.url, json=body) as resp:
+                        if resp.status == 429:
+                            self._on_429(resp.headers.get("Retry-After"))
+                            raise RpcError("rate limited")
+                        if resp.status in (401, 403):
+                            self._on_denied(resp.status)
+                            raise RpcError(f"access denied (HTTP {resp.status})")
+                        try:
+                            data = await resp.json(content_type=None)
+                        except ValueError as exc:      # «Forbidden», страница ошибки шлюза и т. п.
+                            raise RpcError(f"HTTP {resp.status}: answer is not JSON") from exc
+                self._consecutive_429 = 0
+                if "error" in data:
+                    err = data["error"]
+                    if isinstance(err, dict) and err.get("code") in (429, -32429):
+                        self._on_429(None)
+                        raise RpcError("rate limited")
+                    raise RpcError(str(err))   # ошибки запроса не повторяем
+                return data.get("result")
+            except (aiohttp.ClientError, asyncio.TimeoutError, RpcError) as exc:
+                retryable = not isinstance(exc, RpcError) or any(
+                    x in str(exc) for x in ("rate limited", "access denied", "not JSON"))
+                if attempt >= retries or not retryable:
+                    raise RpcError(f"{method}: {exc}") from exc
+                await asyncio.sleep(delay)
+                delay *= 2
+        return None
+
+    def _on_denied(self, status: int) -> None:
+        """Основной узел отказал в доступе (401/403): ключ Helius не принят — неверный, ограничен по IP / домену
+        или аккаунт ещё не активирован. 30 мин работаем через запасной узел, потом пробуем основной снова."""
+        self.denied += 1
+        if self.fallback and self.url == self.primary:
+            self.url = self.fallback
+            self.fallback_until = time.monotonic() + 1800
+            log.warning("RPC: основной узел отвечает %s — ключ Helius не принят; 30 мин работаю через запасной",
+                        status)
+
+    def _on_429(self, retry_after: str | None) -> None:
+        self.rate_limited += 1
+        self._consecutive_429 += 1
+        if self.fallback and self.url == self.primary and self._consecutive_429 >= 5:
+            # основной узел отвечает 429 подряд — у Helius так выглядят кончившиеся кредиты месяца:
+            # 30 минут работаем через запасной (публичный) узел, потом пробуем основной снова
+            self.url = self.fallback
+            self.fallback_until = time.monotonic() + 1800
+            self._consecutive_429 = 0
+            self.pause_until = 0.0
+            log.warning("RPC: основной узел отвечает 429 — 30 мин работаю через запасной")
+            return
+        wait = min(60.0, 2.0 ** self._consecutive_429)
+        try:
+            if retry_after:
+                wait = max(wait, float(retry_after))
+        except ValueError:
+            pass
+        self.pause_until = max(self.pause_until, time.monotonic() + wait)
+        log.warning("RPC 429: пауза %.0f с", wait)
+
+    async def signature_slots(self, signatures: list[str]) -> dict[str, int]:
+        """Слот для каждой подписи (getSignatureStatuses, до 256 за вызов)."""
+        out: dict[str, int] = {}
+        for i in range(0, len(signatures), 256):
+            chunk = signatures[i : i + 256]
+            res = await self.call("getSignatureStatuses", [chunk, {"searchTransactionHistory": False}])
+            for sig, st in zip(chunk, (res or {}).get("value") or []):
+                if st and st.get("slot") is not None:
+                    out[sig] = int(st["slot"])
+        return out
+
+    async def signatures_for(self, address: str, limit: int = 100, before: str | None = None,
+                             until: str | None = None) -> list[dict[str, Any]]:
+        cfg: dict[str, Any] = {"limit": limit, "commitment": "confirmed"}
+        if before:
+            cfg["before"] = before
+        if until:
+            cfg["until"] = until
+        return await self.call("getSignaturesForAddress", [address, cfg]) or []
+
+    async def transaction(self, signature: str) -> dict[str, Any] | None:
+        """Транзакция целиком. С 2026 в Solana есть транзакции версии 1: с maxSupportedTransactionVersion=0 узел
+        их не отдаёт (-32015) — и бот «не видел» транзакций многих кошельков. Узел сам называет нужную версию:
+        поднимаем её и повторяем."""
+        for _ in range(3):
+            try:
+                return await self.call(
+                    "getTransaction",
+                    [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": self.max_tx_version,
+                                 "commitment": "confirmed"}],
+                )
+            except RpcError as exc:
+                m = re.search(r"maxSupportedTransactionVersion\W+(\d+)", str(exc))
+                if m and int(m.group(1)) > self.max_tx_version:
+                    log.warning("RPC: транзакции версии %s — поднимаю maxSupportedTransactionVersion", m.group(1))
+                    self.max_tx_version = int(m.group(1))
+                    continue
+                raise
+        return None
+
+    async def block_time(self, slot: int) -> int | None:
+        try:
+            return await self.call("getBlockTime", [slot], retries=1)
+        except RpcError:
+            return None
