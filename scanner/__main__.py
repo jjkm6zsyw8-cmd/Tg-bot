@@ -39,7 +39,7 @@ def setup_logging(level: str, name: str) -> None:
 # разовые команды (run_tool): новая команда — и сюда, иначе «неизвестная команда» (tests/test_cli.py)
 TOOLS = ("recluster", "history", "verify", "real-check", "real-export", "lookalike", "dune-scout", "cobuyers",
          "patterns", "dips", "whynot", "migration", "research", "copycheck", "jupcheck", "trendfeat", "hunt", "ppcost",
-         "datacheck", "pdcheck")
+         "datacheck", "pdcheck", "shadowwhy")
 
 
 async def main(cmd: str) -> None:
@@ -332,6 +332,14 @@ async def run_tool(cmd: str, db: Database) -> None:
                     print(f"{'🔥' if why is None else '  '} {c['trader']} монет {s.coins_all} копий {s.n} правило "
                           f"{s.rule} ср. {s.avg:+.1%} в плюсе {s.win:.0%} t={s.t:.1f} без цены {s.noprice:.0%} "
                           f"${s.usd_day:,.0f}/день всплеск {s.burst:.0%}" + (f" — {why}" if why else ""))
+    elif cmd == "shadowwhy":
+        # 27.11: почему тень молчит — кошельки бота, сигналы, пропуски, поток: python -m scanner shadowwhy [--hours 24]
+        import re
+        from .config import Settings, YamlConfig, load_env
+        from .real.shadowwhy import shadow_why_text
+        sw_cfg = Settings(YamlConfig(load_env().config_path), await db.get_overrides()).effective()
+        text = await shadow_why_text(db, sw_cfg, float(args[args.index("--hours") + 1]) if "--hours" in args else 24.0)
+        print(re.sub(r"<[^>]+>", "", text))
     elif cmd == "ppcost":
         # 27.11: сколько PumpPortal стоил в SOL по дням: python -m scanner ppcost [--days 30]
         from .analytics.datacheck import pp_cost_text

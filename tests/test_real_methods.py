@@ -883,3 +883,29 @@ async def test_only_trendj_enabled_still_gets_trend_signals(db):
                                                  "trigger_at": time.time()}, None, {"T"})
     assert [p.extra["kind"] for p in tr.positions.values()] == ["trendj"]
     assert skipped(tr, "тренды на pump.fun выключены")
+
+
+async def test_methods_screen_warns_when_wallet_off_or_paused_and_shadowwhy(db):
+    """27.11 (владелец: «методы включены, а по сути отключены» — тень молчит с 25.11): выключенный кошелёк не берёт
+    сигналы ни одного метода — экран методов говорит об этом и даёт кнопку «Тень»; shadowwhy называет причину."""
+    from scanner.real.shadowwhy import shadow_why_text
+    desk = make_desk(db, FakeChain())
+    await desk.start()
+    wid = await desk.create_wallet("Мейныч")
+    await UI.set_wallet(db, wid, {"real_mode": "off", "real_mode_at": "2026-11-25T01:04:00+00:00",
+                                  "real_mode_by": "кнопка «Выкл» в Telegram"})
+    text, kb = await UI.methods_view(db, {}, wid)
+    assert "Кошелёк выключен" in text and ["rl:wm:%d:shadow" % wid] == [
+        b["callback"] for row in kb for b in row if b["callback"].startswith("rl:wm:")]
+    why = await shadow_why_text(db, {})
+    assert "режим «выключен» (выбран 25.11 01:04 UTC" in why and "Мейныч: кошелёк выключен" in why
+    assert "Позиции тени</b>: за период 0" in why
+    await UI.set_wallet(db, wid, {"real_mode": "shadow", "real_paused": "3 неудачных транзакций подряд"})
+    text, kb = await UI.methods_view(db, {}, wid)
+    assert "Кошелёк выключен" not in text and "Новые входы остановлены</b>: 3 неудачных" in text
+    assert "входы остановлены (3 неудачных транзакций подряд)" in await shadow_why_text(db, {})
+    await UI.set_wallet(db, wid, drop="real_paused")
+    await db.execute("INSERT INTO real_skips(wallet_id, mint, mode, kind, why) VALUES ($1, 'M', 'shadow', 'smart', "
+                     "'сигнал опоздал')", wid)
+    why = await shadow_why_text(db, {})
+    assert "тень · smart: сигнал опоздал — 1" in why and "кошелёк выключен" not in why
