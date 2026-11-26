@@ -63,6 +63,8 @@ def trigger_of(r: Any) -> dict[str, Any]:
     out = {"trigger_slot": int(r["slot"]), "trigger_sig": r["signature"], "trigger_mc": float(r["mc_sol"]),
            "trigger_at": time.time()}
     try:
+        if r["source"] == "pumpdata":
+            out["shadow_only"] = True      # 27.11: сделка из pumpdata (задержка ~1.5 с) — только тень, не деньги
         if r["source"] == "pumpportal" and r["pool"] == "pump-amm":
             # 19.11: MC от PumpPortal на PumpSwap — без виртуальных резервов пула (на 4–26% ниже настоящей): как цену
             # не берём (бумага считает цену после трейдера по его транзакции, бой не сравнивает с ней рост цены)

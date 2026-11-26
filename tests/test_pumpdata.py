@@ -255,3 +255,25 @@ async def test_watch_keeps_followed_and_hunter_wallets_first(db):
     rec.watch.last_error = "HTTP 429 wss://mainnet.helius-rpc.com/?api-key=SECRET"
     await rec.publish_watch([], set())
     assert "SECRET" not in str(await db.kv_get("watch:state"))
+
+
+async def test_hunter_wallet_trades_come_from_pumpdata_while_helius_lacks_them(db):
+    """27.11 (владелец: «тень должна реально повторять за кошельками охотника» — слежка Helius лежит): сделки кошелька
+    охотника идут в бот из pumpdata, пока Helius его не ведёт; такой сигнал — только тень, не деньги."""
+    from scanner.analytics.engine import trigger_of
+    from scanner.config import Env, Settings, YamlConfig
+    from scanner.ingest.receiver import Receiver
+    rec = Receiver(Env(pumpportal_api_key="k", pumpdata_api_key="pdk", helius_api_key="K"),
+                   Settings(YamlConfig("config/config.yaml")), db)
+    rec.hunt_wallets = {"HUNT"}
+    rec.pp.last_trade_at = time.monotonic()                             # PumpPortal жив — для кошельков охотника неважно
+    row = PD.parse(trade(mint="OLD", wallet="HUNT"))
+    assert rec.pd_route(row) and not rec.pd_route(PD.parse(trade(mint="OLD", wallet="OTHER")))
+    rec.watch.connected, rec.watch.subs["HUNT"] = True, 1               # Helius ведёт его — только оттуда, без дублей
+    assert not rec.pd_route(row)
+    rec.watch.connected = False
+    assert rec.pd_route(row)
+    ev = PD.to_trade(row)
+    trig = trigger_of({"slot": ev.slot, "signature": ev.signature, "mc_sol": 40.0, "source": ev.source,
+                       "pool": ev.pool, "ts": ev.ts})
+    assert trig["shadow_only"] is True and trig["trigger_slot"] == ev.slot

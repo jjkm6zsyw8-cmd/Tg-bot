@@ -311,6 +311,9 @@ async def run_tool(cmd: str, db: Database) -> None:
             else:
                 print(H.fmt.plain(await H.entry_gap_text(db, prm, arg("--wallet"), float(arg("--hours") or 72),
                                                          int(arg("--top") or 3))))
+        elif "--morning" in args:
+            # 27.11: утренний отчёт охотника сейчас (бот сам шлёт его в 10:00 по Тбилиси)
+            print(H.fmt.plain(await H.morning_text(db, _t.time())))
         elif "--explain" in args:
             # 27.11: откуда $/день у кошелька (формула и копии с самым большим плюсом — по каким сделкам цена)
             if not arg("--wallet"):

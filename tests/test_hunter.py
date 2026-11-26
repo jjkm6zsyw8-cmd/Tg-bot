@@ -428,8 +428,20 @@ async def test_hunt_text_daily_weekly(db):
     await db.execute(
         """INSERT INTO real_positions(mode, kind, mint, trader, opened_at, closed_at, cost_sol, tokens, entry_mc,
                pnl_sol, pnl_pct) VALUES ('shadow', 'copy', 'M', $1, now(), now(), 0.14, 1, 40, 0.02, 0.15)""", ME)
-    await h.daily(time.time())
-    assert any("итог за 24 ч" in p["text"] and "1 сд" in p["text"] for p in e.sent)
+    # 27.11: утренний отчёт — в 10:00 по Тбилиси (06:00 UTC), раз в день, с окном до 14:00
+    day = datetime.now(timezone.utc).replace(hour=6, minute=0, second=0, microsecond=0)
+    assert await h.morning((day - timedelta(minutes=1)).timestamp()) is None          # 09:59 — ещё рано
+    await db.kv_set("health:ingest", {"at": datetime.now(timezone.utc).isoformat(),
+                                      "pumpdata": {"connected": True, "dropped": 0}})
+    await db.kv_set("watch:state", {"connected": False, "fallback": True, "wallets_in": 3, "wallets": 3,
+                                    "key": {ME: "down"}, "primary_error": "HTTP 429"})
+    text = await h.morning(day.timestamp() + 60)
+    assert "Охотник: утро" in text and "Нашёл за сутки: 1" in text and "1 сд, в среднем +15.0% на сделку" in text
+    assert "сумма <b>+$3.00/день</b>" in text and f"Лучший: <code>{ME}</code> +$3.00" in text
+    assert "pumpdata: ✅ подключён" in text and "слежка НЕ подключена (запасной узел)" in text and "HTTP 429" in text
+    assert "без подписки 1" in text and "Диск: " in text and "база" in text
+    assert await h.morning(day.timestamp() + 120) is None                               # второй раз за день — нет
+    assert any("Охотник: утро" in p["text"] for p in e.sent)
     text = await h.weekly(time.time())
     assert "найдено горячих 1" in text and "в плюсе 1 из 1 кошельков" in text
     assert await h.weekly(time.time()) is None

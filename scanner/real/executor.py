@@ -580,8 +580,8 @@ class RealTrader:
             mode = self.mode_for(kind) if kind else "off"
             if kind == "trend" and mode == "off":
                 mode = "shadow"                       # дальше решит биржа: pump.fun — выключено, другие — trendj
-            if probe and mode == "live":
-                mode = "shadow"
+            if (probe or data.get("shadow_only")) and mode == "live":
+                mode = "shadow"                       # 27.11: сигнал из pumpdata (с задержкой) — только тень
         if kind is None:
             return
         manual = followed and wallet not in (getattr(self, "follow_auto", None) or set())

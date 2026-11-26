@@ -209,9 +209,16 @@ class Receiver:
     def pd_route(self, row: Any) -> bool:
         """Сделка pumpdata → основной поток: пока PumpPortal молчит; монета моложе окна или её нужно держать; не то,
         что ведёт слежка Helius (кошельки и монеты — там быстрее и с подписью)."""
+        mint, wallet = row.mint, row.wallet
+        if wallet in self.hunt_wallets:
+            # 27.11 (владелец: «тень должна реально повторять за кошельками охотника» — слежка Helius лежит): сделки
+            # кошельков охотника и «за ним» — из pumpdata, пока слежка Helius их не ведёт (не подключена или кошелёк
+            # не подписан); ведёт — только оттуда (быстрее, с подписью, без дублей). Задержка ~1.5 с: тень входит
+            # позже, чем вошёл бы бой, — оценка осторожная; на деньги «за ним» по-прежнему только Helius
+            w = self.watch
+            return not (w is not None and w.connected and wallet in w.subs)
         if not self.pp_silent():
             return False
-        mint, wallet = row.mint, row.wallet
         if self.watch is not None and (wallet in self.watch.want or mint in self.watch.want):
             return False
         born = self.known_mints.get(mint)

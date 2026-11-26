@@ -93,6 +93,9 @@ EVAL_LIMIT = 200
 REALERT_COOLED_D = 7
 TOPIC = "copy"
 DAY_KEY, WEEK_KEY, BATTLE_KEY = "hunter:day_at", "hunter:week_at", "hunter:battle_ok"
+# 27.11 (владелец): каждое утро в 10:00 по Тбилиси (UTC+4, без перехода на летнее) — один отчёт за сутки; если бот в
+# 10:00 лежал — до 14:00 ещё догонит, позже — уже завтра
+MORNING_KEY, MORNING_TZ, MORNING_HOURS = "hunter:morning_day", timezone(timedelta(hours=4)), (10, 14)
 LIST_NAMES = {"new": "найден", "battle": "в бой", "watch": "наблюдение", "archive": "архив"}
 
 
@@ -538,6 +541,7 @@ class Hunter:
         await self.e.db.enqueue("text", {"topic": TOPIC, "text": text, "keyboard": kb}, priority=5)
 
     async def loop(self) -> None:
+        self._morning = asyncio.create_task(self.morning_loop())
         await asyncio.sleep(120)
         while True:
             try:
@@ -553,7 +557,6 @@ class Hunter:
         await self.track(now, prm)
         await self.watch(now)
         await self.battle_list(now)
-        await self.daily(now)
         await self.weekly(now)
 
     # ------------------------------------------------------------------ поиск (A1–A4, A7)
@@ -763,22 +766,25 @@ class Hunter:
             await db.job("reload")
         return ok
 
-    async def daily(self, now: float) -> None:
+    async def morning_loop(self) -> None:
+        while True:
+            try:
+                await self.morning(time.time())
+            except Exception:  # noqa: BLE001 — отчёт не должен ронять охотника
+                log.exception("охотник: утренний отчёт")
+            await asyncio.sleep(60)
+
+    async def morning(self, now: float) -> str | None:
+        """Один отчёт в 10:00 по Тбилиси (в окне до 14:00, раз в день)."""
         db = self.e.db
-        if now - float(await db.kv_get(DAY_KEY) or 0) < 86400:
-            return
-        rows = await db.fetch("SELECT address, status, followed_at FROM hunter_wallets "
-                              "WHERE status IN ('shadow', 'live') AND followed_at IS NOT NULL")
-        await db.kv_set(DAY_KEY, now)
-        if not rows:
-            return
-        lines = ["🎯 <b>Охотник: итог за 24 ч</b> по кошелькам, за которыми повторяем"]
-        for r in rows:
-            d = await our_results(db, r["address"], max(r["followed_at"],
-                                                        datetime.fromtimestamp(now - 86400, timezone.utc)))
-            lines.append(f"{'💵' if r['status'] == 'live' else '👻'} <code>{r['address'][:4]}…{r['address'][-4:]}</code>: "
-                         f"{d['n']} сд, в среднем {d['avg']:+.1%}, {d['sol']:+.3f} SOL")
-        await self.say("\n".join(lines))
+        local = datetime.fromtimestamp(now, MORNING_TZ)
+        day = local.strftime("%Y-%m-%d")
+        if not MORNING_HOURS[0] <= local.hour < MORNING_HOURS[1] or await db.kv_get(MORNING_KEY) == day:
+            return None
+        await db.kv_set(MORNING_KEY, day)
+        text = await morning_text(db, now)
+        await self.say(text)
+        return text
 
     async def weekly(self, now: float) -> str | None:
         db = self.e.db
@@ -810,6 +816,99 @@ async def save_copies(db: Any, addr: str, rule: str, copies: list[tuple[CM.Entry
                ON CONFLICT (address, mint, entry_at) DO UPDATE SET rule = EXCLUDED.rule, res = EXCLUDED.res,
                    reason = EXCLUDED.reason, entry_mc = EXCLUDED.entry_mc, exit_mc = EXCLUDED.exit_mc,
                    burst = EXCLUDED.burst, stake = EXCLUDED.stake, hold_s = EXCLUDED.hold_s""", rows)
+
+
+def _money(usd: float) -> str:
+    return f"{'+' if usd >= 0 else '−'}${abs(usd):,.2f}"
+
+
+async def health_lines(db: Any, now: float) -> list[str]:
+    """27.11: здоровье для утреннего отчёта — pumpdata, слежка Helius, диск (и база), кошельки бота."""
+    import shutil
+    out = []
+    h = await db.kv_get("health:ingest") or {}
+    at = h.get("at")
+    age = (now - datetime.fromisoformat(at).timestamp()) if at else None
+    if age is None or age > 600:
+        out.append(f"⚠️ приёмник сделок не отвечает (статус {ago(age) + ' назад' if age is not None else 'не найден'})")
+    pd = h.get("pumpdata")
+    hour = await db.fetchval("SELECT count(*) FROM market_trades WHERE ts > now() - interval '1 hour'")
+    if pd is None:
+        out.append("pumpdata: ⚠️ не подключён (нет ключа PUMPDATA_API_KEY)")
+    else:
+        out.append(f"pumpdata: {'✅ подключён' if pd.get('connected') else '⚠️ НЕ подключён'}, за час записано "
+                   f"{int(hour or 0):,} сделок"
+                   + (f", потеряно {pd.get('dropped')}" if pd.get("dropped") else "")
+                   + (f", ошибка: {fmt.esc(str(pd.get('last_error'))[:120])}" if pd.get("last_error")
+                      and not pd.get("connected") else ""))
+    ws = await db.kv_get("watch:state") or {}
+    if not ws:
+        out.append("Helius: состояния слежки нет")
+    else:
+        bad = [a for a, v in (ws.get("key") or {}).items() if v != "sub"]
+        out.append(f"Helius: {'✅ слежка подключена' if ws.get('connected') else '⚠️ слежка НЕ подключена'}"
+                   + (" (запасной узел)" if ws.get("fallback") else "")
+                   + f", кошельков в подписке {ws.get('wallets_in')} из {ws.get('wallets')}"
+                   + (f"; без подписки {len(bad)} из кошельков «за ним» / охотника — их сделки идут из pumpdata"
+                      if bad else "")
+                   + (f"; основной узел отказал: {fmt.esc(str(ws.get('primary_error'))[:120])}"
+                      if ws.get("fallback") and ws.get("primary_error") else ""))
+    try:
+        du = shutil.disk_usage("/")
+        size = await db.fetchval("SELECT pg_database_size(current_database())")
+        pct = du.used / du.total if du.total else 0.0
+        out.append(f"Диск: {'⚠️ ' if pct >= 0.85 else ''}занято {pct:.0%} ({du.used / 1e9:,.0f} из "
+                   f"{du.total / 1e9:,.0f} ГБ), база {float(size or 0) / 1e9:,.1f} ГБ")
+    except Exception:  # noqa: BLE001
+        out.append("Диск: не удалось прочитать")
+    if await bot_watching(db) is False:
+        out.append(SHADOW_OFF)
+    return out
+
+
+async def morning_text(db: Any, now: float) -> str:
+    """27.11 (владелец): утренний отчёт за сутки — сколько кошельков нашёл, сделки тени (и боя) за каждым: итог в $ и
+    средний % на сделку, сумма $ за сутки, лучший кошелёк; внизу здоровье."""
+    since = datetime.fromtimestamp(now - 86400, timezone.utc)
+    price = float((await db.kv_get("sol_usd", {}) or {}).get("price") or 150.0)
+    found = int(await db.fetchval("SELECT count(*) FROM hunter_wallets WHERE found_at >= $1", since) or 0)
+    follow = await db.fetch("SELECT address, status FROM hunter_wallets WHERE status IN ('shadow', 'live') "
+                            "ORDER BY found_at")
+    res = {r["trader"]: r for r in await db.fetch(
+        """SELECT p.trader, count(*) AS n, sum(p.pnl_sol) AS sol, avg(p.pnl_pct) AS pct
+           FROM real_positions p JOIN hunter_wallets h ON h.address = p.trader
+           WHERE p.closed_at >= $1 AND p.pnl_pct IS NOT NULL GROUP BY 1""", since)}
+    opened = {r["trader"]: int(r["n"]) for r in await db.fetch(
+        """SELECT p.trader, count(*) AS n FROM real_positions p JOIN hunter_wallets h ON h.address = p.trader
+           WHERE p.closed_at IS NULL GROUP BY 1""")}
+    status = {r["address"]: r["status"] for r in follow}
+    addrs = list(dict.fromkeys([r["address"] for r in follow] + list(res)))
+    n_all = sum(int(r["n"]) for r in res.values())
+    usd_all = sum(float(r["sol"] or 0) for r in res.values()) * price
+    avg_all = (sum(float(r["pct"]) * int(r["n"]) for r in res.values()) / n_all) if n_all else None
+    local = datetime.fromtimestamp(now, MORNING_TZ)
+    lines = [f"🌅 <b>Охотник: утро {local:%d.%m}</b> — за сутки",
+             f"Нашёл за сутки: {found} · повторяем за {len(follow)} "
+             f"(тень {sum(1 for r in follow if r['status'] == 'shadow')}, "
+             f"бой {sum(1 for r in follow if r['status'] == 'live')})",
+             f"Тень за ними: {n_all} сд"
+             + (f", в среднем {avg_all:+.1%} на сделку, сумма <b>{_money(usd_all)}/день</b>"
+                if n_all else ", сделок не было")]
+    if res:
+        best = max(res.values(), key=lambda r: float(r["sol"] or 0))
+        lines.append(f"Лучший: <code>{best['trader']}</code> {_money(float(best['sol'] or 0) * price)} "
+                     f"({int(best['n'])} сд, в среднем {float(best['pct']):+.1%})")
+    if addrs:
+        lines.append("По кошелькам:")
+        for a in sorted(addrs, key=lambda x: -float((res.get(x) or {}).get("sol") or 0) if x in res else 1e9)[:20]:
+            r = res.get(a)
+            icon = "💵" if status.get(a) == "live" else "👻" if a in status else "🧊"
+            lines.append(f"{icon} <code>{a[:4]}…{a[-4:]}</code>: "
+                         + (f"{int(r['n'])} сд, {_money(float(r['sol'] or 0) * price)}, в среднем "
+                            f"{float(r['pct']):+.1%}" if r else "0 сд")
+                         + (f" (+{opened[a]} откр.)" if opened.get(a) else ""))
+    lines += ["", "<b>Здоровье</b>"] + await health_lines(db, now)
+    return "\n".join(lines)
 
 
 async def weekly_text(db: Any, now: float) -> str:
