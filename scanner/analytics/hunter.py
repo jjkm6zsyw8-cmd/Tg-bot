@@ -891,21 +891,23 @@ async def morning_text(db: Any, now: float) -> str:
              f"Нашёл за сутки: {found} · повторяем за {len(follow)} "
              f"(тень {sum(1 for r in follow if r['status'] == 'shadow')}, "
              f"бой {sum(1 for r in follow if r['status'] == 'live')})",
-             f"Тень за ними: {n_all} сд"
-             + (f", в среднем {avg_all:+.1%} на сделку, сумма <b>{_money(usd_all)}/день</b>"
-                if n_all else ", сделок не было")]
+             # 27.11 (владелец): главная цифра — средний % на сделку, каждая сделка весит одинаково (в тени ставка
+             # всегда 0.14 SOL); $ — вторым
+             "Тень за ними: " + (f"<b>в среднем {avg_all:+.1%} на сделку</b> ({n_all} сд) · сумма "
+                                 f"{_money(usd_all)}/день" if n_all else "сделок не было")]
     if res:
-        best = max(res.values(), key=lambda r: float(r["sol"] or 0))
-        lines.append(f"Лучший: <code>{best['trader']}</code> {_money(float(best['sol'] or 0) * price)} "
-                     f"({int(best['n'])} сд, в среднем {float(best['pct']):+.1%})")
+        pool = [r for r in res.values() if int(r["n"]) >= 3] or list(res.values())   # лучший — от 3 сделок, если есть
+        best = max(pool, key=lambda r: (float(r["pct"]), int(r["n"])))
+        lines.append(f"Лучший: <code>{best['trader']}</code> в среднем {float(best['pct']):+.1%} на сделку "
+                     f"({int(best['n'])} сд, {_money(float(best['sol'] or 0) * price)})")
     if addrs:
         lines.append("По кошелькам:")
-        for a in sorted(addrs, key=lambda x: -float((res.get(x) or {}).get("sol") or 0) if x in res else 1e9)[:20]:
+        for a in sorted(addrs, key=lambda x: -float(res[x]["pct"]) if x in res else 1e9)[:20]:
             r = res.get(a)
             icon = "💵" if status.get(a) == "live" else "👻" if a in status else "🧊"
             lines.append(f"{icon} <code>{a[:4]}…{a[-4:]}</code>: "
-                         + (f"{int(r['n'])} сд, {_money(float(r['sol'] or 0) * price)}, в среднем "
-                            f"{float(r['pct']):+.1%}" if r else "0 сд")
+                         + (f"в среднем {float(r['pct']):+.1%} на сделку, {int(r['n'])} сд, "
+                            f"{_money(float(r['sol'] or 0) * price)}" if r else "0 сд")
                          + (f" (+{opened[a]} откр.)" if opened.get(a) else ""))
     lines += ["", "<b>Здоровье</b>"] + await health_lines(db, now)
     return "\n".join(lines)

@@ -722,6 +722,8 @@ class RealTrader:
         min_pool = float(self.get("real_min_pool_sol"))
         if liq is not None and min_pool > 0 and liq < min_pool:
             return f"в пуле {liq:.1f} SOL < {min_pool:g} — мелкий пул, не входим", 0
+        if mode != "live" and float(self.get("real_shadow_stake_sol") or 0) > 0:
+            return None, stake          # 27.11 (владелец): в тени ставка фиксированная — урезания ниже только в бою
         his = float(data.get("copy_sol") or data.get("trigger_sol") or 0)
         if his > 0:
             stake = min(stake, int(float(self.get("real_copy_max_share")) * his * 1e9))
@@ -920,7 +922,11 @@ class RealTrader:
         trig_slot = 0 if trend else int(data.get("trigger_slot") or 0)
         if trig_slot and st["slot"] and st["slot"] - trig_slot > int(self.get("real_max_blocks")):
             return self._skip(mode, kind, "после сигнала прошло слишком много блоков")
-        stake, why = self.stake_lamports(st["v_quote"], kind, data.get("_followed"))
+        fixed = float(self.get("real_shadow_stake_sol") or 0) if mode != "live" else 0.0
+        if fixed > 0:
+            stake, why = int(fixed * 1e9), None          # 27.11 (владелец): тень — всегда 0.14 SOL
+        else:
+            stake, why = self.stake_lamports(st["v_quote"], kind, data.get("_followed"))
         if why:
             return self._skip(mode, kind, why)
         if data.get("copy_wallet") or data.get("_followed") or kind in COPY_KINDS:

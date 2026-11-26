@@ -436,8 +436,9 @@ async def test_hunt_text_daily_weekly(db):
     await db.kv_set("watch:state", {"connected": False, "fallback": True, "wallets_in": 3, "wallets": 3,
                                     "key": {ME: "down"}, "primary_error": "HTTP 429"})
     text = await h.morning(day.timestamp() + 60)
-    assert "Охотник: утро" in text and "Нашёл за сутки: 1" in text and "1 сд, в среднем +15.0% на сделку" in text
-    assert "сумма <b>+$3.00/день</b>" in text and f"Лучший: <code>{ME}</code> +$3.00" in text
+    assert "Охотник: утро" in text and "Нашёл за сутки: 1" in text
+    assert "<b>в среднем +15.0% на сделку</b> (1 сд) · сумма +$3.00/день" in text
+    assert f"Лучший: <code>{ME}</code> в среднем +15.0% на сделку (1 сд, +$3.00)" in text
     assert "pumpdata: ✅ подключён" in text and "слежка НЕ подключена (запасной узел)" in text and "HTTP 429" in text
     assert "без подписки 1" in text and "Диск: " in text and "база" in text
     assert await h.morning(day.timestamp() + 120) is None                               # второй раз за день — нет
