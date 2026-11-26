@@ -298,15 +298,19 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
     return Copy(None, "нет цены выхода", entry_mc=et.mc, venue=venue)
 
 
-def entries_of(trades: list[dict[str, Any]]) -> list[Entry]:
+def entries_of(trades: list[dict[str, Any]], min_buy: float = 0.0) -> list[Entry]:
     """Входы трейдера, которые бот скопировал бы: первая покупка монеты и каждая новая после того, как он продал
-    90%+ купленного. trades: dict(mint, ts, is_buy, sol, tokens, slot) по времени."""
+    90%+ купленного. trades: dict(mint, ts, is_buy, sol, tokens, slot) по времени.
+    27.11 (разбор Fn9n…: «его покупка 0.00 SOL»): min_buy — покупки цели мельче бот не копирует (copy_min_buy_sol),
+    и модель по ним не входит; такая покупка позицию не открывает — следующая крупная откроет."""
     out: list[Entry] = []
     state: dict[str, tuple[float, float]] = {}       # монета → (остаток, пик)
     for t in sorted(trades, key=lambda x: x["ts"]):
         bal, peak = state.get(t["mint"], (0.0, 0.0))
         if t["is_buy"]:
             if bal <= 0.1 * peak or peak == 0:
+                if min_buy and float(t.get("sol") or 0) < min_buy:
+                    continue
                 out.append(Entry(t["mint"], float(t["ts"]), t.get("slot"), float(t.get("sol") or 0)))
                 bal, peak = 0.0, 0.0
             bal += float(t.get("tokens") or 0)
@@ -395,21 +399,26 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]], reserves:
     mints = list(windows)
     rows = await db.fetch(
         """SELECT p.mint, extract(epoch FROM t.ts) AS ts, t.mc_sol, t.slot, t.trader, t.is_buy, t.sol_amount, t.pool,
-                  t.source
+                  t.source, false AS mt
            FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
            JOIN trades t ON t.mint = p.mint AND t.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi) AND t.mc_sol > 0
                 AND NOT (t.source = 'pumpdata' AND (t.sol_amount < 0.001 OR t.mc_sol < 1
                          OR (t.pool = 'pump' AND t.mc_sol NOT BETWEEN 20 AND 600)))
            UNION ALL
            SELECT p.mint, extract(epoch FROM m.ts), m.mc_sol, m.slot, m.trader, m.is_buy, m.sol_amount, m.pool,
-                  'pumpdata'
+                  'pumpdata', true
            FROM unnest($1::text[], $2::float8[], $3::float8[]) AS p(mint, lo, hi)
            JOIN market_trades m ON m.mint = p.mint AND m.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi)
                 AND m.mc_sol > 0 AND m.sol_amount >= 0.001 AND m.mc_sol >= 1      -- 27.11: мусор из записанного раньше
                 AND (m.pool <> 'pump' OR m.mc_sol BETWEEN 20 AND 600)
            ORDER BY 1, 2""", mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints])
+    # 27.11 (разбор Fn9n…: каждая сделка от 0.2 SOL — дважды): сделка pumpdata, которая ушла и в основной поток
+    # (trades), и в market_trades, — один раз; сделка, записанная слежкой, — тоже (по блоку, кошельку и стороне)
+    seen = {(r["mint"], r["slot"], r["trader"], r["is_buy"]) for r in rows if not r["mt"] and r["slot"] is not None}
     out: dict[str, list[Tick]] = {}
     for r in rows:
+        if r["mt"] and (r["mint"], r["slot"], r["trader"], r["is_buy"]) in seen:
+            continue
         pool = r["pool"] or "pump"
         out.setdefault(r["mint"], []).append(Tick(float(r["ts"]), float(r["mc_sol"]), r["slot"], r["trader"],
                                                   bool(r["is_buy"]), float(r["sol_amount"] or 0), pool,
@@ -442,8 +451,8 @@ class Prepared:
 
 async def prepare(db: Any, address: str, trades: list[dict[str, Any]], since: float, until: float | None = None,
                   limit: int = 120, recent_from: float | None = None, recent_limit: int = 60,
-                  hold_s: float = 1800.0) -> Prepared:
-    all_e = [e for e in entries_of(trades) if e.ts >= since and (until is None or e.ts <= until)]
+                  hold_s: float = 1800.0, min_buy: float = 0.0) -> Prepared:
+    all_e = [e for e in entries_of(trades, min_buy) if e.ts >= since and (until is None or e.ts <= until)]
     pick = {id(e): e for e in spread(all_e, limit)}
     if recent_from is not None:
         for e in [x for x in all_e if x.ts >= recent_from][-recent_limit:]:
@@ -512,9 +521,12 @@ async def wallet_trades(db: Any, address: str, since: float, until: float | None
     rows = await db.fetch(
         """SELECT mint, extract(epoch FROM ts) AS ts, is_buy, sol_amount, token_amount, slot FROM trades
            WHERE trader = $1 AND ts >= $2 AND ts <= $3
+                 AND NOT (source = 'pumpdata' AND (sol_amount < 0.001 OR mc_sol < 1      -- 27.11: мусор pumpdata
+                          OR (pool = 'pump' AND mc_sol NOT BETWEEN 20 AND 600)))
            UNION ALL
            SELECT m.mint, extract(epoch FROM m.ts), m.is_buy, m.sol_amount, m.token_amount, m.slot FROM market_trades m
-           WHERE m.trader = $1 AND m.ts >= $2 AND m.ts <= $3 AND NOT EXISTS (
+           WHERE m.trader = $1 AND m.ts >= $2 AND m.ts <= $3 AND m.sol_amount >= 0.001 AND m.mc_sol >= 1
+                 AND (m.pool <> 'pump' OR m.mc_sol BETWEEN 20 AND 600) AND NOT EXISTS (
                SELECT 1 FROM trades t WHERE t.trader = $1 AND t.mint = m.mint AND t.slot = m.slot AND t.is_buy = m.is_buy)
            ORDER BY 2""", address, lo, hi)
     return [{"mint": r["mint"], "ts": float(r["ts"]), "is_buy": r["is_buy"], "sol": r["sol_amount"],

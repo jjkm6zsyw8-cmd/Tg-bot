@@ -78,6 +78,31 @@ async def test_market_trades_feed_hunter_and_model_once(db):
     assert cands[ME]["coins"] == 2 and cands[OTHER]["coins"] == 1      # кандидаты — и из всего рынка
 
 
+async def test_pumpdata_trade_in_both_tables_counts_once_and_junk_is_skipped(db):
+    """27.11 (разбор Fn9n…): сделка pumpdata от min_sol ушла и в основной поток (trades), и в market_trades — в ценах
+    один раз; его «покупка 0.00 SOL, MC 0.0» из pumpdata — ни входом, ни ценой."""
+    t = datetime.now(timezone.utc) - timedelta(hours=1)
+    row = PD.parse(trade(mint="MINTC", wallet=OTHER, slot=700, idx=2, sol=0.5, token_amount=10_000_000.0,
+                         ts=t.timestamp()))
+    st = PD.PumpDataStream(db, "u", "k")
+    st.queue.append(row)
+    await st.flush()
+    tr = PD.to_trade(row)
+    await db.execute(
+        """INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol, slot, ts, pool, source)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pumpdata')""", tr.signature, tr.mint, tr.trader, tr.is_buy,
+        tr.sol_amount, tr.token_amount, row.mc, tr.slot, tr.ts, tr.pool)
+    await db.execute(
+        """INSERT INTO trades(signature, mint, trader, is_buy, sol_amount, token_amount, mc_sol, slot, ts, pool, source)
+           VALUES ('pd:701:1:1','MINTC',$1,true,0.0004,1000,0.0004,701,$2,'pump','pumpdata')""", ME, t)
+    await db.execute(
+        """INSERT INTO market_trades(slot, idx, sub, ts, mint, trader, is_buy, sol_amount, token_amount, mc_sol, pool)
+           VALUES (702, 1, 1, $1, 'MINTC', $2, true, 0.3, 300, 0.001, 'pump')""", t, ME)
+    ticks = (await M.load_ticks(db, {"MINTC": (t.timestamp() - 5, t.timestamp() + 5)}))["MINTC"]
+    assert [(x.slot, x.trader) for x in ticks] == [(700, OTHER)]
+    assert await M.wallet_trades(db, ME, t.timestamp() - 60) == []
+
+
 def test_pumpportal_counts_raw_messages_by_kind():
     pp = PumpPortalSource("wss://x", "key")
     pp.token_subs = {"COIN": 0.0}

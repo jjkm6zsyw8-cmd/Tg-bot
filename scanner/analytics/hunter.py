@@ -265,6 +265,7 @@ class Params:
     exit_delay: float = CM.EXIT_DELAY_S   # 27.11: продажа «садится» через столько секунд (hunter_exit_delay_s)
     max_stake: float = 0.5               # 27.11: ставка «при 3% пула» — не больше лимита на кошелёк (real_follow_max_sol)
     copy_share: float = 0.10             # и не больше доли его покупки (real_copy_max_share)
+    min_buy: float = 0.1                 # 27.11: его покупки мельче бот не копирует (copy_min_buy_sol) — и модель
 
 
 async def params_of(db: Any, cfg: dict[str, Any] | None = None) -> Params:
@@ -273,7 +274,7 @@ async def params_of(db: Any, cfg: dict[str, Any] | None = None) -> Params:
     return Params(float(cfg.get("hunter_entry_delay_s", ENTRY_DELAY_S)),
                   float(cfg.get("real_min_pool_sol", MIN_POOL_SOL)), float(price or 150.0),
                   float(cfg.get("hunter_exit_delay_s", CM.EXIT_DELAY_S)), float(cfg.get("real_follow_max_sol", 0.5)),
-                  float(cfg.get("real_copy_max_share", 0.10)))
+                  float(cfg.get("real_copy_max_share", 0.10)), float(cfg.get("copy_min_buy_sol", 0.1)))
 
 
 def assess(p: CM.Prepared, trades: list[dict[str, Any]], prm: Params, days: float,
@@ -302,7 +303,7 @@ def assess(p: CM.Prepared, trades: list[dict[str, Any]], prm: Params, days: floa
 async def evaluate(db: Any, address: str, since: float, until: float, prm: Params, limit: int = EVAL_LIMIT,
                    cand: dict[str, Any] | None = None) -> Stats:
     trades = await CM.wallet_trades(db, address, since, until)
-    p = await CM.prepare(db, address, trades, since, until, limit)
+    p = await CM.prepare(db, address, trades, since, until, limit, min_buy=prm.min_buy)
     syms = {r["mint"]: r["symbol"] for r in await db.fetch(
         "SELECT mint, symbol FROM tokens WHERE mint = ANY($1::text[])", list({e.mint for e in p.ents}))}
     s, _ = assess(p, trades, prm, (until - since) / 86400, syms)
@@ -621,7 +622,7 @@ class Hunter:
                 if checked:
                     await db.execute("UPDATE hunter_wallets SET farm_at = now() WHERE address = $1", addr)
             trades = await CM.wallet_trades(db, addr, start - 120, now)
-            p = await CM.prepare(db, addr, trades, start, now, limit=100_000)
+            p = await CM.prepare(db, addr, trades, start, now, limit=100_000, min_buy=prm.min_buy)
             rule = r["rule"] if r["rule"] in SCHEMES else "A"
             copies = CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
             await save_copies(db, addr, rule, copies)
@@ -871,13 +872,15 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
             """SELECT extract(epoch FROM max(ts)) FROM (SELECT ts FROM trades WHERE trader = $1 AND is_buy AND ts < $2
                    UNION ALL SELECT ts FROM market_trades WHERE trader = $1 AND is_buy AND ts < $2) x""", addr, found)
         rule = r["rule"] if r["rule"] in SCHEMES else "A"
-        p = await CM.prepare(db, addr, trades, since, now, limit=100_000)
+        p = await CM.prepare(db, addr, trades, since, now, limit=100_000, min_buy=prm.min_buy)
         cs = CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool)
         model = Counter("с ценой" if c.res is not None else (c.why or "?") for _e, c in cs)
         nopool = sum(1 for _e, c in CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay) if c.res is not None)
         small = [CM.pool_sol(c.entry_mc, c.venue) for _e, c in cs if c.why == CM.SMALL_POOL and c.entry_mc]
         head = (f"<code>{addr}</code> · найден {found:%d.%m %H:%M}, {r['status']}, правило {rule}\n"
                 f"  покупок после находки: {len(buys)} (монет {len({d['mint'] for d in buys})})"
+                + (f", из них мельче {prm.min_buy:g} SOL (бот не копирует) — {tiny}" if (tiny := sum(
+                    1 for d in buys if float(d["sol"] or 0) < prm.min_buy)) else "")
                 + (f", последняя {datetime.fromtimestamp(buys[-1]['ts'], timezone.utc):%d.%m %H:%M}" if buys else "")
                 + (f"; все сделки в базе до {datetime.fromtimestamp(trades[-1]['ts'], timezone.utc):%d.%m %H:%M}"
                    if trades else "; его сделок в базе нет")
@@ -922,7 +925,7 @@ async def entry_gap_text(db: Any, prm: Params, wallet: str, hours: float = 72.0,
     время, MC, источник цены), сделки первых 3 с после него и выход."""
     now = time.time()
     trades = await CM.wallet_trades(db, wallet, now - hours * 3600 - 120, now)
-    p = await CM.prepare(db, wallet, trades, now - hours * 3600, now, limit=100_000)
+    p = await CM.prepare(db, wallet, trades, now - hours * 3600, now, limit=100_000, min_buy=prm.min_buy)
     rule = await db.fetchval("SELECT rule FROM hunter_wallets WHERE address = $1", wallet) or "A"
     sc = SCHEMES[rule if rule in SCHEMES else "A"]
     syms = {r["mint"]: r["symbol"] for r in await db.fetch(
@@ -937,8 +940,11 @@ async def entry_gap_text(db: Any, prm: Params, wallet: str, hours: float = 72.0,
         dl = CM.copy_trade(e, tk, wallet, dev or None, cr, sc, entry_delay_s=prm.delay, **kw)
         if b2.res is not None and dl.res is not None:
             rows.append((b2.res - dl.res, e, tk, b2, dl))
+    tiny = sum(1 for e in CM.entries_of(trades) if e.ts >= now - hours * 3600 and e.sol < prm.min_buy)
+    tiny_s = (f"\nЕго входов мельче {prm.min_buy:g} SOL: {tiny} — бот такие не копирует, в расчёт не идут"
+              if tiny else "")
     if not rows:
-        return f"У {wallet} за {hours:g} ч нет копий с ценой в обоих вариантах."
+        return f"У {wallet} за {hours:g} ч нет копий с ценой в обоих вариантах." + tiny_s
     rows.sort(key=lambda r: -r[0])
     b2s, dls = [r[3].res for r in rows], [r[4].res for r in rows]
     rest = rows[top:]
@@ -946,7 +952,7 @@ async def entry_gap_text(db: Any, prm: Params, wallet: str, hours: float = 72.0,
            f"{hours:g} ч: {len(rows)} копий, блок +2 {statistics.fmean(b2s):+.1%}, {prm.delay:g} с "
            f"{statistics.fmean(dls):+.1%}"
            + (f"; без {top} крайних — {statistics.fmean([r[3].res for r in rest]):+.1%} / "
-              f"{statistics.fmean([r[4].res for r in rest]):+.1%}" if rest else "")]
+              f"{statistics.fmean([r[4].res for r in rest]):+.1%}" if rest else "") + tiny_s]
 
     def tick(t: Any, e: Any) -> str:
         sl = f"блок {t.slot - e.slot:+d}" if t.slot is not None and e.slot else "блок ?"
@@ -1019,7 +1025,7 @@ async def history(db: Any, days: float = 7.0, step_h: float = 6.0, max_wallets: 
     tr_lines: list[str] = []
     for c in cands:
         trades = await CM.wallet_trades(db, c["trader"], lo, until)
-        p = await CM.prepare(db, c["trader"], trades, lo, until, limit=100_000)
+        p = await CM.prepare(db, c["trader"], trades, lo, until, limit=100_000, min_buy=prm.min_buy)
         if not p.ents:
             if c["trader"] == trace:
                 tr_lines.append("  копий нет: в базе нет его покупок за период")

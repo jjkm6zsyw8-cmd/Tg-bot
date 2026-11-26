@@ -83,6 +83,12 @@ def test_entries_and_summary():
               {"mint": "X", "ts": 3, "is_buy": False, "sol": 2, "tokens": 195, "slot": 3},
               {"mint": "X", "ts": 4, "is_buy": True, "sol": 1, "tokens": 50, "slot": 4}]       # продал 97% — новый вход
     assert [e.ts for e in M.entries_of(trades)] == [1, 4]
+    # 27.11: покупки цели мельче copy_min_buy_sol бот не копирует — и модель; мелкая позицию не открывает
+    dust = [{"mint": "Y", "ts": 1, "is_buy": True, "sol": 0.002, "tokens": 5, "slot": 1},
+            {"mint": "Y", "ts": 2, "is_buy": True, "sol": 0.5, "tokens": 100, "slot": 2},
+            {"mint": "Z", "ts": 3, "is_buy": True, "sol": 0.05, "tokens": 100, "slot": 3}]
+    assert [e.ts for e in M.entries_of(dust)] == [1, 3]
+    assert [(e.ts, e.sol) for e in M.entries_of(dust, 0.1)] == [(2, 0.5)]
     s = M.Summary()
     for c in (M.Copy(0.2, reason="take_profit"), M.Copy(-0.1, reason="trader_sell"), M.Copy(None, "нет цены выхода")):
         s.add(c)
