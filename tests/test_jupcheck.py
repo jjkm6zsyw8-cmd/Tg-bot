@@ -52,3 +52,39 @@ async def test_run_reads_positions():
         assert "все          3" in await JC.run(db, all_time=True)            # --all — все сделки базы
     finally:
         await db.close()
+
+
+async def test_trials_and_filter_reports():
+    """27.11: jupcheck --trials — выходы позиции и проб по каждой сделке; --filter — сколько фильтры пропустили и
+    отсекли."""
+    from scanner.db.pool import Database
+    try:
+        db = await Database(DSN).connect(min_size=1, max_size=2)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL недоступен")
+    try:
+        await db.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.migrate()
+        pid = await db.fetchval(
+            """INSERT INTO real_positions(mode, kind, mint, symbol, opened_at, closed_at, entry_mc, exit_mc, cost_sol,
+                   tokens, exit_reason, pnl_sol, pnl_pct, extra)
+               VALUES ('shadow', 'trendj', 'MJ', 'JENSEN', now() - interval '3 hours', now() - interval '1 hour', 100,
+                       0, 0.07, 1, 'rug', -0.07, -1.0, '{"rule": "U"}') RETURNING id""")
+        await db.execute(
+            """INSERT INTO real_rule_trials(position_id, mode, kind, rule, mint, opened_at, closed_at, entry_mc, exit_mc,
+                   max_mc, cost_sol, tokens_raw, exit_reason, pnl_sol, pnl_pct)
+               VALUES ($1, 'shadow', 'trendj', 'R', 'MJ', now() - interval '3 hours', now() - interval '150 minutes',
+                       100, 120, 190, 0.07, 1, 'trailing', 0.014, 0.20)""", pid)
+        text = await JC.trials_text(db, 1)
+        assert "JENSEN" in text and "rug · -100%" in text and "R: 30 мин · ×1.20 · trailing · +20%, пик ×1.90" in text
+        assert "позиция 1 сд, -100.0%" in text and "R 1 сд, +20.0%" in text
+        for why, n in (("LP пула не заблокирован и не сожжён (0%) — создатель может вынуть SOL: не вхожу", 3),
+                       ("пул моложе 6 ч (40 мин) — не вхожу", 2)):
+            for i in range(n):
+                await db.execute("INSERT INTO real_skips(mint, mode, kind, why) VALUES ($1, 'shadow', 'trendj', $2)",
+                                 f"S{why[:3]}{i}", why)
+        f = await JC.filter_text(db, 24)
+        assert "тренды других бирж: прошли 1 (сделок 1), отсечено 5" in f
+        assert "LP не заблокирован / не сожжён: 3" in f and "пул моложе порога: 2" in f
+    finally:
+        await db.close()

@@ -2483,6 +2483,12 @@ class RealTrader:
                 continue
             self._check(p, float(p.extra.get("last_mc") or p.entry_mc), None, confirmed=True)   # выходы по времени
         for t in [t for t in self.trials.values() if not t.closing]:
+            if t.extra.get("venue") == JUP_VENUE and self.no_route(t.mint):
+                # 27.11 (владелец: R в плюсе, хотя 5 монет из 9 обнулились): пул вынули — пробы закрываются сразу
+                # с −100%, а не висят до конца удержания (у R — сутки) вне итога карточки
+                t.closing = True
+                asyncio.create_task(self._trial_exit_safe(t, "rug", 1.0))
+                continue
             self._check(t, float(t.extra.get("last_mc") or t.entry_mc), None, confirmed=True)
         await self._stale_watch(now)
         if now - self._follow_at >= 30:

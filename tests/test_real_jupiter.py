@@ -804,3 +804,54 @@ async def test_jupiter_429_alert():
     stats.rate_limited = 5
     await desk.jup_limit_watch()
     assert len(said) == 1                                       # не чаще раза в 30 мин
+
+
+async def test_rug_closes_every_trial_not_only_short_rules(db):
+    """27.11 (владелец: «R в плюсе, хотя 5 из 9 монет обнулились»): пул вынули — закрываются все пробы, и R (держит
+    сутки), с −100%; раньше она висела открытой вне итога, а в карточке оставались только пробы, вышедшие до рага."""
+    chain = FakeChain()
+    coin = other_coin(chain, "rug-all-trials")
+    tr = shadow(db, chain, real_trendj=True, real_max_open=5, real_rule_trials=True, real_jup_dry_run=False,
+                real_scheme_trendj="Q")
+    tr.e.ext = ext = Ext(chain)
+    await tr.start()
+    await signal(tr, coin)
+    p = only(tr)
+    assert any(t.extra["rule"] == "R" for t in tr.trials.values())
+    ext.rugged = True
+    p.opened_ts -= 31 * 60                                     # позиция (Q, 30 мин) выходит — маршрута нет
+    await tr.tick()
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if not tr.positions:
+            break
+    await tr.tick()                                            # пробы видят «маршрута нет» — закрываются
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if not tr.trials:
+            break
+    assert not tr.trials
+    rows = {r["rule"]: r for r in await db.fetch("SELECT rule, exit_reason, pnl_pct FROM real_rule_trials")}
+    assert rows["R"]["exit_reason"] == "rug" and rows["R"]["pnl_pct"] < -0.99
+
+
+async def test_probe_card_counts_rugged_open_probes_as_zero(db):
+    """Карточка проб: открытая проба, у которой позиция на том же входе закрыта рагом, — в итоге −100%; остальные
+    открытые — отдельным числом."""
+    pid = await db.fetchval(
+        """INSERT INTO real_positions(mode, kind, mint, opened_at, closed_at, cost_sol, tokens, exit_reason, pnl_sol,
+               pnl_pct) VALUES ('shadow', 'trendj', 'RUGM', now() - interval '2 hours', now() - interval '1 hour', 0.1,
+               1, 'rug', -0.1, -1.0) RETURNING id""")
+    pid2 = await db.fetchval(
+        """INSERT INTO real_positions(mode, kind, mint, opened_at, cost_sol, tokens)
+           VALUES ('shadow', 'trendj', 'LIVEM', now() - interval '1 hour', 0.1, 1) RETURNING id""")
+    for p, rule, closed, pnl in ((pid, "R", False, None), (pid, "A", True, 0.3), (pid2, "R", False, None),
+                                 (pid2, "A", True, 0.1)):
+        await db.execute(
+            """INSERT INTO real_rule_trials(position_id, mode, kind, rule, mint, opened_at, cost_sol, tokens_raw,
+                   closed_at, pnl_sol, pnl_pct)
+               VALUES ($1, 'shadow', 'trendj', $2, 'M', now() - interval '2 hours', 0.1, 1,
+                       CASE WHEN $3 THEN now() END, $4::float8 * 0.1, $4::float8)""", p, rule, closed, pnl)
+    st = await UI.trial_stats(db, "trendj", None)
+    assert st["R"][:2] == (1, 0) and st["R"][2] == pytest.approx(-0.1) and st["R"][4] == 1   # раг −100%, 1 открыта
+    assert st["A"][0] == 2 and st["A"][4] == 0

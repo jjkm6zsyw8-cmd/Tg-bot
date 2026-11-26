@@ -247,10 +247,16 @@ async def run_tool(cmd: str, db: Database) -> None:
     elif cmd == "jupcheck":
         # 25.11: сделки других бирж с фильтрами входа (LP закрыт / сожжён, пул старше N ч): python -m scanner jupcheck
         # [--days N] [--lp 0.9]
-        from .real.jupcheck import run as jup_run
+        from .real.jupcheck import filter_text, run as jup_run, trials_text
         days = float(args[args.index("--days") + 1]) if "--days" in args else None
         lp = float(args[args.index("--lp") + 1]) if "--lp" in args else 0.9
-        print(await jup_run(db, lp, days, all_time="--all" in args))
+        if "--trials" in args:
+            print(await trials_text(db, days or 3.0))         # 27.11: выходы позиции и проб A/B/G/R по каждой сделке
+        elif "--filter" in args:
+            hours = float(args[args.index("--hours") + 1]) if "--hours" in args else 24.0
+            print(await filter_text(db, hours))               # 27.11: сколько фильтры входа пропустили и отсекли
+        else:
+            print(await jup_run(db, lp, days, all_time="--all" in args))
     elif cmd == "trendfeat":
         # 25.11: признаки входа трендов: python -m scanner trendfeat [--compare] [--days N] [--kind trend|trendj]
         # [--mode shadow|live] (CSV — в stdout: … > /opt/tg-bot/trend_feat.csv)

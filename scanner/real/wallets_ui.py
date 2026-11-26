@@ -334,17 +334,29 @@ async def paper_stats(db: Any, days: int = PAPER_DAYS) -> dict[str, tuple[int, i
     return {r["portfolio"]: (int(r["n"]), int(r["w"]), float(r["s"]) * 10) for r in rows}
 
 
-async def trial_stats(db: Any, kind: str, wid: int | None, days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float, float]]:
+async def trial_stats(db: Any, kind: str, wid: int | None,
+                      days: int = PAPER_DAYS) -> dict[str, tuple[int, int, float, float, int]]:
     """Пробы правил выхода метода (тень, все 4 правила на тех же входах): правило → (сделок, в плюс, итог SOL,
-    средний %). Кошелёк — его пробы; общие настройки — все."""
+    средний %, ещё открыто). Кошелёк — его пробы; общие настройки — все. 27.11 (владелец: «R в плюсе, хотя 5 из 9
+    монет обнулились»): открытая проба, у которой позиция на том же входе закрыта рагом, — в итоге как −100% (пул
+    пуст, продать некому); остальные открытые в итог не входят, но считаются."""
     zero = await stats_since(db)
     rows = await db.fetch(
-        """SELECT rule, count(*) n, count(*) FILTER (WHERE pnl_sol > 0) w, COALESCE(sum(pnl_sol), 0) s,
-                  COALESCE(avg(pnl_pct), 0) a
-           FROM real_rule_trials WHERE kind = $1 AND closed_at IS NOT NULL
-             AND opened_at > now() - make_interval(days => $2) AND ($3::timestamptz IS NULL OR opened_at >= $3)
-             AND ($4::bigint IS NULL OR wallet_id = $4) GROUP BY rule""", kind, int(days), zero, wid)
-    return {r["rule"]: (int(r["n"]), int(r["w"]), float(r["s"]), float(r["a"])) for r in rows}
+        """WITH t AS (
+               SELECT t.rule, t.closed_at IS NULL AND p.closed_at IS NOT NULL
+                          AND p.exit_reason IN ('rug', 'rug_back') AS rugged,
+                      t.closed_at IS NOT NULL AS closed, t.pnl_sol, t.pnl_pct, t.cost_sol
+               FROM real_rule_trials t LEFT JOIN real_positions p ON p.id = t.position_id
+               WHERE t.kind = $1 AND t.opened_at > now() - make_interval(days => $2)
+                 AND ($3::timestamptz IS NULL OR t.opened_at >= $3) AND ($4::bigint IS NULL OR t.wallet_id = $4))
+           SELECT rule, count(*) FILTER (WHERE closed OR rugged) n,
+                  count(*) FILTER (WHERE closed AND pnl_sol > 0) w,
+                  COALESCE(sum(CASE WHEN rugged THEN -cost_sol ELSE pnl_sol END) FILTER (WHERE closed OR rugged), 0) s,
+                  COALESCE(avg(CASE WHEN rugged THEN -1.0 ELSE pnl_pct END) FILTER (WHERE closed OR rugged), 0) a,
+                  count(*) FILTER (WHERE NOT closed AND NOT rugged) o
+           FROM t GROUP BY rule""", kind, int(days), zero, wid)
+    return {r["rule"]: (int(r["n"]), int(r["w"]), float(r["s"]), float(r["a"]), int(r["o"]))
+            for r in rows if int(r["n"]) or int(r["o"])}
 
 
 async def paper_period(db: Any, days: int = PAPER_DAYS) -> str:
@@ -423,7 +435,8 @@ async def methods_view(db: Any, cfg: dict[str, Any], wid: int | None) -> tuple[s
             t = (await trial_stats(db, kind, wid)).get(rule)
             lines.append(f"   ставка {'$%g' % stake if stake else 'как у кошелька ($%g)' % wallet_stake} · тень {period} "
                          f"по правилу {rule}: " + (f"{t[0]} сд · плюс {t[1] / t[0]:.0%} · {_usd(t[2] * sol_usd)}"
-                                                    if t else "сделок нет"))
+                                                    if t and t[0] else "сделок нет")
+                         + (f" · ещё открыто {t[4]}" if t and t[4] else ""))
         kb.append([{"text": f"{'✅' if on else '⬜'} {name}", "callback": f"rl:wmx:{tag}:{kind}:{'off' if on else 'on'}"},
                    {"text": "⚙️ настроить", "callback": f"rl:wmk:{tag}:{kind}"}])
     if paper_on:
@@ -502,8 +515,11 @@ async def method_view(db: Any, cfg: dict[str, Any], tag: str, kind: str) -> tupl
     for x in rules:
         t = trials.get(x)
         mark = f"{x} ●" if x == rule else x
-        table.append(f"{mark:<6}" + (f"{t[0]:>4}{t[1] / t[0]:>6.0%}{_usd(t[2] * sol_usd):>9}" if t else f"{'—':>4}{'':>6}{'нет':>9}"))
+        table.append(f"{mark:<6}" + (f"{t[0]:>4}{t[1] / t[0]:>6.0%}{_usd(t[2] * sol_usd):>9}" if t and t[0]
+                                     else f"{'—':>4}{'':>6}{'нет':>9}") + (f" +{t[4]} откр." if t and t[4] else ""))
     lines.append("<pre>" + "\n".join(table) + "</pre>")
+    if any(t[4] for t in trials.values()):
+        lines.append("«откр.» — пробы ещё в позиции, в итог не вошли; пробы на монетах, где пул вынули, — в итоге как −100%")
     if paper_on:
         lines += ["", "<b>Бумага</b> " + await paper_period(db)]
         for x in S.SCHEMES:
