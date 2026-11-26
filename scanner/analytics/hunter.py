@@ -263,6 +263,8 @@ class Params:
     min_pool: float = MIN_POOL_SOL
     sol_usd: float = 150.0
     exit_delay: float = CM.EXIT_DELAY_S   # 27.11: продажа «садится» через столько секунд (hunter_exit_delay_s)
+    max_stake: float = 0.5               # 27.11: ставка «при 3% пула» — не больше лимита на кошелёк (real_follow_max_sol)
+    copy_share: float = 0.10             # и не больше доли его покупки (real_copy_max_share)
 
 
 async def params_of(db: Any, cfg: dict[str, Any] | None = None) -> Params:
@@ -270,7 +272,8 @@ async def params_of(db: Any, cfg: dict[str, Any] | None = None) -> Params:
     price = (await db.kv_get("sol_usd", {}) or {}).get("price") if hasattr(db, "kv_get") else None
     return Params(float(cfg.get("hunter_entry_delay_s", ENTRY_DELAY_S)),
                   float(cfg.get("real_min_pool_sol", MIN_POOL_SOL)), float(price or 150.0),
-                  float(cfg.get("hunter_exit_delay_s", CM.EXIT_DELAY_S)))
+                  float(cfg.get("hunter_exit_delay_s", CM.EXIT_DELAY_S)), float(cfg.get("real_follow_max_sol", 0.5)),
+                  float(cfg.get("real_copy_max_share", 0.10)))
 
 
 def assess(p: CM.Prepared, trades: list[dict[str, Any]], prm: Params, days: float,
@@ -285,7 +288,8 @@ def assess(p: CM.Prepared, trades: list[dict[str, Any]], prm: Params, days: floa
     s.trades_day = len(trades) / max(days, 1 / 24)
     s.usd_day = s.per_day * STAKE_SOL * s.avg * prm.sol_usd
     mx = [c for _e, c in CM.run(p, SCHEMES[rule], exit_delay_s=prm.exit_delay, entry_delay_s=prm.delay, min_pool_sol=prm.min_pool,
-                                stake_share=MAX_STAKE_SHARE) if c.res is not None]
+                                stake_share=MAX_STAKE_SHARE, stake_cap=prm.max_stake, his_share=prm.copy_share)
+          if c.res is not None]
     if mx:
         s.usd_day_max = s.per_day * statistics.fmean(c.stake for c in mx) * statistics.fmean(c.res for c in mx) \
             * prm.sol_usd
@@ -357,7 +361,8 @@ def alert_text(s: Stats, now: float, prm: Params | None = None,
             f"<b>{s.coins_all} монет</b> ({s.coins} с ценой), в среднем <b>{s.avg:+.1%}</b>, в плюсе "
             f"<b>{s.win:.0%}</b>, t={s.t:.1f} ({s.n} копий, без цены {s.noprice:.0%})\n"
             f"Правило {s.rule}: на второй половине {test}; со входом «блок +2» {b2}\n"
-            f"<b>${s.usd_day:,.0f} в день</b> при {STAKE_SOL:g} SOL · ${s.usd_day_max:,.0f} при 3% пула · "
+            f"<b>${s.usd_day:,.0f} в день</b> при {STAKE_SOL:g} SOL · ${s.usd_day_max:,.0f} при 3% пула (не больше "
+            f"{prm.max_stake:g} SOL и {prm.copy_share:.0%} его покупки) · "
             f"{s.per_day:.0f} сделок в день{note}\n"
             f"Всплеск (+25% за 30 с): {s.burst:.0%} · слив на копировщиков: {s.dump:.0%}\n"
             f"Удержание у него: медиана {ago(s.hold_s)} · последняя покупка "
@@ -908,6 +913,58 @@ async def why_text(db: Any, prm: Params | None = None, wallet: str | None = None
             else:
                 fate["ни сигнала, ни пропуска бота"] += 1
         out.append("  бот: " + "; ".join(f"{k} — {v}" for k, v in fate.most_common(6)))
+    return "\n".join(out)
+
+
+async def entry_gap_text(db: Any, prm: Params, wallet: str, hours: float = 72.0, top: int = 3) -> str:
+    """27.11 (владелец: у Fn9n… «блок +2: +378%» при +12.5% с задержкой 1.36 с — ошибка цены или весь плюс в первую
+    секунду?): копии с наибольшим разрывом между входом «блок +2» и входом через delay — его покупка, оба входа (блок,
+    время, MC, источник цены), сделки первых 3 с после него и выход."""
+    now = time.time()
+    trades = await CM.wallet_trades(db, wallet, now - hours * 3600 - 120, now)
+    p = await CM.prepare(db, wallet, trades, now - hours * 3600, now, limit=100_000)
+    rule = await db.fetchval("SELECT rule FROM hunter_wallets WHERE address = $1", wallet) or "A"
+    sc = SCHEMES[rule if rule in SCHEMES else "A"]
+    syms = {r["mint"]: r["symbol"] for r in await db.fetch(
+        "SELECT mint, symbol FROM tokens WHERE mint = ANY($1::text[])", list({e.mint for e in p.ents}))}
+    rows = []
+    for e in p.ents:
+        tk = [t for t in p.ticks.get(e.mint, []) if e.ts - 5 <= t.ts <= e.ts + 1900]
+        created, dev = p.meta.get(e.mint, (None, None))
+        kw = dict(covered=p.cover.get(e.mint), min_pool_sol=prm.min_pool, exit_delay_s=prm.exit_delay)
+        cr = float(created) if created is not None else None
+        b2 = CM.copy_trade(e, tk, wallet, dev or None, cr, sc, **kw)
+        dl = CM.copy_trade(e, tk, wallet, dev or None, cr, sc, entry_delay_s=prm.delay, **kw)
+        if b2.res is not None and dl.res is not None:
+            rows.append((b2.res - dl.res, e, tk, b2, dl))
+    if not rows:
+        return f"У {wallet} за {hours:g} ч нет копий с ценой в обоих вариантах."
+    rows.sort(key=lambda r: -r[0])
+    b2s, dls = [r[3].res for r in rows], [r[4].res for r in rows]
+    rest = rows[top:]
+    out = [f"🔬 <b>Вход «блок +2» против входа через {prm.delay:g} с</b> — <code>{wallet}</code>, правило {rule}, "
+           f"{hours:g} ч: {len(rows)} копий, блок +2 {statistics.fmean(b2s):+.1%}, {prm.delay:g} с "
+           f"{statistics.fmean(dls):+.1%}"
+           + (f"; без {top} крайних — {statistics.fmean([r[3].res for r in rest]):+.1%} / "
+              f"{statistics.fmean([r[4].res for r in rest]):+.1%}" if rest else "")]
+
+    def tick(t: Any, e: Any) -> str:
+        sl = f"блок {t.slot - e.slot:+d}" if t.slot is not None and e.slot else "блок ?"
+        return f"{t.ts - e.ts:+.2f} с, {sl}, MC {t.mc:,.1f} ({t.src or '?'})"
+    for gap, e, tk, b2, dl in rows[:top]:
+        et2, etd = CM.entry_tick(e, tk), CM.entry_by_delay(e, tk, prm.delay)
+        own = next((t for t in tk if t.trader == wallet and t.is_buy and abs(t.ts - e.ts) <= 2), None)
+        out.append(f"\n<b>${fmt.esc(syms.get(e.mint) or e.mint[:6])}</b> <code>{e.mint}</code> — разрыв {gap * 100:+.0f} п.п.\n"
+                   f"  его покупка {datetime.fromtimestamp(e.ts, timezone.utc):%d.%m %H:%M:%S}, блок {e.slot}, "
+                   f"{e.sol:.2f} SOL" + (f", MC {own.mc:,.1f} ({own.src or '?'})" if own else "") + "\n"
+                   f"  блок +2: вход " + (tick(et2, e) if et2 else "?") + f" → {b2.reason} MC {b2.exit_mc:,.1f} → "
+                   f"{b2.res:+.0%}\n"
+                   f"  {prm.delay:g} с: вход " + (tick(etd, e) if etd else "?") + f" → {dl.reason} MC {dl.exit_mc:,.1f}"
+                   f" → {dl.res:+.0%}")
+        first = [t for t in tk if e.ts - 0.5 <= t.ts <= e.ts + 3][:10]
+        out.append("  сделки до +3 с: " + "; ".join(
+            f"{t.ts - e.ts:+.2f} с {'покупка' if t.is_buy else 'продажа'} {t.sol:.2f} SOL MC {t.mc:,.1f} "
+            f"({t.src or '?'}{', его' if t.trader == wallet else ''})" for t in first))
     return "\n".join(out)
 
 

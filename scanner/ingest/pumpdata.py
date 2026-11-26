@@ -98,8 +98,17 @@ def parse(msg: Any) -> Row | None:
     venue = str(msg.get("venue") or "").lower()
     pool = "pump-amm" if ("swap" in venue or "amm" in venue) else "pump"
     sub = zlib.crc32(f"{mint}|{wallet}|{side}|{msg.get('token_amount')}".encode())
+    is_buy = side in ("buy", "b")
+    if pool == "pump":
+        # 27.11: цена ПОСЛЕ сделки, как у остальных источников (v_sol / v_tokens), а не средняя цена сделки — у
+        # крупной покупки на кривой средняя ниже итоговой (5 SOL на старте — на 14%), и вход модели «по цене после
+        # его покупки» выходил дешевле, чем возможен
+        v_sol, v_tok = curve_reserves(sol, tok, is_buy)
+        mc = v_sol / v_tok * TOTAL_SUPPLY
+    else:
+        mc = sol / tok * TOTAL_SUPPLY            # пул PumpSwap глубокий — средняя цена ≈ цена после сделки
     return Row(int(slot), int(idx), sub, _ts(msg.get("block_time") or msg.get("ts")), str(mint), str(wallet),
-               side in ("buy", "b"), sol, tok, sol / tok * TOTAL_SUPPLY, pool)
+               is_buy, sol, tok, mc, pool)
 
 
 def curve_reserves(sol: float, tokens: float, is_buy: bool,

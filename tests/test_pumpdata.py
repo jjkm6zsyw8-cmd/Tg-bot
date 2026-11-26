@@ -21,7 +21,8 @@ def trade(**kw):
 def test_parse_trade_messages():
     r = PD.parse(trade())
     assert (r.slot, r.idx, r.mint, r.wallet, r.is_buy, r.pool) == (100, 3, "MINTX", ME, True, "pump")
-    assert abs(r.mc - 50.0) < 1e-9                                  # 1.5 SOL за 30 млн из 1 млрд → MC 50 SOL
+    v_sol, v_tok = PD.curve_reserves(1.5, 30_000_000.0, True)
+    assert abs(r.mc - v_sol / v_tok * 1e9) < 1e-6 and r.mc > 50.0     # цена после сделки выше средней (1.5 / 30 млн)
     assert r.ts == datetime.fromtimestamp(1_795_000_000, timezone.utc)
     s = PD.parse(trade(venue="pumpswap", side="sell", sol=2_000_000_000, token_amount=4e12, ts=1_795_000_000_500))
     assert s.is_buy is False and s.pool == "pump-amm" and s.sol == 2.0 and s.tokens == 4e6   # лампорты и сырые единицы
@@ -170,3 +171,15 @@ async def test_old_market_table_is_rebuilt(db):
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'market_trades'")}
     assert "sub" in cols
     await db.migrate()                                                  # повторная миграция — без ошибок
+
+
+
+def test_curve_mc_is_price_after_trade():
+    """27.11: на кривой MC сделки — цена после неё (как у других источников), а не средняя: 5 SOL с самого старта."""
+    from scanner.solana import INITIAL_V_SOL, INITIAL_V_TOKENS
+    k = INITIAL_V_SOL * INITIAL_V_TOKENS
+    out = INITIAL_V_TOKENS - k / 35.0
+    r = PD.parse(trade(sol=5.0, token_amount=out))
+    after = 35.0 / (k / 35.0) * 1e9
+    avg = 5.0 / out * 1e9
+    assert abs(r.mc - after) < 1e-6 and avg < r.mc and abs(avg / after - 30 / 35) < 1e-6

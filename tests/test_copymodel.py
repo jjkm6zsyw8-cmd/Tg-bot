@@ -385,3 +385,33 @@ def test_take_after_price_hole_sells_at_take_level():
     assert d.exit_mc == 110 and d.res > 0.8                              # цена видна до скачка — скачок настоящий
     covered = M.copy_trade(e, holey, ME, DEV, T0 - 60, entry_delay_s=1.36, covered=[(T0, T0 + 600)])
     assert covered.exit_mc == 110                                        # окно резервов: тишина — цена не менялась
+
+
+def test_max_stake_respects_wallet_limit_and_his_buy():
+    """27.11: ставка «при 3% пула» — не больше лимита на кошелёк (0.5 SOL) и 10% его покупки, как защита копирования."""
+    deep = [tk(0, 2000, 100, ME), tk(1, 2000, 101), tk(2, 2000, 102), tk(4, 2600, 104)]
+    big = M.Entry("MINT", T0, 100, 20.0)
+    c = M.copy_trade(big, deep, ME, DEV, T0 - 60, stake_share=0.03)
+    assert c.stake > 1.0                                                 # 3% глубокого пула — больше SOL
+    assert M.copy_trade(big, deep, ME, DEV, T0 - 60, stake_share=0.03, stake_cap=0.5, his_share=0.10).stake == 0.5
+    small = M.Entry("MINT", T0, 100, 2.0)
+    assert M.copy_trade(small, deep, ME, DEV, T0 - 60, stake_share=0.03, stake_cap=0.5,
+                        his_share=0.10).stake == pytest.approx(0.2)    # 10% его покупки 2 SOL
+
+
+async def test_entry_gap_shows_where_block2_beats_delay(db):
+    """27.11: «блок +2: +378%» при +12.5% с задержкой — разбор копий с наибольшим разрывом: оба входа, сделки первых
+    3 с (с источником цены) и выход."""
+    from scanner.analytics import hunter as H
+    now = datetime.now(timezone.utc)
+    m = "GAPB" + "b" * 40
+    t = now - timedelta(hours=2)
+    await put_coin(db, m, t - timedelta(minutes=1))
+    await put_trade(db, m, ME, t, True, 40, 1000, sol=3.0)
+    await put_trade(db, m, OTHER, t + timedelta(seconds=0.4), True, 42, 1001)           # блок +1 — вход «блок +2»
+    await put_trade(db, m, "SNIP" + "s" * 40, t + timedelta(seconds=1.2), True, 120, 1003)   # через 1.2 с — ×3
+    for i in range(1, 12):
+        await put_trade(db, m, f"F{i:02d}" + "f" * 40, t + timedelta(seconds=1.2 + 2 * i), True, 121, 1003 + i)
+    text = H.fmt.plain(await H.entry_gap_text(db, H.Params(1.36, 0.0, 150.0), ME, 6, 3))
+    assert "1 копий" in text and "разрыв +" in text and "блок +2: вход +0.40 с, блок +1, MC 42.0" in text
+    assert "1.36 с: вход +1.20 с, блок +3, MC 120.0" in text and "сделки до +3 с:" in text and ", его)" in text

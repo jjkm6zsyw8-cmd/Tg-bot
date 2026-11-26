@@ -304,6 +304,13 @@ async def run_tool(cmd: str, db: Database) -> None:
                     await hrpc.close()
         elif "--list" in args:
             print(await H.hunt_text(db, float(arg("--hours") or 24)))
+        elif "--entry-gap" in args:
+            # 27.11: копии с наибольшим разрывом между входом «блок +2» и входом через 1.36 с (--wallet адрес)
+            if not arg("--wallet"):
+                print("Укажите кошелёк: hunt --entry-gap --wallet <адрес> [--hours 72] [--top 3]")
+            else:
+                print(H.fmt.plain(await H.entry_gap_text(db, prm, arg("--wallet"), float(arg("--hours") or 72),
+                                                         int(arg("--top") or 3))))
         elif "--why" in args:
             # 27.11: что стало с покупками кошельков охотника после находки (модель, журнал копий, бот)
             print(H.fmt.plain(await H.why_text(db, prm, arg("--wallet"))))

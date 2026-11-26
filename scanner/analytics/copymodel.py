@@ -59,6 +59,7 @@ class Tick:
     # 25.11: сделки PumpPortal на PumpSwap несут MC без виртуальных резервов пула (на 4–26% ниже, state.TradeRow) —
     # как цена они не годятся, только как событие (трейдер / дев продал)
     price_ok: bool = True
+    src: str = ""                        # 27.11: откуда цена (pumpportal / watch / rpc / pumpdata / reserve) — для разборов
 
 
 @dataclass(slots=True)
@@ -179,7 +180,8 @@ BURST_UP, BURST_S = 0.25, 30.0
 def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, created_ts: float | None,
                scheme: dict[str, Any] | None = None, stake: float = STAKE_SOL,
                covered: list[tuple[float, float]] | None = None, entry_delay_s: float | None = None,
-               stake_share: float | None = None, min_pool_sol: float = 0.0, exit_delay_s: float | None = None) -> Copy:
+               stake_share: float | None = None, min_pool_sol: float = 0.0, exit_delay_s: float | None = None,
+               stake_cap: float | None = None, his_share: float | None = None) -> Copy:
     """Копия одной покупки трейдера: вход как у бота, выход по decide_exit (правило A и общие выходы).
     covered — окна слежения за резервами монеты (reserve_cover): внутри окна тишина значит «цена не менялась».
     26.11: entry_delay_s — вход через нашу задержку (иначе блок +2); stake_share — ставка как доля SOL пула (3%
@@ -198,6 +200,11 @@ def copy_trade(e: Entry, ticks: list[Tick], trader: str, dev: str | None, create
         return Copy(None, SMALL_POOL, entry_mc=et.mc, venue=venue)
     if stake_share:
         stake = max(0.001, stake_share * reserves(et.mc, venue)[0])
+    # 27.11 (владелец): ставка и при 3% пула — как в защите копирования боя: не больше доли его покупки и лимита на кошелёк
+    if his_share and e.sol > 0:
+        stake = min(stake, max(0.001, his_share * e.sol))
+    if stake_cap:
+        stake = min(stake, stake_cap)
     opened = e.ts + ENTRY_DELAY_S
     tokens = buy_tokens(et.mc, venue, stake)
     pos = CopyPos(id=0, portfolio="copy", mint=e.mint, opened_ts=opened, entry_mc=et.mc, cost_sol=stake + FIXED_SOL,
@@ -392,7 +399,8 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]], reserves:
         pool = r["pool"] or "pump"
         out.setdefault(r["mint"], []).append(Tick(float(r["ts"]), float(r["mc_sol"]), r["slot"], r["trader"],
                                                   bool(r["is_buy"]), float(r["sol_amount"] or 0), pool,
-                                                  not (r["source"] == "pumpportal" and pool == AMM)))
+                                                  not (r["source"] == "pumpportal" and pool == AMM),
+                                                  str(r["source"] or "")))
     # 25.11: цена из резервов (подписка на кривую / хранилища пула) — без сделки, только цена
     for r in [] if not reserves else await db.fetch(
             """SELECT p.mint, extract(epoch FROM r.ts) AS ts, r.mc_sol, r.slot, r.venue
@@ -400,7 +408,7 @@ async def load_ticks(db: Any, windows: dict[str, tuple[float, float]], reserves:
                JOIN reserve_ticks r ON r.mint = p.mint AND r.ts BETWEEN to_timestamp(p.lo) AND to_timestamp(p.hi)
                WHERE r.mc_sol > 0""", mints, [windows[m][0] for m in mints], [windows[m][1] for m in mints]):
         out.setdefault(r["mint"], []).append(Tick(float(r["ts"]), float(r["mc_sol"]), r["slot"], "", True, 0.0,
-                                                  r["venue"] or "pump", True))
+                                                  r["venue"] or "pump", True, "reserve"))
     for m in out:
         out[m].sort(key=lambda t: t.ts)
     return out
